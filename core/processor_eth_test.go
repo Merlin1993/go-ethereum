@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/core/state/snapshot"
+
 	"github.com/ethereum/go-ethereum/core/tracing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -24,54 +26,95 @@ import (
 	"github.com/holiman/uint256"
 )
 
+/*
+以太坊账户结构及状态访问说明:
+
+以太坊的账户是作为一个完整的结构体存储的，包含以下字段:
+1. Nonce: 交易计数，用于防止重放攻击
+2. Balance: 账户余额
+3. Root: 账户存储树的根哈希(对于合约账户)
+4. CodeHash: 合约代码的哈希(对于合约账户)
+
+任何修改账户的操作(如SetBalance、SetNonce等)都需要先读取整个账户，
+修改其中的字段，然后再写回。这导致账户状态修改总是先读后写的模式。
+
+而对于合约存储(由GetState/SetState操作)，每个存储槽位是单独读写的，
+可以直接写入而无需先读取(除非业务逻辑本身需要先读取当前值再修改)。
+
+因此在统计中，账户状态(地址级别)的操作通常表现为"读后写"，
+而合约存储的操作则可能是"只读"或"只写"模式。
+*/
+
 // StateAccessCounter 用于记录状态访问信息
 type StateAccessCounter struct {
-	ReadStates     map[string]bool            // 记录读取的状态
-	WriteStates    map[string]bool            // 记录写入的状态
 	AccountReads   map[string]bool            // 记录账户读取(只记录一次)
 	BlockNum       uint64                     // 当前区块号
 	RecentAccess   map[uint64]map[string]bool // 按区块号记录访问的状态
 	MaxHistorySize uint64                     // 最大历史记录数量
+
+	// 新增字段用于跟踪已经访问过的状态
+	VisitedReads      map[string]bool // 本区块内已经读取过的状态
+	VisitedWrites     map[string]bool // 本区块内已经写入过的状态
+	UniqueReads       int             // 区块内唯一的读操作数量
+	UniqueWrites      int             // 区块内唯一的写操作数量
+	DetailedAccessLog bool            // 是否记录详细的访问日志
+	ReadsOnly         map[string]bool // 只读状态
+	ReadThenWritten   map[string]bool // 先读后写状态
+	WritesOnly        map[string]bool // 只写状态
 }
 
 // NewStateAccessCounter 创建一个新的状态访问计数器
 func NewStateAccessCounter(maxHistorySize uint64) *StateAccessCounter {
 	return &StateAccessCounter{
-		ReadStates:     make(map[string]bool),
-		WriteStates:    make(map[string]bool),
-		AccountReads:   make(map[string]bool),
-		RecentAccess:   make(map[uint64]map[string]bool),
-		MaxHistorySize: maxHistorySize,
+		AccountReads:      make(map[string]bool),
+		RecentAccess:      make(map[uint64]map[string]bool),
+		MaxHistorySize:    maxHistorySize,
+		VisitedReads:      make(map[string]bool),
+		VisitedWrites:     make(map[string]bool),
+		DetailedAccessLog: true, // 开启详细日志
+		ReadsOnly:         make(map[string]bool),
+		ReadThenWritten:   make(map[string]bool),
+		WritesOnly:        make(map[string]bool),
 	}
 }
 
 // RecordStateRead 记录状态读取
 func (c *StateAccessCounter) RecordStateRead(key string) {
-	c.ReadStates[key] = true
+	// 如果该键尚未被读取过且尚未被写入过，增加唯一读取计数
+	if !c.VisitedReads[key] && !c.VisitedWrites[key] {
+		c.UniqueReads++
+		c.VisitedReads[key] = true
+
+		// 记录详细访问日志
+		if c.DetailedAccessLog {
+			c.ReadsOnly[key] = true
+		}
+	}
+
 	if c.RecentAccess[c.BlockNum] == nil {
 		c.RecentAccess[c.BlockNum] = make(map[string]bool)
 	}
 	c.RecentAccess[c.BlockNum][key] = true
 }
 
-// RecordAccountRead 记录账户基础信息读取(只记录一次)
-func (c *StateAccessCounter) RecordAccountRead(addr string) {
-	// 如果账户第一次被读取，记录它
-	if !c.AccountReads[addr] {
-		c.AccountReads[addr] = true
-		c.ReadStates[addr] = true
-		if c.RecentAccess[c.BlockNum] == nil {
-			c.RecentAccess[c.BlockNum] = make(map[string]bool)
-		}
-		c.RecentAccess[c.BlockNum][addr] = true
-	}
-}
-
 // RecordStateWrite 记录状态写入
 func (c *StateAccessCounter) RecordStateWrite(key string) {
-	// 写入前也会读取
-	c.ReadStates[key] = true
-	c.WriteStates[key] = true
+	// 如果该键尚未被写入过，增加唯一写入计数
+	if !c.VisitedWrites[key] {
+		c.UniqueWrites++
+		c.VisitedWrites[key] = true
+
+		// 记录详细访问日志
+		if c.DetailedAccessLog {
+			if c.ReadsOnly[key] {
+				delete(c.ReadsOnly, key)
+				c.ReadThenWritten[key] = true
+			} else {
+				c.WritesOnly[key] = true
+			}
+		}
+	}
+
 	if c.RecentAccess[c.BlockNum] == nil {
 		c.RecentAccess[c.BlockNum] = make(map[string]bool)
 	}
@@ -80,10 +123,16 @@ func (c *StateAccessCounter) RecordStateWrite(key string) {
 
 // NextBlock 进入下一个区块，清除旧的状态记录
 func (c *StateAccessCounter) NextBlock(blockNum uint64) {
+
 	c.BlockNum = blockNum
-	c.ReadStates = make(map[string]bool)
-	c.WriteStates = make(map[string]bool)
 	c.AccountReads = make(map[string]bool)
+	c.VisitedReads = make(map[string]bool)
+	c.VisitedWrites = make(map[string]bool)
+	c.UniqueReads = 0
+	c.UniqueWrites = 0
+	c.ReadsOnly = make(map[string]bool)
+	c.ReadThenWritten = make(map[string]bool)
+	c.WritesOnly = make(map[string]bool)
 
 	// 删除历史过久的记录
 	for b := range c.RecentAccess {
@@ -152,11 +201,16 @@ func (c *StateAccessCounter) GetCacheHitRate(n uint64) float64 {
 type CountingStateDB struct {
 	*state.StateDB
 	counter *StateAccessCounter
+	debug   bool // 是否启用调试模式
 }
 
 // GetState 重写GetState方法，增加计数
 func (db *CountingStateDB) GetState(addr common.Address, key common.Hash) common.Hash {
 	stateKey := addr.Hex() + ":" + key.Hex()
+	if db.debug {
+		fmt.Printf("读取状态: %s\n", stateKey)
+	}
+	// 合约存储的读取，是直接读取存储槽，不涉及到修改，因此是纯读取操作
 	db.counter.RecordStateRead(stateKey)
 	return db.StateDB.GetState(addr, key)
 }
@@ -164,35 +218,53 @@ func (db *CountingStateDB) GetState(addr common.Address, key common.Hash) common
 // SetState 重写SetState方法，增加计数
 func (db *CountingStateDB) SetState(addr common.Address, key, value common.Hash) common.Hash {
 	stateKey := addr.Hex() + ":" + key.Hex()
-	db.counter.RecordStateRead(stateKey)
+	if db.debug {
+		fmt.Printf("写入状态: %s = %s\n", stateKey, value.Hex())
+	}
 	db.counter.RecordStateWrite(stateKey)
 	return db.StateDB.SetState(addr, key, value)
 }
 
 // GetBalance 重写GetBalance方法，增加计数
 func (db *CountingStateDB) GetBalance(addr common.Address) *uint256.Int {
-	db.counter.RecordAccountRead(addr.Hex())
+	addrStr := addr.Hex()
+	if db.debug {
+		fmt.Printf("读取余额: %s\n", addrStr)
+	}
+	db.counter.RecordStateRead(addrStr)
 	return db.StateDB.GetBalance(addr)
 }
 
 // SetBalance 重写SetBalance方法，增加计数
 func (db *CountingStateDB) SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) {
 	addrStr := addr.Hex()
-	db.counter.RecordAccountRead(addrStr) // 写入前会先读取
+	if db.debug {
+		fmt.Printf("设置余额: %s = %s, 原因: %v\n", addrStr, amount.String(), reason)
+	}
+	// 以太坊账户是完整的结构体，设置余额操作需要先读取整个账户
+	db.counter.RecordStateRead(addrStr) // 写入前会先读取，因为账户是一个结构体，这里只会更改结构体的一小部分，所以是先读后写
 	db.counter.RecordStateWrite(addrStr)
 	db.StateDB.SetBalance(addr, amount, reason)
 }
 
 // GetNonce 重写GetNonce方法，增加计数
 func (db *CountingStateDB) GetNonce(addr common.Address) uint64 {
-	db.counter.RecordAccountRead(addr.Hex())
+	addrStr := addr.Hex()
+	if db.debug {
+		fmt.Printf("读取Nonce: %s\n", addrStr)
+	}
+	db.counter.RecordStateRead(addrStr)
 	return db.StateDB.GetNonce(addr)
 }
 
 // SetNonce 重写SetNonce方法，增加计数
 func (db *CountingStateDB) SetNonce(addr common.Address, nonce uint64, reason tracing.NonceChangeReason) {
 	addrStr := addr.Hex()
-	db.counter.RecordAccountRead(addrStr) // 写入前会先读取
+	if db.debug {
+		fmt.Printf("设置Nonce: %s = %d, 原因: %v\n", addrStr, nonce, reason)
+	}
+	// 以太坊账户是完整的结构体，设置Nonce操作需要先读取整个账户
+	db.counter.RecordStateRead(addrStr) // 写入前会先读取
 	db.counter.RecordStateWrite(addrStr)
 	db.StateDB.SetNonce(addr, nonce, reason)
 }
@@ -200,7 +272,11 @@ func (db *CountingStateDB) SetNonce(addr common.Address, nonce uint64, reason tr
 // SubBalance 重写SubBalance方法，增加计数
 func (db *CountingStateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
 	addrStr := addr.Hex()
-	db.counter.RecordAccountRead(addrStr) // 写入前会先读取
+	if db.debug {
+		fmt.Printf("减少余额: %s - %s, 原因: %v\n", addrStr, amount.String(), reason)
+	}
+	// SubBalance 确实需要先读取当前余额
+	db.counter.RecordStateRead(addrStr)
 	db.counter.RecordStateWrite(addrStr)
 	return db.StateDB.SubBalance(addr, amount, reason)
 }
@@ -208,44 +284,73 @@ func (db *CountingStateDB) SubBalance(addr common.Address, amount *uint256.Int, 
 // AddBalance 重写AddBalance方法，增加计数
 func (db *CountingStateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
 	addrStr := addr.Hex()
-	db.counter.RecordAccountRead(addrStr) // 写入前会先读取
+	if db.debug {
+		fmt.Printf("增加余额: %s + %s, 原因: %v\n", addrStr, amount.String(), reason)
+	}
+	// AddBalance 确实需要先读取当前余额
+	db.counter.RecordStateRead(addrStr)
 	db.counter.RecordStateWrite(addrStr)
 	return db.StateDB.AddBalance(addr, amount, reason)
 }
 
 // 区块统计数据结构
 type BlockStats struct {
-	BlockNum           uint64        // 区块号
-	TransactionCount   int           // 交易数
+	BlockNum             uint64  // 区块号
+	TransactionCount     int     // 交易数
+	SuccessCount         int     // 成功交易数
+	SuccessRate          float64 // 交易成功率
+	ContractTxCount      int     // 合约交易数
+	ContractTxPercent    float64 // 合约交易占比
+	ContractSuccessCount int     // 成功的合约交易数
+	ContractSuccessRate  float64 // 合约交易成功率
+
 	ProcessTime        time.Duration // 交易处理时间
 	RootGenTime        time.Duration // 根哈希生成时间
 	CommitTime         time.Duration // 数据库提交时间
 	TotalTime          time.Duration // 总时间
 	ProcessTimePercent float64       // 处理时间占比
 	RootGenTimePercent float64       // 根哈希时间占比
-	CommitTimePercent  float64       // 提交时间占比
-	ReadStates         int           // 读状态数量
-	WriteStates        int           // 写状态数量
-	CacheHitRate5      float64       // 最近5个区块缓存命中率
-	CacheHitRate10     float64       // 最近10个区块缓存命中率
-	CacheHitRate20     float64       // 最近20个区块缓存命中率
-	CacheHitRate40     float64       // 最近40个区块缓存命中率
+
+	UniqueReads  int // 唯一读状态数
+	UniqueWrites int // 唯一写状态数
+
+	AvgStatesPerTx         float64 // 每个交易平均状态访问数
+	AvgStatesPerContractTx float64 // 每个合约交易平均状态访问数
+
+	CacheHitRate5  float64 // 最近5个区块缓存命中率
+	CacheHitRate10 float64 // 最近10个区块缓存命中率
+	CacheHitRate20 float64 // 最近20个区块缓存命中率
+	CacheHitRate40 float64 // 最近40个区块缓存命中率
 }
 
 // 统计聚合结构
 type StatsAggregator struct {
-	Stats            []BlockStats  // 所有区块的统计数据
-	OutputDir        string        // 输出目录
-	BlockWindow      uint64        // 统计窗口大小(每隔多少区块打印一次)
-	CsvWindow        uint64        // CSV输出窗口大小(每隔多少区块生成一个CSV)
-	LastOutputBlock  uint64        // 上次输出统计的区块号
-	LastCsvBlock     uint64        // 上次输出CSV的区块号
-	TotalProcessed   int           // 总处理区块数
-	TotalTransaction int           // 总交易数
-	MaxProcessTime   time.Duration // 最大处理时间
-	MaxRootGenTime   time.Duration // 最大根哈希生成时间
-	MaxCommitTime    time.Duration // 最大提交时间
-	MaxTotalTime     time.Duration // 最大总时间
+	Stats                []BlockStats // 所有区块的统计数据
+	OutputDir            string       // 输出目录
+	BlockWindow          uint64       // 统计窗口大小(每隔多少区块打印一次)
+	CsvWindow            uint64       // CSV输出窗口大小(每隔多少区块生成一个CSV)
+	LastOutputBlock      uint64       // 上次输出统计的区块号
+	LastCsvBlock         uint64       // 上次输出CSV的区块号
+	TotalProcessed       int          // 总处理区块数
+	TotalTransaction     int          // 总交易数
+	TotalSuccess         int          // 总成功交易数
+	TotalContractTx      int          // 总合约交易数
+	TotalContractSuccess int          // 总成功的合约交易数
+
+	MaxProcessTime  time.Duration // 最大处理时间
+	MaxRootGenTime  time.Duration // 最大根哈希生成时间
+	MaxCommitTime   time.Duration // 最大提交时间
+	MaxTotalTime    time.Duration // 最大总时间
+	MaxTxCount      int           // 最大交易数
+	MaxReadStates   int           // 最大读状态数
+	MaxWriteStates  int           // 最大写状态数
+	MaxUniqueReads  int           // 最大唯一读状态数
+	MaxUniqueWrites int           // 最大唯一写状态数
+
+	MinHitRate5  float64 // 最小5区块命中率
+	MinHitRate10 float64 // 最小10区块命中率
+	MinHitRate20 float64 // 最小20区块命中率
+	MinHitRate40 float64 // 最小40区块命中率
 }
 
 // 创建新的统计聚合器
@@ -256,17 +361,23 @@ func NewStatsAggregator(outputDir string, blockWindow, csvWindow uint64) *StatsA
 	}
 
 	return &StatsAggregator{
-		Stats:           make([]BlockStats, 0),
-		OutputDir:       outputDir,
-		BlockWindow:     blockWindow,
-		CsvWindow:       csvWindow,
-		LastOutputBlock: 0,
-		LastCsvBlock:    0,
-		TotalProcessed:  0,
-		MaxProcessTime:  0,
-		MaxRootGenTime:  0,
-		MaxCommitTime:   0,
-		MaxTotalTime:    0,
+		Stats:                make([]BlockStats, 0),
+		OutputDir:            outputDir,
+		BlockWindow:          blockWindow,
+		CsvWindow:            csvWindow,
+		LastOutputBlock:      0,
+		LastCsvBlock:         0,
+		TotalProcessed:       0,
+		TotalTransaction:     0,
+		TotalSuccess:         0,
+		TotalContractTx:      0,
+		TotalContractSuccess: 0,
+		MaxUniqueReads:       0,
+		MaxUniqueWrites:      0,
+		MinHitRate5:          1.0, // 初始化为最大值1.0
+		MinHitRate10:         1.0,
+		MinHitRate20:         1.0,
+		MinHitRate40:         1.0,
 	}
 }
 
@@ -275,6 +386,9 @@ func (s *StatsAggregator) AddBlockStats(stats BlockStats) {
 	s.Stats = append(s.Stats, stats)
 	s.TotalProcessed++
 	s.TotalTransaction += stats.TransactionCount
+	s.TotalSuccess += stats.SuccessCount
+	s.TotalContractTx += stats.ContractTxCount
+	s.TotalContractSuccess += stats.ContractSuccessCount
 
 	// 更新最大值
 	if stats.ProcessTime > s.MaxProcessTime {
@@ -288,6 +402,29 @@ func (s *StatsAggregator) AddBlockStats(stats BlockStats) {
 	}
 	if stats.TotalTime > s.MaxTotalTime {
 		s.MaxTotalTime = stats.TotalTime
+	}
+	if stats.TransactionCount > s.MaxTxCount {
+		s.MaxTxCount = stats.TransactionCount
+	}
+	if stats.UniqueReads > s.MaxUniqueReads {
+		s.MaxUniqueReads = stats.UniqueReads
+	}
+	if stats.UniqueWrites > s.MaxUniqueWrites {
+		s.MaxUniqueWrites = stats.UniqueWrites
+	}
+
+	// 更新最小命中率
+	if stats.CacheHitRate5 < s.MinHitRate5 {
+		s.MinHitRate5 = stats.CacheHitRate5
+	}
+	if stats.CacheHitRate10 < s.MinHitRate10 {
+		s.MinHitRate10 = stats.CacheHitRate10
+	}
+	if stats.CacheHitRate20 < s.MinHitRate20 {
+		s.MinHitRate20 = stats.CacheHitRate20
+	}
+	if stats.CacheHitRate40 < s.MinHitRate40 {
+		s.MinHitRate40 = stats.CacheHitRate40
 	}
 
 	// 检查是否需要打印统计信息
@@ -307,14 +444,16 @@ func (s *StatsAggregator) AddBlockStats(stats BlockStats) {
 
 // 计算平均值
 func (s *StatsAggregator) CalculateAvg() (avgProcessTime, avgRootGenTime, avgCommitTime, avgTotalTime time.Duration,
-	avgProcessPercent, avgRootGenPercent, avgCommitPercent, avgHitRate5, avgHitRate10, avgHitRate20, avgHitRate40 float64) {
+	avgProcessPercent, avgRootGenPercent, avgCommitPercent, avgHitRate5, avgHitRate10, avgHitRate20, avgHitRate40 float64,
+	avgTxCount, avgReadStates, avgWriteStates float64) {
 
 	if len(s.Stats) == 0 {
 		return
 	}
 
 	var totalProcessTime, totalRootGenTime, totalCommitTime, totalTotalTime time.Duration
-	var totalProcessPercent, totalRootGenPercent, totalCommitPercent, totalHitRate5, totalHitRate10, totalHitRate20, totalHitRate40 float64
+	var totalProcessPercent, totalRootGenPercent, totalHitRate5, totalHitRate10, totalHitRate20, totalHitRate40 float64
+	var totalTxCount, totalReadStates, totalWriteStates int
 
 	for _, stat := range s.Stats {
 		totalProcessTime += stat.ProcessTime
@@ -323,25 +462,26 @@ func (s *StatsAggregator) CalculateAvg() (avgProcessTime, avgRootGenTime, avgCom
 		totalTotalTime += stat.TotalTime
 		totalProcessPercent += stat.ProcessTimePercent
 		totalRootGenPercent += stat.RootGenTimePercent
-		totalCommitPercent += stat.CommitTimePercent
 		totalHitRate5 += stat.CacheHitRate5
 		totalHitRate10 += stat.CacheHitRate10
 		totalHitRate20 += stat.CacheHitRate20
 		totalHitRate40 += stat.CacheHitRate40
+		totalTxCount += stat.TransactionCount
 	}
 
 	count := float64(len(s.Stats))
 	avgProcessTime = time.Duration(float64(totalProcessTime) / count)
 	avgRootGenTime = time.Duration(float64(totalRootGenTime) / count)
-	avgCommitTime = time.Duration(float64(totalCommitTime) / count)
 	avgTotalTime = time.Duration(float64(totalTotalTime) / count)
 	avgProcessPercent = totalProcessPercent / count
 	avgRootGenPercent = totalRootGenPercent / count
-	avgCommitPercent = totalCommitPercent / count
 	avgHitRate5 = totalHitRate5 / count
 	avgHitRate10 = totalHitRate10 / count
 	avgHitRate20 = totalHitRate20 / count
 	avgHitRate40 = totalHitRate40 / count
+	avgTxCount = float64(totalTxCount) / count
+	avgReadStates = float64(totalReadStates) / count
+	avgWriteStates = float64(totalWriteStates) / count
 
 	return
 }
@@ -352,20 +492,168 @@ func (s *StatsAggregator) PrintStats() {
 		return
 	}
 
-	avgProcessTime, avgRootGenTime, avgCommitTime, avgTotalTime,
-		avgProcessPercent, avgRootGenPercent, avgCommitPercent,
-		avgHitRate5, avgHitRate10, avgHitRate20, avgHitRate40 := s.CalculateAvg()
+	// 只取最近的BlockWindow个区块或者全部（如果数量不足）
+	startIdx := 0
+	if len(s.Stats) > int(s.BlockWindow) {
+		startIdx = len(s.Stats) - int(s.BlockWindow)
+	}
+	recentStats := s.Stats[startIdx:]
+
+	// 计算这部分的统计数据
+	var totalProcessTime, totalRootGenTime, totalCommitTime, totalTotalTime time.Duration
+	var totalProcessPercent, totalRootGenPercent float64
+	var totalTxCount, totalSuccessCount, totalContractTxCount, totalContractSuccessCount int
+	var totalUniqueReads, totalUniqueWrites int
+
+	var maxProcessTime, maxRootGenTime, maxCommitTime, maxTotalTime time.Duration
+	var maxTxCount, maxUniqueReads, maxUniqueWrites int
+
+	// 收集所有区块的状态访问情况，用于计算整体命中率
+	accessedStates := make(map[string]bool)   // 所有访问过的状态
+	cacheHitStates5 := make(map[string]bool)  // 命中5区块缓存的状态
+	cacheHitStates10 := make(map[string]bool) // 命中10区块缓存的状态
+	cacheHitStates20 := make(map[string]bool) // 命中20区块缓存的状态
+	cacheHitStates40 := make(map[string]bool) // 命中40区块缓存的状态
+
+	// 用于跟踪每个区块的状态访问
+	blockStateAccess := make(map[uint64]map[string]bool)
+	blockStateHits5 := make(map[uint64]map[string]bool)
+	blockStateHits10 := make(map[uint64]map[string]bool)
+	blockStateHits20 := make(map[uint64]map[string]bool)
+	blockStateHits40 := make(map[uint64]map[string]bool)
+
+	// 交易统计
+	var totalSuccessRate, totalContractTxPercent, totalContractSuccessRate float64
+	var totalAvgStatesPerTx, totalAvgStatesPerContractTx float64
+
+	for _, stat := range recentStats {
+		totalProcessTime += stat.ProcessTime
+		totalRootGenTime += stat.RootGenTime
+		totalCommitTime += stat.CommitTime
+		totalTotalTime += stat.TotalTime
+		totalProcessPercent += stat.ProcessTimePercent
+		totalRootGenPercent += stat.RootGenTimePercent
+		totalTxCount += stat.TransactionCount
+		totalSuccessCount += stat.SuccessCount
+		totalContractTxCount += stat.ContractTxCount
+		totalContractSuccessCount += stat.ContractSuccessCount
+		totalUniqueReads += stat.UniqueReads
+		totalUniqueWrites += stat.UniqueWrites
+		totalSuccessRate += stat.SuccessRate
+		totalContractTxPercent += stat.ContractTxPercent
+		totalContractSuccessRate += stat.ContractSuccessRate
+		totalAvgStatesPerTx += stat.AvgStatesPerTx
+		totalAvgStatesPerContractTx += stat.AvgStatesPerContractTx
+
+		// 计算最大值
+		if stat.ProcessTime > maxProcessTime {
+			maxProcessTime = stat.ProcessTime
+		}
+		if stat.RootGenTime > maxRootGenTime {
+			maxRootGenTime = stat.RootGenTime
+		}
+		if stat.CommitTime > maxCommitTime {
+			maxCommitTime = stat.CommitTime
+		}
+		if stat.TotalTime > maxTotalTime {
+			maxTotalTime = stat.TotalTime
+		}
+		if stat.TransactionCount > maxTxCount {
+			maxTxCount = stat.TransactionCount
+		}
+		if stat.UniqueReads > maxUniqueReads {
+			maxUniqueReads = stat.UniqueReads
+		}
+		if stat.UniqueWrites > maxUniqueWrites {
+			maxUniqueWrites = stat.UniqueWrites
+		}
+
+		// 为每个区块创建状态访问跟踪
+		blockNum := stat.BlockNum
+		blockStateAccess[blockNum] = make(map[string]bool)
+		blockStateHits5[blockNum] = make(map[string]bool)
+		blockStateHits10[blockNum] = make(map[string]bool)
+		blockStateHits20[blockNum] = make(map[string]bool)
+		blockStateHits40[blockNum] = make(map[string]bool)
+
+		// 估算该区块访问的状态数量和命中的状态数量
+		stateCount := stat.UniqueReads
+		hit5Count := int(float64(stateCount) * stat.CacheHitRate5)
+		hit10Count := int(float64(stateCount) * stat.CacheHitRate10)
+		hit20Count := int(float64(stateCount) * stat.CacheHitRate20)
+		hit40Count := int(float64(stateCount) * stat.CacheHitRate40)
+
+		// 为每个区块生成唯一的状态ID
+		for i := 0; i < stateCount; i++ {
+			stateID := fmt.Sprintf("block_%d_state_%d", blockNum, i)
+
+			// 记录访问的状态
+			accessedStates[stateID] = true
+			blockStateAccess[blockNum][stateID] = true
+
+			// 记录命中缓存的状态
+			if i < hit5Count {
+				cacheHitStates5[stateID] = true
+				blockStateHits5[blockNum][stateID] = true
+			}
+			if i < hit10Count {
+				cacheHitStates10[stateID] = true
+				blockStateHits10[blockNum][stateID] = true
+			}
+			if i < hit20Count {
+				cacheHitStates20[stateID] = true
+				blockStateHits20[blockNum][stateID] = true
+			}
+			if i < hit40Count {
+				cacheHitStates40[stateID] = true
+				blockStateHits40[blockNum][stateID] = true
+			}
+		}
+	}
+
+	// 计算整体命中率
+	totalAccessedCount := len(accessedStates)
+	cacheHitRate5 := float64(len(cacheHitStates5)) / float64(totalAccessedCount)
+	cacheHitRate10 := float64(len(cacheHitStates10)) / float64(totalAccessedCount)
+	cacheHitRate20 := float64(len(cacheHitStates20)) / float64(totalAccessedCount)
+	cacheHitRate40 := float64(len(cacheHitStates40)) / float64(totalAccessedCount)
+
+	// 计算基于区块的平均值
+	count := float64(len(recentStats))
+	avgProcessTime := time.Duration(float64(totalProcessTime) / count)
+	avgRootGenTime := time.Duration(float64(totalRootGenTime) / count)
+	avgTotalTime := time.Duration(float64(totalTotalTime) / count)
+	// 只计算处理和根哈希的时间百分比
+	avgProcessPercent := float64(totalProcessTime) / float64(totalProcessTime+totalRootGenTime) * 100
+	avgRootGenPercent := float64(totalRootGenTime) / float64(totalProcessTime+totalRootGenTime) * 100
+
+	avgTxCount := float64(totalTxCount) / count
+	avgSuccessRate := totalSuccessRate / count
+	avgContractTxPercent := totalContractTxPercent / count
+	avgContractSuccessRate := float64(totalContractSuccessCount) / float64(totalContractTxCount)
+	avgStatesPerTx := totalAvgStatesPerTx / count
+	avgStatesPerContractTx := totalAvgStatesPerContractTx / count
+	avgUniqueReads := float64(totalUniqueReads) / count
+	avgUniqueWrites := float64(totalUniqueWrites) / count
 
 	fmt.Printf("===== 区块统计 (区块范围: %d - %d) =====\n",
-		s.Stats[0].BlockNum, s.Stats[len(s.Stats)-1].BlockNum)
-	fmt.Printf("处理区块数: %d, 总交易数: %d\n", s.TotalProcessed, s.TotalTransaction)
-	fmt.Printf("平均时间 - 交易处理: %v (%.2f%%), 根哈希: %v (%.2f%%), 提交: %v (%.2f%%), 总计: %v\n",
-		avgProcessTime, avgProcessPercent, avgRootGenTime, avgRootGenPercent,
-		avgCommitTime, avgCommitPercent, avgTotalTime)
-	fmt.Printf("最大时间 - 交易处理: %v, 根哈希: %v, 提交: %v, 总计: %v\n",
-		s.MaxProcessTime, s.MaxRootGenTime, s.MaxCommitTime, s.MaxTotalTime)
-	fmt.Printf("缓存命中率 - 5区块: %.2f%%, 10区块: %.2f%%, 20区块: %.2f%%, 40区块: %.2f%%\n",
-		avgHitRate5*100, avgHitRate10*100, avgHitRate20*100, avgHitRate40*100)
+		recentStats[0].BlockNum, recentStats[len(recentStats)-1].BlockNum)
+	fmt.Printf("处理区块数: %d, 总交易数: %d, 成功交易数: %d, 成功率: %.2f%%\n",
+		len(recentStats), totalTxCount, totalSuccessCount, avgSuccessRate*100)
+	fmt.Printf("合约交易: %d (%.2f%%), 成功合约交易: %d, 合约成功率: %.2f%%\n",
+		totalContractTxCount, avgContractTxPercent*100, totalContractSuccessCount, avgContractSuccessRate*100)
+	fmt.Printf("交易数 - 平均: %.1f, 最大: %d\n",
+		avgTxCount, maxTxCount)
+	fmt.Printf("唯一状态访问 - 读(平均/最大): %.1f/%d, 写(平均/最大): %.1f/%d\n",
+		avgUniqueReads, maxUniqueReads, avgUniqueWrites, maxUniqueWrites)
+	fmt.Printf("每交易状态访问 - 所有交易: %.2f, 合约交易: %.2f\n",
+		avgStatesPerTx, avgStatesPerContractTx)
+	fmt.Printf("平均时间 - 交易处理: %v (%.1f%%), 根哈希: %v (%.1f%%), 总计: %v\n",
+		avgProcessTime, avgProcessPercent, avgRootGenTime, avgRootGenPercent, avgTotalTime)
+	fmt.Printf("最大时间 - 交易处理: %v, 根哈希: %v, 总计: %v\n",
+		maxProcessTime, maxRootGenTime, maxTotalTime)
+	fmt.Printf("缓存命中率 - 总状态数: %d, 5区块(%.1f%%), 10区块(%.1f%%), 20区块(%.1f%%), 40区块(%.1f%%)\n",
+		totalAccessedCount, cacheHitRate5*100, cacheHitRate10*100, cacheHitRate20*100, cacheHitRate40*100)
 	fmt.Println("=======================================")
 }
 
@@ -390,9 +678,13 @@ func (s *StatsAggregator) OutputCSV() {
 
 	// 写入CSV头
 	headers := []string{
-		"BlockNum", "TransactionCount", "ProcessTime(ms)", "RootGenTime(ms)", "CommitTime(ms)",
-		"TotalTime(ms)", "ProcessPercent", "RootGenPercent", "CommitPercent",
-		"ReadStates", "WriteStates", "HitRate5", "HitRate10", "HitRate20", "HitRate40",
+		"BlockNum", "TransactionCount", "SuccessCount", "SuccessRate",
+		"ContractTxCount", "ContractTxPercent", "ContractSuccessCount", "ContractSuccessRate",
+		"ProcessTime(ms)", "RootGenTime(ms)", "TotalTime(ms)",
+		"ProcessPercent", "RootGenPercent",
+		"UniqueReads", "UniqueWrites",
+		"AvgStatesPerTx", "AvgStatesPerContractTx",
+		"HitRate5", "HitRate10", "HitRate20", "HitRate40",
 	}
 	writer.Write(headers)
 
@@ -401,15 +693,21 @@ func (s *StatsAggregator) OutputCSV() {
 		record := []string{
 			strconv.FormatUint(stat.BlockNum, 10),
 			strconv.Itoa(stat.TransactionCount),
+			strconv.Itoa(stat.SuccessCount),
+			strconv.FormatFloat(stat.SuccessRate, 'f', 4, 64),
+			strconv.Itoa(stat.ContractTxCount),
+			strconv.FormatFloat(stat.ContractTxPercent, 'f', 4, 64),
+			strconv.Itoa(stat.ContractSuccessCount),
+			strconv.FormatFloat(stat.ContractSuccessRate, 'f', 4, 64),
 			strconv.FormatInt(stat.ProcessTime.Milliseconds(), 10),
 			strconv.FormatInt(stat.RootGenTime.Milliseconds(), 10),
-			strconv.FormatInt(stat.CommitTime.Milliseconds(), 10),
 			strconv.FormatInt(stat.TotalTime.Milliseconds(), 10),
 			strconv.FormatFloat(stat.ProcessTimePercent, 'f', 2, 64),
 			strconv.FormatFloat(stat.RootGenTimePercent, 'f', 2, 64),
-			strconv.FormatFloat(stat.CommitTimePercent, 'f', 2, 64),
-			strconv.Itoa(stat.ReadStates),
-			strconv.Itoa(stat.WriteStates),
+			strconv.Itoa(stat.UniqueReads),
+			strconv.Itoa(stat.UniqueWrites),
+			strconv.FormatFloat(stat.AvgStatesPerTx, 'f', 4, 64),
+			strconv.FormatFloat(stat.AvgStatesPerContractTx, 'f', 4, 64),
 			strconv.FormatFloat(stat.CacheHitRate5, 'f', 4, 64),
 			strconv.FormatFloat(stat.CacheHitRate10, 'f', 4, 64),
 			strconv.FormatFloat(stat.CacheHitRate20, 'f', 4, 64),
@@ -421,14 +719,29 @@ func (s *StatsAggregator) OutputCSV() {
 	fmt.Printf("已输出CSV文件: %s\n", filename)
 }
 
-// TestProcessCSVTransactions 测试处理CSV中的交易
+// 处理配置
+type ProcessConfig struct {
+	CommitInterval uint64 // 每处理多少个区块提交一次，默认1000
+}
+
+// 默认配置
+func DefaultProcessConfig() ProcessConfig {
+	return ProcessConfig{
+		CommitInterval: 1000,
+	}
+}
+
+// TestProcessTransactions 测试处理CSV中的交易
 func TestProcessTransactions(t *testing.T) {
 	// 定义数据库路径
-	dbDir := "E:\\ethdata\\geth_db"
-	statsDir := "E:\\ethdata\\stats"
+	dbDir := "F:\\ethdata\\geth_db"
+	statsDir := "F:\\ethdata\\stats"
 
 	// 创建统计聚合器，每100,000个区块打印一次统计，每1,000,000个区块生成一个CSV
 	statsAgg := NewStatsAggregator(statsDir, 100000, 1000000)
+
+	// 处理配置
+	config := DefaultProcessConfig()
 
 	// 创建或打开持久化数据库
 	ldb, err := leveldb.New(dbDir, 1024, 1024, "eth-process-test", false)
@@ -439,6 +752,9 @@ func TestProcessTransactions(t *testing.T) {
 
 	db := rawdb.NewDatabase(ldb)
 	trieDB := triedb.NewDatabase(db, nil)
+	tdb := triedb.NewDatabase(db, nil)
+	snaps, _ := snapshot.New(snapshot.Config{CacheSize: 10}, db, tdb, types.EmptyRootHash)
+	sdb := state.NewDatabase(trieDB, snaps)
 
 	// 创建genesis区块和区块链
 	//engine := ethash.NewFaker()
@@ -455,6 +771,7 @@ func TestProcessTransactions(t *testing.T) {
 	if header := genesis.Header(); header != nil {
 		lastStateRoot = header.Root
 	}
+	t.Logf("state:%s", lastStateRoot.String())
 
 	// 创建状态访问计数器
 	counter := NewStateAccessCounter(50) // 记录最近50个区块
@@ -541,15 +858,17 @@ func TestProcessTransactions(t *testing.T) {
 
 			// 创建消息
 			msg := &Message{
-				To:        to,
-				From:      from,
-				Nonce:     0, // 可以考虑从CSV中读取nonce
-				Value:     value,
-				GasLimit:  gasLimit,
-				GasPrice:  gasPrice,
-				GasFeeCap: gasPrice, // 对于旧交易，使用gasPrice作为GasFeeCap
-				GasTipCap: gasPrice, // 对于旧交易，使用gasPrice作为GasTipCap
-				Data:      data,
+				To:               to,
+				From:             from,
+				Nonce:            0, // 可以考虑从CSV中读取nonce
+				Value:            value,
+				GasLimit:         gasLimit,
+				GasPrice:         gasPrice,
+				GasFeeCap:        gasPrice, // 对于旧交易，使用gasPrice作为GasFeeCap
+				GasTipCap:        gasPrice, // 对于旧交易，使用gasPrice作为GasTipCap
+				Data:             data,
+				SkipNonceChecks:  true,
+				SkipFromEOACheck: false,
 			}
 
 			msgsByBlock[blockNum.Uint64()] = append(msgsByBlock[blockNum.Uint64()], msg)
@@ -568,6 +887,8 @@ func TestProcessTransactions(t *testing.T) {
 
 		// 处理每个区块
 		parent := lastProcessedBlock
+		var lastCommitBlock uint64 = 0 // 记录上次提交的区块号
+
 		for blockNum := minBlock; blockNum <= maxBlock; blockNum++ {
 			if len(msgsByBlock[blockNum]) == 0 {
 				continue
@@ -587,7 +908,7 @@ func TestProcessTransactions(t *testing.T) {
 			}
 
 			// 创建statedb，使用上一个区块的状态根
-			statedb, err := state.New(lastStateRoot, state.NewDatabase(trieDB, nil))
+			statedb, err := state.New(lastStateRoot, sdb)
 			if err != nil {
 				t.Fatalf("创建状态失败: %v", err)
 			}
@@ -596,6 +917,7 @@ func TestProcessTransactions(t *testing.T) {
 			countingStateDB := &CountingStateDB{
 				StateDB: statedb,
 				counter: counter,
+				debug:   false,
 			}
 
 			bigBalance := new(big.Int).Mul(big.NewInt(1000000), big.NewInt(1e18))
@@ -616,6 +938,11 @@ func TestProcessTransactions(t *testing.T) {
 			var usedGas uint64
 			var receipts types.Receipts
 
+			// 交易统计
+			var successCount int
+			var contractTxCount int
+			var contractSuccessCount int
+
 			// 创建EVM上下文
 			blockContext := vm.BlockContext{
 				CanTransfer: CanTransfer,
@@ -633,10 +960,16 @@ func TestProcessTransactions(t *testing.T) {
 			vmenv := vm.NewEVM(blockContext, countingStateDB, params.TestChainConfig, vm.Config{})
 
 			for _, msg := range msgsByBlock[blockNum] {
+				// 判断是否为合约交易 (有data的为合约交易)
+				isContractTx := len(msg.Data) > 0
+				if isContractTx {
+					contractTxCount++
+				}
+
 				// 处理交易
 				result, err := ApplyMessage(vmenv, msg, gp)
 				var receipt *types.Receipt
-				if err != nil {
+				if err != nil || result.Err != nil {
 					// t.Logf("receipt err： %s", err.Error()) // 不再打印错误信息
 					receipt = &types.Receipt{
 						Type:              types.LegacyTxType,
@@ -649,6 +982,11 @@ func TestProcessTransactions(t *testing.T) {
 						BlockHash:         common.Hash{},
 					}
 				} else {
+					// 交易成功
+					successCount++
+					if isContractTx {
+						contractSuccessCount++
+					}
 					usedGas += result.UsedGas
 
 					// 创建收据
@@ -669,16 +1007,23 @@ func TestProcessTransactions(t *testing.T) {
 
 			// 生成根哈希阶段
 			rootGenStart := time.Now()
-			root := countingStateDB.IntermediateRoot(true)
+			root, _ := countingStateDB.Commit(blockNum, false, false)
 			rootGenDuration := time.Since(rootGenStart)
 
-			// 提交状态到数据库阶段
-			commitStart := time.Now()
-			err = trieDB.Commit(root, false)
-			commitDuration := time.Since(commitStart)
+			// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
+			var commitDuration time.Duration
+			if blockNum-lastCommitBlock >= config.CommitInterval {
+				commitStart := time.Now()
+				err = trieDB.Commit(root, false)
+				commitDuration = time.Since(commitStart)
+				lastCommitBlock = blockNum
 
-			if err != nil {
-				t.Fatalf("提交状态失败，区块 %d: %v", blockNum, err)
+				if err != nil {
+					t.Fatalf("提交状态失败，区块 %d: %v", blockNum, err)
+				}
+
+				// 刷新数据库，避免内存占用过大
+				trieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
 			}
 
 			// 更新区块头的状态根和保存最新状态根
@@ -695,10 +1040,18 @@ func TestProcessTransactions(t *testing.T) {
 			rawdb.WriteHeadBlockHash(db, block.Hash())
 
 			// 计算总时间和百分比
-			totalTime := processDuration + rootGenDuration + commitDuration
-			processPercent := float64(processDuration) / float64(totalTime) * 100
-			rootGenPercent := float64(rootGenDuration) / float64(totalTime) * 100
-			commitPercent := float64(commitDuration) / float64(totalTime) * 100
+			totalTime := processDuration + rootGenDuration
+			var processPercent, rootGenPercent float64
+
+			// 重新计算时间百分比，只关注交易处理和根哈希计算
+			if totalTime > 0 {
+				processPercent = float64(processDuration) / float64(totalTime) * 100
+				rootGenPercent = float64(rootGenDuration) / float64(totalTime) * 100
+			} else {
+				// 时间为0时设置默认值
+				processPercent = 0
+				rootGenPercent = 0
+			}
 
 			// 获取缓存命中率
 			hitRate5 := counter.GetCacheHitRate(5)
@@ -706,42 +1059,76 @@ func TestProcessTransactions(t *testing.T) {
 			hitRate20 := counter.GetCacheHitRate(20)
 			hitRate40 := counter.GetCacheHitRate(40)
 
+			// 计算交易成功率
+			successRate := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				successRate = float64(successCount) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			// 计算合约交易占比
+			contractTxPercent := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				contractTxPercent = float64(contractTxCount) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			// 计算合约交易成功率
+			contractSuccessRate := 0.0
+			if contractTxCount > 0 {
+				contractSuccessRate = float64(contractSuccessCount) / float64(contractTxCount)
+			}
+
+			// 输出该区块的详细状态访问统计
+			//counter.OutputAccessStats()
+
+			// 计算每个交易平均状态访问数
+			avgStatesPerTx := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				totalStates := counter.UniqueReads + counter.UniqueWrites
+				avgStatesPerTx = float64(totalStates) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			// 计算每个合约交易平均状态访问数
+			avgStatesPerContractTx := 0.0
+			if contractTxCount > 0 {
+				totalStates := counter.UniqueReads + counter.UniqueWrites
+				avgStatesPerContractTx = float64(totalStates) / float64(contractTxCount)
+			}
+
 			// 创建区块统计数据
 			blockStats := BlockStats{
-				BlockNum:           blockNum,
-				TransactionCount:   len(msgsByBlock[blockNum]),
-				ProcessTime:        processDuration,
-				RootGenTime:        rootGenDuration,
-				CommitTime:         commitDuration,
-				TotalTime:          totalTime,
-				ProcessTimePercent: processPercent,
-				RootGenTimePercent: rootGenPercent,
-				CommitTimePercent:  commitPercent,
-				ReadStates:         len(counter.ReadStates),
-				WriteStates:        len(counter.WriteStates),
-				CacheHitRate5:      hitRate5,
-				CacheHitRate10:     hitRate10,
-				CacheHitRate20:     hitRate20,
-				CacheHitRate40:     hitRate40,
+				BlockNum:               blockNum,
+				TransactionCount:       len(msgsByBlock[blockNum]),
+				SuccessCount:           successCount,
+				SuccessRate:            successRate,
+				ContractTxCount:        contractTxCount,
+				ContractTxPercent:      contractTxPercent,
+				ContractSuccessCount:   contractSuccessCount,
+				ContractSuccessRate:    contractSuccessRate,
+				ProcessTime:            processDuration,
+				RootGenTime:            rootGenDuration,
+				CommitTime:             commitDuration,
+				TotalTime:              totalTime,
+				ProcessTimePercent:     processPercent,
+				RootGenTimePercent:     rootGenPercent,
+				UniqueReads:            counter.UniqueReads,
+				UniqueWrites:           counter.UniqueWrites,
+				AvgStatesPerTx:         avgStatesPerTx,
+				AvgStatesPerContractTx: avgStatesPerContractTx,
+				CacheHitRate5:          hitRate5,
+				CacheHitRate10:         hitRate10,
+				CacheHitRate20:         hitRate20,
+				CacheHitRate40:         hitRate40,
 			}
 
 			// 添加到统计聚合器
 			statsAgg.AddBlockStats(blockStats)
-
-			// 定期刷新数据库
-			if blockNum%1000 == 0 {
-				//flushStart := time.Now()
-				trieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
-				//flushDuration := time.Since(flushStart)
-				//t.Logf("区块 %d - 数据库刷新时间: %v", blockNum, flushDuration)
-			}
 		}
 
 		t.Logf("文件处理完成: %s", filePath)
 	}
 
 	// 查找所有匹配的CSV文件并按顺序排序
-	dataDir := "E:\\ethdata\\0to999999_BlockTransaction"
+	dataDir := "F:\\eth_snapshot"
 	csvFiles, err := filepath.Glob(filepath.Join(dataDir, "*_BlockTransaction.csv"))
 	if err != nil {
 		t.Fatalf("查找CSV文件失败: %v", err)
@@ -807,3 +1194,121 @@ func TestProcessTransactions(t *testing.T) {
 
 // 确保CountingStateDB实现了vm.StateDB接口
 var _ vm.StateDB = (*CountingStateDB)(nil)
+
+// OutputAccessStats 输出状态访问统计
+func (c *StateAccessCounter) OutputAccessStats() {
+	if c.DetailedAccessLog {
+		// 统计账户访问 vs 存储访问
+		accountReads := 0
+		accountWrites := 0
+		storageReads := 0
+		storageWrites := 0
+
+		// 统计只读账户、读后写账户
+		accountReadOnly := 0
+		accountReadWrite := 0
+		storageReadOnly := 0
+		storageReadWrite := 0
+		storageWriteOnly := 0
+
+		for key := range c.ReadsOnly {
+			if !strings.Contains(key, ":") {
+				accountReadOnly++
+			} else {
+				storageReadOnly++
+			}
+		}
+
+		for key := range c.ReadThenWritten {
+			if !strings.Contains(key, ":") {
+				accountReadWrite++
+				accountReads++
+				accountWrites++
+			} else {
+				storageReadWrite++
+				storageReads++
+				storageWrites++
+			}
+		}
+
+		for key := range c.WritesOnly {
+			if !strings.Contains(key, ":") {
+				accountWrites++
+			} else {
+				storageWriteOnly++
+				storageWrites++
+			}
+		}
+
+		fmt.Printf("\n===== 状态访问详细统计 (区块 %d) =====\n", c.BlockNum)
+		fmt.Printf("总唯一状态数: %d (读: %d, 写: %d)\n",
+			len(c.ReadsOnly)+len(c.ReadThenWritten)+len(c.WritesOnly),
+			c.UniqueReads, c.UniqueWrites)
+
+		// 账户访问统计
+		fmt.Printf("\n## 账户访问统计 ##\n")
+		fmt.Printf("账户总读取: %d, 账户总写入: %d\n", accountReads+accountReadOnly+accountReadWrite, accountWrites+accountReadWrite)
+		fmt.Printf("只读账户: %d, 读后写账户: %d\n", accountReadOnly, accountReadWrite)
+
+		// 存储访问统计
+		fmt.Printf("\n## 存储访问统计 ##\n")
+		fmt.Printf("存储总读取: %d, 存储总写入: %d\n", storageReads+storageReadOnly+storageReadWrite, storageWrites+storageWriteOnly+storageReadWrite)
+		fmt.Printf("只读存储: %d, 读后写存储: %d, 只写存储: %d\n", storageReadOnly, storageReadWrite, storageWriteOnly)
+
+		fmt.Printf("\n## 整体访问统计 ##\n")
+		fmt.Printf("只读状态: %d (%.2f%%)\n",
+			len(c.ReadsOnly), float64(len(c.ReadsOnly))*100/float64(c.UniqueReads+c.UniqueWrites))
+		fmt.Printf("读后写状态: %d (%.2f%%)\n",
+			len(c.ReadThenWritten), float64(len(c.ReadThenWritten))*100/float64(c.UniqueReads+c.UniqueWrites))
+		fmt.Printf("只写状态: %d (%.2f%%)\n",
+			len(c.WritesOnly), float64(len(c.WritesOnly))*100/float64(c.UniqueReads+c.UniqueWrites))
+
+		// 添加对只写状态的分析，这应该主要是存储写入
+		if len(c.WritesOnly) > 0 {
+			storageWriteOnlyPercent := float64(storageWriteOnly) * 100 / float64(len(c.WritesOnly))
+			fmt.Printf("只写状态中存储写入: %d (%.2f%%)\n",
+				storageWriteOnly, storageWriteOnlyPercent)
+		}
+
+		// 输出前10个只读状态的键
+		if len(c.ReadsOnly) > 0 {
+			fmt.Printf("\n前10个只读状态示例:\n")
+			i := 0
+			for key := range c.ReadsOnly {
+				fmt.Printf("  %s\n", key)
+				i++
+				if i >= 10 {
+					break
+				}
+			}
+		}
+
+		// 输出前10个读后写状态的键
+		if len(c.ReadThenWritten) > 0 {
+			fmt.Printf("\n前10个读后写状态示例:\n")
+			i := 0
+			for key := range c.ReadThenWritten {
+				fmt.Printf("  %s\n", key)
+				i++
+				if i >= 10 {
+					break
+				}
+			}
+		}
+
+		// 输出前10个只写状态的键
+		if len(c.WritesOnly) > 0 {
+			fmt.Printf("\n前10个只写状态示例:\n")
+			i := 0
+			for key := range c.WritesOnly {
+				fmt.Printf("  %s\n", key)
+				i++
+				if i >= 10 {
+					break
+				}
+			}
+		}
+
+		fmt.Println("======================================")
+	}
+}
