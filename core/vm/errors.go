@@ -24,6 +24,7 @@ import (
 
 // List evm execution errors
 var (
+	ErrFailCode                 = errors.New("fail get code")
 	ErrOutOfGas                 = errors.New("out of gas")
 	ErrCodeStoreOutOfGas        = errors.New("contract creation code storage out of gas")
 	ErrDepth                    = errors.New("max call depth exceeded")

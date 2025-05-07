@@ -217,6 +217,9 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 
 		if !isPrecompile && evm.chainRules.IsEIP158 && value.IsZero() {
 			// Calling a non-existing account, don't do anything.
+			if len(input) > 0 {
+				return nil, gas, ErrFailCode
+			}
 			return nil, gas, nil
 		}
 		evm.StateDB.CreateAccount(addr)
@@ -229,6 +232,10 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 		// Initialise a new contract and set the code that is to be used by the EVM.
 		code := evm.resolveCode(addr)
 		if len(code) == 0 {
+			if len(input) > 0 {
+				return nil, gas, ErrFailCode
+			}
+			return nil, gas, nil
 			ret, err = nil, nil // gas is unchanged
 		} else {
 			// The contract is a scoped environment for this execution context only.

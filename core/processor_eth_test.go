@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -295,14 +296,28 @@ func (db *CountingStateDB) AddBalance(addr common.Address, amount *uint256.Int, 
 
 // 区块统计数据结构
 type BlockStats struct {
-	BlockNum             uint64  // 区块号
-	TransactionCount     int     // 交易数
-	SuccessCount         int     // 成功交易数
-	SuccessRate          float64 // 交易成功率
-	ContractTxCount      int     // 合约交易数
+	BlockNum         uint64  // 区块号
+	TransactionCount int     // 交易数
+	SuccessCount     int     // 成功交易数
+	SuccessRate      float64 // 交易成功率
+
+	// 合约相关统计
+	ContractTxCount      int     // 合约交易总数(创建+调用)
 	ContractTxPercent    float64 // 合约交易占比
 	ContractSuccessCount int     // 成功的合约交易数
 	ContractSuccessRate  float64 // 合约交易成功率
+
+	// 合约创建统计
+	CreateContractCount   int     // 创建合约交易数
+	CreateContractPercent float64 // 创建合约交易占比
+	CreateSuccessCount    int     // 成功的创建合约数
+	CreateSuccessRate     float64 // 创建合约成功率
+
+	// 合约调用统计
+	CallContractCount   int     // 调用合约交易数
+	CallContractPercent float64 // 调用合约交易占比
+	CallSuccessCount    int     // 成功的调用合约数
+	CallSuccessRate     float64 // 调用合约成功率
 
 	ProcessTime        time.Duration // 交易处理时间
 	RootGenTime        time.Duration // 根哈希生成时间
@@ -316,6 +331,8 @@ type BlockStats struct {
 
 	AvgStatesPerTx         float64 // 每个交易平均状态访问数
 	AvgStatesPerContractTx float64 // 每个合约交易平均状态访问数
+	AvgStatesPerCreateTx   float64 // 每个创建合约交易平均状态访问数
+	AvgStatesPerCallTx     float64 // 每个调用合约交易平均状态访问数
 
 	CacheHitRate5  float64 // 最近5个区块缓存命中率
 	CacheHitRate10 float64 // 最近10个区块缓存命中率
@@ -731,17 +748,31 @@ func DefaultProcessConfig() ProcessConfig {
 	}
 }
 
+// 查找所有匹配的CSV文件并按顺序排序
+func findTransactionFiles(dataDir string) ([]string, error) {
+	// 使用通配符匹配所有transactions_*.csv文件
+	pattern := filepath.Join(dataDir, "transactions_*.csv")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("查找CSV文件失败: %v", err)
+	}
+
+	// 按文件名排序
+	sort.Strings(files)
+	return files, nil
+}
+
 // TestProcessTransactions 测试处理CSV中的交易
 func TestProcessTransactions(t *testing.T) {
 	// 定义数据库路径
 	dbDir := "F:\\ethdata\\geth_db"
 	statsDir := "F:\\ethdata\\stats"
+	dataDir := "E:\\ethdata"
+
+	var maxBlockNum uint64 = 5000000
 
 	// 创建统计聚合器，每100,000个区块打印一次统计，每1,000,000个区块生成一个CSV
 	statsAgg := NewStatsAggregator(statsDir, 100000, 1000000)
-
-	// 处理配置
-	config := DefaultProcessConfig()
 
 	// 创建或打开持久化数据库
 	ldb, err := leveldb.New(dbDir, 1024, 1024, "eth-process-test", false)
@@ -757,7 +788,6 @@ func TestProcessTransactions(t *testing.T) {
 	sdb := state.NewDatabase(trieDB, snaps)
 
 	// 创建genesis区块和区块链
-	//engine := ethash.NewFaker()
 	gspec := &Genesis{
 		Config: params.TestChainConfig,
 		Alloc:  GenesisAlloc{},
@@ -768,27 +798,49 @@ func TestProcessTransactions(t *testing.T) {
 	lastProcessedBlock := genesis
 	// 获取genesis区块的状态根
 	var lastStateRoot common.Hash
-	if header := genesis.Header(); header != nil {
-		lastStateRoot = header.Root
+	if genesis != nil {
+		if header := genesis.Header(); header != nil {
+			lastStateRoot = header.Root
+		}
 	}
 	t.Logf("state:%s", lastStateRoot.String())
 
 	// 创建状态访问计数器
 	counter := NewStateAccessCounter(50) // 记录最近50个区块
 
-	// 处理CSV文件的函数
-	processCSVFile := func(filePath string, startBlock, endBlock uint64) {
-		t.Logf("开始处理文件: %s，区块范围: %d - %d", filePath, startBlock, endBlock)
+	// 使用新的数据文件路径
+	pattern := filepath.Join(dataDir, "transactions_*.csv")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("查找CSV文件失败: %v", err)
+	}
+
+	if len(files) == 0 {
+		t.Fatalf("未找到任何交易文件")
+	}
+
+	// 按文件名排序
+	sort.Strings(files)
+
+	t.Logf("找到 %d 个交易文件", len(files))
+	for i, file := range files {
+		t.Logf("文件 %d: %s", i+1, file)
+	}
+
+	// 依次处理每个文件
+	for i, file := range files {
+		t.Logf("开始处理第 %d/%d 个文件: %s", i+1, len(files), file)
 
 		// 打开CSV文件
-		file, err := os.Open(filePath)
+		csvFile, err := os.Open(file)
 		if err != nil {
-			t.Fatalf("无法打开CSV文件 %s: %v", filePath, err)
+			t.Fatalf("无法打开CSV文件 %s: %v", file, err)
 		}
-		defer file.Close()
+		defer csvFile.Close()
 
 		// 解析CSV数据
-		reader := csv.NewReader(file)
+		reader := csv.NewReader(csvFile)
+		reader.Comma = ',' // 设置分隔符为逗号
 		headers, err := reader.Read()
 		if err != nil {
 			t.Fatalf("读取CSV头失败: %v", err)
@@ -806,61 +858,82 @@ func TestProcessTransactions(t *testing.T) {
 			}
 
 			// 确保记录有足够的字段
-			if len(record) < 9 { // 至少需要value字段
-				t.Logf("跳过不完整的记录: %v", record)
+			if len(record) < 10 { // 至少需要基本交易字段
+				t.Logf("跳过不完整的记录: %v (长度: %d)", record, len(record))
 				continue
 			}
 
-			blockNum := new(big.Int)
-			blockNum.SetString(record[0], 10)
+			// 打印前几个字段，确认数据格式
+			if record[0] == "hash" {
+				// 跳过标题行
+				continue
+			}
+
+			// 解析区块号
+			blockNumStr := record[3]
+			blockNum, err := strconv.ParseUint(blockNumStr, 10, 64)
+			if err != nil {
+				t.Logf("解析区块号失败: %v, 记录: %s", err, blockNumStr)
+				continue
+			}
 
 			// 检查区块是否在处理范围内
-			if blockNum.Uint64() < startBlock || blockNum.Uint64() > endBlock {
+			if blockNum < 0 || blockNum > maxBlockNum {
 				continue
 			}
 
-			// CSV格式: blockNumber timestamp transactionHash from to toCreate fromIsContract toIsContract value gasLimit gasPrice gasUsed callingFunction isError...
-			from := common.HexToAddress(record[3])
+			// 新CSV格式: hash nonce block_hash block_number transaction_index from_address to_address value gas gas_price input block_timestamp max_fee_per_gas max_priority_fee_per_gas transaction_type
+			from := common.HexToAddress(record[5])
 			var to *common.Address
-			if record[4] != "" {
-				toAddr := common.HexToAddress(record[4])
+			if record[6] != "" && record[6] != "null" {
+				toAddr := common.HexToAddress(record[6])
 				to = &toAddr
 			}
 
-			// 转换value
+			// 解析value
 			value := new(big.Int)
-			if record[8] != "" {
-				value.SetString(record[8], 10)
+			if record[7] != "" {
+				value.SetString(record[7], 10)
 			}
 
-			// 设置gasLimit和gasPrice
+			// 解析gas
 			gasLimit := uint64(21000) // 默认值
-			if len(record) > 9 && record[9] != "" {
-				gl, err := strconv.ParseUint(record[9], 10, 64)
-				if err == nil {
+			if record[8] != "" {
+				gl, err := strconv.ParseUint(record[8], 10, 64)
+				if err == nil && gl > 0 {
 					gasLimit = gl
 				}
 			}
 
+			// 解析gas price
 			gasPrice := big.NewInt(1000000000) // 默认值
-			if len(record) > 10 && record[10] != "" {
+			if record[9] != "" {
 				gp := new(big.Int)
-				if _, ok := gp.SetString(record[10], 10); ok {
+				if _, ok := gp.SetString(record[9], 10); ok && gp.Sign() > 0 {
 					gasPrice = gp
 				}
 			}
 
-			// 处理callingFunction作为data
+			// 解析nonce
+			nonce := uint64(0)
+			if record[1] != "" {
+				n, err := strconv.ParseUint(record[1], 10, 64)
+				if err == nil {
+					nonce = n
+				}
+			}
+
+			// 解析input数据
 			var data []byte
-			if len(record) > 12 && record[12] != "" && record[12] != "null" {
-				data = common.FromHex(record[12])
+			if record[10] != "" && record[10] != "null" {
+				data = common.FromHex(record[10])
 			}
 
 			// 创建消息
 			msg := &Message{
 				To:               to,
 				From:             from,
-				Nonce:            0, // 可以考虑从CSV中读取nonce
+				Nonce:            nonce,
 				Value:            value,
 				GasLimit:         gasLimit,
 				GasPrice:         gasPrice,
@@ -871,11 +944,26 @@ func TestProcessTransactions(t *testing.T) {
 				SkipFromEOACheck: false,
 			}
 
-			msgsByBlock[blockNum.Uint64()] = append(msgsByBlock[blockNum.Uint64()], msg)
+			// 解析max_fee_per_gas和max_priority_fee_per_gas（如果有）
+			if len(record) > 12 && record[12] != "" {
+				maxFeePerGas := new(big.Int)
+				if _, ok := maxFeePerGas.SetString(record[12], 10); ok && maxFeePerGas.Sign() > 0 {
+					msg.GasFeeCap = maxFeePerGas
+				}
+			}
+
+			if len(record) > 13 && record[13] != "" {
+				maxPriorityFeePerGas := new(big.Int)
+				if _, ok := maxPriorityFeePerGas.SetString(record[13], 10); ok && maxPriorityFeePerGas.Sign() > 0 {
+					msg.GasTipCap = maxPriorityFeePerGas
+				}
+			}
+
+			msgsByBlock[blockNum] = append(msgsByBlock[blockNum], msg)
 		}
 
 		// 计算区块范围
-		var minBlock, maxBlock uint64 = endBlock, startBlock
+		var minBlock, maxBlock uint64 = 1000000, 0
 		for blockNum := range msgsByBlock {
 			if blockNum < minBlock {
 				minBlock = blockNum
@@ -942,6 +1030,10 @@ func TestProcessTransactions(t *testing.T) {
 			var successCount int
 			var contractTxCount int
 			var contractSuccessCount int
+			var createContractCount int
+			var createSuccessCount int
+			var callContractCount int
+			var callSuccessCount int
 
 			// 创建EVM上下文
 			blockContext := vm.BlockContext{
@@ -960,8 +1052,18 @@ func TestProcessTransactions(t *testing.T) {
 			vmenv := vm.NewEVM(blockContext, countingStateDB, params.TestChainConfig, vm.Config{})
 
 			for _, msg := range msgsByBlock[blockNum] {
-				// 判断是否为合约交易 (有data的为合约交易)
-				isContractTx := len(msg.Data) > 0
+				// 判断是否为合约交易
+				isContractTx := false
+				isContractCreate := false
+				if msg.To == nil {
+					isContractTx = true
+					isContractCreate = true
+					createContractCount++
+				} else if len(msg.Data) > 0 {
+					isContractTx = true
+					callContractCount++
+				}
+
 				if isContractTx {
 					contractTxCount++
 				}
@@ -986,6 +1088,11 @@ func TestProcessTransactions(t *testing.T) {
 					successCount++
 					if isContractTx {
 						contractSuccessCount++
+						if isContractCreate {
+							createSuccessCount++
+						} else {
+							callSuccessCount++
+						}
 					}
 					usedGas += result.UsedGas
 
@@ -1012,7 +1119,7 @@ func TestProcessTransactions(t *testing.T) {
 
 			// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
 			var commitDuration time.Duration
-			if blockNum-lastCommitBlock >= config.CommitInterval {
+			if blockNum-lastCommitBlock >= 1000 { // 每1000个区块提交一次
 				commitStart := time.Now()
 				err = trieDB.Commit(root, false)
 				commitDuration = time.Since(commitStart)
@@ -1077,6 +1184,28 @@ func TestProcessTransactions(t *testing.T) {
 				contractSuccessRate = float64(contractSuccessCount) / float64(contractTxCount)
 			}
 
+			// 计算合约创建占比和成功率
+			createContractPercent := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				createContractPercent = float64(createContractCount) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			createSuccessRate := 0.0
+			if createContractCount > 0 {
+				createSuccessRate = float64(createSuccessCount) / float64(createContractCount)
+			}
+
+			// 计算合约调用占比和成功率
+			callContractPercent := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				callContractPercent = float64(callContractCount) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			callSuccessRate := 0.0
+			if callContractCount > 0 {
+				callSuccessRate = float64(callSuccessCount) / float64(callContractCount)
+			}
+
 			// 输出该区块的详细状态访问统计
 			//counter.OutputAccessStats()
 
@@ -1094,6 +1223,20 @@ func TestProcessTransactions(t *testing.T) {
 				avgStatesPerContractTx = float64(totalStates) / float64(contractTxCount)
 			}
 
+			// 计算每个合约创建交易平均状态访问数
+			avgStatesPerCreateTx := 0.0
+			if createContractCount > 0 {
+				totalStates := counter.UniqueReads + counter.UniqueWrites
+				avgStatesPerCreateTx = float64(totalStates) / float64(createContractCount)
+			}
+
+			// 计算每个合约调用交易平均状态访问数
+			avgStatesPerCallTx := 0.0
+			if callContractCount > 0 {
+				totalStates := counter.UniqueReads + counter.UniqueWrites
+				avgStatesPerCallTx = float64(totalStates) / float64(callContractCount)
+			}
+
 			// 创建区块统计数据
 			blockStats := BlockStats{
 				BlockNum:               blockNum,
@@ -1104,6 +1247,14 @@ func TestProcessTransactions(t *testing.T) {
 				ContractTxPercent:      contractTxPercent,
 				ContractSuccessCount:   contractSuccessCount,
 				ContractSuccessRate:    contractSuccessRate,
+				CreateContractCount:    createContractCount,
+				CreateContractPercent:  createContractPercent,
+				CreateSuccessCount:     createSuccessCount,
+				CreateSuccessRate:      createSuccessRate,
+				CallContractCount:      callContractCount,
+				CallContractPercent:    callContractPercent,
+				CallSuccessCount:       callSuccessCount,
+				CallSuccessRate:        callSuccessRate,
 				ProcessTime:            processDuration,
 				RootGenTime:            rootGenDuration,
 				CommitTime:             commitDuration,
@@ -1114,6 +1265,8 @@ func TestProcessTransactions(t *testing.T) {
 				UniqueWrites:           counter.UniqueWrites,
 				AvgStatesPerTx:         avgStatesPerTx,
 				AvgStatesPerContractTx: avgStatesPerContractTx,
+				AvgStatesPerCreateTx:   avgStatesPerCreateTx,
+				AvgStatesPerCallTx:     avgStatesPerCallTx,
 				CacheHitRate5:          hitRate5,
 				CacheHitRate10:         hitRate10,
 				CacheHitRate20:         hitRate20,
@@ -1124,63 +1277,7 @@ func TestProcessTransactions(t *testing.T) {
 			statsAgg.AddBlockStats(blockStats)
 		}
 
-		t.Logf("文件处理完成: %s", filePath)
-	}
-
-	// 查找所有匹配的CSV文件并按顺序排序
-	dataDir := "F:\\eth_snapshot"
-	csvFiles, err := filepath.Glob(filepath.Join(dataDir, "*_BlockTransaction.csv"))
-	if err != nil {
-		t.Fatalf("查找CSV文件失败: %v", err)
-	}
-
-	// 创建一个切片存储文件和对应的区块范围
-	type FileRange struct {
-		path       string
-		startBlock uint64
-		endBlock   uint64
-	}
-	fileRanges := []FileRange{}
-
-	// 解析所有文件的区块范围
-	for _, csvFile := range csvFiles {
-		baseName := filepath.Base(csvFile)
-		parts := strings.Split(baseName, "_")
-		if len(parts) != 2 {
-			continue
-		}
-
-		// 解析文件名中的区块范围
-		rangeParts := strings.Split(parts[0], "to")
-		if len(rangeParts) != 2 {
-			continue
-		}
-
-		startBlock := new(big.Int)
-		startBlock.SetString(rangeParts[0], 10)
-
-		endBlock := new(big.Int)
-		endBlock.SetString(rangeParts[1], 10)
-
-		fileRanges = append(fileRanges, FileRange{
-			path:       csvFile,
-			startBlock: startBlock.Uint64(),
-			endBlock:   endBlock.Uint64(),
-		})
-	}
-
-	// 按起始区块排序
-	for i := 0; i < len(fileRanges); i++ {
-		for j := i + 1; j < len(fileRanges); j++ {
-			if fileRanges[i].startBlock > fileRanges[j].startBlock {
-				fileRanges[i], fileRanges[j] = fileRanges[j], fileRanges[i]
-			}
-		}
-	}
-
-	// 按顺序处理所有文件
-	for _, fr := range fileRanges {
-		processCSVFile(fr.path, fr.startBlock, fr.endBlock)
+		t.Logf("完成处理文件: %s", file)
 	}
 
 	// 处理完成后输出最终统计信息
