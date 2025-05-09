@@ -46,6 +46,9 @@ import (
 而合约存储的操作则可能是"只读"或"只写"模式。
 */
 
+// 自定义区块数量维度配置，用于缓存命中率统计
+var CacheBlockSizes = []uint64{5, 10, 20, 40, 80, 160}
+
 // StateAccessCounter 用于记录状态访问信息
 type StateAccessCounter struct {
 	AccountReads   map[string]bool            // 记录账户读取(只记录一次)
@@ -334,10 +337,12 @@ type BlockStats struct {
 	AvgStatesPerCreateTx   float64 // 每个创建合约交易平均状态访问数
 	AvgStatesPerCallTx     float64 // 每个调用合约交易平均状态访问数
 
-	CacheHitRate5  float64 // 最近5个区块缓存命中率
-	CacheHitRate10 float64 // 最近10个区块缓存命中率
-	CacheHitRate20 float64 // 最近20个区块缓存命中率
-	CacheHitRate40 float64 // 最近40个区块缓存命中率
+	CacheHitRate5   float64 // 最近5个区块缓存命中率
+	CacheHitRate10  float64 // 最近10个区块缓存命中率
+	CacheHitRate20  float64 // 最近20个区块缓存命中率
+	CacheHitRate40  float64 // 最近40个区块缓存命中率
+	CacheHitRate80  float64 // 最近80个区块缓存命中率
+	CacheHitRate160 float64 // 最近160个区块缓存命中率
 }
 
 // 统计聚合结构
@@ -364,10 +369,12 @@ type StatsAggregator struct {
 	MaxUniqueReads  int           // 最大唯一读状态数
 	MaxUniqueWrites int           // 最大唯一写状态数
 
-	MinHitRate5  float64 // 最小5区块命中率
-	MinHitRate10 float64 // 最小10区块命中率
-	MinHitRate20 float64 // 最小20区块命中率
-	MinHitRate40 float64 // 最小40区块命中率
+	MinHitRate5   float64 // 最小5区块命中率
+	MinHitRate10  float64 // 最小10区块命中率
+	MinHitRate20  float64 // 最小20区块命中率
+	MinHitRate40  float64 // 最小40区块命中率
+	MinHitRate80  float64 // 最小80区块命中率
+	MinHitRate160 float64 // 最小160区块命中率
 }
 
 // 创建新的统计聚合器
@@ -395,6 +402,8 @@ func NewStatsAggregator(outputDir string, blockWindow, csvWindow uint64) *StatsA
 		MinHitRate10:         1.0,
 		MinHitRate20:         1.0,
 		MinHitRate40:         1.0,
+		MinHitRate80:         1.0, // 新增80区块命中率
+		MinHitRate160:        1.0, // 新增160区块命中率
 	}
 }
 
@@ -443,6 +452,12 @@ func (s *StatsAggregator) AddBlockStats(stats BlockStats) {
 	if stats.CacheHitRate40 < s.MinHitRate40 {
 		s.MinHitRate40 = stats.CacheHitRate40
 	}
+	if stats.CacheHitRate80 < s.MinHitRate80 {
+		s.MinHitRate80 = stats.CacheHitRate80
+	}
+	if stats.CacheHitRate160 < s.MinHitRate160 {
+		s.MinHitRate160 = stats.CacheHitRate160
+	}
 
 	// 检查是否需要打印统计信息
 	if stats.BlockNum-s.LastOutputBlock >= s.BlockWindow {
@@ -461,7 +476,7 @@ func (s *StatsAggregator) AddBlockStats(stats BlockStats) {
 
 // 计算平均值
 func (s *StatsAggregator) CalculateAvg() (avgProcessTime, avgRootGenTime, avgCommitTime, avgTotalTime time.Duration,
-	avgProcessPercent, avgRootGenPercent, avgCommitPercent, avgHitRate5, avgHitRate10, avgHitRate20, avgHitRate40 float64,
+	avgProcessPercent, avgRootGenPercent, avgCommitPercent, avgHitRate5, avgHitRate10, avgHitRate20, avgHitRate40, avgHitRate80, avgHitRate160 float64,
 	avgTxCount, avgReadStates, avgWriteStates float64) {
 
 	if len(s.Stats) == 0 {
@@ -469,7 +484,7 @@ func (s *StatsAggregator) CalculateAvg() (avgProcessTime, avgRootGenTime, avgCom
 	}
 
 	var totalProcessTime, totalRootGenTime, totalCommitTime, totalTotalTime time.Duration
-	var totalProcessPercent, totalRootGenPercent, totalHitRate5, totalHitRate10, totalHitRate20, totalHitRate40 float64
+	var totalProcessPercent, totalRootGenPercent, totalHitRate5, totalHitRate10, totalHitRate20, totalHitRate40, totalHitRate80, totalHitRate160 float64
 	var totalTxCount, totalReadStates, totalWriteStates int
 
 	for _, stat := range s.Stats {
@@ -483,6 +498,8 @@ func (s *StatsAggregator) CalculateAvg() (avgProcessTime, avgRootGenTime, avgCom
 		totalHitRate10 += stat.CacheHitRate10
 		totalHitRate20 += stat.CacheHitRate20
 		totalHitRate40 += stat.CacheHitRate40
+		totalHitRate80 += stat.CacheHitRate80
+		totalHitRate160 += stat.CacheHitRate160
 		totalTxCount += stat.TransactionCount
 	}
 
@@ -496,6 +513,8 @@ func (s *StatsAggregator) CalculateAvg() (avgProcessTime, avgRootGenTime, avgCom
 	avgHitRate10 = totalHitRate10 / count
 	avgHitRate20 = totalHitRate20 / count
 	avgHitRate40 = totalHitRate40 / count
+	avgHitRate80 = totalHitRate80 / count
+	avgHitRate160 = totalHitRate160 / count
 	avgTxCount = float64(totalTxCount) / count
 	avgReadStates = float64(totalReadStates) / count
 	avgWriteStates = float64(totalWriteStates) / count
@@ -526,11 +545,13 @@ func (s *StatsAggregator) PrintStats() {
 	var maxTxCount, maxUniqueReads, maxUniqueWrites int
 
 	// 收集所有区块的状态访问情况，用于计算整体命中率
-	accessedStates := make(map[string]bool)   // 所有访问过的状态
-	cacheHitStates5 := make(map[string]bool)  // 命中5区块缓存的状态
-	cacheHitStates10 := make(map[string]bool) // 命中10区块缓存的状态
-	cacheHitStates20 := make(map[string]bool) // 命中20区块缓存的状态
-	cacheHitStates40 := make(map[string]bool) // 命中40区块缓存的状态
+	accessedStates := make(map[string]bool)    // 所有访问过的状态
+	cacheHitStates5 := make(map[string]bool)   // 命中5区块缓存的状态
+	cacheHitStates10 := make(map[string]bool)  // 命中10区块缓存的状态
+	cacheHitStates20 := make(map[string]bool)  // 命中20区块缓存的状态
+	cacheHitStates40 := make(map[string]bool)  // 命中40区块缓存的状态
+	cacheHitStates80 := make(map[string]bool)  // 命中80区块缓存的状态
+	cacheHitStates160 := make(map[string]bool) // 命中160区块缓存的状态
 
 	// 用于跟踪每个区块的状态访问
 	blockStateAccess := make(map[uint64]map[string]bool)
@@ -538,6 +559,8 @@ func (s *StatsAggregator) PrintStats() {
 	blockStateHits10 := make(map[uint64]map[string]bool)
 	blockStateHits20 := make(map[uint64]map[string]bool)
 	blockStateHits40 := make(map[uint64]map[string]bool)
+	blockStateHits80 := make(map[uint64]map[string]bool)
+	blockStateHits160 := make(map[uint64]map[string]bool)
 
 	// 交易统计
 	var totalSuccessRate, totalContractTxPercent, totalContractSuccessRate float64
@@ -592,6 +615,8 @@ func (s *StatsAggregator) PrintStats() {
 		blockStateHits10[blockNum] = make(map[string]bool)
 		blockStateHits20[blockNum] = make(map[string]bool)
 		blockStateHits40[blockNum] = make(map[string]bool)
+		blockStateHits80[blockNum] = make(map[string]bool)
+		blockStateHits160[blockNum] = make(map[string]bool)
 
 		// 估算该区块访问的状态数量和命中的状态数量
 		stateCount := stat.UniqueReads
@@ -599,6 +624,8 @@ func (s *StatsAggregator) PrintStats() {
 		hit10Count := int(float64(stateCount) * stat.CacheHitRate10)
 		hit20Count := int(float64(stateCount) * stat.CacheHitRate20)
 		hit40Count := int(float64(stateCount) * stat.CacheHitRate40)
+		hit80Count := int(float64(stateCount) * stat.CacheHitRate80)
+		hit160Count := int(float64(stateCount) * stat.CacheHitRate160)
 
 		// 为每个区块生成唯一的状态ID
 		for i := 0; i < stateCount; i++ {
@@ -625,6 +652,14 @@ func (s *StatsAggregator) PrintStats() {
 				cacheHitStates40[stateID] = true
 				blockStateHits40[blockNum][stateID] = true
 			}
+			if i < hit80Count {
+				cacheHitStates80[stateID] = true
+				blockStateHits80[blockNum][stateID] = true
+			}
+			if i < hit160Count {
+				cacheHitStates160[stateID] = true
+				blockStateHits160[blockNum][stateID] = true
+			}
 		}
 	}
 
@@ -634,6 +669,8 @@ func (s *StatsAggregator) PrintStats() {
 	cacheHitRate10 := float64(len(cacheHitStates10)) / float64(totalAccessedCount)
 	cacheHitRate20 := float64(len(cacheHitStates20)) / float64(totalAccessedCount)
 	cacheHitRate40 := float64(len(cacheHitStates40)) / float64(totalAccessedCount)
+	cacheHitRate80 := float64(len(cacheHitStates80)) / float64(totalAccessedCount)
+	cacheHitRate160 := float64(len(cacheHitStates160)) / float64(totalAccessedCount)
 
 	// 计算基于区块的平均值
 	count := float64(len(recentStats))
@@ -669,8 +706,8 @@ func (s *StatsAggregator) PrintStats() {
 		avgProcessTime, avgProcessPercent, avgRootGenTime, avgRootGenPercent, avgTotalTime)
 	fmt.Printf("最大时间 - 交易处理: %v, 根哈希: %v, 总计: %v\n",
 		maxProcessTime, maxRootGenTime, maxTotalTime)
-	fmt.Printf("缓存命中率 - 总状态数: %d, 5区块(%.1f%%), 10区块(%.1f%%), 20区块(%.1f%%), 40区块(%.1f%%)\n",
-		totalAccessedCount, cacheHitRate5*100, cacheHitRate10*100, cacheHitRate20*100, cacheHitRate40*100)
+	fmt.Printf("缓存命中率 - 总状态数: %d, 5区块(%.1f%%), 10区块(%.1f%%), 20区块(%.1f%%), 40区块(%.1f%%), 80区块(%.1f%%), 160区块(%.1f%%)\n",
+		totalAccessedCount, cacheHitRate5*100, cacheHitRate10*100, cacheHitRate20*100, cacheHitRate40*100, cacheHitRate80*100, cacheHitRate160*100)
 	fmt.Println("=======================================")
 }
 
@@ -701,7 +738,7 @@ func (s *StatsAggregator) OutputCSV() {
 		"ProcessPercent", "RootGenPercent",
 		"UniqueReads", "UniqueWrites",
 		"AvgStatesPerTx", "AvgStatesPerContractTx",
-		"HitRate5", "HitRate10", "HitRate20", "HitRate40",
+		"HitRate5", "HitRate10", "HitRate20", "HitRate40", "HitRate80", "HitRate160",
 	}
 	writer.Write(headers)
 
@@ -729,6 +766,8 @@ func (s *StatsAggregator) OutputCSV() {
 			strconv.FormatFloat(stat.CacheHitRate10, 'f', 4, 64),
 			strconv.FormatFloat(stat.CacheHitRate20, 'f', 4, 64),
 			strconv.FormatFloat(stat.CacheHitRate40, 'f', 4, 64),
+			strconv.FormatFloat(stat.CacheHitRate80, 'f', 4, 64),
+			strconv.FormatFloat(stat.CacheHitRate160, 'f', 4, 64),
 		}
 		writer.Write(record)
 	}
@@ -806,7 +845,7 @@ func TestProcessTransactions(t *testing.T) {
 	t.Logf("state:%s", lastStateRoot.String())
 
 	// 创建状态访问计数器
-	counter := NewStateAccessCounter(50) // 记录最近50个区块
+	counter := NewStateAccessCounter(160) // 记录最近50个区块
 
 	// 使用新的数据文件路径
 	pattern := filepath.Join(dataDir, "transactions_*.csv")
@@ -1165,6 +1204,8 @@ func TestProcessTransactions(t *testing.T) {
 			hitRate10 := counter.GetCacheHitRate(10)
 			hitRate20 := counter.GetCacheHitRate(20)
 			hitRate40 := counter.GetCacheHitRate(40)
+			hitRate80 := counter.GetCacheHitRate(80)
+			hitRate160 := counter.GetCacheHitRate(160)
 
 			// 计算交易成功率
 			successRate := 0.0
@@ -1271,12 +1312,13 @@ func TestProcessTransactions(t *testing.T) {
 				CacheHitRate10:         hitRate10,
 				CacheHitRate20:         hitRate20,
 				CacheHitRate40:         hitRate40,
+				CacheHitRate80:         hitRate80,
+				CacheHitRate160:        hitRate160,
 			}
 
 			// 添加到统计聚合器
 			statsAgg.AddBlockStats(blockStats)
 		}
-
 		t.Logf("完成处理文件: %s", file)
 	}
 
