@@ -23,6 +23,7 @@ import (
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // -----------------------------------------------------------------------------
@@ -72,6 +73,7 @@ func (t *CacheTrie) getCacheBitPosition() int {
 		return 0 // 如果当前区块小于起始区块，默认使用第0位
 	}
 
+	//position表示当前区块在window中的位置,因为是一个滑动窗口，所以会循环使用window得位，只要不超过最大缓存两，就和startNum无关
 	position := t.blockNum / t.multiple
 	return int(position % 32) // 限制在32位之内，因为window是一个int
 }
@@ -117,7 +119,7 @@ func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (c
 		// 移动位置并递归到子节点
 		newPos := pos + len(n.Key)
 
-		// 如果到达key末尾，返回当前节点
+		// 如果到达key末尾，返回当前节点的Val
 		if newPos == len(key) {
 			return n.Val, nil
 		}
@@ -125,8 +127,8 @@ func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (c
 		// 否则继续递归查找
 		childNode, err := t.get(n.Val, key, newPos, bitPosition)
 
-		//如果找到了，则更新其window字段，对于shortNode，具体为如果是value节点，则直接是当前window，如果是fullNode，则直接是fullNode的window
-		if childNode != nil && err != nil {
+		//如果找到了，则更新其window字段
+		if childNode != nil {
 			n.updateFlag(bitPosition)
 		}
 
@@ -144,8 +146,8 @@ func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (c
 		// 继续递归查找
 		childNode, err := t.get(n.Children[childIndex], key, pos+1, bitPosition)
 
-		//如果找到了，则更新其window字段，对于fullNode，具体为其所有子节点的window的异或
-		if childNode != nil && err != nil {
+		//如果找到了，则更新其window字段
+		if childNode != nil {
 			n.updateFlag(bitPosition)
 		}
 
@@ -202,13 +204,16 @@ func (t *CacheTrie) SetBlockNum(blockNum uint64) {
 
 // GetSize 返回trie中键值对的总数
 func (t *CacheTrie) GetSize() int {
+	if t.root == nil {
+		return 0
+	}
 	return t.root.size()
 }
 
 // -----------------------------------------------------------------------------
 // 主要操作方法 - 公共API
 
-// getNodeForPath 通过路径获取节点
+// Get 通过路径获取节点
 // 从根节点开始，沿着key指定的路径查找，返回路径末端的节点
 //
 // 参数:
@@ -218,7 +223,9 @@ func (t *CacheTrie) GetSize() int {
 //   - 找到的节点
 //   - 错误信息
 func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
-	hexKey := keybytesToHex(key)
+	// 确保key是哈希值（固定长度）
+	hashedKey := hashKey(key)
+	hexKey := keybytesToHex(hashedKey)
 	bitPosition := t.getCacheBitPosition()
 	return t.get(t.root, hexKey, 0, bitPosition)
 }
@@ -230,7 +237,9 @@ func (t *CacheTrie) Update(key, value []byte) error {
 		return t.Delete(key)
 	}
 
-	hexKey := keybytesToHex(key)
+	// 确保key是哈希值（固定长度）
+	hashedKey := hashKey(key)
+	hexKey := keybytesToHex(hashedKey)
 
 	// 设置当前位置
 	bitPos := t.getCacheBitPosition()
@@ -242,6 +251,8 @@ func (t *CacheTrie) Update(key, value []byte) error {
 	if err != nil {
 		return err
 	}
+
+	// 更新根节点
 	t.root = root
 	return nil
 }
@@ -249,7 +260,9 @@ func (t *CacheTrie) Update(key, value []byte) error {
 // Delete 从trie中删除key
 // 内部实现使用"墓碑"标记(空值节点)替代真正的删除
 func (t *CacheTrie) Delete(key []byte) error {
-	hexKey := keybytesToHex(key)
+	// 确保key是哈希值（固定长度）
+	hashedKey := hashKey(key)
+	hexKey := keybytesToHex(hashedKey)
 
 	// 创建一个特殊的标记值作为"墓碑"
 	// 这里使用一个空的ValueNode作为墓碑标记
@@ -270,13 +283,14 @@ func (t *CacheTrie) Delete(key []byte) error {
 
 // Hash 返回trie的根哈希
 // 同时执行必要的缓存清理
-func (t *CacheTrie) Hash() common.Hash {
+// 返回trie的根哈希和在pruneCache过程中删除的键值对
+func (t *CacheTrie) Hash() (common.Hash, []*DeleteKV) {
 	if t.root == nil {
-		return EmptyRoot
+		return EmptyRoot, nil
 	}
 
 	// 如果设置了最大大小且超出限制，或window的位数不足，清理不常用的缓存
-	t.pruneCache()
+	deleteKeyValues := t.pruneCache()
 
 	// 即时生成哈希
 	h := newHasher(false)
@@ -284,7 +298,7 @@ func (t *CacheTrie) Hash() common.Hash {
 
 	rootHash := h.hash(t.root)
 
-	return common.BytesToHash(rootHash)
+	return common.BytesToHash(rootHash), deleteKeyValues
 }
 
 type DeleteKV struct {
@@ -293,10 +307,10 @@ type DeleteKV struct {
 }
 
 // pruneCache清理不常用的缓存节点
-func (t *CacheTrie) pruneCache() {
+// 返回在清理过程中删除的键值对列表
+func (t *CacheTrie) pruneCache() []*DeleteKV {
 	// 计算当前window的可用位数
 	// 当前位置表示已经使用了多少位
-	//todo 这里计算应该根据startNum和blockNum进行计算，这种算法是不对的
 	windowBits := t.getWindowPosition()
 
 	// 判断是否需要清理
@@ -314,7 +328,7 @@ func (t *CacheTrie) pruneCache() {
 
 	// 如果不需要清理，直接返回
 	if !needPrune {
-		return
+		return nil
 	}
 
 	// 执行循环操作，直到根节点size数量小于2/3的maxSize且window位数等于16bit
@@ -345,10 +359,10 @@ func (t *CacheTrie) pruneCache() {
 		// 重新计算windowBits
 		windowBits = t.getWindowPosition()
 	}
+	return deleteKeyValue
 }
 
 // pruneNodeAtBit递归查找指定位设置的节点并清理
-// todo 我需要把prefixkey带上，这样我在删除valueNode时，才知道他的key
 func (t *CacheTrie) pruneNodeAtBit(n cacheNode, prefixKey []byte, bit int, deleteKeyValue []*DeleteKV) cacheNode {
 	if n == nil {
 		return nil
@@ -485,19 +499,37 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 		//首先把旧的数据取出来，放到fullNode的位置
 		// 处理旧的shortNode，允许shortNode的key是空数组
 		// 创建一个带有键剩余部分的短节点
-		child := &ShortNode{
-			Key:   n.Key[prefixLength+1:],
-			Val:   n.Val,
-			flags: t.newNodeFlag(),
+		var child *ShortNode
+		if prefixLength < len(n.Key) {
+			child = &ShortNode{
+				Key:   n.Key[prefixLength+1:],
+				Val:   n.Val,
+				flags: t.newNodeFlag(),
+			}
+		} else {
+			child = &ShortNode{
+				Key:   make([]byte, 0),
+				Val:   n.Val,
+				flags: t.newNodeFlag(),
+			}
 		}
 		child.updateFlag(bitPos)
 		branch.Children[n.Key[prefixLength]] = child
 
 		// 创建一个新的节点
-		child2 := &ShortNode{
-			Key:   key[prefixLength+1:],
-			Val:   value,
-			flags: t.newNodeFlag(),
+		var child2 *ShortNode
+		if prefixLength < len(key) {
+			child2 = &ShortNode{
+				Key:   key[prefixLength+1:],
+				Val:   value,
+				flags: t.newNodeFlag(),
+			}
+		} else {
+			child2 = &ShortNode{
+				Key:   make([]byte, 0),
+				Val:   value,
+				flags: t.newNodeFlag(),
+			}
 		}
 		child2.updateFlag(bitPos)
 		branch.Children[key[prefixLength]] = child2
@@ -553,12 +585,15 @@ func (t *CacheTrie) IsCachedAtBlock(key []byte, blockNum uint64) (bool, error) {
 	}
 
 	// 计算目标区块在window中的位置
-	position := (blockNum - t.startNum) / t.multiple
+	position := blockNum / t.multiple
 	bitPos := int(position % 32)
 	blockPosition := 1 << bitPos
 
+	// 确保key是哈希值（固定长度）
+	hashedKey := hashKey(key)
+
 	// 获取对应路径的节点
-	node, err := t.Get(key)
+	node, err := t.Get(hashedKey)
 	if err != nil {
 		return false, err
 	}
@@ -569,4 +604,10 @@ func (t *CacheTrie) IsCachedAtBlock(key []byte, blockNum uint64) (bool, error) {
 	// 获取节点的window并检查指定位置是否设置
 	window := node.window()
 	return (window & blockPosition) != 0, nil
+}
+
+// hashKey 对输入的key进行哈希处理，确保返回固定长度的键
+func hashKey(key []byte) []byte {
+	// 使用crypto包中的Keccak256哈希函数
+	return crypto.Keccak256(key)
 }
