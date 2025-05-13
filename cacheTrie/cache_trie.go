@@ -119,7 +119,7 @@ func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (c
 
 		// 如果到达key末尾，返回当前节点
 		if newPos == len(key) {
-			return n, nil
+			return n.Val, nil
 		}
 
 		// 否则继续递归查找
