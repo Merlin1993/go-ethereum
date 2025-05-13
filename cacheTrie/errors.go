@@ -18,9 +18,6 @@ package cacheTrie
 
 import (
 	"errors"
-	"fmt"
-
-	"github.com/ethereum/go-ethereum/common"
 )
 
 // CacheTrie相关错误
@@ -31,22 +28,3 @@ var (
 	// ErrCommitted 表示树已提交
 	ErrCommitted = errors.New("trie already committed")
 )
-
-// MissingNodeError 当请求的节点在缓存中未找到时返回
-type MissingNodeError struct {
-	NodeHash common.Hash // 请求的节点的哈希值
-	Path     []byte      // 到达缺失节点的Hex-编码路径
-	err      error       // 底层存储错误
-}
-
-func (err *MissingNodeError) Error() string {
-	if err.err != nil {
-		return fmt.Sprintf("missing trie node %x (path %x): %v", err.NodeHash, err.Path, err.err)
-	}
-	return fmt.Sprintf("missing trie node %x (path %x)", err.NodeHash, err.Path)
-}
-
-// 返回底层错误，如果有
-func (err *MissingNodeError) Unwrap() error {
-	return err.err
-}

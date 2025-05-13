@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+// Package cacheTrie 提供了一个带有增强缓存功能的Merkle Patricia树实现。
+// 该实现使用位图窗口(window bitmap)跟踪不同区块高度的缓存状态。
 package cacheTrie
 
 import (
@@ -23,240 +25,207 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
+// -----------------------------------------------------------------------------
+// 常量和变量定义
+
 // EmptyRoot是一个特殊的根哈希，表示空树
 var EmptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 
+// -----------------------------------------------------------------------------
+// 数据结构定义
+
 // CacheTrie是一个Merkle Patricia树变种，具有增强的缓存功能。
-// 它扩展了常规Trie功能，增加了额外的缓存特性。
+// 它通过window位图机制跟踪键值对在不同区块高度的状态，
+// 使得可以在一定范围内实现区块特定的缓存查询。
 //
 // CacheTrie不是线程安全的。
 type CacheTrie struct {
-	root   cacheNode
-	nodeDB map[string][]byte // 简化版数据库，存储hash和节点的对应关系
-
-	// 标记commit操作是否已执行
-	committed bool
-
-	// 跟踪自上次哈希操作以来插入的叶子数量
-	unhashed int
-
-	// uncommitted是自上次commit以来的更新数
-	uncommitted int
+	// 树的根节点
+	root cacheNode
 
 	// 当前区块高度
 	blockNum uint64
 
-	// 起始区块号
+	// 起始区块号，表示窗口的起始位置
 	startNum uint64
 
 	// multiple表示window中每个位存储多少个区块
+	// 例如：multiple=10表示每个位记录10个区块的状态
 	multiple uint64
 
-	// maxSize是树中可以缓存的键值对的最大数量
-	maxSize int
+	// 缓存大小限制和计数
+	maxSize int // 可缓存的最大键值对数量，0表示无限制
 }
 
-// newNodeFlag返回新创建节点的缓存标志值
+// -----------------------------------------------------------------------------
+// 内部辅助方法
+
+// newNodeFlag 返回新创建节点的缓存标志值
 func (t *CacheTrie) newNodeFlag() nodeFlag {
 	return nodeFlag{dirty: true}
 }
 
-// Copy返回CacheTrie的副本
-func (t *CacheTrie) Copy() *CacheTrie {
-	return &CacheTrie{
-		root:        t.root,
-		nodeDB:      t.nodeDB,
-		committed:   t.committed,
-		uncommitted: t.uncommitted,
-		unhashed:    t.unhashed,
-		blockNum:    t.blockNum,
-		startNum:    t.startNum,
-		multiple:    t.multiple,
-		maxSize:     t.maxSize,
+// getCacheBitPosition 计算window中当前区块的位位置
+// 根据当前区块高度、起始区块和倍数计算当前区块在32位window中的位置
+func (t *CacheTrie) getCacheBitPosition() int {
+	if t.blockNum < t.startNum {
+		return 0 // 如果当前区块小于起始区块，默认使用第0位
+	}
+
+	position := t.blockNum / t.multiple
+	return int(position % 32) // 限制在32位之内，因为window是一个int
+}
+
+// 获取剩余可用的position
+func (t *CacheTrie) getWindowPosition() int {
+	return 32 - int((t.blockNum-t.startNum)/t.multiple)
+}
+
+// getNodeWindow 获取节点的window位图
+func (t *CacheTrie) getNodeWindow(n cacheNode) int {
+	return n.window()
+}
+
+// getNodeForPathRecursive 是getNodeForPath的递归实现
+// 参数:
+//   - node: 当前检查的节点
+//   - key: 十六进制格式的键
+//   - pos: 当前在key中的位置
+//
+// 返回:
+//   - 找到的节点
+//   - 错误信息
+func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (cacheNode, error) {
+	// 基本情况: 节点为nil
+	if node == nil {
+		return nil, nil
+	}
+
+	// 基本情况: 已经处理完整个key
+	if pos >= len(key) {
+		return node, nil
+	}
+
+	switch n := node.(type) {
+	case *ShortNode:
+		// 检查key是否匹配短节点的前缀
+		if len(key)-pos < len(n.Key) || !bytes.HasPrefix(key[pos:], n.Key) {
+			// 不匹配，返回nil
+			return nil, nil
+		}
+
+		// 移动位置并递归到子节点
+		newPos := pos + len(n.Key)
+
+		// 如果到达key末尾，返回当前节点
+		if newPos == len(key) {
+			return n, nil
+		}
+
+		// 否则继续递归查找
+		childNode, err := t.get(n.Val, key, newPos, bitPosition)
+
+		//如果找到了，则更新其window字段，对于shortNode，具体为如果是value节点，则直接是当前window，如果是fullNode，则直接是fullNode的window
+		if childNode != nil && err != nil {
+			n.updateFlag(bitPosition)
+		}
+
+		return childNode, err
+
+	case *FullNode:
+		// 获取下一个字符作为分支索引
+		childIndex := key[pos]
+
+		// 检查索引是否有效
+		if int(childIndex) >= len(n.Children) {
+			return nil, nil
+		}
+
+		// 继续递归查找
+		childNode, err := t.get(n.Children[childIndex], key, pos+1, bitPosition)
+
+		//如果找到了，则更新其window字段，对于fullNode，具体为其所有子节点的window的异或
+		if childNode != nil && err != nil {
+			n.updateFlag(bitPosition)
+		}
+
+		return childNode, err
+
+	case ValueNode:
+		// 如果已经到达key末尾，返回值节点
+		if pos == len(key) {
+			return n, nil
+		}
+		// 否则值节点不能有子节点，返回nil
+		return nil, nil
+
+	default:
+		// 未知节点类型
+		return nil, fmt.Errorf("unknown node type: %T", node)
 	}
 }
 
-// NewCacheTrie创建一个新的缓存树实例
-func NewCacheTrie() *CacheTrie {
+// countBits 计算整数中设置的位数
+// 用于统计window位图中有多少位被设置
+func countBits(n int) int {
+	count := 0
+	for n != 0 {
+		count += n & 1
+		n >>= 1
+	}
+	return count
+}
+
+// -----------------------------------------------------------------------------
+// 构造和配置方法 - 公共API
+
+// NewCacheTrie 创建一个具有指定参数的缓存树实例
+// 参数：
+//   - startNum: 起始区块号，表示窗口的起始位置
+//   - multiple: 每个位表示的区块数量
+//   - maxSize: 最大缓存键值对数量，0表示无限制
+func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 	trie := &CacheTrie{
-		nodeDB:   make(map[string][]byte),
 		blockNum: 0,
-		startNum: 0,
-		multiple: 1, // 默认每位存储1个区块的缓存
-		maxSize:  0, // 默认无限制
+		startNum: startNum,
+		multiple: multiple,
+		maxSize:  maxSize,
 	}
 	return trie
 }
 
-// NewCacheTrieWithRoot创建一个具有指定根的缓存树实例
-func NewCacheTrieWithRoot(root common.Hash) (*CacheTrie, error) {
-	trie := &CacheTrie{
-		nodeDB:   make(map[string][]byte),
-		blockNum: 0,
-		startNum: 0,
-		multiple: 1, // 默认每位存储1个区块的缓存
-		maxSize:  0, // 默认无限制
-	}
-
-	if root != (common.Hash{}) && root != EmptyRoot {
-		// 在实际情况下，我们会尝试从nodeDB中加载根节点
-		// 但在简化实现中，我们直接返回一个空树
-	}
-
-	return trie, nil
-}
-
-// SetBlockNum更新CacheTrie的当前区块高度
+// SetBlockNum 更新CacheTrie的当前区块高度
+// 这会影响后续操作的缓存位置计算
 func (t *CacheTrie) SetBlockNum(blockNum uint64) {
 	t.blockNum = blockNum
 }
 
-// SetCacheParams设置CacheTrie的缓存参数
-func (t *CacheTrie) SetCacheParams(startNum, multiple uint64) {
-	t.startNum = startNum
-	t.multiple = multiple
+// GetSize 返回trie中键值对的总数
+func (t *CacheTrie) GetSize() int {
+	return t.root.size()
 }
 
-// NewEmptyCacheTrie创建一个空的缓存树，主要用于测试
-func NewEmptyCacheTrie() *CacheTrie {
-	return NewCacheTrie()
-}
+// -----------------------------------------------------------------------------
+// 主要操作方法 - 公共API
 
-// SetMaxSize设置树中可缓存的键值对的最大数量，0表示无限制
-func (t *CacheTrie) SetMaxSize(maxSize int) {
-	t.maxSize = maxSize
-}
-
-// Get返回trie中存储的key对应的值
-func (t *CacheTrie) Get(key []byte) ([]byte, error) {
-	if t.committed {
-		return nil, ErrCommitted
-	}
-
-	// 获取当前区块对应的位置
-	bitPos := t.getCacheBitPosition()
-
-	// 将key转换为十六进制格式
+// getNodeForPath 通过路径获取节点
+// 从根节点开始，沿着key指定的路径查找，返回路径末端的节点
+//
+// 参数:
+//   - key: 要查找的键
+//
+// 返回:
+//   - 找到的节点
+//   - 错误信息
+func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
 	hexKey := keybytesToHex(key)
-
-	// 首先尝试直接访问节点以更新window
-	node, err := t.getNodeForPath(key)
-	if err == nil && node != nil {
-		// 如果找到了节点，更新它的window
-		switch n := node.(type) {
-		case *ShortNode:
-			n.window |= (1 << bitPos)
-		case *FullNode:
-			n.window |= (1 << bitPos)
-		}
-	}
-
-	// 执行Get操作
-	value, newRoot, _, err := t.get(t.root, hexKey, 0, bitPos)
-	if err == nil {
-		// 不管是否解析了新节点，都更新根节点
-		// 这样确保window更改被保存
-		t.root = newRoot
-	}
-
-	return value, err
+	bitPosition := t.getCacheBitPosition()
+	return t.get(t.root, hexKey, 0, bitPosition)
 }
 
-// get是Get的内部实现，递归查找键值
-func (t *CacheTrie) get(origNode cacheNode, key []byte, pos int, bitPos int) (value []byte, newnode cacheNode, didResolve bool, err error) {
-	switch n := (origNode).(type) {
-	case nil:
-		return nil, nil, false, nil
-	case ValueNode:
-		// 检查是否是墓碑标记（空值）
-		if len(n) == 0 {
-			return nil, n, false, nil // 墓碑标记返回nil
-		}
-		return n, n, false, nil
-	case *ShortNode:
-		// 对短节点总是创建一个副本，以便更新window
-		n = n.copy()
-		// 设置当前区块对应的位
-		n.window |= (1 << bitPos)
-
-		// 检查是否到达key的末尾
-		if pos >= len(key) {
-			if valueNode, isValue := n.Val.(ValueNode); isValue {
-				// 检查是否是墓碑标记（空值）
-				if len(valueNode) == 0 {
-					return nil, n, true, nil // 墓碑标记返回nil
-				}
-				return valueNode, n, true, nil
-			}
-			return nil, n, true, nil
-		}
-
-		if !bytes.HasPrefix(key[pos:], n.Key) {
-			// key不在trie中
-			return nil, n, true, nil
-		}
-
-		value, newChild, _, err := t.get(n.Val, key, pos+len(n.Key), bitPos)
-
-		// 不管子节点是否改变，都返回更新了window的父节点
-		n.Val = newChild
-		return value, n, true, err
-
-	case *FullNode:
-		// 对全节点总是创建一个副本，以便更新window
-		n = n.copy()
-		// 设置当前区块对应的位
-		n.window |= (1 << bitPos)
-
-		// 检查是否到达key的末尾
-		if pos >= len(key) {
-			if n.Children[16] != nil {
-				if valueNode, isValue := n.Children[16].(ValueNode); isValue {
-					// 检查是否是墓碑标记（空值）
-					if len(valueNode) == 0 {
-						return nil, n, true, nil // 墓碑标记返回nil
-					}
-					return valueNode, n, true, nil
-				}
-			}
-			return nil, n, true, nil
-		}
-
-		// 确保不会越界
-		if pos >= len(key) || int(key[pos]) >= len(n.Children) {
-			return nil, n, true, nil
-		}
-
-		value, newChild, _, err := t.get(n.Children[key[pos]], key, pos+1, bitPos)
-
-		// 不管子节点是否改变，都返回更新了window的父节点
-		n.Children[key[pos]] = newChild
-		return value, n, true, err
-
-	case HashNode:
-		// 在简化版实现中，我们直接从nodeDB获取节点
-		nodehash := common.BytesToHash(n)
-		if encoded, ok := t.nodeDB[nodehash.Hex()]; ok {
-			child, err := decodeNode(n, encoded)
-			if err != nil {
-				return nil, n, true, err
-			}
-			value, newnode, _, err := t.get(child, key, pos, bitPos)
-			return value, newnode, true, err
-		}
-		return nil, n, true, &MissingNodeError{NodeHash: common.BytesToHash(n), Path: key[:pos]}
-	default:
-		panic(fmt.Sprintf("%T: invalid node: %v", origNode, origNode))
-	}
-}
-
-// Update将键值对添加到trie中
+// Update 将键值对添加到trie中
+// 如果value为空，则调用Delete方法删除该键
 func (t *CacheTrie) Update(key, value []byte) error {
-	if t.committed {
-		return ErrCommitted
-	}
-	t.uncommitted++
-
 	if len(value) == 0 {
 		return t.Delete(key)
 	}
@@ -269,16 +238,212 @@ func (t *CacheTrie) Update(key, value []byte) error {
 	// 将value转换为ValueNode类型
 	valueNode := ValueNode(value)
 
-	newroot, err := t.insert(t.root, hexKey, valueNode, bitPos)
+	root, err := t.insert(t.root, hexKey, valueNode, bitPos)
 	if err != nil {
 		return err
 	}
-	t.root = newroot
-	t.unhashed++
+	t.root = root
 	return nil
 }
 
-// insert是Update的内部实现，递归插入键值
+// Delete 从trie中删除key
+// 内部实现使用"墓碑"标记(空值节点)替代真正的删除
+func (t *CacheTrie) Delete(key []byte) error {
+	hexKey := keybytesToHex(key)
+
+	// 创建一个特殊的标记值作为"墓碑"
+	// 这里使用一个空的ValueNode作为墓碑标记
+	tombstone := ValueNode([]byte{})
+
+	// 获取当前block位置
+	bitPos := t.getCacheBitPosition()
+
+	// 使用insert方法插入墓碑标记，而不是真正删除
+	newroot, err := t.insert(t.root, hexKey, tombstone, bitPos)
+	if err != nil {
+		return err
+	}
+
+	t.root = newroot
+	return nil
+}
+
+// Hash 返回trie的根哈希
+// 同时执行必要的缓存清理
+func (t *CacheTrie) Hash() common.Hash {
+	if t.root == nil {
+		return EmptyRoot
+	}
+
+	// 如果设置了最大大小且超出限制，或window的位数不足，清理不常用的缓存
+	t.pruneCache()
+
+	// 即时生成哈希
+	h := newHasher(false)
+	defer returnHasherToPool(h)
+
+	rootHash := h.hash(t.root)
+
+	return common.BytesToHash(rootHash)
+}
+
+type DeleteKV struct {
+	Key   []byte
+	Value []byte
+}
+
+// pruneCache清理不常用的缓存节点
+func (t *CacheTrie) pruneCache() {
+	// 计算当前window的可用位数
+	// 当前位置表示已经使用了多少位
+	//todo 这里计算应该根据startNum和blockNum进行计算，这种算法是不对的
+	windowBits := t.getWindowPosition()
+
+	// 判断是否需要清理
+	needPrune := false
+
+	// 条件1：当window的位数只剩下8bit（也就是用了四分之三的窗口），触发清理
+	if windowBits <= 8 {
+		needPrune = true
+	}
+
+	// 条件2：size大于MaxSize时，触发清理
+	if t.maxSize > 0 && t.root.size() > t.maxSize {
+		needPrune = true
+	}
+
+	// 如果不需要清理，直接返回
+	if !needPrune {
+		return
+	}
+
+	// 执行循环操作，直到根节点size数量小于2/3的maxSize且window位数等于16bit
+	// 使用2/3作为阈值
+	targetSize := t.maxSize * 2 / 3
+	if targetSize <= 0 {
+		targetSize = 1 // 确保至少有一个目标大小
+	}
+	deleteKeyValue := make([]*DeleteKV, 0)
+	// 循环直到满足条件
+	for {
+		// 检查是否已经满足条件：size小于目标值，且window位数大于等于16bit
+		if t.root.size() <= targetSize && windowBits >= 16 {
+			break
+		}
+
+		// 找到最低一位的缓存窗口（即最早的缓存）
+		lowestBit := int(t.startNum / t.multiple % 32)
+
+		// 从根节点递归查找所有节点，对于所有最低一位的叶子节点进行实际的删除
+		if t.root != nil {
+			t.root = t.pruneNodeAtBit(t.root, make([]byte, 0), lowestBit, deleteKeyValue)
+		}
+
+		// 更新startNum（向前移动window）
+		t.startNum += t.multiple
+
+		// 重新计算windowBits
+		windowBits = t.getWindowPosition()
+	}
+}
+
+// pruneNodeAtBit递归查找指定位设置的节点并清理
+// todo 我需要把prefixkey带上，这样我在删除valueNode时，才知道他的key
+func (t *CacheTrie) pruneNodeAtBit(n cacheNode, prefixKey []byte, bit int, deleteKeyValue []*DeleteKV) cacheNode {
+	if n == nil {
+		return nil
+	}
+
+	//首先需要向下查找，然后删除对应的值。
+	//然后回到父节点，重新计算window和size
+	switch node := n.(type) {
+	case *ShortNode:
+		// 检查这个节点是否有指定的位设置
+		if (node.window() & (1 << bit)) != 0 {
+			// 如果是叶子节点（Val是ValueNode）且window变为0，则清除此节点
+			if valueNode, isValueNode := node.Val.(ValueNode); isValueNode {
+				// 使用append合并字节切片，而不是加法操作符
+				fullKey := append(append([]byte{}, prefixKey...), node.Key...)
+				// 将十六进制格式的键转换回二进制格式
+				binaryKey := hexToKeybytes(fullKey)
+				deleteKeyValue = append(deleteKeyValue, &DeleteKV{Key: binaryKey, Value: []byte(valueNode)})
+				return nil
+			} else {
+				// 对子节点递归处理，使用append合并路径
+				newPrefixKey := append(append([]byte{}, prefixKey...), node.Key...)
+				newVal := t.pruneNodeAtBit(node.Val, newPrefixKey, bit, deleteKeyValue)
+
+				// 如果子节点被删除并且这个节点的window为0，则删除此节点
+				if newVal == nil {
+					return nil
+				} else {
+					node.Val = newVal
+					//如果是valueNode，肯定已经被删除了，如果是branchNode,那么没问题，所以这样写可以
+					node.updateFlag(bit)
+				}
+			}
+		}
+		return node
+
+	case *FullNode:
+		// 检查这个节点是否有指定的位设置
+		if (node.window() & (1 << bit)) != 0 {
+			// 对所有子节点递归处理
+			allChildrenNil := true
+			for i := 0; i < 16; i++ {
+				if node.Children[i] != nil {
+					// 记录子节点路径，添加当前索引作为一个字节
+					newPrefixKey := append(append([]byte{}, prefixKey...), byte(i))
+
+					// 递归处理子节点
+					node.Children[i] = t.pruneNodeAtBit(node.Children[i], newPrefixKey, bit, deleteKeyValue)
+
+					// 检查子节点是否被删除
+					if node.Children[i] != nil {
+						allChildrenNil = false
+					}
+				}
+			}
+
+			// 如果所有子节点都为空且window为0，则删除此节点
+			if allChildrenNil {
+				return nil
+			}
+			node.updateFlag(bit)
+		}
+		return node
+	}
+	return n
+}
+
+// hexToKeybytes 将十六进制格式的键转换回二进制格式
+// 此函数处理终端标志并支持奇数长度的hex键
+func hexToKeybytes(hex []byte) []byte {
+	// 如果有终端标志，移除它
+	if hasTerm(hex) {
+		hex = hex[:len(hex)-1]
+	}
+
+	// 如果长度为奇数，则无法正确转换
+	if len(hex)%2 != 0 {
+		panic("无法转换奇数长度的十六进制键")
+	}
+
+	// 长度为偶数的正常处理
+	result := make([]byte, len(hex)/2)
+	for i := 0; i < len(hex); i += 2 {
+		result[i/2] = (hex[i] << 4) | hex[i+1]
+	}
+
+	return result
+}
+
+// insert 是Update的内部实现，递归插入键值
+// 参数:
+//   - n: 当前操作的节点
+//   - key: 十六进制格式的键
+//   - value: 要插入的值节点
+//   - bitPos: 当前区块在window中的位置
 func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int) (cacheNode, error) {
 	if len(key) == 0 {
 		// 值节点只能在路径末尾插入
@@ -306,229 +471,82 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 				flags: t.newNodeFlag(),
 			}
 
-			// 更新window属性，将其重置为0并在当前位置设置为1
-			shortNode.window = 0
-			if _, ok := value.(ValueNode); ok {
-				// 这是叶子节点，设置当前区块对应的位
-				shortNode.window = 1 << bitPos
-			}
-
+			// 更新window属性
+			shortNode.updateFlag(bitPos)
 			return shortNode, nil
 		}
 
+		//1.如果有相同的前缀，那么现构造一个相同前缀的short，然后生成一个fullNode，再fullNode生成两个short。
+		//2.如果没有相同的前缀，那么构造一个fullNode，然后直接生成两个shortNode放进去。
+
 		// 如果共享前缀，在分叉点分裂
-		if prefixLength > 0 {
-			// 分叉点的分支节点
-			branch := &FullNode{flags: t.newNodeFlag()}
+		// 分叉点的分支节点
+		branch := &FullNode{flags: t.newNodeFlag()}
+		//首先把旧的数据取出来，放到fullNode的位置
+		// 处理旧的shortNode，允许shortNode的key是空数组
+		// 创建一个带有键剩余部分的短节点
+		child := &ShortNode{
+			Key:   n.Key[prefixLength+1:],
+			Val:   n.Val,
+			flags: t.newNodeFlag(),
+		}
+		child.updateFlag(bitPos)
+		branch.Children[n.Key[prefixLength]] = child
 
-			// 复用现有子节点（如果有）
-			if prefixLength < len(n.Key) {
-				// 创建一个带有键剩余部分的短节点
-				child := &ShortNode{
-					Key:   n.Key[prefixLength+1:],
-					Val:   n.Val,
-					flags: t.newNodeFlag(),
-					// 保留原始窗口信息
-					window: n.window,
-				}
-				branch.Children[n.Key[prefixLength]] = child
-			} else {
-				// 这种情况下，短节点的完整键与新键的前缀匹配
-				// 在这种情况下，我们在分支节点中按原样使用短节点的值
-				branch.Children[key[prefixLength]] = n.Val
-			}
+		// 创建一个新的节点
+		child2 := &ShortNode{
+			Key:   key[prefixLength+1:],
+			Val:   value,
+			flags: t.newNodeFlag(),
+		}
+		child2.updateFlag(bitPos)
+		branch.Children[key[prefixLength]] = child2
 
-			// 在分支节点中插入新值
-			var err error
-			if prefixLength < len(key) {
-				branch.Children[key[prefixLength]], err = t.insert(nil, key[prefixLength+1:], value, bitPos)
-				if err != nil {
-					return nil, err
-				}
-			} else {
-				// 新键更短，所以我们只添加一个值节点
-				branch.Children[16] = value
-
-				// 如果这是叶子节点，更新窗口位
-				if _, ok := value.(ValueNode); ok {
-					branch.window = 1 << bitPos
-				}
-			}
-
-			if prefixLength == 1 { // 只有一个字符前缀
-				return branch, nil
-			}
-
-			// 返回包装在短节点中的分支节点
-			shortNode := &ShortNode{
-				Key:   key[:prefixLength],
+		// 然后在分支节点中插入新的shortNode
+		if prefixLength != 0 {
+			parentNode := &ShortNode{
+				Key:   n.Key[:prefixLength],
 				Val:   branch,
 				flags: t.newNodeFlag(),
 			}
-
-			// 短节点的窗口应继承其子节点的窗口
-			if branch.window != 0 {
-				shortNode.window = branch.window
-			}
-
-			return shortNode, nil
+			parentNode.updateFlag(bitPos)
+			return parentNode, nil
+		} else {
+			branch.updateFlag(bitPos)
+			return branch, nil
 		}
-
-		// 如果没有公共前缀，转换为分支节点
-		branch := &FullNode{flags: t.newNodeFlag()}
-
-		// 插入旧节点
-		if len(n.Key) == 0 {
-			return nil, fmt.Errorf("shortNode has empty key")
-		}
-
-		branch.Children[n.Key[0]] = &ShortNode{
-			Key:    n.Key[1:],
-			Val:    n.Val,
-			flags:  t.newNodeFlag(),
-			window: n.window, // 保留原始窗口信息
-		}
-
-		// 插入新节点
-		var err error
-		if len(key) == 0 {
-			return nil, fmt.Errorf("key has empty content")
-		}
-
-		branch.Children[key[0]], err = t.insert(nil, key[1:], value, bitPos)
-		if err != nil {
-			return nil, err
-		}
-
-		// 更新branch的window
-		if _, ok := value.(ValueNode); ok && len(key) == 1 {
-			// 如果新插入的是叶子节点，并且在当前branch层结束
-			branch.window = 1 << bitPos
-		}
-
-		return branch, nil
-
 	case *FullNode:
 		// 更新特定分支
 		var err error
-		if len(key) == 0 {
-			// 当key为空时，这是全节点的值节点
-			n = n.copy()
-			n.Children[16] = value
 
-			// 如果这是叶子节点，更新窗口位
-			if _, ok := value.(ValueNode); ok {
-				n.window = 1 << bitPos
-			}
-
-			return n, nil
-		}
-
-		n = n.copy()
 		n.Children[key[0]], err = t.insert(n.Children[key[0]], key[1:], value, bitPos)
 		if err != nil {
 			return nil, err
 		}
-
-		// 如果子节点被更新，可能需要更新当前节点的window
-		// 这个逻辑会在Hash阶段完全处理，这里只是初始化设置
-		if childNode, ok := n.Children[key[0]].(*ShortNode); ok && childNode.window != 0 {
-			if n.window == 0 {
-				n.window = childNode.window
-			}
-		} else if childNode, ok := n.Children[key[0]].(*FullNode); ok && childNode.window != 0 {
-			if n.window == 0 {
-				n.window = childNode.window
-			}
-		}
+		n.updateFlag(bitPos)
 
 		return n, nil
-
-	case HashNode:
-		// 在简化版实现中，从nodeDB获取节点
-		nodehash := common.BytesToHash(n)
-		if encoded, ok := t.nodeDB[nodehash.Hex()]; ok {
-			child, err := decodeNode(n, encoded)
-			if err != nil {
-				return nil, err
-			}
-			return t.insert(child, key, value, bitPos)
-		}
-		return nil, &MissingNodeError{NodeHash: common.BytesToHash(n), Path: key}
-
 	case nil:
-		// 当插入到空树时，只使用一个短节点
+		// 如果当前节点为空，创建一个新的短节点
 		shortNode := &ShortNode{
 			Key:   key,
 			Val:   value,
 			flags: t.newNodeFlag(),
 		}
-
-		// 如果这是叶子节点，设置当前区块对应的位
-		if _, ok := value.(ValueNode); ok {
-			shortNode.window = 1 << bitPos
-		}
-
+		shortNode.updateFlag(bitPos)
 		return shortNode, nil
-
 	default:
 		panic(fmt.Sprintf("%T: invalid node: %v", n, n))
 	}
 }
 
-// Delete从trie中删除key
-func (t *CacheTrie) Delete(key []byte) error {
-	if t.committed {
-		return ErrCommitted
-	}
-	t.uncommitted++
+//-------------------------------验证类方法，不属于正常逻辑，只是检查树是否有问题-------------------------------
 
-	hexKey := keybytesToHex(key)
-
-	// 创建一个特殊的标记值作为"墓碑"
-	// 这里使用一个空的ValueNode作为墓碑标记
-	tombstone := ValueNode([]byte{})
-
-	// 获取当前block位置
-	bitPos := t.getCacheBitPosition()
-
-	// 使用Update方法插入墓碑标记，而不是真正删除
-	newroot, err := t.insert(t.root, hexKey, tombstone, bitPos)
-	if err != nil {
-		return err
-	}
-
-	t.root = newroot
-	t.unhashed++
-	return nil
-}
-
-// Hash返回trie的根哈希
-func (t *CacheTrie) Hash() common.Hash {
-	if t.root == nil {
-		return EmptyRoot
-	}
-	hash, cached := t.root.cache()
-	if hash != nil && !cached {
-		return common.BytesToHash(hash)
-	}
-
-	// Trie还没有写入磁盘，即时生成哈希
-	h := newHasher(false)
-	defer returnHasherToPool(h)
-
-	rootHash, newRoot := h.hashRoot(t.root, true)
-	t.root = newRoot
-	return rootHash
-}
-
-// IsCachedAtBlock检查节点在给定路径是否有指定区块的缓存数据
+// IsCachedAtBlock 检查节点在给定路径是否有指定区块的缓存数据
+// 返回:
+//   - true: 表示在指定区块高度有缓存
+//   - false: 表示在指定区块高度没有缓存
 func (t *CacheTrie) IsCachedAtBlock(key []byte, blockNum uint64) (bool, error) {
-	// 短路检查
-	if t.committed {
-		return false, ErrCommitted
-	}
-
 	// 如果目标区块小于起始区块或者超出了窗口范围（32位*multiple），返回false
 	if blockNum < t.startNum || (blockNum-t.startNum)/t.multiple >= 32 {
 		return false, nil
@@ -540,7 +558,7 @@ func (t *CacheTrie) IsCachedAtBlock(key []byte, blockNum uint64) (bool, error) {
 	blockPosition := 1 << bitPos
 
 	// 获取对应路径的节点
-	node, err := t.getNodeForPath(key)
+	node, err := t.Get(key)
 	if err != nil {
 		return false, err
 	}
@@ -549,168 +567,6 @@ func (t *CacheTrie) IsCachedAtBlock(key []byte, blockNum uint64) (bool, error) {
 	}
 
 	// 获取节点的window并检查指定位置是否设置
-	window := t.getNodeWindow(node)
+	window := node.window()
 	return (window & blockPosition) != 0, nil
-}
-
-// 获取节点的window
-func (t *CacheTrie) getNodeWindow(n cacheNode) int {
-	switch n := n.(type) {
-	case *ShortNode:
-		return n.window
-	case *FullNode:
-		return n.window
-	default:
-		return 0
-	}
-}
-
-// 通过路径获取节点
-func (t *CacheTrie) getNodeForPath(key []byte) (cacheNode, error) {
-	if t.committed {
-		return nil, ErrCommitted
-	}
-
-	hexKey := keybytesToHex(key)
-
-	// 从根节点开始遍历
-	node := t.root
-	pos := 0
-
-	// 逐步匹配路径
-	for node != nil && pos < len(hexKey) {
-		switch n := node.(type) {
-		case *ShortNode:
-			// 如果路径不匹配短节点的键，则找不到节点
-			if len(hexKey)-pos < len(n.Key) || !bytes.HasPrefix(hexKey[pos:], n.Key) {
-				return nil, nil
-			}
-			// 如果已经到达路径末尾，返回当前节点
-			if pos+len(n.Key) == len(hexKey) {
-				return n, nil
-			}
-			// 否则继续查找
-			pos += len(n.Key)
-			node = n.Val
-		case *FullNode:
-			// 如果已经到达路径末尾，返回值节点（如果存在）
-			if pos == len(hexKey) {
-				return n.Children[16], nil
-			}
-			// 否则跟随路径继续查找
-			childIndex := hexKey[pos]
-			node = n.Children[childIndex]
-			pos++
-		case HashNode:
-			// 解析哈希节点
-			nodehash := common.BytesToHash(n)
-			if encoded, ok := t.nodeDB[nodehash.Hex()]; ok {
-				child, err := decodeNode(n, encoded)
-				if err != nil {
-					return nil, err
-				}
-				node = child
-			} else {
-				return nil, &MissingNodeError{NodeHash: nodehash, Path: hexKey[:pos]}
-			}
-		case ValueNode:
-			// 如果找到了值节点，检查我们是否已经完成路径
-			if pos == len(hexKey) {
-				return n, nil
-			}
-			// 否则无法继续（值节点是叶子节点）
-			return nil, nil
-		default:
-			return nil, nil
-		}
-	}
-
-	// 如果找到了完整路径匹配
-	if pos == len(hexKey) {
-		return node, nil
-	}
-
-	// 没有完整路径匹配
-	return nil, nil
-}
-
-// getCacheBitPosition计算window中当前区块的位位置
-func (t *CacheTrie) getCacheBitPosition() int {
-	if t.blockNum < t.startNum {
-		return 0 // 如果当前区块小于起始区块，默认使用第0位
-	}
-
-	position := (t.blockNum - t.startNum) / t.multiple
-	return int(position % 32) // 限制在32位之内，因为window是一个int
-}
-
-// GetSize返回trie中键值对的总数
-func (t *CacheTrie) GetSize() int {
-	if t.root == nil {
-		return 0
-	}
-
-	// 创建一个简单的结构来存储结果
-	result := struct{ count int }{0}
-
-	// 从根节点开始递归计算非墓碑的值节点数量
-	t.countNodesWithoutTombstones(t.root, &result)
-
-	return result.count
-}
-
-// countNodesWithoutTombstones计算trie中的实际键值对数量，不包括墓碑标记
-func (t *CacheTrie) countNodesWithoutTombstones(n cacheNode, result *struct{ count int }) {
-	if n == nil {
-		return
-	}
-
-	switch n := n.(type) {
-	case *ShortNode:
-		if valueNode, isValue := n.Val.(ValueNode); isValue {
-			// 是否是墓碑标记
-			if len(valueNode) > 0 {
-				result.count++
-			}
-		} else if n.Val != nil {
-			// 递归处理非值类型的子节点
-			t.countNodesWithoutTombstones(n.Val, result)
-		}
-
-	case *FullNode:
-		// 检查节点16（值节点）
-		if n.Children[16] != nil {
-			if valueNode, isValue := n.Children[16].(ValueNode); isValue {
-				if len(valueNode) > 0 {
-					result.count++
-				}
-			} else {
-				t.countNodesWithoutTombstones(n.Children[16], result)
-			}
-		}
-
-		// 递归处理所有子节点
-		for i := 0; i < 16; i++ {
-			if n.Children[i] != nil {
-				t.countNodesWithoutTombstones(n.Children[i], result)
-			}
-		}
-
-	case ValueNode:
-		// 独立的值节点，检查是否是墓碑标记
-		if len(n) > 0 {
-			result.count++
-		}
-
-	case HashNode:
-		// 解析哈希节点
-		nodehash := common.BytesToHash(n)
-		if encoded, ok := t.nodeDB[nodehash.Hex()]; ok {
-			child, err := decodeNode(n, encoded)
-			if err != nil {
-				return
-			}
-			t.countNodesWithoutTombstones(child, result)
-		}
-	}
 }
