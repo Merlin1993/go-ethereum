@@ -125,18 +125,13 @@ func TestWindowCalculation(t *testing.T) {
 		t.Fatalf("Update at block 110 failed: %v", err)
 	}
 
-	// 打印调试信息
-	t.Logf("BlockNum: %d, StartNum: %d, Multiple: %d", trie.blockNum, trie.startNum, trie.multiple)
-	t.Logf("Actual bitPos calculation: %d / %d %% 32 = %d", trie.blockNum, trie.multiple, trie.blockNum/trie.multiple%32)
-	t.Logf("Expected window calculation: 1 << %d = %032b", trie.blockNum/trie.multiple%32, 1<<(trie.blockNum/trie.multiple%32))
-	t.Logf("Actual window value: %032b", trie.root.window())
-
-	// 检查window位
-	// 计算期望的bit位置: 110 / 5 = 22，然后对32取模得到22
-	expected := 1 << (110 / 5 % 32) // 应该是第22位
-
-	// 验证window是否正确
-	if trie.root.window() != expected {
+	expected := 1 << (trie.blockNum / trie.multiple % 32)
+	if expected != trie.root.window() {
+		// 打印调试信息
+		t.Logf("BlockNum: %d, StartNum: %d, Multiple: %d", trie.blockNum, trie.startNum, trie.multiple)
+		t.Logf("Actual bitPos calculation: %d / %d %% 32 = %d", trie.blockNum, trie.multiple, trie.blockNum/trie.multiple%32)
+		t.Logf("Expected window calculation: 1 << %d = %032b", trie.blockNum/trie.multiple%32, 1<<(trie.blockNum/trie.multiple%32))
+		t.Logf("Actual window value: %032b", trie.root.window())
 		t.Errorf("Wrong window for key1 at block 110: got %032b, expected %032b",
 			trie.root.window(), expected)
 	}
@@ -185,39 +180,6 @@ func TestWindowCalculation(t *testing.T) {
 	if trie.root.window() != expected {
 		t.Errorf("Wrong window for key1 at block 120: got %032b, expected %032b",
 			trie.root.window(), expected)
-	}
-
-	// 使用IsCachedAtBlock验证
-	// 因为IsCachedAtBlock方法中使用的是t.blockNum来计算位置
-	// 所以我们需要先设置为110，然后再验证
-	trie.SetBlockNum(110)
-	isCached, err := trie.IsCachedAtBlock([]byte("key1"), 110)
-	if err != nil {
-		t.Fatalf("IsCachedAtBlock for block 110 failed: %v", err)
-	}
-	if !isCached {
-		t.Error("key1 should be cached at block 110")
-	}
-
-	// 设置回120继续测试
-	trie.SetBlockNum(120)
-	isCached, err = trie.IsCachedAtBlock([]byte("key1"), 120)
-	if err != nil {
-		t.Fatalf("IsCachedAtBlock for block 120 failed: %v", err)
-	}
-	if !isCached {
-		t.Error("key1 should be cached at block 120")
-	}
-
-	// 测试不应该缓存的区块
-	// 设置为115
-	trie.SetBlockNum(115)
-	isCached, err = trie.IsCachedAtBlock([]byte("key1"), 115)
-	if err != nil {
-		t.Fatalf("IsCachedAtBlock for block 115 failed: %v", err)
-	}
-	if isCached {
-		t.Error("key1 should NOT be cached at block 115")
 	}
 }
 
@@ -344,9 +306,7 @@ func TestPruneCacheBySize(t *testing.T) {
 // 测试基于window的pruneCache功能
 func TestPruneCacheByWindow(t *testing.T) {
 	// 创建一个缓存树，startNum从100开始，multiple=1
-	startNum := uint64(100)
-	multiple := uint64(1)
-	trie := NewCacheTrie(startNum, multiple, 100) // 设置较大的maxSize确保不会因size触发
+	trie := NewCacheTrie(100, 1, 100) // 设置较大的maxSize确保不会因size触发
 
 	// 在不同区块高度插入键值对
 	keys := []string{"keyA", "keyB", "keyC"}
@@ -359,7 +319,7 @@ func TestPruneCacheByWindow(t *testing.T) {
 	}
 
 	// 在区块110插入keyB
-	trie.SetBlockNum(110)
+	trie.SetBlockNum(100 + WindowLeft + 8)
 	err = trie.Update([]byte(keys[1]), []byte("valueB"))
 	if err != nil {
 		t.Fatalf("Update keyB failed: %v", err)
@@ -373,12 +333,12 @@ func TestPruneCacheByWindow(t *testing.T) {
 	}
 
 	// 在区块125处理哈希，不应触发清理(因为还有足够的窗口位)
-	trie.SetBlockNum(125)
+	trie.SetBlockNum(100 + 32 - WindowLeft - 1)
 	trie.Hash()
 
 	// 验证startNum未变
-	if trie.startNum != startNum {
-		t.Errorf("startNum changed unexpectedly: expected %d, got %d", startNum, trie.startNum)
+	if trie.startNum != 100 {
+		t.Errorf("startNum changed unexpectedly: expected %d, got %d", 100, trie.startNum)
 	}
 
 	// 验证所有键值对都可以获取
@@ -410,7 +370,7 @@ func TestPruneCacheByWindow(t *testing.T) {
 	trie.Hash()
 
 	// 验证startNum已经更新(应该向前移动)
-	if trie.startNum <= startNum {
+	if trie.startNum <= 100 {
 		t.Errorf("startNum didn't increase after pruning, still at %d", trie.startNum)
 	} else {
 		t.Logf("startNum updated to %d after pruning", trie.startNum)

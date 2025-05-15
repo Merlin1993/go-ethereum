@@ -72,7 +72,13 @@ func (n ValueNode) window() int  { return 0 } // 值节点没有窗口
 // 大小访问方法
 func (n *FullNode) size() int  { return n.flags.size }
 func (n *ShortNode) size() int { return n.flags.size }
-func (n ValueNode) size() int  { return 1 }
+
+func (n ValueNode) size() int {
+	if len(n) > 0 { // 非空值节点，算作1
+		return 1
+	}
+	return 0 // 空值节点（墓碑），不计入size
+}
 
 // 节点的字符串表示
 func (n *FullNode) String() string  { return n.fstring("") }
@@ -108,11 +114,12 @@ func (n *FullNode) updateFlag(bitPos int) {
 	n.flags.size = 0
 	for _, node := range &n.Children {
 		if node != nil {
-			n.flags.window ^= node.window()
+			n.flags.window |= node.window()
 			n.flags.size += node.size()
 		}
 	}
 }
+
 func (n *ShortNode) updateFlag(bitPos int) {
 	if _, ok := n.Val.(ValueNode); ok {
 		// 这是叶子节点，设置当前区块对应的位

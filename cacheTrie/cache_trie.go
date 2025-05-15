@@ -32,6 +32,8 @@ import (
 // EmptyRoot是一个特殊的根哈希，表示空树
 var EmptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 
+const WindowLeft = 0
+
 // -----------------------------------------------------------------------------
 // 数据结构定义
 
@@ -317,7 +319,7 @@ func (t *CacheTrie) pruneCache() []*DeleteKV {
 	needPrune := false
 
 	// 条件1：当window的位数只剩下8bit（也就是用了四分之三的窗口），触发清理
-	if windowBits <= 8 {
+	if windowBits <= WindowLeft {
 		needPrune = true
 	}
 
@@ -341,7 +343,7 @@ func (t *CacheTrie) pruneCache() []*DeleteKV {
 	// 循环直到满足条件
 	for {
 		// 检查是否已经满足条件：size小于目标值，且window位数大于等于16bit
-		if t.root.size() <= targetSize && windowBits >= 16 {
+		if t.root.size() <= targetSize && windowBits >= WindowLeft+8 {
 			break
 		}
 
@@ -504,16 +506,15 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 			child = &ShortNode{
 				Key:   n.Key[prefixLength+1:],
 				Val:   n.Val,
-				flags: t.newNodeFlag(),
+				flags: n.flags,
 			}
 		} else {
 			child = &ShortNode{
 				Key:   make([]byte, 0),
 				Val:   n.Val,
-				flags: t.newNodeFlag(),
+				flags: n.flags,
 			}
 		}
-		child.updateFlag(bitPos)
 		branch.Children[n.Key[prefixLength]] = child
 
 		// 创建一个新的节点
@@ -570,40 +571,6 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 	default:
 		panic(fmt.Sprintf("%T: invalid node: %v", n, n))
 	}
-}
-
-//-------------------------------验证类方法，不属于正常逻辑，只是检查树是否有问题-------------------------------
-
-// IsCachedAtBlock 检查节点在给定路径是否有指定区块的缓存数据
-// 返回:
-//   - true: 表示在指定区块高度有缓存
-//   - false: 表示在指定区块高度没有缓存
-func (t *CacheTrie) IsCachedAtBlock(key []byte, blockNum uint64) (bool, error) {
-	// 如果目标区块小于起始区块或者超出了窗口范围（32位*multiple），返回false
-	if blockNum < t.startNum || (blockNum-t.startNum)/t.multiple >= 32 {
-		return false, nil
-	}
-
-	// 计算目标区块在window中的位置
-	position := blockNum / t.multiple
-	bitPos := int(position % 32)
-	blockPosition := 1 << bitPos
-
-	// 确保key是哈希值（固定长度）
-	hashedKey := hashKey(key)
-
-	// 获取对应路径的节点
-	node, err := t.Get(hashedKey)
-	if err != nil {
-		return false, err
-	}
-	if node == nil {
-		return false, nil
-	}
-
-	// 获取节点的window并检查指定位置是否设置
-	window := node.window()
-	return (window & blockPosition) != 0, nil
 }
 
 // hashKey 对输入的key进行哈希处理，确保返回固定长度的键
