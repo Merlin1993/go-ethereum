@@ -90,6 +90,67 @@ func (t *CacheTrie) getNodeWindow(n cacheNode) int {
 	return n.window()
 }
 
+// prepareKey 处理键并返回十六进制格式的哈希键
+// 可选参数address允许将地址与键组合
+func (t *CacheTrie) prepareKey(key []byte, address ...common.Address) []byte {
+	var dataToHash []byte
+
+	// 如果提供了地址，将地址与键组合
+	if len(address) > 0 {
+		dataToHash = append(address[0].Bytes(), key...)
+	} else {
+		dataToHash = key
+	}
+
+	// 对数据进行哈希处理
+	hashedKey := hashKey(dataToHash)
+	// 转换为十六进制格式
+	return keybytesToHex(hashedKey)
+}
+
+// getInternal 是Get和GetWithAddress的内部实现
+func (t *CacheTrie) getInternal(hexKey []byte) (cacheNode, error) {
+	bitPosition := t.getCacheBitPosition()
+	return t.get(t.root, hexKey, 0, bitPosition)
+}
+
+// updateInternal 是Update和UpdateWithAddress的内部实现
+func (t *CacheTrie) updateInternal(hexKey []byte, value []byte, isNew bool) error {
+	// 设置当前位置
+	bitPos := t.getCacheBitPosition()
+
+	// 将value转换为ValueNode类型
+	valueNode := ValueNode{Data: value, New: isNew}
+
+	root, err := t.insert(t.root, hexKey, valueNode, bitPos)
+	if err != nil {
+		return err
+	}
+
+	// 更新根节点
+	t.root = root
+	return nil
+}
+
+// deleteInternal 是Delete和DeleteWithAddress的内部实现
+func (t *CacheTrie) deleteInternal(hexKey []byte) error {
+	// 创建一个特殊的标记值作为"墓碑"
+	// 这里使用一个空的ValueNode作为墓碑标记，并设置New为true
+	tombstone := ValueNode{Data: []byte{}, New: true}
+
+	// 获取当前block位置
+	bitPos := t.getCacheBitPosition()
+
+	// 使用insert方法插入墓碑标记，而不是真正删除
+	newroot, err := t.insert(t.root, hexKey, tombstone, bitPos)
+	if err != nil {
+		return err
+	}
+
+	t.root = newroot
+	return nil
+}
+
 // getNodeForPathRecursive 是getNodeForPath的递归实现
 // 参数:
 //   - node: 当前检查的节点
@@ -225,11 +286,23 @@ func (t *CacheTrie) GetSize() int {
 //   - 找到的节点
 //   - 错误信息
 func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
-	// 确保key是哈希值（固定长度）
-	hashedKey := hashKey(key)
-	hexKey := keybytesToHex(hashedKey)
-	bitPosition := t.getCacheBitPosition()
-	return t.get(t.root, hexKey, 0, bitPosition)
+	hexKey := t.prepareKey(key)
+	return t.getInternal(hexKey)
+}
+
+// GetWithAddress 通过地址和路径获取节点
+// 从根节点开始，沿着由address+key组合的路径查找，返回路径末端的节点
+//
+// 参数:
+//   - address: 账户地址
+//   - key: 要查找的键
+//
+// 返回:
+//   - 找到的节点
+//   - 错误信息
+func (t *CacheTrie) GetWithAddress(address common.Address, key []byte) (cacheNode, error) {
+	hexKey := t.prepareKey(key, address)
+	return t.getInternal(hexKey)
 }
 
 // Update 将键值对添加到trie中
@@ -239,48 +312,33 @@ func (t *CacheTrie) Update(key, value []byte, isNew bool) error {
 		return t.Delete(key)
 	}
 
-	// 确保key是哈希值（固定长度）
-	hashedKey := hashKey(key)
-	hexKey := keybytesToHex(hashedKey)
+	hexKey := t.prepareKey(key)
+	return t.updateInternal(hexKey, value, isNew)
+}
 
-	// 设置当前位置
-	bitPos := t.getCacheBitPosition()
-
-	// 将value转换为ValueNode类型
-	valueNode := ValueNode{Data: value, New: isNew}
-
-	root, err := t.insert(t.root, hexKey, valueNode, bitPos)
-	if err != nil {
-		return err
+// UpdateWithAddress 将带有地址前缀的键值对添加到trie中
+// 如果value为空，则调用DeleteWithAddress方法删除该键
+func (t *CacheTrie) UpdateWithAddress(address common.Address, key, value []byte, isNew bool) error {
+	if len(value) == 0 {
+		return t.DeleteWithAddress(address, key)
 	}
 
-	// 更新根节点
-	t.root = root
-	return nil
+	hexKey := t.prepareKey(key, address)
+	return t.updateInternal(hexKey, value, isNew)
 }
 
 // Delete 从trie中删除key
 // 内部实现使用"墓碑"标记(空值节点)替代真正的删除
 func (t *CacheTrie) Delete(key []byte) error {
-	// 确保key是哈希值（固定长度）
-	hashedKey := hashKey(key)
-	hexKey := keybytesToHex(hashedKey)
+	hexKey := t.prepareKey(key)
+	return t.deleteInternal(hexKey)
+}
 
-	// 创建一个特殊的标记值作为"墓碑"
-	// 这里使用一个空的ValueNode作为墓碑标记，并设置New为true
-	tombstone := ValueNode{Data: []byte{}, New: true}
-
-	// 获取当前block位置
-	bitPos := t.getCacheBitPosition()
-
-	// 使用insert方法插入墓碑标记，而不是真正删除
-	newroot, err := t.insert(t.root, hexKey, tombstone, bitPos)
-	if err != nil {
-		return err
-	}
-
-	t.root = newroot
-	return nil
+// DeleteWithAddress 从trie中删除带有地址前缀的key
+// 内部实现使用"墓碑"标记(空值节点)替代真正的删除
+func (t *CacheTrie) DeleteWithAddress(address common.Address, key []byte) error {
+	hexKey := t.prepareKey(key, address)
+	return t.deleteInternal(hexKey)
 }
 
 // Hash 返回trie的根哈希

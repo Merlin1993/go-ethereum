@@ -321,7 +321,7 @@ func TestPruneCacheByWindow(t *testing.T) {
 	}
 
 	// 在区块110插入keyB
-	trie.SetBlockNum(100 + WindowLeft + 8)
+	trie.SetBlockNum(100 + WindowLeft + 8 + 1)
 	err = trie.Update([]byte(keys[1]), []byte("valueB"), true)
 	if err != nil {
 		t.Fatalf("Update keyB failed: %v", err)
@@ -335,7 +335,7 @@ func TestPruneCacheByWindow(t *testing.T) {
 	}
 
 	// 在区块125处理哈希，不应触发清理(因为还有足够的窗口位)
-	trie.SetBlockNum(100 + 32 - WindowLeft - 1)
+	trie.SetBlockNum(100 + 32 - WindowLeft - 2)
 	trie.Hash()
 
 	// 验证startNum未变
