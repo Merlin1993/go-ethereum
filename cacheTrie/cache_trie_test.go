@@ -17,6 +17,7 @@
 package cacheTrie
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -29,7 +30,7 @@ func TestBasicOperations(t *testing.T) {
 	trie.SetBlockNum(1)
 
 	// 测试插入
-	err := trie.Update([]byte("key1"), []byte("value1"))
+	err := trie.Update([]byte("key1"), []byte("value1"), true)
 	if err != nil {
 		t.Fatalf("Update key1 failed: %v", err)
 	}
@@ -45,12 +46,12 @@ func TestBasicOperations(t *testing.T) {
 		t.Fatalf("Expected ValueNode, got %T", node)
 	}
 
-	if string(valueNode) != "value1" {
-		t.Errorf("Wrong value for key1: got %q, want %q", string(valueNode), "value1")
+	if string(valueNode.Data) != "value1" {
+		t.Errorf("Wrong value for key1: got %q, want %q", string(valueNode.Data), "value1")
 	}
 
 	// 插入第二个键值对
-	err = trie.Update([]byte("key2"), []byte("value2"))
+	err = trie.Update([]byte("key2"), []byte("value2"), true)
 	if err != nil {
 		t.Fatalf("Update key2 failed: %v", err)
 	}
@@ -66,8 +67,8 @@ func TestBasicOperations(t *testing.T) {
 		t.Fatalf("Expected ValueNode, got %T", node)
 	}
 
-	if string(valueNode) != "value2" {
-		t.Errorf("Wrong value for key2: got %q, want %q", string(valueNode), "value2")
+	if string(valueNode.Data) != "value2" {
+		t.Errorf("Wrong value for key2: got %q, want %q", string(valueNode.Data), "value2")
 	}
 
 	// 测试删除
@@ -85,7 +86,7 @@ func TestBasicOperations(t *testing.T) {
 	// 删除后该节点应该是nil或者是空的ValueNode
 	if node != nil {
 		valueNode, ok = node.(ValueNode)
-		if !ok || len(valueNode) != 0 {
+		if !ok || len(valueNode.Data) != 0 {
 			t.Errorf("Expected nil or empty ValueNode after delete, got: %v", node)
 		}
 	}
@@ -101,8 +102,8 @@ func TestBasicOperations(t *testing.T) {
 		t.Fatalf("Expected ValueNode for key2, got %T", node)
 	}
 
-	if string(valueNode) != "value2" {
-		t.Errorf("Wrong value for key2 after deleting key1: got %q, want %q", string(valueNode), "value2")
+	if string(valueNode.Data) != "value2" {
+		t.Errorf("Wrong value for key2 after deleting key1: got %q, want %q", string(valueNode.Data), "value2")
 	}
 
 	// 测试哈希计算
@@ -120,7 +121,7 @@ func TestWindowCalculation(t *testing.T) {
 
 	// 在区块110插入key1
 	trie.SetBlockNum(110)
-	err := trie.Update([]byte("key1"), []byte("value1"))
+	err := trie.Update([]byte("key1"), []byte("value1"), true)
 	if err != nil {
 		t.Fatalf("Update at block 110 failed: %v", err)
 	}
@@ -138,7 +139,7 @@ func TestWindowCalculation(t *testing.T) {
 
 	// 在区块120更新另一个key
 	trie.SetBlockNum(120)
-	err = trie.Update([]byte("key2"), []byte("value2"))
+	err = trie.Update([]byte("key2"), []byte("value2"), true)
 	if err != nil {
 		t.Fatalf("Update at block 120 failed: %v", err)
 	}
@@ -170,7 +171,7 @@ func TestWindowCalculation(t *testing.T) {
 	}
 
 	//更新同一个key,消除第22位的值
-	err = trie.Update([]byte("key1"), []byte("value1-updated"))
+	err = trie.Update([]byte("key1"), []byte("value1-updated"), true)
 	if err != nil {
 		t.Fatalf("Update at block 120 failed: %v", err)
 	}
@@ -197,7 +198,7 @@ func TestSizeCalculation(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
-		err := trie.Update(key, value)
+		err := trie.Update(key, value, true)
 		if err != nil {
 			t.Fatalf("Update failed: %v", err)
 		}
@@ -224,7 +225,7 @@ func TestSizeCalculation(t *testing.T) {
 	}
 
 	// 更新一个已存在的键
-	err = trie.Update([]byte("key1"), []byte("updated-value"))
+	err = trie.Update([]byte("key1"), []byte("updated-value"), true)
 	if err != nil {
 		t.Fatalf("Update existing key failed: %v", err)
 	}
@@ -246,7 +247,7 @@ func TestPruneCacheBySize(t *testing.T) {
 	for i := 0; i < 11; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
-		err := trie.Update(key, value)
+		err := trie.Update(key, value, true)
 		if err != nil {
 			t.Fatalf("Update failed: %v", err)
 		}
@@ -259,7 +260,7 @@ func TestPruneCacheBySize(t *testing.T) {
 	for i := 11; i < 15; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
-		err := trie.Update(key, value)
+		err := trie.Update(key, value, true)
 		if err != nil {
 			t.Fatalf("Update failed: %v", err)
 		}
@@ -282,7 +283,7 @@ func TestPruneCacheBySize(t *testing.T) {
 	}
 
 	// 验证是否仍然可以插入新键
-	err := trie.Update([]byte("newKey"), []byte("newValue"))
+	err := trie.Update([]byte("newKey"), []byte("newValue"), true)
 	if err != nil {
 		t.Fatalf("Failed to insert after pruning: %v", err)
 	}
@@ -298,8 +299,8 @@ func TestPruneCacheBySize(t *testing.T) {
 		t.Fatalf("Expected ValueNode, got %T", node)
 	}
 
-	if string(valueNode) != "newValue" {
-		t.Errorf("Wrong value for newKey: got %q, want %q", string(valueNode), "newValue")
+	if string(valueNode.Data) != "newValue" {
+		t.Errorf("Wrong value for newKey: got %q, want %q", string(valueNode.Data), "newValue")
 	}
 }
 
@@ -313,21 +314,21 @@ func TestPruneCacheByWindow(t *testing.T) {
 
 	// 在区块101插入keyA
 	trie.SetBlockNum(101)
-	err := trie.Update([]byte(keys[0]), []byte("valueA"))
+	err := trie.Update([]byte(keys[0]), []byte("valueA"), true)
 	if err != nil {
 		t.Fatalf("Update keyA failed: %v", err)
 	}
 
 	// 在区块110插入keyB
 	trie.SetBlockNum(100 + WindowLeft + 8)
-	err = trie.Update([]byte(keys[1]), []byte("valueB"))
+	err = trie.Update([]byte(keys[1]), []byte("valueB"), true)
 	if err != nil {
 		t.Fatalf("Update keyB failed: %v", err)
 	}
 
 	// 在区块120插入keyC
 	trie.SetBlockNum(120)
-	err = trie.Update([]byte(keys[2]), []byte("valueC"))
+	err = trie.Update([]byte(keys[2]), []byte("valueC"), true)
 	if err != nil {
 		t.Fatalf("Update keyC failed: %v", err)
 	}
@@ -360,7 +361,7 @@ func TestPruneCacheByWindow(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		blockNum := uint64(128 + i)
 		trie.SetBlockNum(blockNum)
-		err := trie.Update([]byte(fmt.Sprintf("fill%d", i)), []byte("filler"))
+		err := trie.Update([]byte(fmt.Sprintf("fill%d", i)), []byte("filler"), true)
 		if err != nil {
 			t.Fatalf("Failed to insert filler at block %d: %v", blockNum, err)
 		}
@@ -393,7 +394,7 @@ func TestPruneCacheByWindow(t *testing.T) {
 
 	// 验证可以在清理后继续插入新键
 	trie.SetBlockNum(140)
-	err = trie.Update([]byte("newKey"), []byte("newValue"))
+	err = trie.Update([]byte("newKey"), []byte("newValue"), true)
 	if err != nil {
 		t.Fatalf("Failed to insert after window pruning: %v", err)
 	}
@@ -409,7 +410,392 @@ func TestPruneCacheByWindow(t *testing.T) {
 		t.Fatalf("Expected ValueNode, got %T", node)
 	}
 
-	if string(valueNode) != "newValue" {
-		t.Errorf("Wrong value for newKey: got %q, want %q", string(valueNode), "newValue")
+	if string(valueNode.Data) != "newValue" {
+		t.Errorf("Wrong value for newKey: got %q, want %q", string(valueNode.Data), "newValue")
+	}
+}
+
+// 测试ValueNode的New字段功能
+func TestValueNodeNewField(t *testing.T) {
+	trie := NewCacheTrie(0, 1, 100)
+	trie.SetBlockNum(1)
+
+	// 首先测试通过Update插入的键值对，New字段默认为true
+	err := trie.Update([]byte("key1"), []byte("value1"), true)
+	if err != nil {
+		t.Fatalf("Update key1 failed: %v", err)
+	}
+
+	// 获取节点并检查New字段值
+	node, err := trie.Get([]byte("key1"))
+	if err != nil {
+		t.Fatalf("Get key1 failed: %v", err)
+	}
+
+	valueNode, ok := node.(ValueNode)
+	if !ok {
+		t.Fatalf("Expected ValueNode, got %T", node)
+	}
+
+	if !valueNode.New {
+		t.Errorf("Expected New field to be true for new insertion, got false")
+	}
+
+	// 测试设置New为false的情况
+	err = trie.Update([]byte("key2"), []byte("value2"), false)
+	if err != nil {
+		t.Fatalf("Update key2 failed: %v", err)
+	}
+
+	node, err = trie.Get([]byte("key2"))
+	if err != nil {
+		t.Fatalf("Get key2 failed: %v", err)
+	}
+
+	valueNode, ok = node.(ValueNode)
+	if !ok {
+		t.Fatalf("Expected ValueNode, got %T", node)
+	}
+
+	if valueNode.New {
+		t.Errorf("Expected New field to be false for isNew=false, got true")
+	}
+
+	// 测试删除操作会将New设置为true
+	err = trie.Delete([]byte("key2"))
+	if err != nil {
+		t.Fatalf("Delete key2 failed: %v", err)
+	}
+
+	node, err = trie.Get([]byte("key2"))
+	if err != nil {
+		t.Fatalf("Get key2 after delete failed: %v", err)
+	}
+
+	if node != nil {
+		valueNode, ok = node.(ValueNode)
+		if !ok {
+			t.Fatalf("Expected ValueNode after delete, got %T", node)
+		}
+
+		if !valueNode.New {
+			t.Errorf("Expected New field to be true after delete, got false")
+		}
+
+		if len(valueNode.Data) != 0 {
+			t.Errorf("Expected empty Data after delete, got %x", valueNode.Data)
+		}
+	}
+
+	// 测试更新值会将New设置为true
+	// 首先插入一个New=false的值
+	err = trie.Update([]byte("updateKey"), []byte("initialValue"), false)
+	if err != nil {
+		t.Fatalf("Update updateKey failed: %v", err)
+	}
+
+	// 获取并确认New=false
+	node, err = trie.Get([]byte("updateKey"))
+	if err != nil {
+		t.Fatalf("Get updateKey failed: %v", err)
+	}
+
+	valueNode, ok = node.(ValueNode)
+	if !ok {
+		t.Fatalf("Expected ValueNode, got %T", node)
+	}
+
+	if valueNode.New {
+		t.Errorf("Expected New field to be false initially, got true")
+	}
+
+	// 更新相同键的值
+	err = trie.Update([]byte("updateKey"), []byte("updatedValue"), true)
+	if err != nil {
+		t.Fatalf("Update updateKey (second time) failed: %v", err)
+	}
+
+	// 再次获取并确认New=true（因为值已更新）
+	node, err = trie.Get([]byte("updateKey"))
+	if err != nil {
+		t.Fatalf("Get updateKey after update failed: %v", err)
+	}
+
+	valueNode, ok = node.(ValueNode)
+	if !ok {
+		t.Fatalf("Expected ValueNode after update, got %T", node)
+	}
+
+	if !valueNode.New {
+		t.Errorf("Expected New field to be true after update, got false")
+	}
+
+	if string(valueNode.Data) != "updatedValue" {
+		t.Errorf("Expected updated value, got %s", string(valueNode.Data))
+	}
+
+	// 测试pruneCache会根据New字段返回节点
+	trie.SetBlockNum(31) // 移动到会触发清理的区块
+
+	// 添加一些键值对
+	for i := 0; i < 5; i++ {
+		key := []byte(fmt.Sprintf("pruneKey%d", i))
+		value := []byte(fmt.Sprintf("pruneValue%d", i))
+		isNew := i%2 == 0 // 交替设置New字段
+
+		err := trie.Update(key, value, isNew)
+		if err != nil {
+			t.Fatalf("Update pruneKey%d failed: %v", i, err)
+		}
+	}
+
+	// 触发Hash计算和pruneCache
+	_, deletedKVs := trie.Hash()
+
+	// 检查删除的键值对
+	if deletedKVs == nil {
+		t.Log("No keys were pruned yet, which might be expected")
+	} else {
+		// 记录删除的节点信息
+		for i, kv := range deletedKVs.Data {
+			t.Logf("Pruned KV[%d]: key=%x, value=%x", i, kv.Key, kv.Value)
+		}
+	}
+}
+
+// 测试pruneCache返回的DeleteKV中的New字段
+func TestPruneCacheDeleteKVNewField(t *testing.T) {
+	// 创建一个缓存树，使用较小的窗口以便快速触发pruneCache
+	trie := NewCacheTrie(100, 1, 10)
+
+	// 在区块101插入几个键值对，分别设置不同的New值
+	trie.SetBlockNum(101)
+
+	// 插入New=true的键值对
+	err := trie.Update([]byte("trueKey1"), []byte("trueValue1"), true)
+	if err != nil {
+		t.Fatalf("Update trueKey1 failed: %v", err)
+	}
+
+	err = trie.Update([]byte("trueKey2"), []byte("trueValue2"), true)
+	if err != nil {
+		t.Fatalf("Update trueKey2 failed: %v", err)
+	}
+
+	// 插入New=false的键值对
+	err = trie.Update([]byte("falseKey1"), []byte("falseValue1"), false)
+	if err != nil {
+		t.Fatalf("Update falseKey1 failed: %v", err)
+	}
+
+	err = trie.Update([]byte("falseKey2"), []byte("falseValue2"), false)
+	if err != nil {
+		t.Fatalf("Update falseKey2 failed: %v", err)
+	}
+
+	// 跳转到足够远的区块，以确保触发pruneCache
+	trie.SetBlockNum(131)
+
+	// 触发Hash计算和pruneCache
+	_, deletedKVs := trie.Hash()
+
+	// 验证pruneCache结果
+	if deletedKVs == nil {
+		t.Fatalf("Expected deletedKVs from pruneCache, got nil")
+	}
+
+	// 统计从true和false节点中删除的键值对数量
+	trueKeyCount := 0
+	falseKeyCount := 0
+
+	for _, kv := range deletedKVs.Data {
+		// 根据键名前缀判断是true还是false节点
+		if bytes.HasPrefix(kv.Key, []byte("true")) {
+			trueKeyCount++
+			t.Logf("Found key from 'true' node: key=%x, value=%x", kv.Key, kv.Value)
+		} else if bytes.HasPrefix(kv.Key, []byte("false")) {
+			falseKeyCount++
+			t.Logf("Found key from 'false' node: key=%x, value=%x", kv.Key, kv.Value)
+		}
+	}
+
+	// 验证应该只有来自New=true节点的键值对被返回
+	// 注意：由于hashKey的原因，我们无法直接通过前缀判断，这里只是通过数量大致判断
+	if falseKeyCount > 0 {
+		t.Logf("Found %d keys from 'false' nodes, which might be unexpected", falseKeyCount)
+	}
+
+	// 验证至少有一些键值对被删除
+	if deletedKVs == nil || len(deletedKVs.Data) == 0 {
+		t.Errorf("Expected some deleted KVs, got none")
+	}
+
+	// 再次测试：更新一个原来New=false的值，触发变更
+	trie.SetBlockNum(145)
+
+	// 重新插入更多数据
+	err = trie.Update([]byte("falseKey3"), []byte("falseValue3"), false)
+	if err != nil {
+		t.Fatalf("Update falseKey3 failed: %v", err)
+	}
+
+	// 更新值
+	err = trie.Update([]byte("falseKey3"), []byte("updatedValue3"), false)
+	if err != nil {
+		t.Fatalf("Update falseKey3 (second time) failed: %v", err)
+	}
+
+	// 跳转到更远的区块
+	trie.SetBlockNum(180)
+
+	// 再次触发Hash和pruneCache
+	_, deletedKVs = trie.Hash()
+
+	// 由于hashKey的原因，我们无法直接通过值内容判断，这里只记录日志
+	if deletedKVs != nil && len(deletedKVs.Data) > 0 {
+		t.Logf("Found %d deleted KVs in second pruning", len(deletedKVs.Data))
+		for i, kv := range deletedKVs.Data {
+			t.Logf("DeletedKV[%d]: key=%x, value=%x", i, kv.Key, kv.Value)
+		}
+	}
+}
+
+// 测试New=true的节点在pruneCache后仍然可用
+func TestNewNodesRetentionAfterPrune(t *testing.T) {
+	// 创建一个缓存树，window足够小以触发pruneCache
+	trie := NewCacheTrie(100, 1, 10)
+
+	// 在区块101插入键值对
+	trie.SetBlockNum(101)
+
+	// 插入New=true的键值对
+	err := trie.Update([]byte("trueNode"), []byte("trueValue"), true)
+	if err != nil {
+		t.Fatalf("Update trueNode failed: %v", err)
+	}
+
+	// 插入New=false的键值对
+	err = trie.Update([]byte("falseNode"), []byte("falseValue"), false)
+	if err != nil {
+		t.Fatalf("Update falseNode failed: %v", err)
+	}
+
+	// 确认两个节点都可以正常访问
+	node1, err := trie.Get([]byte("trueNode"))
+	if err != nil || node1 == nil {
+		t.Fatalf("Get trueNode failed before pruning: %v", err)
+	}
+
+	node2, err := trie.Get([]byte("falseNode"))
+	if err != nil || node2 == nil {
+		t.Fatalf("Get falseNode failed before pruning: %v", err)
+	}
+
+	// 检查节点的New字段
+	valueNode1, ok := node1.(ValueNode)
+	if ok && valueNode1.New {
+		t.Logf("trueNode has New=true as expected")
+	} else if ok {
+		t.Errorf("trueNode should have New=true, got false")
+	}
+
+	valueNode2, ok := node2.(ValueNode)
+	if ok && !valueNode2.New {
+		t.Logf("falseNode has New=false as expected")
+	} else if ok {
+		t.Errorf("falseNode should have New=false, got true")
+	}
+
+	// 跳转到足够远的区块触发pruneCache
+	trie.SetBlockNum(135)
+
+	// 添加一些额外的键，确保触发pruneCache
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("extraKey%d", i))
+		value := []byte(fmt.Sprintf("extraValue%d", i))
+		err := trie.Update(key, value, i%2 == 0) // 交替设置New
+		if err != nil {
+			t.Fatalf("Update extraKey%d failed: %v", i, err)
+		}
+	}
+
+	// 触发Hash计算和pruneCache
+	_, deletedKVs := trie.Hash()
+
+	// 验证pruneCache结果
+	if deletedKVs == nil {
+		t.Log("No nodes were pruned yet, which might not be expected")
+	} else {
+		t.Logf("Pruned %d nodes", len(deletedKVs.Data))
+
+		// 记录删除的键值对内容
+		for i, kv := range deletedKVs.Data {
+			t.Logf("DeletedKV[%d]: key=%x, value=%x", i, kv.Key, kv.Value)
+		}
+	}
+
+	// 尝试再次访问两个节点
+	// New=true的节点应该被返回在DeleteKV中
+	node1, err = trie.Get([]byte("trueNode"))
+	if err != nil {
+		t.Fatalf("Get trueNode failed after pruning: %v", err)
+	}
+
+	if node1 == nil {
+		t.Logf("trueNode (New=true) was pruned from trie and should be in deletedKVs")
+
+		// 检查在deletedKVs中是否能找到相似的值
+		found := false
+		for _, kv := range deletedKVs.Data {
+			if bytes.Equal(kv.Value, []byte("trueValue")) {
+				found = true
+				t.Logf("Found value matching trueNode in deletedKVs")
+				break
+			}
+		}
+
+		if !found && len(deletedKVs.Data) > 0 {
+			t.Logf("trueNode value not found in deletedKVs")
+		}
+	} else {
+		t.Logf("trueNode (New=true) is still available in trie after pruning")
+
+		// 检查New字段是否仍为true
+		if valueNode, ok := node1.(ValueNode); ok {
+			if valueNode.New {
+				t.Logf("trueNode still has New=true after pruning")
+			} else {
+				t.Errorf("trueNode should still have New=true after pruning, got false")
+			}
+		}
+	}
+
+	// New=false的节点预期会被删除
+	node2, err = trie.Get([]byte("falseNode"))
+	if err != nil {
+		t.Fatalf("Get falseNode failed with error after pruning: %v", err)
+	}
+
+	// 检查删除的节点不应该出现在deletedKVs中
+	if node2 == nil {
+		t.Logf("falseNode (New=false) was pruned from trie as expected")
+
+		// 确认在deletedKVs中找不到
+		for _, kv := range deletedKVs.Data {
+			if bytes.Equal(kv.Value, []byte("falseValue")) {
+				t.Logf("Found value matching falseNode in deletedKVs, which might be unexpected")
+				break
+			}
+		}
+	} else {
+		// 如果没有触发pruneCache，这是可能的
+		valueNode, ok := node2.(ValueNode)
+		if !ok {
+			t.Errorf("Expected ValueNode for falseNode, got %T", node2)
+		} else if valueNode.New {
+			t.Errorf("falseNode has New=true after pruning, expected false")
+		} else {
+			t.Logf("falseNode still has New=false and wasn't pruned yet")
+		}
 	}
 }

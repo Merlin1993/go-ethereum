@@ -82,7 +82,7 @@ func (t *CacheTrie) getCacheBitPosition() int {
 
 // 获取剩余可用的position
 func (t *CacheTrie) getWindowPosition() int {
-	return 32 - int((t.blockNum-t.startNum)/t.multiple)
+	return 32 - int((t.blockNum-t.startNum)/t.multiple) - 1
 }
 
 // getNodeWindow 获取节点的window位图
@@ -234,7 +234,7 @@ func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
 
 // Update 将键值对添加到trie中
 // 如果value为空，则调用Delete方法删除该键
-func (t *CacheTrie) Update(key, value []byte) error {
+func (t *CacheTrie) Update(key, value []byte, isNew bool) error {
 	if len(value) == 0 {
 		return t.Delete(key)
 	}
@@ -247,7 +247,7 @@ func (t *CacheTrie) Update(key, value []byte) error {
 	bitPos := t.getCacheBitPosition()
 
 	// 将value转换为ValueNode类型
-	valueNode := ValueNode(value)
+	valueNode := ValueNode{Data: value, New: isNew}
 
 	root, err := t.insert(t.root, hexKey, valueNode, bitPos)
 	if err != nil {
@@ -267,8 +267,8 @@ func (t *CacheTrie) Delete(key []byte) error {
 	hexKey := keybytesToHex(hashedKey)
 
 	// 创建一个特殊的标记值作为"墓碑"
-	// 这里使用一个空的ValueNode作为墓碑标记
-	tombstone := ValueNode([]byte{})
+	// 这里使用一个空的ValueNode作为墓碑标记，并设置New为true
+	tombstone := ValueNode{Data: []byte{}, New: true}
 
 	// 获取当前block位置
 	bitPos := t.getCacheBitPosition()
@@ -286,7 +286,7 @@ func (t *CacheTrie) Delete(key []byte) error {
 // Hash 返回trie的根哈希
 // 同时执行必要的缓存清理
 // 返回trie的根哈希和在pruneCache过程中删除的键值对
-func (t *CacheTrie) Hash() (common.Hash, []*DeleteKV) {
+func (t *CacheTrie) Hash() (common.Hash, *DeleteKVList) {
 	if t.root == nil {
 		return EmptyRoot, nil
 	}
@@ -298,6 +298,9 @@ func (t *CacheTrie) Hash() (common.Hash, []*DeleteKV) {
 	h := newHasher(false)
 	defer returnHasherToPool(h)
 
+	if t.root == nil {
+		return EmptyRoot, deleteKeyValues
+	}
 	rootHash := h.hash(t.root)
 
 	return common.BytesToHash(rootHash), deleteKeyValues
@@ -308,9 +311,13 @@ type DeleteKV struct {
 	Value []byte
 }
 
+type DeleteKVList struct {
+	Data []*DeleteKV
+}
+
 // pruneCache清理不常用的缓存节点
 // 返回在清理过程中删除的键值对列表
-func (t *CacheTrie) pruneCache() []*DeleteKV {
+func (t *CacheTrie) pruneCache() *DeleteKVList {
 	// 计算当前window的可用位数
 	// 当前位置表示已经使用了多少位
 	windowBits := t.getWindowPosition()
@@ -339,11 +346,11 @@ func (t *CacheTrie) pruneCache() []*DeleteKV {
 	if targetSize <= 0 {
 		targetSize = 1 // 确保至少有一个目标大小
 	}
-	deleteKeyValue := make([]*DeleteKV, 0)
+	deleteKVList := &DeleteKVList{make([]*DeleteKV, 0)}
 	// 循环直到满足条件
 	for {
 		// 检查是否已经满足条件：size小于目标值，且window位数大于等于16bit
-		if t.root.size() <= targetSize && windowBits >= WindowLeft+8 {
+		if t.root == nil || (t.root.size() <= targetSize && windowBits >= WindowLeft+8) {
 			break
 		}
 
@@ -352,7 +359,7 @@ func (t *CacheTrie) pruneCache() []*DeleteKV {
 
 		// 从根节点递归查找所有节点，对于所有最低一位的叶子节点进行实际的删除
 		if t.root != nil {
-			t.root = t.pruneNodeAtBit(t.root, make([]byte, 0), lowestBit, deleteKeyValue)
+			t.root = t.pruneNodeAtBit(t.root, make([]byte, 0), lowestBit, deleteKVList)
 		}
 
 		// 更新startNum（向前移动window）
@@ -361,11 +368,11 @@ func (t *CacheTrie) pruneCache() []*DeleteKV {
 		// 重新计算windowBits
 		windowBits = t.getWindowPosition()
 	}
-	return deleteKeyValue
+	return deleteKVList
 }
 
 // pruneNodeAtBit递归查找指定位设置的节点并清理
-func (t *CacheTrie) pruneNodeAtBit(n cacheNode, prefixKey []byte, bit int, deleteKeyValue []*DeleteKV) cacheNode {
+func (t *CacheTrie) pruneNodeAtBit(n cacheNode, prefixKey []byte, bit int, deleteKVList *DeleteKVList) cacheNode {
 	if n == nil {
 		return nil
 	}
@@ -382,12 +389,19 @@ func (t *CacheTrie) pruneNodeAtBit(n cacheNode, prefixKey []byte, bit int, delet
 				fullKey := append(append([]byte{}, prefixKey...), node.Key...)
 				// 将十六进制格式的键转换回二进制格式
 				binaryKey := hexToKeybytes(fullKey)
-				deleteKeyValue = append(deleteKeyValue, &DeleteKV{Key: binaryKey, Value: []byte(valueNode)})
+
+				// 只有当ValueNode.New为true时才添加到deleteKeyValue
+				if valueNode.New {
+					deleteKVList.Data = append(deleteKVList.Data, &DeleteKV{
+						Key:   binaryKey,
+						Value: valueNode.Data,
+					})
+				}
 				return nil
 			} else {
 				// 对子节点递归处理，使用append合并路径
 				newPrefixKey := append(append([]byte{}, prefixKey...), node.Key...)
-				newVal := t.pruneNodeAtBit(node.Val, newPrefixKey, bit, deleteKeyValue)
+				newVal := t.pruneNodeAtBit(node.Val, newPrefixKey, bit, deleteKVList)
 
 				// 如果子节点被删除并且这个节点的window为0，则删除此节点
 				if newVal == nil {
@@ -412,7 +426,7 @@ func (t *CacheTrie) pruneNodeAtBit(n cacheNode, prefixKey []byte, bit int, delet
 					newPrefixKey := append(append([]byte{}, prefixKey...), byte(i))
 
 					// 递归处理子节点
-					node.Children[i] = t.pruneNodeAtBit(node.Children[i], newPrefixKey, bit, deleteKeyValue)
+					node.Children[i] = t.pruneNodeAtBit(node.Children[i], newPrefixKey, bit, deleteKVList)
 
 					// 检查子节点是否被删除
 					if node.Children[i] != nil {

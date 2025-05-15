@@ -48,7 +48,10 @@ type (
 	}
 
 	// 值节点，存储实际的值
-	ValueNode []byte
+	ValueNode struct {
+		Data []byte
+		New  bool // 标记该节点是否为新节点
+	}
 )
 
 // 节点标志，用于存储节点的哈希和状态
@@ -62,7 +65,7 @@ type nodeFlag struct {
 // 返回节点的哈希值和dirty标志
 func (n *FullNode) cache() ([]byte, bool)  { return n.flags.hash, n.flags.dirty }
 func (n *ShortNode) cache() ([]byte, bool) { return n.flags.hash, n.flags.dirty }
-func (n ValueNode) cache() ([]byte, bool)  { return n, false }
+func (n ValueNode) cache() ([]byte, bool)  { return n.Data, false }
 
 // 窗口访问方法
 func (n *FullNode) window() int  { return n.flags.window }
@@ -74,7 +77,7 @@ func (n *FullNode) size() int  { return n.flags.size }
 func (n *ShortNode) size() int { return n.flags.size }
 
 func (n ValueNode) size() int {
-	if len(n) > 0 { // 非空值节点，算作1
+	if len(n.Data) > 0 { // 非空值节点，算作1
 		return 1
 	}
 	return 0 // 空值节点（墓碑），不计入size
@@ -103,11 +106,11 @@ func (n *ShortNode) fstring(ind string) string {
 }
 
 func (n ValueNode) fstring(ind string) string {
-	return fmt.Sprintf("%x ", []byte(n))
+	return fmt.Sprintf("%x (New: %v) ", []byte(n.Data), n.New)
 }
 
 // NilValueNode 用于表示空值节点
-var NilValueNode = ValueNode(nil)
+var NilValueNode = ValueNode{Data: nil, New: false}
 
 func (n *FullNode) updateFlag(bitPos int) {
 	n.flags.window = 0
