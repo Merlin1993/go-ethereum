@@ -3,7 +3,6 @@ package core
 import (
 	"encoding/csv"
 	"fmt"
-	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -12,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ethereum/go-ethereum/triedb/hashdb"
 
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 
@@ -323,6 +324,12 @@ type BlockStats struct {
 	CallSuccessCount    int     // 成功的调用合约数
 	CallSuccessRate     float64 // 调用合约成功率
 
+	// 合约错误统计（新增）
+	ErrorCount         int            // 错误总数
+	ErrorReasons       map[string]int // 错误原因统计
+	CreateErrorReasons map[string]int // 合约创建错误原因统计
+	CallErrorReasons   map[string]int // 合约调用错误原因统计
+
 	ProcessTime        time.Duration // 交易处理时间
 	RootGenTime        time.Duration // 根哈希生成时间
 	CommitTime         time.Duration // 数据库提交时间
@@ -410,6 +417,17 @@ func NewStatsAggregator(outputDir string, blockWindow, csvWindow uint64) *StatsA
 
 // 添加区块统计数据
 func (s *StatsAggregator) AddBlockStats(stats BlockStats) {
+	// 确保错误统计map不为nil
+	if stats.ErrorReasons == nil {
+		stats.ErrorReasons = make(map[string]int)
+	}
+	if stats.CreateErrorReasons == nil {
+		stats.CreateErrorReasons = make(map[string]int)
+	}
+	if stats.CallErrorReasons == nil {
+		stats.CallErrorReasons = make(map[string]int)
+	}
+
 	s.Stats = append(s.Stats, stats)
 	s.TotalProcessed++
 	s.TotalTransaction += stats.TransactionCount
@@ -699,6 +717,123 @@ func (s *StatsAggregator) PrintStats() {
 		totalContractTxCount, avgContractTxPercent*100, totalContractSuccessCount, avgContractSuccessRate*100)
 	fmt.Printf("交易数 - 平均: %.1f, 最大: %d\n",
 		avgTxCount, maxTxCount)
+
+	// 添加错误统计信息
+	fmt.Println("\n----- 合约错误统计 -----")
+
+	// 合并所有区块的错误计数
+	allErrorReasons := make(map[string]int)
+	allCreateErrorReasons := make(map[string]int)
+	allCallErrorReasons := make(map[string]int)
+	totalErrors := 0
+
+	for _, stat := range recentStats {
+		totalErrors += stat.ErrorCount
+
+		// 合并错误原因计数
+		if stat.ErrorReasons != nil {
+			for reason, count := range stat.ErrorReasons {
+				allErrorReasons[reason] += count
+			}
+		}
+		if stat.CreateErrorReasons != nil {
+			for reason, count := range stat.CreateErrorReasons {
+				allCreateErrorReasons[reason] += count
+			}
+		}
+		if stat.CallErrorReasons != nil {
+			for reason, count := range stat.CallErrorReasons {
+				allCallErrorReasons[reason] += count
+			}
+		}
+	}
+
+	// 打印错误统计
+	fmt.Printf("总错误数: %d (%.2f%% 的交易)\n",
+		totalErrors, float64(totalErrors)/float64(totalTxCount)*100)
+
+	// 错误原因排序
+	type ErrorCount struct {
+		Reason string
+		Count  int
+	}
+
+	// 对所有错误进行排序
+	allErrorCounts := make([]ErrorCount, 0, len(allErrorReasons))
+	for reason, count := range allErrorReasons {
+		allErrorCounts = append(allErrorCounts, ErrorCount{reason, count})
+	}
+	sort.Slice(allErrorCounts, func(i, j int) bool {
+		return allErrorCounts[i].Count > allErrorCounts[j].Count
+	})
+
+	// 打印总体错误类型分布
+	fmt.Println("\n常见错误原因 (全部):")
+	var totalPrinted int
+	for i, ec := range allErrorCounts {
+		if i >= 10 && float64(ec.Count)/float64(totalErrors) < 0.01 {
+			// 只打印前10个错误和占比超过1%的错误
+			break
+		}
+		fmt.Printf("  %-30s: %d (%.2f%%)\n",
+			ec.Reason, ec.Count, float64(ec.Count)/float64(totalErrors)*100)
+		totalPrinted += ec.Count
+	}
+
+	// 如果还有其他错误未打印
+	if totalPrinted < totalErrors {
+		fmt.Printf("  %-30s: %d (%.2f%%)\n",
+			"其他错误", totalErrors-totalPrinted,
+			float64(totalErrors-totalPrinted)/float64(totalErrors)*100)
+	}
+
+	// 打印合约创建错误
+	createErrorCounts := make([]ErrorCount, 0, len(allCreateErrorReasons))
+	totalCreateErrors := 0
+	for reason, count := range allCreateErrorReasons {
+		createErrorCounts = append(createErrorCounts, ErrorCount{reason, count})
+		totalCreateErrors += count
+	}
+	sort.Slice(createErrorCounts, func(i, j int) bool {
+		return createErrorCounts[i].Count > createErrorCounts[j].Count
+	})
+
+	if totalCreateErrors > 0 {
+		fmt.Println("\n合约创建错误原因:")
+		for i, ec := range createErrorCounts {
+			if i >= 5 && float64(ec.Count)/float64(totalCreateErrors) < 0.05 {
+				// 只打印前5个错误和占比超过5%的错误
+				break
+			}
+			fmt.Printf("  %-30s: %d (%.2f%%)\n",
+				ec.Reason, ec.Count, float64(ec.Count)/float64(totalCreateErrors)*100)
+		}
+	}
+
+	// 打印合约调用错误
+	callErrorCounts := make([]ErrorCount, 0, len(allCallErrorReasons))
+	totalCallErrors := 0
+	for reason, count := range allCallErrorReasons {
+		callErrorCounts = append(callErrorCounts, ErrorCount{reason, count})
+		totalCallErrors += count
+	}
+	sort.Slice(callErrorCounts, func(i, j int) bool {
+		return callErrorCounts[i].Count > callErrorCounts[j].Count
+	})
+
+	if totalCallErrors > 0 {
+		fmt.Println("\n合约调用错误原因:")
+		for i, ec := range callErrorCounts {
+			if i >= 5 && float64(ec.Count)/float64(totalCallErrors) < 0.05 {
+				// 只打印前5个错误和占比超过5%的错误
+				break
+			}
+			fmt.Printf("  %-30s: %d (%.2f%%)\n",
+				ec.Reason, ec.Count, float64(ec.Count)/float64(totalCallErrors)*100)
+		}
+	}
+
+	fmt.Println("\n----- 性能统计 -----")
 	fmt.Printf("唯一状态访问 - 读(平均/最大): %.1f/%d, 写(平均/最大): %.1f/%d\n",
 		avgUniqueReads, maxUniqueReads, avgUniqueWrites, maxUniqueWrites)
 	fmt.Printf("每交易状态访问 - 所有交易: %.2f, 合约交易: %.2f\n",
@@ -740,11 +875,24 @@ func (s *StatsAggregator) OutputCSV() {
 		"UniqueReads", "UniqueWrites",
 		"AvgStatesPerTx", "AvgStatesPerContractTx",
 		"HitRate5", "HitRate10", "HitRate20", "HitRate40", "HitRate80", "HitRate160",
+		"ErrorCount", "TopErrorReason", "TopErrorCount", // 添加错误统计字段
 	}
 	writer.Write(headers)
 
 	// 写入每个区块的统计数据
 	for _, stat := range s.Stats {
+		// 找出最常见的错误原因
+		var topErrorReason string
+		var topErrorCount int
+		if stat.ErrorReasons != nil {
+			for reason, count := range stat.ErrorReasons {
+				if count > topErrorCount {
+					topErrorReason = reason
+					topErrorCount = count
+				}
+			}
+		}
+
 		record := []string{
 			strconv.FormatUint(stat.BlockNum, 10),
 			strconv.Itoa(stat.TransactionCount),
@@ -769,6 +917,9 @@ func (s *StatsAggregator) OutputCSV() {
 			strconv.FormatFloat(stat.CacheHitRate40, 'f', 4, 64),
 			strconv.FormatFloat(stat.CacheHitRate80, 'f', 4, 64),
 			strconv.FormatFloat(stat.CacheHitRate160, 'f', 4, 64),
+			strconv.Itoa(stat.ErrorCount),
+			topErrorReason,
+			strconv.Itoa(topErrorCount),
 		}
 		writer.Write(record)
 	}
@@ -972,6 +1123,7 @@ func TestProcessTransactions(t *testing.T) {
 			var data []byte
 			if record[10] != "" && record[10] != "null" {
 				data = common.FromHex(record[10])
+				gasLimit *= 3
 			}
 
 			// 创建消息
@@ -1081,6 +1233,12 @@ func TestProcessTransactions(t *testing.T) {
 			var callContractCount int
 			var callSuccessCount int
 
+			// 错误统计（新增）
+			var errorCount int
+			errorReasons := make(map[string]int)
+			createErrorReasons := make(map[string]int)
+			callErrorReasons := make(map[string]int)
+
 			// 创建EVM上下文
 			blockContext := vm.BlockContext{
 				CanTransfer: CanTransfer,
@@ -1118,7 +1276,31 @@ func TestProcessTransactions(t *testing.T) {
 				result, err := ApplyMessage(vmenv, msg, gp)
 				var receipt *types.Receipt
 				if err != nil || result.Err != nil {
-					// t.Logf("receipt err： %s", err.Error()) // 不再打印错误信息
+					// 记录错误
+					errorCount++
+					var errReason string
+					if err != nil {
+						errReason = err.Error()
+					} else if result.Err != nil {
+						errReason = result.Err.Error()
+					} else {
+						errReason = "未知错误"
+					}
+
+					// 简化错误原因，提取主要错误类型
+					errReason = simplifyErrorReason(errReason)
+
+					// 更新错误计数
+					errorReasons[errReason]++
+
+					// 根据合约类型更新特定错误计数
+					if isContractCreate {
+						createErrorReasons[errReason]++
+					} else if isContractTx {
+						callErrorReasons[errReason]++
+					}
+
+					// t.Logf("receipt err： %s", errReason) // 不再打印每个错误信息
 					receipt = &types.Receipt{
 						Type:              types.LegacyTxType,
 						Status:            types.ReceiptStatusFailed,
@@ -1287,22 +1469,29 @@ func TestProcessTransactions(t *testing.T) {
 
 			// 创建区块统计数据
 			blockStats := BlockStats{
-				BlockNum:               blockNum,
-				TransactionCount:       len(msgsByBlock[blockNum]),
-				SuccessCount:           successCount,
-				SuccessRate:            successRate,
-				ContractTxCount:        contractTxCount,
-				ContractTxPercent:      contractTxPercent,
-				ContractSuccessCount:   contractSuccessCount,
-				ContractSuccessRate:    contractSuccessRate,
-				CreateContractCount:    createContractCount,
-				CreateContractPercent:  createContractPercent,
-				CreateSuccessCount:     createSuccessCount,
-				CreateSuccessRate:      createSuccessRate,
-				CallContractCount:      callContractCount,
-				CallContractPercent:    callContractPercent,
-				CallSuccessCount:       callSuccessCount,
-				CallSuccessRate:        callSuccessRate,
+				BlockNum:              blockNum,
+				TransactionCount:      len(msgsByBlock[blockNum]),
+				SuccessCount:          successCount,
+				SuccessRate:           successRate,
+				ContractTxCount:       contractTxCount,
+				ContractTxPercent:     contractTxPercent,
+				ContractSuccessCount:  contractSuccessCount,
+				ContractSuccessRate:   contractSuccessRate,
+				CreateContractCount:   createContractCount,
+				CreateContractPercent: createContractPercent,
+				CreateSuccessCount:    createSuccessCount,
+				CreateSuccessRate:     createSuccessRate,
+				CallContractCount:     callContractCount,
+				CallContractPercent:   callContractPercent,
+				CallSuccessCount:      callSuccessCount,
+				CallSuccessRate:       callSuccessRate,
+
+				// 错误统计（新增）
+				ErrorCount:         errorCount,
+				ErrorReasons:       errorReasons,
+				CreateErrorReasons: createErrorReasons,
+				CallErrorReasons:   callErrorReasons,
+
 				ProcessTime:            processDuration,
 				RootGenTime:            rootGenDuration,
 				CommitTime:             commitDuration,
@@ -1457,4 +1646,53 @@ func (c *StateAccessCounter) OutputAccessStats() {
 
 		fmt.Println("======================================")
 	}
+}
+
+// simplifyErrorReason 简化错误原因，归类常见错误
+func simplifyErrorReason(errMsg string) string {
+	// 常见错误类型
+	if strings.Contains(errMsg, "out of gas") || strings.Contains(errMsg, "gas required exceeds allowance") {
+		return "燃料不足"
+	} else if strings.Contains(errMsg, "execution reverted") {
+		if strings.Contains(errMsg, "execution reverted: ") {
+			// 提取revert原因，如果有
+			parts := strings.SplitN(errMsg, "execution reverted: ", 2)
+			if len(parts) > 1 && len(parts[1]) > 0 {
+				return "执行回退: " + parts[1]
+			}
+		}
+		return "执行回退"
+	} else if strings.Contains(errMsg, "invalid opcode") {
+		return "无效操作码"
+	} else if strings.Contains(errMsg, "stack overflow") || strings.Contains(errMsg, "stack underflow") {
+		return "栈溢出/下溢"
+	} else if strings.Contains(errMsg, "nonce too high") || strings.Contains(errMsg, "nonce too low") {
+		return "Nonce错误"
+	} else if strings.Contains(errMsg, "insufficient balance") {
+		return "余额不足"
+	} else if strings.Contains(errMsg, "invalid jump destination") {
+		return "无效跳转目标"
+	} else if strings.Contains(errMsg, "code size") || strings.Contains(errMsg, "code length") {
+		return "代码大小错误"
+	} else if strings.Contains(errMsg, "max code size exceeded") {
+		return "代码大小超限"
+	} else if strings.Contains(errMsg, "max initcode size exceeded") {
+		return "初始化代码大小超限"
+	} else if strings.Contains(errMsg, "intrinsic gas too low") {
+		return "内在燃料不足"
+	} else if strings.Contains(errMsg, "sender doesn't have enough funds") {
+		return "发送方资金不足"
+	} else if strings.Contains(errMsg, "reached the EIP-170 contract code size limit") {
+		return "合约代码大小达到EIP-170限制"
+	} else if strings.Contains(errMsg, "reached the EIP-3860 initcode size limit") {
+		return "初始化代码大小达到EIP-3860限制"
+	} else if strings.Contains(errMsg, "failed to execute call") {
+		return "执行调用失败"
+	}
+
+	// 其他错误，保留前50个字符并添加省略号
+	if len(errMsg) > 50 {
+		return errMsg[:50] + "..."
+	}
+	return errMsg
 }
