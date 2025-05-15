@@ -19,6 +19,7 @@ package triedb
 import (
 	"errors"
 
+	"github.com/ethereum/go-ethereum/cacheTrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -33,6 +34,8 @@ import (
 type Config struct {
 	Preimages bool           // Flag whether the preimage of node key is recorded
 	IsVerkle  bool           // Flag whether the db is holding a verkle tree
+	CacheTrie bool           // Flag whether to use CacheTrie instead of normal Trie
+	ReadCache bool           // Flag whether to enable reading from cache
 	HashDB    *hashdb.Config // Configs for hash-based scheme
 	PathDB    *pathdb.Config // Configs for experimental path-based scheme
 }
@@ -42,6 +45,16 @@ type Config struct {
 var HashDefaults = &Config{
 	Preimages: false,
 	IsVerkle:  false,
+	CacheTrie: false,
+	ReadCache: false,
+	HashDB:    hashdb.Defaults,
+}
+
+var CacheHashDefaults = &Config{
+	Preimages: false,
+	IsVerkle:  false,
+	CacheTrie: true,
+	ReadCache: false,
 	HashDB:    hashdb.Defaults,
 }
 
@@ -50,6 +63,7 @@ var HashDefaults = &Config{
 var VerkleDefaults = &Config{
 	Preimages: false,
 	IsVerkle:  true,
+	ReadCache: false,
 	PathDB:    pathdb.Defaults,
 }
 
@@ -79,14 +93,14 @@ type backend interface {
 	Close() error
 }
 
-// Database is the wrapper of the underlying backend which is shared by different
-// types of node backend as an entrypoint. It's responsible for all interactions
-// relevant with trie nodes and node preimages.
+// Database是底层后端的包装器，由不同类型的节点后端作为入口点共享。
+// 它负责与trie节点和节点preimages相关的所有交互。
 type Database struct {
 	disk      ethdb.Database
-	config    *Config        // Configuration for trie database
-	preimages *preimageStore // The store for caching preimages
-	backend   backend        // The backend for managing trie nodes
+	config    *Config              // Configuration for trie database
+	preimages *preimageStore       // The store for caching preimages
+	backend   backend              // The backend for managing trie nodes
+	cacheTrie *cacheTrie.CacheTrie // Cache trie used for enhanced caching
 }
 
 // NewDatabase initializes the trie database with default settings, note
@@ -113,6 +127,12 @@ func NewDatabase(diskdb ethdb.Database, config *Config) *Database {
 	} else {
 		db.backend = hashdb.New(diskdb, config.HashDB)
 	}
+
+	// Initialize the cache trie if enabled
+	if config.CacheTrie {
+		db.cacheTrie = cacheTrie.NewCacheTrie(0, 1, 500000)
+	}
+
 	return db
 }
 
@@ -320,4 +340,19 @@ func (db *Database) IsVerkle() bool {
 // Disk returns the underlying disk database.
 func (db *Database) Disk() ethdb.Database {
 	return db.disk
+}
+
+// Config returns the configuration of the database.
+func (db *Database) Config() *Config {
+	return db.config
+}
+
+// CacheTrie returns the cache trie instance.
+func (db *Database) CacheTrie() *cacheTrie.CacheTrie {
+	return db.cacheTrie
+}
+
+// ReadCache returns whether to enable reading from cache.
+func (db *Database) ReadCache() bool {
+	return db.config.ReadCache
 }

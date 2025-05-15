@@ -17,6 +17,7 @@
 package database
 
 import (
+	"github.com/ethereum/go-ethereum/cacheTrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
@@ -37,6 +38,17 @@ type NodeDatabase interface {
 	// NodeReader returns a node reader associated with the specific state.
 	// An error will be returned if the specified state is not available.
 	NodeReader(stateRoot common.Hash) (NodeReader, error)
+}
+
+// CacheNodeDatabase extends NodeDatabase with caching capabilities
+type CacheNodeDatabase interface {
+	NodeDatabase
+
+	// CacheTrie returns the cacheTrie instance used for caching
+	CacheTrie() *cacheTrie.CacheTrie
+
+	// ReadCache returns the flag indicating whether to use cache for reading
+	ReadCache() bool
 }
 
 // StateReader wraps the Account and Storage method of a backing state reader.

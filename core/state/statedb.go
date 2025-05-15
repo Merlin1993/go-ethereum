@@ -20,8 +20,6 @@ package state
 import (
 	"errors"
 	"fmt"
-	"maps"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +36,7 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/utils"
+	"github.com/ethereum/go-ethereum/triedb/database"
 	"github.com/holiman/uint256"
 	"golang.org/x/sync/errgroup"
 )
@@ -266,7 +265,7 @@ func (s *StateDB) Logs() []*types.Log {
 // AddPreimage records a SHA3 preimage seen by the VM.
 func (s *StateDB) AddPreimage(hash common.Hash, preimage []byte) {
 	if _, ok := s.preimages[hash]; !ok {
-		s.preimages[hash] = slices.Clone(preimage)
+		s.preimages[hash] = common.CopyBytes(preimage)
 	}
 }
 
@@ -666,7 +665,7 @@ func (s *StateDB) Copy() *StateDB {
 		txIndex:              s.txIndex,
 		logs:                 make(map[common.Hash][]*types.Log, len(s.logs)),
 		logSize:              s.logSize,
-		preimages:            maps.Clone(s.preimages),
+		preimages:            make(map[common.Hash][]byte, len(s.preimages)),
 
 		// Do we need to copy the access list and transient storage?
 		// In practice: No. At the start of a transaction, these two lists are empty.
@@ -695,6 +694,10 @@ func (s *StateDB) Copy() *StateDB {
 	// Deep copy the object state markers.
 	for addr, op := range s.mutations {
 		state.mutations[addr] = op.copy()
+	}
+	// 复制preimages
+	for hash, preimage := range s.preimages {
+		state.preimages[hash] = common.CopyBytes(preimage)
 	}
 	// Deep copy the logs occurred in the scope of block
 	for hash, logs := range s.logs {
@@ -868,6 +871,86 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			s.trie = trie
 		}
 	}
+
+	// 如果启用了cacheTrie，处理删除的键值对并刷新到主MPT树
+	if cacheDB, ok := s.db.(database.CacheNodeDatabase); ok && cacheDB.CacheTrie() != nil {
+		// 计算缓存树的哈希，这将触发缓存清理，并返回被删除的键值对
+		_, deleteKVList := cacheDB.CacheTrie().Hash()
+
+		// 如果有被删除的键值对，将它们写入主MPT树
+		if deleteKVList != nil && len(deleteKVList.Data) > 0 {
+			// 记录哪些账户的状态被改变了
+			modifiedAccounts := make(map[common.Address]bool)
+
+			// 第一步：先处理所有状态（存储槽）
+			for _, kv := range deleteKVList.Data {
+				if len(kv.Key) > 0 {
+					// 检查前20字节，如果是全0，则是账户，否则是状态
+					isAccount := true
+					if len(kv.Key) >= 20 {
+						addrBytes := kv.Key[:20]
+						for _, b := range addrBytes {
+							if b != 0 {
+								isAccount = false
+								break
+							}
+						}
+					}
+
+					// 如果不是账户（即是状态），则处理
+					if !isAccount && len(kv.Key) > 20 {
+						// 提取地址和键
+						addr := common.BytesToAddress(kv.Key[:20])
+						key := kv.Key[20:]
+
+						if obj := s.getStateObject(addr); obj != nil && obj.trie != nil {
+							// 将存储数据写入账户的存储trie
+							obj.SetState(common.BytesToHash(key), common.BytesToHash(kv.Value))
+							// 标记这个账户的状态被修改
+							modifiedAccounts[addr] = true
+						}
+					}
+				}
+			}
+
+			// 第二步：更新所有状态被修改的账户的root
+			for addr := range modifiedAccounts {
+				if obj := s.getStateObject(addr); obj != nil {
+					// 更新账户的root
+					obj.updateRoot()
+					// 标记状态对象需要更新
+					s.markUpdate(addr)
+				}
+			}
+
+			// 第三步：处理所有账户
+			for _, kv := range deleteKVList.Data {
+				if len(kv.Key) > 0 {
+					// 检查前20字节，如果是全0，则是账户，否则是状态
+					isAccount := true
+					if len(kv.Key) >= 20 {
+						addrBytes := kv.Key[:20]
+						for _, b := range addrBytes {
+							if b != 0 {
+								isAccount = false
+								break
+							}
+						}
+					}
+
+					// 如果是账户，则处理
+					if isAccount && len(kv.Key) == 20 {
+						addr := common.BytesToAddress(kv.Key)
+						if obj := s.getStateObject(addr); obj != nil {
+							// 将账户数据写入主MPT
+							s.updateStateObject(obj)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Perform updates before deletions.  This prevents resolution of unnecessary trie nodes
 	// in circumstances similar to the following:
 	//

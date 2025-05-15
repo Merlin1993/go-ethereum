@@ -171,6 +171,12 @@ func NewDatabaseForTesting() *CachingDB {
 	return NewDatabase(triedb.NewDatabase(rawdb.NewMemoryDatabase(), nil), nil)
 }
 
+func (db *CachingDB) SetBlockNum(num uint64) {
+	if db.triedb.CacheTrie() != nil {
+		db.triedb.CacheTrie().SetBlockNum(num)
+	}
+}
+
 // Reader returns a state reader associated with the specified state root.
 func (db *CachingDB) Reader(stateRoot common.Hash) (Reader, error) {
 	var readers []StateReader

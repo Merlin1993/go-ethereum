@@ -17,6 +17,7 @@
 package trie
 
 import (
+	"github.com/ethereum/go-ethereum/cacheTrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -104,12 +105,51 @@ func (t *StateTrie) MustGet(key []byte) []byte {
 // and slot key. The value bytes must not be modified by the caller.
 // If the specified storage slot is not in the trie, nil will be returned.
 // If a trie node is not found in the database, a MissingNodeError is returned.
-func (t *StateTrie) GetStorage(_ common.Address, key []byte) ([]byte, error) {
+func (t *StateTrie) GetStorage(addr common.Address, key []byte) ([]byte, error) {
+	// 检查db是否实现了CacheNodeDatabase接口
+	cacheDb, hasCacheDb := t.db.(database.CacheNodeDatabase)
+
+	// 如果启用了缓存且cacheTrie不为空，优先从缓存中获取
+	if hasCacheDb && cacheDb.ReadCache() && cacheDb.CacheTrie() != nil {
+		// 将地址转换为0x00000...如果addr是空
+		useAddr := addr
+		if (addr == common.Address{}) {
+			useAddr = common.Address{}
+		}
+
+		// 从缓存中获取
+		cacheNode, err := cacheDb.CacheTrie().GetWithAddress(useAddr, key)
+		if err == nil && cacheNode != nil {
+			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok && len(valueNode.Data) > 0 {
+				content := valueNode.Data
+				// 如果需要将RLP编码的数据提取出实际内容
+				_, actualContent, _, err := rlp.Split(content)
+				if err != nil {
+					return content, nil // 如果解码失败，直接返回原始内容
+				}
+				return actualContent, nil
+			}
+		}
+	}
+
+	// 如果缓存中没有或缓存未启用，从原始trie中获取
 	enc, err := t.trie.Get(t.hashKey(key))
 	if err != nil || len(enc) == 0 {
 		return nil, err
 	}
+
+	// 提取RLP编码中的实际内容
 	_, content, _, err := rlp.Split(enc)
+
+	// 如果启用了缓存，将读取到的内容写入缓存（标记为非新内容）
+	if hasCacheDb && cacheDb.ReadCache() && cacheDb.CacheTrie() != nil && err == nil {
+		useAddr := addr
+		if (addr == common.Address{}) {
+			useAddr = common.Address{}
+		}
+		cacheDb.CacheTrie().UpdateWithAddress(useAddr, key, enc, false)
+	}
+
 	return content, err
 }
 
@@ -117,12 +157,37 @@ func (t *StateTrie) GetStorage(_ common.Address, key []byte) ([]byte, error) {
 // If the specified account is not in the trie, nil will be returned.
 // If a trie node is not found in the database, a MissingNodeError is returned.
 func (t *StateTrie) GetAccount(address common.Address) (*types.StateAccount, error) {
+	// 检查db是否实现了CacheNodeDatabase接口
+	cacheDb, hasCacheDb := t.db.(database.CacheNodeDatabase)
+
+	// 如果启用了缓存且cacheTrie不为空，优先从缓存中获取
+	if hasCacheDb && cacheDb.ReadCache() && cacheDb.CacheTrie() != nil {
+		// 从缓存中获取
+		cacheNode, err := cacheDb.CacheTrie().Get(address.Bytes())
+		if err == nil && cacheNode != nil {
+			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok && len(valueNode.Data) > 0 {
+				ret := new(types.StateAccount)
+				if err := rlp.DecodeBytes(valueNode.Data, ret); err == nil {
+					return ret, nil
+				}
+			}
+		}
+	}
+
+	// 如果缓存中没有或缓存未启用，从原始trie中获取
 	res, err := t.trie.Get(t.hashKey(address.Bytes()))
 	if res == nil || err != nil {
 		return nil, err
 	}
+
 	ret := new(types.StateAccount)
 	err = rlp.DecodeBytes(res, ret)
+
+	// 如果启用了缓存，将读取到的内容写入缓存（标记为非新内容）
+	if hasCacheDb && cacheDb.ReadCache() && cacheDb.CacheTrie() != nil && err == nil {
+		cacheDb.CacheTrie().Update(address.Bytes(), res, false)
+	}
+
 	return ret, err
 }
 
@@ -170,9 +235,26 @@ func (t *StateTrie) MustUpdate(key, value []byte) {
 // stored in the trie.
 //
 // If a node is not found in the database, a MissingNodeError is returned.
-func (t *StateTrie) UpdateStorage(_ common.Address, key, value []byte) error {
+func (t *StateTrie) UpdateStorage(addr common.Address, key, value []byte) error {
 	hk := t.hashKey(key)
 	v, _ := rlp.EncodeToBytes(value)
+
+	// 检查db是否实现了CacheNodeDatabase接口
+	cacheDb, hasCacheDb := t.db.(database.CacheNodeDatabase)
+
+	// 如果启用了缓存，只更新缓存而不更新原始trie
+	if hasCacheDb && cacheDb.CacheTrie() != nil {
+		// 将地址转换为0x00000...如果addr是空
+		useAddr := addr
+		if (addr == common.Address{}) {
+			useAddr = common.Address{}
+		}
+		cacheDb.CacheTrie().UpdateWithAddress(useAddr, key, v, true)
+		t.getSecKeyCache()[string(hk)] = common.CopyBytes(key)
+		return nil
+	}
+
+	// 未启用缓存，按原来逻辑更新原始trie
 	err := t.trie.Update(hk, v)
 	if err != nil {
 		return err
@@ -188,6 +270,18 @@ func (t *StateTrie) UpdateAccount(address common.Address, acc *types.StateAccoun
 	if err != nil {
 		return err
 	}
+
+	// 检查db是否实现了CacheNodeDatabase接口
+	cacheDb, hasCacheDb := t.db.(database.CacheNodeDatabase)
+
+	// 如果启用了缓存，只更新缓存而不更新原始trie
+	if hasCacheDb && cacheDb.CacheTrie() != nil {
+		cacheDb.CacheTrie().Update(address.Bytes(), data, true)
+		t.getSecKeyCache()[string(hk)] = address.Bytes()
+		return nil
+	}
+
+	// 未启用缓存，按原来逻辑更新原始trie
 	if err := t.trie.Update(hk, data); err != nil {
 		return err
 	}
@@ -204,15 +298,41 @@ func (t *StateTrie) UpdateContractCode(_ common.Address, _ common.Hash, _ []byte
 func (t *StateTrie) MustDelete(key []byte) {
 	hk := t.hashKey(key)
 	delete(t.getSecKeyCache(), string(hk))
+
+	// 检查db是否实现了CacheNodeDatabase接口
+	cacheDb, hasCacheDb := t.db.(database.CacheNodeDatabase)
+
+	// 如果启用了缓存，只更新缓存而不更新原始trie
+	if hasCacheDb && cacheDb.CacheTrie() != nil {
+		// 使用空地址调用DeleteWithAddress
+		cacheDb.CacheTrie().DeleteWithAddress(common.Address{}, key)
+		return
+	}
+
 	t.trie.MustDelete(hk)
 }
 
 // DeleteStorage removes any existing storage slot from the trie.
 // If the specified trie node is not in the trie, nothing will be changed.
 // If a node is not found in the database, a MissingNodeError is returned.
-func (t *StateTrie) DeleteStorage(_ common.Address, key []byte) error {
+func (t *StateTrie) DeleteStorage(addr common.Address, key []byte) error {
 	hk := t.hashKey(key)
 	delete(t.getSecKeyCache(), string(hk))
+
+	// 检查db是否实现了CacheNodeDatabase接口
+	cacheDb, hasCacheDb := t.db.(database.CacheNodeDatabase)
+
+	// 如果启用了缓存，只更新缓存而不更新原始trie
+	if hasCacheDb && cacheDb.CacheTrie() != nil {
+		// 将地址转换为0x00000...如果addr是空
+		useAddr := addr
+		if (addr == common.Address{}) {
+			useAddr = common.Address{}
+		}
+		cacheDb.CacheTrie().DeleteWithAddress(useAddr, key)
+		return nil
+	}
+
 	return t.trie.Delete(hk)
 }
 
@@ -220,6 +340,16 @@ func (t *StateTrie) DeleteStorage(_ common.Address, key []byte) error {
 func (t *StateTrie) DeleteAccount(address common.Address) error {
 	hk := t.hashKey(address.Bytes())
 	delete(t.getSecKeyCache(), string(hk))
+
+	// 检查db是否实现了CacheNodeDatabase接口
+	cacheDb, hasCacheDb := t.db.(database.CacheNodeDatabase)
+
+	// 如果启用了缓存，只更新缓存而不更新原始trie
+	if hasCacheDb && cacheDb.CacheTrie() != nil {
+		cacheDb.CacheTrie().Delete(address.Bytes())
+		return nil
+	}
+
 	return t.trie.Delete(hk)
 }
 
@@ -259,6 +389,7 @@ func (t *StateTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 		}
 		t.secKeyCache = make(map[string][]byte)
 	}
+
 	// Commit the trie and return its modified nodeset.
 	return t.trie.Commit(collectLeaf)
 }

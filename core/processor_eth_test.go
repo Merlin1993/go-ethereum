@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/csv"
 	"fmt"
+	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -821,9 +822,14 @@ func TestProcessTransactions(t *testing.T) {
 	defer ldb.Close()
 
 	db := rawdb.NewDatabase(ldb)
-	trieDB := triedb.NewDatabase(db, nil)
-	tdb := triedb.NewDatabase(db, nil)
-	snaps, _ := snapshot.New(snapshot.Config{CacheSize: 10}, db, tdb, types.EmptyRootHash)
+	trieDB := triedb.NewDatabase(db, &triedb.Config{
+		Preimages: false,
+		IsVerkle:  false,
+		CacheTrie: true,
+		ReadCache: false,
+		HashDB:    hashdb.Defaults,
+	})
+	snaps, _ := snapshot.New(snapshot.Config{CacheSize: 10}, db, trieDB, types.EmptyRootHash)
 	sdb := state.NewDatabase(trieDB, snaps)
 
 	// 创建genesis区块和区块链
@@ -1034,6 +1040,7 @@ func TestProcessTransactions(t *testing.T) {
 				BaseFee:    big.NewInt(1000000000),
 			}
 
+			sdb.SetBlockNum(blockNum)
 			// 创建statedb，使用上一个区块的状态根
 			statedb, err := state.New(lastStateRoot, sdb)
 			if err != nil {
