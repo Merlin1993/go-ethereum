@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -798,4 +799,143 @@ func TestNewNodesRetentionAfterPrune(t *testing.T) {
 			t.Logf("falseNode still has New=false and wasn't pruned yet")
 		}
 	}
+}
+
+// 测试性能：测试1000个区块，window是10个区块一计，每个区块有2w的数据写入
+func TestPerformance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("跳过耗时的性能测试")
+	}
+
+	// 测试参数
+	blockCount := 200
+	entriesPerBlock := 5000
+	multiple := 1   // window是10个区块一计
+	newRatio := 0.3 // 3成是new,7成是false
+
+	// 创建足够大的maxSize，保证只有window满时才修剪
+	maxSize := entriesPerBlock * blockCount
+
+	// 生成测试数据
+	keys := make([][]byte, entriesPerBlock)
+	values := make([][]byte, entriesPerBlock)
+	isNews := make([]bool, entriesPerBlock)
+
+	for i := 0; i < entriesPerBlock; i++ {
+		keys[i] = []byte(fmt.Sprintf("key-%d", i))
+		values[i] = []byte(fmt.Sprintf("value-%d", i))
+		isNews[i] = float64(i)/float64(entriesPerBlock) < newRatio
+	}
+
+	// 1. 测试有修剪情况下的性能
+	t.Run("WithPruning", func(t *testing.T) {
+		trie := NewCacheTrie(1, uint64(multiple), maxSize)
+
+		totalBlockTime := int64(0)
+		totalHashTime := int64(0)
+		pruneCount := 0
+
+		for blockNum := 1; blockNum <= blockCount; blockNum++ {
+			trie.SetBlockNum(uint64(blockNum))
+
+			// 记录区块写入时间
+			blockStart := time.Now()
+			for i := 0; i < entriesPerBlock; i++ {
+				// 生成该区块特定的key
+				blockKey := []byte(fmt.Sprintf("%s-block%d", keys[i], blockNum))
+				err := trie.Update(blockKey, values[i], isNews[i])
+				if err != nil {
+					t.Fatalf("无法更新key: %v", err)
+				}
+			}
+			blockDuration := time.Since(blockStart)
+			totalBlockTime += blockDuration.Nanoseconds()
+
+			// 生成Hash并记录时间
+			hashStart := time.Now()
+			_, deletedKVs := trie.Hash()
+			hashDuration := time.Since(hashStart)
+			totalHashTime += hashDuration.Nanoseconds()
+
+			// 检查是否发生了修剪
+			if deletedKVs != nil && len(deletedKVs.Data) > 0 {
+				pruneCount++
+				t.Logf("区块 %d: 修剪了 %d 个键值对", blockNum, len(deletedKVs.Data))
+			}
+
+			// 每100个区块输出一次进度
+			if blockNum%100 == 0 {
+				t.Logf("处理进度: %d/%d 区块", blockNum, blockCount)
+			}
+		}
+
+		// 计算平均时间
+		avgBlockTime := time.Duration(totalBlockTime / int64(blockCount))
+		avgHashTime := time.Duration(totalHashTime / int64(blockCount))
+
+		t.Logf("有修剪模式性能统计:")
+		t.Logf("总区块数: %d", blockCount)
+		t.Logf("每区块条目数: %d", entriesPerBlock)
+		t.Logf("修剪次数: %d", pruneCount)
+		t.Logf("平均区块写入时间: %v", avgBlockTime)
+		t.Logf("平均Hash计算时间: %v", avgHashTime)
+		t.Logf("总区块写入时间: %v", time.Duration(totalBlockTime))
+		t.Logf("总Hash计算时间: %v", time.Duration(totalHashTime))
+		t.Logf("总处理时间: %v", time.Duration(totalBlockTime+totalHashTime))
+	})
+
+	// 2. 测试无修剪情况下的性能
+	t.Run("WithoutPruning", func(t *testing.T) {
+		// 创建一个超级大的window，保证永远不会修剪
+		trie := NewCacheTrie(1, uint64(blockCount*2), maxSize)
+
+		totalBlockTime := int64(0)
+		totalHashTime := int64(0)
+
+		for blockNum := 1; blockNum <= blockCount; blockNum++ {
+			trie.SetBlockNum(uint64(blockNum))
+
+			// 记录区块写入时间
+			blockStart := time.Now()
+			for i := 0; i < entriesPerBlock; i++ {
+				// 生成该区块特定的key
+				blockKey := []byte(fmt.Sprintf("%s-block%d", keys[i], blockNum))
+				err := trie.Update(blockKey, values[i], isNews[i])
+				if err != nil {
+					t.Fatalf("无法更新key: %v", err)
+				}
+			}
+			blockDuration := time.Since(blockStart)
+			totalBlockTime += blockDuration.Nanoseconds()
+
+			// 生成Hash并记录时间
+			hashStart := time.Now()
+			_, deletedKVs := trie.Hash()
+			hashDuration := time.Since(hashStart)
+			totalHashTime += hashDuration.Nanoseconds()
+
+			// 检查确认没有发生修剪
+			if deletedKVs != nil && len(deletedKVs.Data) > 0 {
+				t.Errorf("区块 %d: 意外修剪了 %d 个键值对", blockNum, len(deletedKVs.Data))
+			}
+
+			// 每100个区块输出一次进度
+			if blockNum%100 == 0 {
+				t.Logf("处理进度: %d/%d 区块", blockNum, blockCount)
+			}
+		}
+
+		// 计算平均时间
+		avgBlockTime := time.Duration(totalBlockTime / int64(blockCount))
+		avgHashTime := time.Duration(totalHashTime / int64(blockCount))
+
+		t.Logf("无修剪模式性能统计:")
+		t.Logf("总区块数: %d", blockCount)
+		t.Logf("每区块条目数: %d", entriesPerBlock)
+		t.Logf("平均区块写入时间: %v", avgBlockTime)
+		t.Logf("平均Hash计算时间: %v", avgHashTime)
+		t.Logf("总区块写入时间: %v", time.Duration(totalBlockTime))
+		t.Logf("总Hash计算时间: %v", time.Duration(totalHashTime))
+		t.Logf("总处理时间: %v", time.Duration(totalBlockTime+totalHashTime))
+	})
 }

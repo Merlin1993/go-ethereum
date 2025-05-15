@@ -494,16 +494,26 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 		}
 
 		// 如果键完全匹配，直接更新值
-		if prefixLength == len(n.Key) && prefixLength == len(key) {
-			shortNode := &ShortNode{
-				Key:   n.Key,
-				Val:   value,
-				flags: t.newNodeFlag(),
-			}
+		if prefixLength == len(n.Key) {
+			if prefixLength == len(key) {
+				shortNode := &ShortNode{
+					Key:   n.Key,
+					Val:   value,
+					flags: t.newNodeFlag(),
+				}
 
-			// 更新window属性
-			shortNode.updateFlag(bitPos)
-			return shortNode, nil
+				// 更新window属性
+				shortNode.updateFlag(bitPos)
+				return shortNode, nil
+			} else {
+				//更新子节点
+				childNode, err := t.insert(n.Val, key[prefixLength+1:], value, bitPos)
+				if err != nil {
+					return nil, err
+				}
+				n.Val = childNode
+				return n, nil
+			}
 		}
 
 		//1.如果有相同的前缀，那么现构造一个相同前缀的short，然后生成一个fullNode，再fullNode生成两个short。
@@ -528,6 +538,9 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 				Val:   n.Val,
 				flags: n.flags,
 			}
+		}
+		if prefixLength == 1 && len(n.Key) == 1 {
+			prefixLength = 1
 		}
 		branch.Children[n.Key[prefixLength]] = child
 
