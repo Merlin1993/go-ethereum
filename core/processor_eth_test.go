@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -325,10 +326,12 @@ type BlockStats struct {
 	CallSuccessRate     float64 // 调用合约成功率
 
 	// 合约错误统计（新增）
-	ErrorCount         int            // 错误总数
-	ErrorReasons       map[string]int // 错误原因统计
-	CreateErrorReasons map[string]int // 合约创建错误原因统计
-	CallErrorReasons   map[string]int // 合约调用错误原因统计
+	ErrorCount         int                      // 错误总数
+	ErrorReasons       map[string]int           // 错误原因统计
+	CreateErrorReasons map[string]int           // 合约创建错误原因统计
+	CallErrorReasons   map[string]int           // 合约调用错误原因统计
+	ContractErrors     map[common.Address]int   // 每个合约的错误次数
+	ErrorContracts     map[string]*ContractInfo // 合约错误信息记录
 
 	ProcessTime        time.Duration // 交易处理时间
 	RootGenTime        time.Duration // 根哈希生成时间
@@ -355,17 +358,19 @@ type BlockStats struct {
 
 // 统计聚合结构
 type StatsAggregator struct {
-	Stats                []BlockStats // 所有区块的统计数据
-	OutputDir            string       // 输出目录
-	BlockWindow          uint64       // 统计窗口大小(每隔多少区块打印一次)
-	CsvWindow            uint64       // CSV输出窗口大小(每隔多少区块生成一个CSV)
-	LastOutputBlock      uint64       // 上次输出统计的区块号
-	LastCsvBlock         uint64       // 上次输出CSV的区块号
-	TotalProcessed       int          // 总处理区块数
-	TotalTransaction     int          // 总交易数
-	TotalSuccess         int          // 总成功交易数
-	TotalContractTx      int          // 总合约交易数
-	TotalContractSuccess int          // 总成功的合约交易数
+	Stats                []BlockStats                     // 所有区块的统计数据
+	OutputDir            string                           // 输出目录
+	BlockWindow          uint64                           // 统计窗口大小(每隔多少区块打印一次)
+	CsvWindow            uint64                           // CSV输出窗口大小(每隔多少区块生成一个CSV)
+	LastOutputBlock      uint64                           // 上次输出统计的区块号
+	LastCsvBlock         uint64                           // 上次输出CSV的区块号
+	TotalProcessed       int                              // 总处理区块数
+	TotalTransaction     int                              // 总交易数
+	TotalSuccess         int                              // 总成功交易数
+	TotalContractTx      int                              // 总合约交易数
+	TotalContractSuccess int                              // 总成功的合约交易数
+	Contracts            map[common.Address]*ContractInfo // 记录所有合约信息
+	ContractErrorCount   map[common.Address]int           // 所有合约的错误计数
 
 	MaxProcessTime  time.Duration // 最大处理时间
 	MaxRootGenTime  time.Duration // 最大根哈希生成时间
@@ -404,6 +409,8 @@ func NewStatsAggregator(outputDir string, blockWindow, csvWindow uint64) *StatsA
 		TotalSuccess:         0,
 		TotalContractTx:      0,
 		TotalContractSuccess: 0,
+		Contracts:            make(map[common.Address]*ContractInfo),
+		ContractErrorCount:   make(map[common.Address]int),
 		MaxUniqueReads:       0,
 		MaxUniqueWrites:      0,
 		MinHitRate5:          1.0, // 初始化为最大值1.0
@@ -426,6 +433,42 @@ func (s *StatsAggregator) AddBlockStats(stats BlockStats) {
 	}
 	if stats.CallErrorReasons == nil {
 		stats.CallErrorReasons = make(map[string]int)
+	}
+
+	// 更新全局合约错误计数
+	if stats.ContractErrors != nil {
+		for addr, count := range stats.ContractErrors {
+			s.ContractErrorCount[addr] += count
+		}
+	}
+
+	// 更新合约错误信息
+	if stats.ErrorContracts != nil {
+		for _, contractInfo := range stats.ErrorContracts {
+			addr := contractInfo.Address
+			if existing, exists := s.Contracts[addr]; exists {
+				// 更新现有记录的错误信息
+				existing.ErrorCount += contractInfo.ErrorCount
+				for reason, count := range contractInfo.ErrorReasons {
+					existing.ErrorReasons[reason] += count
+				}
+			} else {
+				// 复制合约信息到全局记录
+				s.Contracts[addr] = &ContractInfo{
+					Address:        addr,
+					Creator:        contractInfo.Creator,
+					CreationBlock:  contractInfo.CreationBlock,
+					CreationTxHash: contractInfo.CreationTxHash,
+					Code:           contractInfo.Code,
+					ErrorCount:     contractInfo.ErrorCount,
+					ErrorReasons:   make(map[string]int),
+				}
+				// 复制错误原因
+				for reason, count := range contractInfo.ErrorReasons {
+					s.Contracts[addr].ErrorReasons[reason] = count
+				}
+			}
+		}
 	}
 
 	s.Stats = append(s.Stats, stats)
@@ -751,6 +794,97 @@ func (s *StatsAggregator) PrintStats() {
 	// 打印错误统计
 	fmt.Printf("总错误数: %d (%.2f%% 的交易)\n",
 		totalErrors, float64(totalErrors)/float64(totalTxCount)*100)
+
+	// 对合约按错误次数排序
+	type ContractErrorCount struct {
+		Address common.Address
+		Count   int
+	}
+	contractErrors := make([]ContractErrorCount, 0, len(s.ContractErrorCount))
+	for addr, count := range s.ContractErrorCount {
+		contractErrors = append(contractErrors, ContractErrorCount{addr, count})
+	}
+	sort.Slice(contractErrors, func(i, j int) bool {
+		return contractErrors[i].Count > contractErrors[j].Count
+	})
+
+	// 打印错误最多的合约信息
+	fmt.Println("\n----- 错误最多的合约 -----")
+	for i, ce := range contractErrors {
+		if i >= 5 || ce.Count < 5 {
+			// 只打印前5个合约或错误次数大于等于5的合约
+			break
+		}
+
+		contract := s.Contracts[ce.Address]
+		if contract != nil {
+			fmt.Printf("  合约地址: %s\n", contract.Address.Hex())
+			fmt.Printf("  合约代码哈希: %s\n", contract.CodeHash.Hex())
+			fmt.Printf("  合约余额: %s\n", contract.Balance)
+			fmt.Printf("  合约Nonce: %d\n", contract.Nonce)
+
+			if contract.Creator != (common.Address{}) {
+				fmt.Printf("  创建者: %s\n", contract.Creator.Hex())
+			}
+			if contract.CreationBlock > 0 {
+				fmt.Printf("  创建区块: %d\n", contract.CreationBlock)
+			}
+			fmt.Printf("  错误次数: %d\n", contract.ErrorCount)
+
+			// 检查合约是否存在代码
+			codeExists := len(contract.Code) > 0
+			fmt.Printf("  合约代码存在: %t\n", codeExists)
+			if codeExists {
+				fmt.Printf("  合约代码大小: %d 字节\n", len(contract.Code))
+			} else {
+				fmt.Printf("  注意: 该合约可能未成功部署或已被销毁\n")
+				fmt.Printf("  排查建议: 检查该合约地址是否正确，或者该合约是否已被自毁(SELFDESTRUCT)\n")
+			}
+
+			// 显示详细错误信息
+			if contract.DetailedError != "" {
+				fmt.Printf("  详细错误: %s\n", contract.DetailedError)
+			}
+
+			// 显示失败交易样本
+			if len(contract.FailedTxs) > 0 {
+				fmt.Printf("  失败交易样本:\n")
+				for j, tx := range contract.FailedTxs {
+					if j >= 3 { // 只显示前3个
+						break
+					}
+					fmt.Printf("    交易 #%d - 来源: %s, 块号: %d, 燃料: %d, 数据大小: %d\n",
+						j+1, tx.From.Hex(), tx.BlockNum, tx.GasLimit, tx.DataSize)
+				}
+			}
+
+			// 打印该合约的主要错误原因
+			if len(contract.ErrorReasons) > 0 {
+				fmt.Printf("  主要错误原因:\n")
+				type ErrorCountItem struct {
+					Reason string
+					Count  int
+				}
+				errReasons := make([]ErrorCountItem, 0, len(contract.ErrorReasons))
+				for reason, count := range contract.ErrorReasons {
+					errReasons = append(errReasons, ErrorCountItem{reason, count})
+				}
+				sort.Slice(errReasons, func(i, j int) bool {
+					return errReasons[i].Count > errReasons[j].Count
+				})
+
+				for j, er := range errReasons {
+					if j >= 3 {
+						break // 只显示前3个错误原因
+					}
+					fmt.Printf("    %-30s: %d (%.2f%%)\n",
+						er.Reason, er.Count, float64(er.Count)/float64(contract.ErrorCount)*100)
+				}
+			}
+
+			fmt.Println() // 空行分隔
+		}
+	}
 
 	// 错误原因排序
 	type ErrorCount struct {
@@ -1123,7 +1257,7 @@ func TestProcessTransactions(t *testing.T) {
 			var data []byte
 			if record[10] != "" && record[10] != "null" {
 				data = common.FromHex(record[10])
-				gasLimit *= 3
+				gasLimit *= 5
 			}
 
 			// 创建消息
@@ -1206,7 +1340,7 @@ func TestProcessTransactions(t *testing.T) {
 				debug:   false,
 			}
 
-			bigBalance := new(big.Int).Mul(big.NewInt(1000000), big.NewInt(1e18))
+			bigBalance := new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18))
 			// 转换为uint256.Int
 			balance, overflow := uint256.FromBig(bigBalance)
 			if overflow {
@@ -1238,6 +1372,8 @@ func TestProcessTransactions(t *testing.T) {
 			errorReasons := make(map[string]int)
 			createErrorReasons := make(map[string]int)
 			callErrorReasons := make(map[string]int)
+			contractErrors := make(map[common.Address]int)   // 按合约地址统计错误
+			errorContracts := make(map[string]*ContractInfo) // 记录出错合约的详细信息
 
 			// 创建EVM上下文
 			blockContext := vm.BlockContext{
@@ -1296,11 +1432,97 @@ func TestProcessTransactions(t *testing.T) {
 					// 根据合约类型更新特定错误计数
 					if isContractCreate {
 						createErrorReasons[errReason]++
-					} else if isContractTx {
+						// 对于创建失败的合约，不记录地址（因为没有创建成功）
+					} else if isContractTx && msg.To != nil {
 						callErrorReasons[errReason]++
+
+						// 记录被调用合约的错误
+						contractAddr := *msg.To
+						contractErrors[contractAddr]++
+
+						// 记录或更新合约详细信息
+						contractKey := contractAddr.Hex()
+						if contract, exists := errorContracts[contractKey]; !exists {
+							// 获取合约代码
+							code := countingStateDB.GetCode(contractAddr)
+							codeExists := len(code) > 0
+							codeHash := countingStateDB.GetCodeHash(contractAddr)
+
+							// 尝试查找合约的创建者和创建区块信息
+							var creator common.Address
+							var creationBlock uint64
+							// 在已有的合约记录中查找
+							for _, stats := range statsAgg.Stats {
+								if info, ok := stats.ErrorContracts[contractKey]; ok && info.CreationBlock > 0 {
+									creator = info.Creator
+									creationBlock = info.CreationBlock
+									break
+								}
+							}
+
+							// 获取账户状态详情
+							balance := countingStateDB.GetBalance(contractAddr)
+							nonce := countingStateDB.GetNonce(contractAddr)
+
+							// 记录更详细的错误信息
+							var detailedError string
+							if !codeExists {
+								detailedError = fmt.Sprintf("合约代码不存在 (可能未部署或已销毁) - 余额: %s, Nonce: %d, CodeHash: %s",
+									balance.String(), nonce, codeHash.Hex())
+
+								if errReason == "执行回退" {
+									detailedError = fmt.Sprintf("合约执行被回退，但代码不存在 - 余额: %s, Nonce: %d, CodeHash: %s",
+										balance.String(), nonce, codeHash.Hex())
+								}
+							} else {
+								if strings.Contains(errReason, "燃料不足") {
+									detailedError = fmt.Sprintf("合约执行燃料不足，代码大小: %d 字节, 余额: %s, Nonce: %d",
+										len(code), balance.String(), nonce)
+								} else if strings.Contains(errReason, "执行回退") {
+									detailedError = fmt.Sprintf("合约执行被回退，代码大小: %d 字节, 余额: %s, Nonce: %d",
+										len(code), balance.String(), nonce)
+								} else {
+									detailedError = fmt.Sprintf("合约代码存在，大小: %d 字节, 余额: %s, Nonce: %d",
+										len(code), balance.String(), nonce)
+								}
+							}
+
+							// 添加交易上下文信息
+							detailedError += fmt.Sprintf(", 交易来源: %s, 燃料限制: %d, 数据长度: %d",
+								msg.From.Hex(), msg.GasLimit, len(msg.Data))
+
+							// 创建新的合约错误记录
+							errorContracts[contractKey] = &ContractInfo{
+								Address:       contractAddr,
+								Creator:       creator,
+								CreationBlock: creationBlock,
+								Code:          code,
+								CodeHash:      codeHash,
+								Balance:       balance.ToBig(),
+								Nonce:         nonce,
+								ErrorCount:    1,
+								ErrorReasons:  make(map[string]int),
+								DetailedError: detailedError,
+								FailedTxs:     []TxInfo{{From: msg.From, GasLimit: msg.GasLimit, DataSize: len(msg.Data), BlockNum: blockNum}},
+							}
+							errorContracts[contractKey].ErrorReasons[errReason] = 1
+						} else {
+							// 更新现有合约错误记录
+							contract.ErrorCount++
+							contract.ErrorReasons[errReason]++
+
+							// 限制记录的交易数量，避免内存占用过大
+							if len(contract.FailedTxs) < 10 {
+								contract.FailedTxs = append(contract.FailedTxs, TxInfo{
+									From:     msg.From,
+									GasLimit: msg.GasLimit,
+									DataSize: len(msg.Data),
+									BlockNum: blockNum,
+								})
+							}
+						}
 					}
 
-					// t.Logf("receipt err： %s", errReason) // 不再打印每个错误信息
 					receipt = &types.Receipt{
 						Type:              types.LegacyTxType,
 						Status:            types.ReceiptStatusFailed,
@@ -1318,13 +1540,58 @@ func TestProcessTransactions(t *testing.T) {
 						contractSuccessCount++
 						if isContractCreate {
 							createSuccessCount++
+
+							// 计算合约地址
+							contractAddr := crypto.CreateAddress(msg.From, msg.Nonce)
+							code := countingStateDB.GetCode(contractAddr)
+
+							contractKey := contractAddr.Hex()
+							errorContracts[contractKey] = &ContractInfo{
+								Address:        contractAddr,
+								Creator:        msg.From,
+								CreationBlock:  blockNum,
+								CreationTxHash: common.Hash{}, // 实际应用中应使用真实交易哈希
+								Code:           code,
+								ErrorCount:     0,
+								ErrorReasons:   make(map[string]int),
+							}
 						} else {
 							callSuccessCount++
-						}
-					}
-					usedGas += result.UsedGas
 
-					// 创建收据
+							// 可以选择记录成功调用的合约信息，但不增加错误计数
+							if msg.To != nil {
+								contractAddr := *msg.To
+								contractKey := contractAddr.Hex()
+
+								// 如果是首次遇到该合约，记录基本信息
+								if _, exists := errorContracts[contractKey]; !exists {
+									code := countingStateDB.GetCode(contractAddr)
+
+									// 尝试查找合约的创建者和创建区块信息
+									var creator common.Address
+									var creationBlock uint64
+									// 在已有的合约记录中查找
+									for _, stats := range statsAgg.Stats {
+										if info, ok := stats.ErrorContracts[contractKey]; ok && info.CreationBlock > 0 {
+											creator = info.Creator
+											creationBlock = info.CreationBlock
+											break
+										}
+									}
+
+									errorContracts[contractKey] = &ContractInfo{
+										Address:       contractAddr,
+										Creator:       creator,
+										CreationBlock: creationBlock,
+										Code:          code,
+										ErrorCount:    0,
+										ErrorReasons:  make(map[string]int),
+									}
+								}
+							}
+						}
+						usedGas += result.UsedGas
+					}
 					receipt = &types.Receipt{
 						Type:              types.LegacyTxType,
 						Status:            types.ReceiptStatusSuccessful,
@@ -1491,6 +1758,8 @@ func TestProcessTransactions(t *testing.T) {
 				ErrorReasons:       errorReasons,
 				CreateErrorReasons: createErrorReasons,
 				CallErrorReasons:   callErrorReasons,
+				ContractErrors:     contractErrors,
+				ErrorContracts:     errorContracts,
 
 				ProcessTime:            processDuration,
 				RootGenTime:            rootGenDuration,
@@ -1695,4 +1964,28 @@ func simplifyErrorReason(errMsg string) string {
 		return errMsg[:50] + "..."
 	}
 	return errMsg
+}
+
+// 合约信息结构
+type ContractInfo struct {
+	Address        common.Address // 合约地址
+	Creator        common.Address // 创建者地址
+	CreationBlock  uint64         // 创建区块
+	CreationTxHash common.Hash    // 创建交易哈希
+	Code           []byte         // 合约代码
+	CodeHash       common.Hash    // 合约代码哈希
+	Balance        *big.Int       // 合约余额
+	Nonce          uint64         // 合约Nonce
+	ErrorCount     int            // 错误计数
+	ErrorReasons   map[string]int // 错误原因统计
+	DetailedError  string         // 详细错误信息
+	FailedTxs      []TxInfo       // 失败交易信息
+}
+
+// 添加TxInfo结构
+type TxInfo struct {
+	From     common.Address
+	GasLimit uint64
+	DataSize int
+	BlockNum uint64
 }

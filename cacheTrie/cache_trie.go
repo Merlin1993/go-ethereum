@@ -99,13 +99,9 @@ func (t *CacheTrie) prepareKey(key []byte, address ...common.Address) []byte {
 	if len(address) > 0 {
 		dataToHash = append(address[0].Bytes(), key...)
 	} else {
-		dataToHash = key
+		dataToHash = hashKey(key)
 	}
-
-	// 对数据进行哈希处理
-	hashedKey := hashKey(dataToHash)
-	// 转换为十六进制格式
-	return keybytesToHex(hashedKey)
+	return keybytesToHex(dataToHash)
 }
 
 // getInternal 是Get和GetWithAddress的内部实现
