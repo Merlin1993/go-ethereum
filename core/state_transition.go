@@ -26,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
@@ -34,10 +35,11 @@ import (
 // ExecutionResult includes all output after executing given evm
 // message no matter the execution itself is successful or not.
 type ExecutionResult struct {
-	UsedGas     uint64 // Total used gas, not including the refunded gas
-	RefundedGas uint64 // Total gas refunded after execution
-	Err         error  // Any error encountered during the execution(listed in core/vm/errors.go)
-	ReturnData  []byte // Returned data from evm(function result or data supplied with revert opcode)
+	UsedGas         uint64         // Total used gas, not including the refunded gas
+	RefundedGas     uint64         // Total gas refunded after execution
+	Err             error          // Any error encountered during the execution(listed in core/vm/errors.go)
+	ReturnData      []byte         // Returned data from evm(function result or data supplied with revert opcode)
+	ContractAddress common.Address // 合约地址 (对于合约创建交易)
 }
 
 // Unwrap returns the internal evm error which allows us for further
@@ -549,11 +551,17 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		}
 	}
 
+	var contractAddr common.Address
+	if contractCreation {
+		contractAddr = crypto.CreateAddress(msg.From, msg.Nonce)
+	}
+
 	return &ExecutionResult{
-		UsedGas:     st.gasUsed(),
-		RefundedGas: gasRefund,
-		Err:         vmerr,
-		ReturnData:  ret,
+		UsedGas:         st.gasUsed(),
+		RefundedGas:     gasRefund,
+		Err:             vmerr,
+		ReturnData:      ret,
+		ContractAddress: contractAddr,
 	}, nil
 }
 

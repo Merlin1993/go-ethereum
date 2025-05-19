@@ -235,7 +235,6 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 			if len(input) > 0 {
 				return nil, gas, ErrFailCode
 			}
-			return nil, gas, nil
 			ret, err = nil, nil // gas is unchanged
 		} else {
 			// The contract is a scoped environment for this execution context only.

@@ -67,6 +67,9 @@ type StateAccessCounter struct {
 	ReadsOnly         map[string]bool // 只读状态
 	ReadThenWritten   map[string]bool // 先读后写状态
 	WritesOnly        map[string]bool // 只写状态
+
+	// 新增字段，记录所有部署的合约地址
+	ContractAddresses map[common.Address]bool // 记录所有部署的合约地址
 }
 
 // NewStateAccessCounter 创建一个新的状态访问计数器
@@ -81,6 +84,7 @@ func NewStateAccessCounter(maxHistorySize uint64) *StateAccessCounter {
 		ReadsOnly:         make(map[string]bool),
 		ReadThenWritten:   make(map[string]bool),
 		WritesOnly:        make(map[string]bool),
+		ContractAddresses: make(map[common.Address]bool), // 初始化合约地址map
 	}
 }
 
@@ -139,6 +143,7 @@ func (c *StateAccessCounter) NextBlock(blockNum uint64) {
 	c.ReadsOnly = make(map[string]bool)
 	c.ReadThenWritten = make(map[string]bool)
 	c.WritesOnly = make(map[string]bool)
+	// 注意：不清除ContractAddresses，这是全局记录
 
 	// 删除历史过久的记录
 	for b := range c.RecentAccess {
@@ -1123,7 +1128,9 @@ func TestProcessTransactions(t *testing.T) {
 			var data []byte
 			if record[10] != "" && record[10] != "null" {
 				data = common.FromHex(record[10])
-				gasLimit *= 3
+				if gasLimit > 30000 {
+					gasLimit *= 3
+				}
 			}
 
 			// 创建消息
@@ -1256,14 +1263,26 @@ func TestProcessTransactions(t *testing.T) {
 			vmenv := vm.NewEVM(blockContext, countingStateDB, params.TestChainConfig, vm.Config{})
 
 			for _, msg := range msgsByBlock[blockNum] {
+
+				// 处理交易
+				result, err := ApplyMessage(vmenv, msg, gp)
+				var receipt *types.Receipt
+
 				// 判断是否为合约交易
 				isContractTx := false
 				isContractCreate := false
 				if msg.To == nil {
+					// 合约创建
 					isContractTx = true
 					isContractCreate = true
 					createContractCount++
-				} else if len(msg.Data) > 0 {
+
+					// 如果交易成功，记录创建的合约地址
+					if result != nil && result.ContractAddress != (common.Address{}) {
+						counter.ContractAddresses[result.ContractAddress] = true
+					}
+				} else if counter.ContractAddresses[*msg.To] {
+					// 使用记录的合约地址判断是否为合约调用
 					isContractTx = true
 					callContractCount++
 				}
@@ -1272,9 +1291,6 @@ func TestProcessTransactions(t *testing.T) {
 					contractTxCount++
 				}
 
-				// 处理交易
-				result, err := ApplyMessage(vmenv, msg, gp)
-				var receipt *types.Receipt
 				if err != nil || result.Err != nil {
 					// 记录错误
 					errorCount++
