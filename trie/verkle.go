@@ -121,6 +121,11 @@ func (t *VerkleTrie) GetStorage(addr common.Address, key []byte) ([]byte, error)
 	return common.TrimLeftZeroes(val), nil
 }
 
+func (t *VerkleTrie) UpdateAccountRLP(address common.Address, account []byte, codeLen int) error {
+	//noting
+	return nil
+}
+
 // UpdateAccount implements state.Trie, writing the provided account into the tree.
 // If the tree is corrupted, an error will be returned.
 func (t *VerkleTrie) UpdateAccount(addr common.Address, acc *types.StateAccount, codeLen int) error {

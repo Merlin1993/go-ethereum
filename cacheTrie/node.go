@@ -18,6 +18,8 @@ package cacheTrie
 
 import (
 	"fmt"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 var nodeIndices = []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f", "[17]"}
@@ -49,8 +51,10 @@ type (
 
 	// 值节点，存储实际的值
 	ValueNode struct {
-		Data []byte
-		New  bool // 标记该节点是否为新节点
+		Data    []byte
+		New     bool           // 标记该节点是否为新节点
+		RawKey  []byte         // 原始未哈希的键
+		Address common.Address // 关联的地址
 	}
 )
 
@@ -110,7 +114,7 @@ func (n ValueNode) fstring(ind string) string {
 }
 
 // NilValueNode 用于表示空值节点
-var NilValueNode = ValueNode{Data: nil, New: false}
+var NilValueNode = ValueNode{Data: nil, New: false, RawKey: nil, Address: common.Address{}}
 
 func (n *FullNode) updateFlag(bitPos int) {
 	n.flags.window = 0

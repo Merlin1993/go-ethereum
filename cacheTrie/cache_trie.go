@@ -98,6 +98,7 @@ func (t *CacheTrie) prepareKey(key []byte, address ...common.Address) []byte {
 	// 如果提供了地址，将地址与键组合
 	if len(address) > 0 {
 		dataToHash = append(address[0].Bytes(), key...)
+		dataToHash = hashKey(key)
 	} else {
 		dataToHash = hashKey(key)
 	}
@@ -111,12 +112,21 @@ func (t *CacheTrie) getInternal(hexKey []byte) (cacheNode, error) {
 }
 
 // updateInternal 是Update和UpdateWithAddress的内部实现
-func (t *CacheTrie) updateInternal(hexKey []byte, value []byte, isNew bool) error {
+func (t *CacheTrie) updateInternal(hexKey []byte, value []byte, isNew bool, originalKey []byte, address ...common.Address) error {
 	// 设置当前位置
 	bitPos := t.getCacheBitPosition()
 
 	// 将value转换为ValueNode类型
-	valueNode := ValueNode{Data: value, New: isNew}
+	valueNode := ValueNode{
+		Data:   value,
+		New:    isNew,
+		RawKey: originalKey,
+	}
+
+	// 如果提供了地址，保存它
+	if len(address) > 0 {
+		valueNode.Address = address[0]
+	}
 
 	root, err := t.insert(t.root, hexKey, valueNode, bitPos)
 	if err != nil {
@@ -129,10 +139,19 @@ func (t *CacheTrie) updateInternal(hexKey []byte, value []byte, isNew bool) erro
 }
 
 // deleteInternal 是Delete和DeleteWithAddress的内部实现
-func (t *CacheTrie) deleteInternal(hexKey []byte) error {
+func (t *CacheTrie) deleteInternal(hexKey []byte, originalKey []byte, address ...common.Address) error {
 	// 创建一个特殊的标记值作为"墓碑"
-	// 这里使用一个空的ValueNode作为墓碑标记，并设置New为true
-	tombstone := ValueNode{Data: []byte{}, New: true}
+	// 使用一个空的ValueNode作为墓碑标记，并设置New为true
+	tombstone := ValueNode{
+		Data:   []byte{},
+		New:    true,
+		RawKey: originalKey,
+	}
+
+	// 如果提供了地址，保存它
+	if len(address) > 0 {
+		tombstone.Address = address[0]
+	}
 
 	// 获取当前block位置
 	bitPos := t.getCacheBitPosition()
@@ -309,7 +328,7 @@ func (t *CacheTrie) Update(key, value []byte, isNew bool) error {
 	}
 
 	hexKey := t.prepareKey(key)
-	return t.updateInternal(hexKey, value, isNew)
+	return t.updateInternal(hexKey, value, isNew, key)
 }
 
 // UpdateWithAddress 将带有地址前缀的键值对添加到trie中
@@ -320,21 +339,21 @@ func (t *CacheTrie) UpdateWithAddress(address common.Address, key, value []byte,
 	}
 
 	hexKey := t.prepareKey(key, address)
-	return t.updateInternal(hexKey, value, isNew)
+	return t.updateInternal(hexKey, value, isNew, key, address)
 }
 
 // Delete 从trie中删除key
 // 内部实现使用"墓碑"标记(空值节点)替代真正的删除
 func (t *CacheTrie) Delete(key []byte) error {
 	hexKey := t.prepareKey(key)
-	return t.deleteInternal(hexKey)
+	return t.deleteInternal(hexKey, key)
 }
 
 // DeleteWithAddress 从trie中删除带有地址前缀的key
 // 内部实现使用"墓碑"标记(空值节点)替代真正的删除
 func (t *CacheTrie) DeleteWithAddress(address common.Address, key []byte) error {
 	hexKey := t.prepareKey(key, address)
-	return t.deleteInternal(hexKey)
+	return t.deleteInternal(hexKey, key, address)
 }
 
 // Hash 返回trie的根哈希
@@ -361,8 +380,9 @@ func (t *CacheTrie) Hash() (common.Hash, *DeleteKVList) {
 }
 
 type DeleteKV struct {
-	Key   []byte
-	Value []byte
+	Key     []byte
+	Value   []byte
+	Address common.Address
 }
 
 type DeleteKVList struct {
@@ -413,7 +433,7 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 
 		// 从根节点递归查找所有节点，对于所有最低一位的叶子节点进行实际的删除
 		if t.root != nil {
-			t.root = t.pruneNodeAtBit(t.root, make([]byte, 0), lowestBit, deleteKVList)
+			t.root = t.pruneNodeAtBit(t.root, lowestBit, deleteKVList)
 		}
 
 		// 更新startNum（向前移动window）
@@ -426,7 +446,7 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 }
 
 // pruneNodeAtBit递归查找指定位设置的节点并清理
-func (t *CacheTrie) pruneNodeAtBit(n cacheNode, prefixKey []byte, bit int, deleteKVList *DeleteKVList) cacheNode {
+func (t *CacheTrie) pruneNodeAtBit(n cacheNode, bit int, deleteKVList *DeleteKVList) cacheNode {
 	if n == nil {
 		return nil
 	}
@@ -439,23 +459,17 @@ func (t *CacheTrie) pruneNodeAtBit(n cacheNode, prefixKey []byte, bit int, delet
 		if (node.window() & (1 << bit)) != 0 {
 			// 如果是叶子节点（Val是ValueNode）且window变为0，则清除此节点
 			if valueNode, isValueNode := node.Val.(ValueNode); isValueNode {
-				// 使用append合并字节切片，而不是加法操作符
-				fullKey := append(append([]byte{}, prefixKey...), node.Key...)
-				// 将十六进制格式的键转换回二进制格式
-				binaryKey := hexToKeybytes(fullKey)
-
 				// 只有当ValueNode.New为true时才添加到deleteKeyValue
 				if valueNode.New {
 					deleteKVList.Data = append(deleteKVList.Data, &DeleteKV{
-						Key:   binaryKey,
-						Value: valueNode.Data,
+						Key:     valueNode.RawKey,
+						Value:   valueNode.Data,
+						Address: valueNode.Address,
 					})
 				}
 				return nil
 			} else {
-				// 对子节点递归处理，使用append合并路径
-				newPrefixKey := append(append([]byte{}, prefixKey...), node.Key...)
-				newVal := t.pruneNodeAtBit(node.Val, newPrefixKey, bit, deleteKVList)
+				newVal := t.pruneNodeAtBit(node.Val, bit, deleteKVList)
 
 				// 如果子节点被删除并且这个节点的window为0，则删除此节点
 				if newVal == nil {
@@ -476,11 +490,9 @@ func (t *CacheTrie) pruneNodeAtBit(n cacheNode, prefixKey []byte, bit int, delet
 			allChildrenNil := true
 			for i := 0; i < 16; i++ {
 				if node.Children[i] != nil {
-					// 记录子节点路径，添加当前索引作为一个字节
-					newPrefixKey := append(append([]byte{}, prefixKey...), byte(i))
 
 					// 递归处理子节点
-					node.Children[i] = t.pruneNodeAtBit(node.Children[i], newPrefixKey, bit, deleteKVList)
+					node.Children[i] = t.pruneNodeAtBit(node.Children[i], bit, deleteKVList)
 
 					// 检查子节点是否被删除
 					if node.Children[i] != nil {

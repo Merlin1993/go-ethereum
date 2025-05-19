@@ -33,6 +33,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/utils"
@@ -877,74 +878,57 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		// 计算缓存树的哈希，这将触发缓存清理，并返回被删除的键值对
 		_, deleteKVList := cacheDB.CacheTrie().Hash()
 
-		// 如果有被删除的键值对，将它们写入主MPT树
-		if deleteKVList != nil && len(deleteKVList.Data) > 0 {
-			// 记录哪些账户的状态被改变了
-			modifiedAccounts := make(map[common.Address]bool)
+		// 记录哪些账户的状态被改变了
+		modifiedAccounts := make(map[common.Address]bool)
 
-			// 第一步：先处理所有状态（存储槽）
-			for _, kv := range deleteKVList.Data {
-				if len(kv.Key) > 0 {
-					// 检查前20字节，如果是全0，则是账户，否则是状态
-					isAccount := true
-					if len(kv.Key) >= 20 {
-						addrBytes := kv.Key[:20]
-						for _, b := range addrBytes {
-							if b != 0 {
-								isAccount = false
-								break
-							}
-						}
-					}
+		// 第一步：先处理所有状态（存储槽）
+		for _, kv := range deleteKVList.Data {
+			// 通过Address区分是否有地址，如果地址非空，则是存储槽
+			if (kv.Address != common.Address{}) && len(kv.Key) > 0 {
+				// 有地址且有键，说明是存储槽
+				addr := kv.Address
+				key := kv.Key
 
-					// 如果不是账户（即是状态），则处理
-					if !isAccount && len(kv.Key) > 20 {
-						// 提取地址和键
-						addr := common.BytesToAddress(kv.Key[:20])
-						key := kv.Key[20:]
-
-						if obj := s.getStateObject(addr); obj != nil && obj.trie != nil {
-							// 将存储数据写入账户的存储trie
-							obj.SetState(common.BytesToHash(key), common.BytesToHash(kv.Value))
-							// 标记这个账户的状态被修改
-							modifiedAccounts[addr] = true
-						}
-					}
+				if obj := s.getStateObject(addr); obj != nil && obj.trie != nil {
+					// 将存储数据写入账户的存储trie
+					obj.SetState(common.BytesToHash(key), common.BytesToHash(kv.Value))
+					// 标记这个账户的状态被修改
+					modifiedAccounts[addr] = true
 				}
 			}
+		}
 
-			// 第二步：更新所有状态被修改的账户的root
-			for addr := range modifiedAccounts {
-				if obj := s.getStateObject(addr); obj != nil {
-					// 更新账户的root
-					obj.updateRoot()
-					// 标记状态对象需要更新
-					s.markUpdate(addr)
-				}
+		// 第二步：更新所有状态被修改的账户的root
+		for addr := range modifiedAccounts {
+			if obj := s.getStateObject(addr); obj != nil {
+				// 更新账户的root
+				obj.updateRoot()
+				// 标记状态对象需要更新
+				s.markUpdate(addr)
 			}
+		}
 
-			// 第三步：处理所有账户
-			for _, kv := range deleteKVList.Data {
-				if len(kv.Key) > 0 {
-					// 检查前20字节，如果是全0，则是账户，否则是状态
-					isAccount := true
-					if len(kv.Key) >= 20 {
-						addrBytes := kv.Key[:20]
-						for _, b := range addrBytes {
-							if b != 0 {
-								isAccount = false
-								break
-							}
-						}
+		// 第三步：处理所有账户
+		for _, kv := range deleteKVList.Data {
+			// 地址为空且键存在，说明是账户
+			if (kv.Address == common.Address{}) && len(kv.Key) > 0 {
+				addr := common.BytesToAddress(kv.Key)
+				// 解析账户数据
+				account := new(types.StateAccount)
+				if err := rlp.DecodeBytes(kv.Value, account); err != nil {
+					s.setError(fmt.Errorf("failed to decode account RLP: %v", err))
+					continue
+				}
+
+				// 当s.trie是StateTrie类型时，使用直接写入trie的方法
+				if secureTrie, ok := s.trie.(*trie.StateTrie); ok {
+					if err := secureTrie.UpdateAccountDirectToTrie(addr, account); err != nil {
+						s.setError(fmt.Errorf("updateAccountDirectToTrie (%x) error: %v", addr[:], err))
 					}
-
-					// 如果是账户，则处理
-					if isAccount && len(kv.Key) == 20 {
-						addr := common.BytesToAddress(kv.Key)
-						if obj := s.getStateObject(addr); obj != nil {
-							// 将账户数据写入主MPT
-							s.updateStateObject(obj)
-						}
+				} else {
+					// 如果不是StateTrie类型，使用原来的方式
+					if err := s.trie.UpdateAccountRLP(addr, kv.Value, 0); err != nil {
+						s.setError(fmt.Errorf("updateStateObject (%x) error: %v", addr[:], err))
 					}
 				}
 			}
@@ -1517,4 +1501,16 @@ func (s *StateDB) Witness() *stateless.Witness {
 
 func (s *StateDB) AccessEvents() *AccessEvents {
 	return s.accessEvents
+}
+
+// mustCopyTrie returns a deep-copied trie.
+func mustCopyTrie(t Trie) Trie {
+	switch t := t.(type) {
+	case *trie.StateTrie:
+		return t.Copy()
+	case *trie.VerkleTrie:
+		return t.Copy()
+	default:
+		panic(fmt.Errorf("unknown trie type %T", t))
+	}
 }

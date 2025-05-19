@@ -17,8 +17,6 @@
 package state
 
 import (
-	"fmt"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -90,6 +88,7 @@ type Trie interface {
 	// in the trie with provided address.
 	UpdateAccount(address common.Address, account *types.StateAccount, codeLen int) error
 
+	UpdateAccountRLP(address common.Address, account []byte, codeLen int) error
 	// UpdateStorage associates key with value in the trie. If value has length zero,
 	// any existing value is deleted from the trie. The value bytes must not be modified
 	// by the caller while they are stored in the trie. If a node was not found in the
@@ -189,14 +188,14 @@ func (db *CachingDB) Reader(stateRoot common.Hash) (Reader, error) {
 		// then construct the legacy snap reader.
 		snap := db.snap.Snapshot(stateRoot)
 		if snap != nil {
-			readers = append(readers, newFlatReader(snap))
+			readers = append(readers, newFlatReader(snap, db.triedb.CacheTrie()))
 		}
 	} else {
 		// If standalone state snapshot is not available, try to construct
 		// the state reader with database.
 		reader, err := db.triedb.StateReader(stateRoot)
 		if err == nil {
-			readers = append(readers, newFlatReader(reader)) // state reader is optional
+			readers = append(readers, newFlatReader(reader, db.triedb.CacheTrie())) // state reader is optional
 		}
 	}
 	// Set up the trie reader, which is expected to always be available
@@ -270,16 +269,4 @@ func (db *CachingDB) PointCache() *utils.PointCache {
 // Snapshot returns the underlying state snapshot.
 func (db *CachingDB) Snapshot() *snapshot.Tree {
 	return db.snap
-}
-
-// mustCopyTrie returns a deep-copied trie.
-func mustCopyTrie(t Trie) Trie {
-	switch t := t.(type) {
-	case *trie.StateTrie:
-		return t.Copy()
-	case *trie.VerkleTrie:
-		return t.Copy()
-	default:
-		panic(fmt.Errorf("unknown trie type %T", t))
-	}
 }

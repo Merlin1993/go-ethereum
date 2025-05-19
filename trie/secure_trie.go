@@ -263,6 +263,16 @@ func (t *StateTrie) UpdateStorage(addr common.Address, key, value []byte) error 
 	return nil
 }
 
+func (t *StateTrie) UpdateAccountRLP(address common.Address, data []byte, codeLen int) error {
+	hk := t.hashKey(address.Bytes())
+	// 未启用缓存，按原来逻辑更新原始trie
+	if err := t.trie.Update(hk, data); err != nil {
+		return err
+	}
+	t.getSecKeyCache()[string(hk)] = address.Bytes()
+	return nil
+}
+
 // UpdateAccount will abstract the write of an account to the secure trie.
 func (t *StateTrie) UpdateAccount(address common.Address, acc *types.StateAccount, _ int) error {
 	hk := t.hashKey(address.Bytes())
@@ -447,4 +457,34 @@ func (t *StateTrie) getSecKeyCache() map[string][]byte {
 
 func (t *StateTrie) IsVerkle() bool {
 	return false
+}
+
+// UpdateAccountDirectToTrie 直接更新账户信息到底层trie而不经过缓存
+func (t *StateTrie) UpdateAccountDirectToTrie(address common.Address, acc *types.StateAccount) error {
+	hk := t.hashKey(address.Bytes())
+	data, err := rlp.EncodeToBytes(acc)
+	if err != nil {
+		return err
+	}
+
+	// 直接更新到底层trie
+	if err := t.trie.Update(hk, data); err != nil {
+		return err
+	}
+	t.getSecKeyCache()[string(hk)] = address.Bytes()
+	return nil
+}
+
+// UpdateStorageDirectToTrie 直接更新存储槽到底层trie而不经过缓存
+func (t *StateTrie) UpdateStorageDirectToTrie(addr common.Address, key, value []byte) error {
+	hk := t.hashKey(key)
+	v, _ := rlp.EncodeToBytes(value)
+
+	// 直接更新到底层trie
+	err := t.trie.Update(hk, v)
+	if err != nil {
+		return err
+	}
+	t.getSecKeyCache()[string(hk)] = common.CopyBytes(key)
+	return nil
 }
