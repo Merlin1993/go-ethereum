@@ -21,6 +21,7 @@ package cacheTrie
 import (
 	"bytes"
 	"fmt"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -58,6 +59,19 @@ type CacheTrie struct {
 
 	// 缓存大小限制和计数
 	maxSize int // 可缓存的最大键值对数量，0表示无限制
+
+	// 删除键值缓存
+	deletedCache     map[string][]byte                    // 缓存删除的键值对
+	deletedByBlock   map[uint64]*DeleteKVList             // 按区块号缓存删除的键值列表
+	deletedByAddress map[common.Address]map[string][]byte // 按地址缓存删除的键值对
+	cacheMu          sync.RWMutex                         // 缓存操作的读写锁
+
+	// 清理操作相关
+	cleanupMu           sync.Mutex             // 清理操作的互斥锁
+	currentCleanupBlock uint64                 // 当前正在清理的区块号
+	cleanupResults      map[uint64]common.Hash // 清理结果缓存
+	cleanupChan         chan common.Hash       // 清理结果通知通道
+	isCleaningUp        bool                   // 是否正在清理
 }
 
 // -----------------------------------------------------------------------------
@@ -301,8 +315,22 @@ func (t *CacheTrie) GetSize() int {
 //   - 找到的节点
 //   - 错误信息
 func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
+	// 首先从树中查找
 	hexKey := t.prepareKey(key)
-	return t.getInternal(hexKey)
+	node, err := t.getInternal(hexKey)
+
+	// 如果在树中找不到，则尝试从删除缓存中查找
+	if node == nil && err == nil && t.deletedCache != nil {
+		if value := t.GetDeletedValue(key); value != nil {
+			return ValueNode{
+				Data:   value,
+				New:    false,
+				RawKey: key,
+			}, nil
+		}
+	}
+
+	return node, err
 }
 
 // GetWithAddress 通过地址和路径获取节点
@@ -316,8 +344,23 @@ func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
 //   - 找到的节点
 //   - 错误信息
 func (t *CacheTrie) GetWithAddress(address common.Address, key []byte) (cacheNode, error) {
+	// 首先从树中查找
 	hexKey := t.prepareKey(key, address)
-	return t.getInternal(hexKey)
+	node, err := t.getInternal(hexKey)
+
+	// 如果在树中找不到，则尝试从删除缓存中查找
+	if node == nil && err == nil {
+		if value := t.GetDeletedValueWithAddress(address, key); value != nil {
+			return ValueNode{
+				Data:    value,
+				New:     false,
+				RawKey:  key,
+				Address: address,
+			}, nil
+		}
+	}
+
+	return node, err
 }
 
 // Update 将键值对添加到trie中
@@ -366,6 +409,11 @@ func (t *CacheTrie) Hash() (common.Hash, *DeleteKVList) {
 
 	// 如果设置了最大大小且超出限制，或window的位数不足，清理不常用的缓存
 	deleteKeyValues := t.pruneCache()
+
+	// 缓存删除的键值对
+	if deleteKeyValues != nil && len(deleteKeyValues.Data) > 0 {
+		t.cacheDeletedKVs(t.blockNum, deleteKeyValues)
+	}
 
 	// 即时生成哈希
 	h := newHasher(false)
@@ -670,4 +718,198 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 func hashKey(key []byte) []byte {
 	// 使用crypto包中的Keccak256哈希函数
 	return crypto.Keccak256(key)
+}
+
+// 添加DeleteKV相关方法
+
+// cacheDeletedKVs 缓存被删除的键值对
+func (t *CacheTrie) cacheDeletedKVs(blockNum uint64, kvList *DeleteKVList) {
+	if kvList == nil || len(kvList.Data) == 0 {
+		return
+	}
+
+	t.cacheMu.Lock()
+	defer t.cacheMu.Unlock()
+
+	// 懒初始化缓存
+	if t.deletedCache == nil {
+		t.deletedCache = make(map[string][]byte)
+	}
+	if t.deletedByBlock == nil {
+		t.deletedByBlock = make(map[uint64]*DeleteKVList)
+	}
+	if t.deletedByAddress == nil {
+		t.deletedByAddress = make(map[common.Address]map[string][]byte)
+	}
+
+	// 按区块号缓存
+	t.deletedByBlock[blockNum] = kvList
+
+	// 按键值和地址缓存
+	for _, kv := range kvList.Data {
+		keyStr := string(kv.Key)
+		t.deletedCache[keyStr] = kv.Value
+
+		// 如果有地址，按地址缓存
+		if (kv.Address != common.Address{}) {
+			if _, ok := t.deletedByAddress[kv.Address]; !ok {
+				t.deletedByAddress[kv.Address] = make(map[string][]byte)
+			}
+			t.deletedByAddress[kv.Address][keyStr] = kv.Value
+		}
+	}
+}
+
+// GetDeletedValue 获取被删除的值
+func (t *CacheTrie) GetDeletedValue(key []byte) []byte {
+	t.cacheMu.RLock()
+	defer t.cacheMu.RUnlock()
+
+	if t.deletedCache == nil {
+		return nil
+	}
+	if value, ok := t.deletedCache[string(key)]; ok {
+		return value
+	}
+	return nil
+}
+
+// GetDeletedValueWithAddress 通过地址获取被删除的值
+func (t *CacheTrie) GetDeletedValueWithAddress(address common.Address, key []byte) []byte {
+	t.cacheMu.RLock()
+	defer t.cacheMu.RUnlock()
+
+	if t.deletedByAddress == nil {
+		return nil
+	}
+	if addrCache, ok := t.deletedByAddress[address]; ok {
+		if value, ok := addrCache[string(key)]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+// StartCleanup 启动某区块号的清理操作
+// 此接口支持异步调用，但会进行锁，保证不同区块号的清理操作会排队执行
+// 返回是否成功获取到锁
+func (t *CacheTrie) StartCleanup(blockNum uint64) bool {
+	// 尝试获取锁
+	t.cleanupMu.Lock()
+
+	// 如果已经在清理中，返回失败
+	if t.isCleaningUp {
+		t.cleanupMu.Unlock()
+		return false
+	}
+
+	// 记录当前清理的区块号并设置清理标志
+	t.currentCleanupBlock = blockNum
+	t.isCleaningUp = true
+
+	// 确保通道已初始化
+	if t.cleanupChan == nil {
+		t.cleanupChan = make(chan common.Hash, 1)
+	}
+
+	// 确保结果缓存已初始化
+	if t.cleanupResults == nil {
+		t.cleanupResults = make(map[uint64]common.Hash)
+	}
+
+	return true
+}
+
+// FinishCleanup 完成某区块的清理操作
+// 传入清理结果的哈希值，并清理缓存的deleteKVList
+func (t *CacheTrie) FinishCleanup(blockNum uint64, resultHash common.Hash) {
+	defer t.cleanupMu.Unlock()
+
+	// 检查是否是当前正在清理的区块
+	if !t.isCleaningUp || t.currentCleanupBlock != blockNum {
+		return
+	}
+
+	// 获取缓存锁，进行写操作
+	t.cacheMu.Lock()
+	defer t.cacheMu.Unlock()
+
+	// 清理该区块的deleteKVList中未更新过的值
+	if kvList, ok := t.deletedByBlock[blockNum]; ok && kvList != nil {
+		for _, kv := range kvList.Data {
+			keyStr := string(kv.Key)
+
+			// 判断是否被更新：比较缓存中的值和当前值
+			if cachedValue, exists := t.deletedCache[keyStr]; exists {
+				// 如果值相同（未被更新过），则删除
+				if bytes.Equal(cachedValue, kv.Value) {
+					delete(t.deletedCache, keyStr)
+				}
+			}
+
+			// 如果有地址，从地址缓存中删除
+			if (kv.Address != common.Address{}) {
+				if addrCache, ok := t.deletedByAddress[kv.Address]; ok {
+					if cachedValue, exists := addrCache[keyStr]; exists {
+						// 如果值相同（未被更新过），则删除
+						if bytes.Equal(cachedValue, kv.Value) {
+							delete(addrCache, keyStr)
+
+							// 如果地址下没有键值对了，删除该地址缓存
+							if len(addrCache) == 0 {
+								delete(t.deletedByAddress, kv.Address)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// 清理完成后删除该区块的记录
+		delete(t.deletedByBlock, blockNum)
+	}
+
+	// 缓存清理结果
+	t.cleanupResults[blockNum] = resultHash
+
+	// 如果有等待的通道，发送结果
+	select {
+	case t.cleanupChan <- resultHash:
+		// 成功发送
+	default:
+		// 没有接收者，不做处理
+	}
+
+	// 重置清理状态
+	t.isCleaningUp = false
+	t.currentCleanupBlock = 0
+}
+
+// GetCleanupResult 获取某区块的清理结果
+// 如果未进行清理或已完成清理，直接返回结果
+// 如果正在清理中，则等待清理完成
+func (t *CacheTrie) GetCleanupResult(blockNum uint64) common.Hash {
+	// 使用读锁检查是否已有结果
+	t.cacheMu.RLock()
+	hash, ok := t.cleanupResults[blockNum]
+	t.cacheMu.RUnlock()
+
+	if ok {
+		return hash
+	}
+
+	// 检查是否正在清理该区块
+	t.cleanupMu.Lock()
+	isCleaningUp := t.isCleaningUp && t.currentCleanupBlock == blockNum
+	ch := t.cleanupChan
+	t.cleanupMu.Unlock()
+
+	if isCleaningUp {
+		// 需要等待清理完成
+		hash := <-ch
+		return hash
+	}
+
+	// 既不在清理中，也没有结果，返回空哈希
+	return common.Hash{}
 }
