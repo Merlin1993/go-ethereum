@@ -50,28 +50,22 @@ type CacheTrie struct {
 	// 当前区块高度
 	blockNum uint64
 
-	// 起始区块号，表示窗口的起始位置
-	startNum uint64
+	// 当前记录位
+	currentBit int
 
-	// multiple表示window中每个位存储多少个区块
-	// 例如：multiple=10表示每个位记录10个区块的状态
-	multiple uint64
-
-	// 缓存大小限制和计数
-	maxSize int // 可缓存的最大键值对数量，0表示无限制
-
-	// 删除键值缓存
+	// 删除键值缓存,因为最多只有一个区块会在此环节，所以只需要保留一次
 	deletedCache     map[string][]byte                    // 缓存删除的键值对
-	deletedByBlock   map[uint64]*DeleteKVList             // 按区块号缓存删除的键值列表
 	deletedByAddress map[common.Address]map[string][]byte // 按地址缓存删除的键值对
 	cacheMu          sync.RWMutex                         // 缓存操作的读写锁
 
 	// 清理操作相关
-	cleanupMu           sync.Mutex             // 清理操作的互斥锁
-	currentCleanupBlock uint64                 // 当前正在清理的区块号
-	cleanupResults      map[uint64]common.Hash // 清理结果缓存
-	cleanupChan         chan common.Hash       // 清理结果通知通道
-	isCleaningUp        bool                   // 是否正在清理
+	cleanupMu           sync.Mutex       // 清理操作的互斥锁
+	currentCleanupBlock uint64           // 当前正在清理的区块号
+	cleanupResults      common.Hash      // 清理结果缓存
+	cleanupChan         chan common.Hash // 清理结果通知通道
+	isCleaningUp        bool             // 是否正在清理
+
+	hrw *HeightRangeWindow //拥塞控制
 }
 
 // -----------------------------------------------------------------------------
@@ -85,18 +79,7 @@ func (t *CacheTrie) newNodeFlag() nodeFlag {
 // getCacheBitPosition 计算window中当前区块的位位置
 // 根据当前区块高度、起始区块和倍数计算当前区块在32位window中的位置
 func (t *CacheTrie) getCacheBitPosition() int {
-	if t.blockNum < t.startNum {
-		return 0 // 如果当前区块小于起始区块，默认使用第0位
-	}
-
-	//position表示当前区块在window中的位置,因为是一个滑动窗口，所以会循环使用window得位，只要不超过最大缓存两，就和startNum无关
-	position := t.blockNum / t.multiple
-	return int(position % 32) // 限制在32位之内，因为window是一个int
-}
-
-// 获取剩余可用的position
-func (t *CacheTrie) getWindowPosition() int {
-	return 32 - int((t.blockNum-t.startNum)/t.multiple) - 1
+	return t.currentBit
 }
 
 // getNodeWindow 获取节点的window位图
@@ -281,10 +264,8 @@ func countBits(n int) int {
 func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 	trie := &CacheTrie{
 		blockNum: 0,
-		startNum: startNum,
-		multiple: multiple,
-		maxSize:  maxSize,
 	}
+	trie.hrw = NewHeightRangeWindow(startNum, multiple, maxSize)
 	return trie
 }
 
@@ -292,6 +273,11 @@ func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 // 这会影响后续操作的缓存位置计算
 func (t *CacheTrie) SetBlockNum(blockNum uint64) {
 	t.blockNum = blockNum
+	t.currentBit = t.hrw.GetBitPosition(blockNum)
+	if t.currentBit < 0 {
+		panic(fmt.Sprintf("CacheTrie位置计算错误: 当前区块高度=%v, 窗口起始区块=%v, 窗口结束区块=%v, 错误码=%v (若-1则表示区块高度小于窗口起始位置; 若-2则表示区块高度超出窗口最大容量), 当前窗口位数=%v, 首段索引=%v, 慢启动阈值=%v",
+			blockNum, t.hrw.windowStartNumber, t.hrw.windowEndNumber, t.currentBit, t.hrw.getWindowPosition(), t.hrw.firstSegmentIndex, t.hrw.currentSsthresh))
+	}
 }
 
 // GetSize 返回trie中键值对的总数
@@ -412,7 +398,13 @@ func (t *CacheTrie) Hash() (common.Hash, *DeleteKVList) {
 
 	// 缓存删除的键值对
 	if deleteKeyValues != nil && len(deleteKeyValues.Data) > 0 {
+		// 确保BlockNum字段已设置
+		deleteKeyValues.BlockNum = t.blockNum
 		t.cacheDeletedKVs(t.blockNum, deleteKeyValues)
+	}
+
+	if t.isCleaningUp && t.blockNum-t.currentCleanupBlock >= 5 {
+		panic(fmt.Sprintf("cache trie expire, blockNum: %v , currentCleanupBlock: %v", t.blockNum, t.currentCleanupBlock))
 	}
 
 	// 即时生成哈希
@@ -434,7 +426,8 @@ type DeleteKV struct {
 }
 
 type DeleteKVList struct {
-	Data []*DeleteKV
+	Data     []*DeleteKV
+	BlockNum uint64 // 添加区块号字段
 }
 
 // pruneCache清理不常用的缓存节点
@@ -442,7 +435,7 @@ type DeleteKVList struct {
 func (t *CacheTrie) pruneCache() *DeleteKVList {
 	// 计算当前window的可用位数
 	// 当前位置表示已经使用了多少位
-	windowBits := t.getWindowPosition()
+	windowBits := t.hrw.getWindowPosition()
 
 	// 判断是否需要清理
 	needPrune := false
@@ -453,7 +446,7 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 	}
 
 	// 条件2：size大于MaxSize时，触发清理
-	if t.maxSize > 0 && t.root.size() > t.maxSize {
+	if t.hrw.CheckAndTriggerCongestionControl(t.root.size()) {
 		needPrune = true
 	}
 
@@ -462,13 +455,19 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 		return nil
 	}
 
-	// 执行循环操作，直到根节点size数量小于2/3的maxSize且window位数等于16bit
+	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
+	t.StartCleanup()
+
+	// 执行循环操作，直到根节点size数量小于2/3的maxSize且window位数等于8bit
 	// 使用2/3作为阈值
-	targetSize := t.maxSize * 2 / 3
+	targetSize := t.hrw.maxTotalAllowedSize * 2 / 3
 	if targetSize <= 0 {
 		targetSize = 1 // 确保至少有一个目标大小
 	}
-	deleteKVList := &DeleteKVList{make([]*DeleteKV, 0)}
+	deleteKVList := &DeleteKVList{
+		Data:     make([]*DeleteKV, 0),
+		BlockNum: t.blockNum, // 设置当前区块号
+	}
 	// 循环直到满足条件
 	for {
 		// 检查是否已经满足条件：size小于目标值，且window位数大于等于16bit
@@ -477,18 +476,17 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 		}
 
 		// 找到最低一位的缓存窗口（即最早的缓存）
-		lowestBit := int(t.startNum / t.multiple % 32)
+		lowestBit := t.hrw.firstSegmentIndex
 
 		// 从根节点递归查找所有节点，对于所有最低一位的叶子节点进行实际的删除
 		if t.root != nil {
 			t.root = t.pruneNodeAtBit(t.root, lowestBit, deleteKVList)
 		}
 
-		// 更新startNum（向前移动window）
-		t.startNum += t.multiple
+		t.hrw.PruneWindow(1)
 
 		// 重新计算windowBits
-		windowBits = t.getWindowPosition()
+		windowBits = t.hrw.getWindowPosition()
 	}
 	return deleteKVList
 }
@@ -735,27 +733,21 @@ func (t *CacheTrie) cacheDeletedKVs(blockNum uint64, kvList *DeleteKVList) {
 	if t.deletedCache == nil {
 		t.deletedCache = make(map[string][]byte)
 	}
-	if t.deletedByBlock == nil {
-		t.deletedByBlock = make(map[uint64]*DeleteKVList)
-	}
 	if t.deletedByAddress == nil {
 		t.deletedByAddress = make(map[common.Address]map[string][]byte)
 	}
 
-	// 按区块号缓存
-	t.deletedByBlock[blockNum] = kvList
-
 	// 按键值和地址缓存
 	for _, kv := range kvList.Data {
 		keyStr := string(kv.Key)
-		t.deletedCache[keyStr] = kv.Value
-
 		// 如果有地址，按地址缓存
 		if (kv.Address != common.Address{}) {
 			if _, ok := t.deletedByAddress[kv.Address]; !ok {
 				t.deletedByAddress[kv.Address] = make(map[string][]byte)
 			}
 			t.deletedByAddress[kv.Address][keyStr] = kv.Value
+		} else {
+			t.deletedCache[keyStr] = kv.Value
 		}
 	}
 }
@@ -793,7 +785,7 @@ func (t *CacheTrie) GetDeletedValueWithAddress(address common.Address, key []byt
 // StartCleanup 启动某区块号的清理操作
 // 此接口支持异步调用，但会进行锁，保证不同区块号的清理操作会排队执行
 // 返回是否成功获取到锁
-func (t *CacheTrie) StartCleanup(blockNum uint64) bool {
+func (t *CacheTrie) StartCleanup() bool {
 	// 尝试获取锁
 	t.cleanupMu.Lock()
 
@@ -804,17 +796,12 @@ func (t *CacheTrie) StartCleanup(blockNum uint64) bool {
 	}
 
 	// 记录当前清理的区块号并设置清理标志
-	t.currentCleanupBlock = blockNum
+	t.currentCleanupBlock = t.blockNum
 	t.isCleaningUp = true
 
 	// 确保通道已初始化
 	if t.cleanupChan == nil {
 		t.cleanupChan = make(chan common.Hash, 1)
-	}
-
-	// 确保结果缓存已初始化
-	if t.cleanupResults == nil {
-		t.cleanupResults = make(map[uint64]common.Hash)
 	}
 
 	return true
@@ -823,55 +810,25 @@ func (t *CacheTrie) StartCleanup(blockNum uint64) bool {
 // FinishCleanup 完成某区块的清理操作
 // 传入清理结果的哈希值，并清理缓存的deleteKVList
 func (t *CacheTrie) FinishCleanup(blockNum uint64, resultHash common.Hash) {
-	defer t.cleanupMu.Unlock()
 
 	// 检查是否是当前正在清理的区块
 	if !t.isCleaningUp || t.currentCleanupBlock != blockNum {
 		return
 	}
+	defer t.cleanupMu.Unlock()
 
 	// 获取缓存锁，进行写操作
 	t.cacheMu.Lock()
-	defer t.cacheMu.Unlock()
 
-	// 清理该区块的deleteKVList中未更新过的值
-	if kvList, ok := t.deletedByBlock[blockNum]; ok && kvList != nil {
-		for _, kv := range kvList.Data {
-			keyStr := string(kv.Key)
-
-			// 判断是否被更新：比较缓存中的值和当前值
-			if cachedValue, exists := t.deletedCache[keyStr]; exists {
-				// 如果值相同（未被更新过），则删除
-				if bytes.Equal(cachedValue, kv.Value) {
-					delete(t.deletedCache, keyStr)
-				}
-			}
-
-			// 如果有地址，从地址缓存中删除
-			if (kv.Address != common.Address{}) {
-				if addrCache, ok := t.deletedByAddress[kv.Address]; ok {
-					if cachedValue, exists := addrCache[keyStr]; exists {
-						// 如果值相同（未被更新过），则删除
-						if bytes.Equal(cachedValue, kv.Value) {
-							delete(addrCache, keyStr)
-
-							// 如果地址下没有键值对了，删除该地址缓存
-							if len(addrCache) == 0 {
-								delete(t.deletedByAddress, kv.Address)
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// 清理完成后删除该区块的记录
-		delete(t.deletedByBlock, blockNum)
-	}
+	t.deletedCache = make(map[string][]byte)
+	t.deletedByAddress = make(map[common.Address]map[string][]byte)
+	t.cacheMu.Unlock()
 
 	// 缓存清理结果
-	t.cleanupResults[blockNum] = resultHash
-
+	t.cleanupResults = resultHash
+	// 重置清理状态
+	t.isCleaningUp = false
+	t.currentCleanupBlock = 0
 	// 如果有等待的通道，发送结果
 	select {
 	case t.cleanupChan <- resultHash:
@@ -879,28 +836,23 @@ func (t *CacheTrie) FinishCleanup(blockNum uint64, resultHash common.Hash) {
 	default:
 		// 没有接收者，不做处理
 	}
-
-	// 重置清理状态
-	t.isCleaningUp = false
-	t.currentCleanupBlock = 0
 }
 
 // GetCleanupResult 获取某区块的清理结果
 // 如果未进行清理或已完成清理，直接返回结果
 // 如果正在清理中，则等待清理完成
-func (t *CacheTrie) GetCleanupResult(blockNum uint64) common.Hash {
+func (t *CacheTrie) GetCleanupResult() common.Hash {
 	// 使用读锁检查是否已有结果
-	t.cacheMu.RLock()
-	hash, ok := t.cleanupResults[blockNum]
-	t.cacheMu.RUnlock()
-
-	if ok {
-		return hash
+	if t.cleanupResults != (common.Hash{}) {
+		//用后即抛
+		result := t.cleanupResults
+		t.cleanupResults = common.Hash{}
+		return result
 	}
 
 	// 检查是否正在清理该区块
 	t.cleanupMu.Lock()
-	isCleaningUp := t.isCleaningUp && t.currentCleanupBlock == blockNum
+	isCleaningUp := t.isCleaningUp
 	ch := t.cleanupChan
 	t.cleanupMu.Unlock()
 

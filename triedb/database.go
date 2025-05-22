@@ -130,7 +130,7 @@ func NewDatabase(diskdb ethdb.Database, config *Config) *Database {
 
 	// Initialize the cache trie if enabled
 	if config.CacheTrie {
-		db.cacheTrie = cacheTrie.NewCacheTrie(0, 1, 500000)
+		db.cacheTrie = cacheTrie.NewCacheTrie(46147, 1024, 500000)
 	}
 
 	return db

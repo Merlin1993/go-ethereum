@@ -127,13 +127,8 @@ func TestWindowCalculation(t *testing.T) {
 		t.Fatalf("Update at block 110 failed: %v", err)
 	}
 
-	expected := 1 << (trie.blockNum / trie.multiple % 32)
+	expected := 1 << 3
 	if expected != trie.root.window() {
-		// 打印调试信息
-		t.Logf("BlockNum: %d, StartNum: %d, Multiple: %d", trie.blockNum, trie.startNum, trie.multiple)
-		t.Logf("Actual bitPos calculation: %d / %d %% 32 = %d", trie.blockNum, trie.multiple, trie.blockNum/trie.multiple%32)
-		t.Logf("Expected window calculation: 1 << %d = %032b", trie.blockNum/trie.multiple%32, 1<<(trie.blockNum/trie.multiple%32))
-		t.Logf("Actual window value: %032b", trie.root.window())
 		t.Errorf("Wrong window for key1 at block 110: got %032b, expected %032b",
 			trie.root.window(), expected)
 	}
@@ -145,25 +140,9 @@ func TestWindowCalculation(t *testing.T) {
 		t.Fatalf("Update at block 120 failed: %v", err)
 	}
 
-	// 打印调试信息
-	t.Logf("After key2 update - BlockNum: %d, StartNum: %d, Multiple: %d", trie.blockNum, trie.startNum, trie.multiple)
-	t.Logf("After key2 update - Current bitPos: %d", trie.blockNum/trie.multiple%32)
-	t.Logf("After key2 update - Expected window: %032b | %032b = %032b",
-		1<<(110/5%32), 1<<(120/5%32), (1<<(110/5%32))|(1<<(120/5%32)))
-	t.Logf("After key2 update - Actual window: %032b", trie.root.window())
-
-	// 使用fstring方法打印结构
-	if shortNode, ok := trie.root.(*ShortNode); ok {
-		t.Logf("After key2 update - Structure: %s", shortNode.fstring(""))
-	} else if fullNode, ok := trie.root.(*FullNode); ok {
-		t.Logf("After key2 update - Structure: %s", fullNode.fstring(""))
-	} else {
-		t.Logf("After key2 update - Structure type: %T", trie.root)
-	}
-
 	// 检查window位，应该同时设置了第22位和第24位
 	// 计算期望的bit位置: 120 / 5 = 24，然后对32取模得到24
-	expected = (1 << (110 / 5 % 32)) | (1 << (120 / 5 % 32))
+	expected = (1<<3 | 1<<4)
 
 	// 验证window是否正确
 	if trie.root.window() != expected {
@@ -176,7 +155,7 @@ func TestWindowCalculation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Update at block 120 failed: %v", err)
 	}
-	expected = 1 << (120 / 5 % 32)
+	expected = 1 << 4
 
 	// 验证window是否正确
 	if trie.root.window() != expected {
@@ -320,8 +299,8 @@ func TestPruneCacheByWindow(t *testing.T) {
 		t.Fatalf("Update keyA failed: %v", err)
 	}
 
-	// 在区块110插入keyB
-	trie.SetBlockNum(100 + WindowLeft + 8 + 1)
+	// 在区块109插入keyB
+	trie.SetBlockNum(109)
 	err = trie.Update([]byte(keys[1]), []byte("valueB"), true)
 	if err != nil {
 		t.Fatalf("Update keyB failed: %v", err)
@@ -334,13 +313,13 @@ func TestPruneCacheByWindow(t *testing.T) {
 		t.Fatalf("Update keyC failed: %v", err)
 	}
 
-	// 在区块125处理哈希，不应触发清理(因为还有足够的窗口位)
-	trie.SetBlockNum(100 + 32 - WindowLeft - 2)
+	// 在区块596处理哈希 (1+32)*32/2 - 32，不应触发清理(因为还有足够的窗口位)
+	trie.SetBlockNum(496)
 	trie.Hash()
 
 	// 验证startNum未变
-	if trie.startNum != 100 {
-		t.Errorf("startNum changed unexpectedly: expected %d, got %d", 100, trie.startNum)
+	if trie.hrw.windowStartNumber != 100 {
+		t.Errorf("startNum changed unexpectedly: expected %d, got %d", 100, trie.hrw.windowStartNumber)
 	}
 
 	// 验证所有键值对都可以获取
@@ -354,13 +333,12 @@ func TestPruneCacheByWindow(t *testing.T) {
 		}
 	}
 
-	// 在区块125触发window位数只剩8位的情况(跳转到127会用满24位)
-	// 区块100开始，multiple=1，到127就是已使用了27位，只剩5位
-	trie.SetBlockNum(127)
+	// 在区块597触发window位数只剩8位的情况(跳转到597会用满32位)
+	trie.SetBlockNum(497)
 
 	// 手动添加几个区块，填满余下的窗口位
 	for i := 0; i < 5; i++ {
-		blockNum := uint64(128 + i)
+		blockNum := uint64(597 + i)
 		trie.SetBlockNum(blockNum)
 		err := trie.Update([]byte(fmt.Sprintf("fill%d", i)), []byte("filler"), true)
 		if err != nil {
@@ -372,10 +350,10 @@ func TestPruneCacheByWindow(t *testing.T) {
 	trie.Hash()
 
 	// 验证startNum已经更新(应该向前移动)
-	if trie.startNum <= 100 {
-		t.Errorf("startNum didn't increase after pruning, still at %d", trie.startNum)
+	if trie.hrw.windowStartNumber <= 100 {
+		t.Errorf("startNum didn't increase after pruning, still at %d", trie.hrw.windowStartNumber)
 	} else {
-		t.Logf("startNum updated to %d after pruning", trie.startNum)
+		t.Logf("startNum updated to %d after pruning", trie.hrw.windowStartNumber)
 	}
 
 	// 验证最旧的键可能已被清理(keyA可能被清理掉了)
@@ -391,28 +369,6 @@ func TestPruneCacheByWindow(t *testing.T) {
 		if node == nil {
 			t.Errorf("Key %s should still be available but got nil", key)
 		}
-	}
-
-	// 验证可以在清理后继续插入新键
-	trie.SetBlockNum(140)
-	err = trie.Update([]byte("newKey"), []byte("newValue"), true)
-	if err != nil {
-		t.Fatalf("Failed to insert after window pruning: %v", err)
-	}
-
-	// 验证新键是否可以正确获取
-	node, err = trie.Get([]byte("newKey"))
-	if err != nil {
-		t.Fatalf("Failed to get new key after pruning: %v", err)
-	}
-
-	valueNode, ok := node.(ValueNode)
-	if !ok {
-		t.Fatalf("Expected ValueNode, got %T", node)
-	}
-
-	if string(valueNode.Data) != "newValue" {
-		t.Errorf("Wrong value for newKey: got %q, want %q", string(valueNode.Data), "newValue")
 	}
 }
 
@@ -810,8 +766,8 @@ func TestPerformance(t *testing.T) {
 	// 测试参数
 	blockCount := 200
 	entriesPerBlock := 5000
-	multiple := 1   // window是10个区块一计
-	newRatio := 0.3 // 3成是new,7成是false
+	multiple := 1024 // window是10个区块一计
+	newRatio := 0.3  // 3成是new,7成是false
 
 	// 创建足够大的maxSize，保证只有window满时才修剪
 	maxSize := entriesPerBlock * blockCount

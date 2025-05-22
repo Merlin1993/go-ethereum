@@ -218,7 +218,7 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 		if !isPrecompile && evm.chainRules.IsEIP158 && value.IsZero() {
 			// Calling a non-existing account, don't do anything.
 			if len(input) > 0 {
-				return nil, gas, ErrFailCode
+				return nil, gas, ErrFailAccCode
 			}
 			return nil, gas, nil
 		}

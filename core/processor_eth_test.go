@@ -981,7 +981,7 @@ func TestProcessTransactions(t *testing.T) {
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
 		Preimages: false,
 		IsVerkle:  false,
-		CacheTrie: false,
+		CacheTrie: useCacheTrie,
 		ReadCache: false,
 		HashDB:    hashdb.Defaults,
 	})
@@ -1181,7 +1181,12 @@ func TestProcessTransactions(t *testing.T) {
 		parent := lastProcessedBlock
 		var lastCommitBlock uint64 = 0 // 记录上次提交的区块号
 
+		ct := sdb.TrieDB().CacheTrie()
 		for blockNum := minBlock; blockNum <= maxBlock; blockNum++ {
+			if ct != nil {
+				lastStateRoot = ct.GetCleanupResult()
+			}
+
 			if len(msgsByBlock[blockNum]) == 0 {
 				continue
 			}
@@ -1196,7 +1201,7 @@ func TestProcessTransactions(t *testing.T) {
 				GasLimit:   30000000,
 				Time:       uint64(blockNum * 15),
 				Difficulty: big.NewInt(1),
-				BaseFee:    big.NewInt(1000000000),
+				BaseFee:    big.NewInt(0),
 			}
 
 			sdb.SetBlockNum(blockNum)
@@ -1358,24 +1363,47 @@ func TestProcessTransactions(t *testing.T) {
 
 			// 生成根哈希阶段
 			rootGenStart := time.Now()
-			root, _ := countingStateDB.Commit(blockNum, false, false)
-			rootGenDuration := time.Since(rootGenStart)
-
-			// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
 			var commitDuration time.Duration
-			if blockNum-lastCommitBlock >= 1000 { // 每1000个区块提交一次
-				commitStart := time.Now()
-				err = trieDB.Commit(root, false)
-				commitDuration = time.Since(commitStart)
-				lastCommitBlock = blockNum
+			root := lastStateRoot
+			if useCacheTrie {
+				countingStateDB.PreCommit(false)
+				sBlockNum := blockNum
+				go func() {
+					sRoot, _ := countingStateDB.PostCommit(sBlockNum, false, false)
+					// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
+					commitStart := time.Now()
+					err = trieDB.Commit(sRoot, false)
 
-				if err != nil {
-					t.Fatalf("提交状态失败，区块 %d: %v", blockNum, err)
+					// 完成清理操作，设置结果哈希
+					trieDB.CacheTrie().FinishCleanup(sBlockNum, sRoot)
+					commitDuration = time.Since(commitStart)
+					lastCommitBlock = sBlockNum
+
+					if err != nil {
+						t.Fatalf("提交状态失败，区块 %d: %v", sBlockNum, err)
+					}
+
+					// 刷新数据库，避免内存占用过大
+					trieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
+				}()
+			} else {
+				root, _ = countingStateDB.Commit(blockNum, false, false)
+				// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
+				if blockNum-lastCommitBlock >= 1000 { // 每1000个区块提交一次
+					commitStart := time.Now()
+					err = trieDB.Commit(root, false)
+					commitDuration = time.Since(commitStart)
+					lastCommitBlock = blockNum
+
+					if err != nil {
+						t.Fatalf("提交状态失败，区块 %d: %v", blockNum, err)
+					}
+
+					// 刷新数据库，避免内存占用过大
+					trieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
 				}
-
-				// 刷新数据库，避免内存占用过大
-				trieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
 			}
+			rootGenDuration := time.Since(rootGenStart)
 
 			// 更新区块头的状态根和保存最新状态根
 			header.Root = root

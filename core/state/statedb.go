@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ethereum/go-ethereum/cacheTrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -37,7 +38,6 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/utils"
-	"github.com/ethereum/go-ethereum/triedb/database"
 	"github.com/holiman/uint256"
 	"golang.org/x/sync/errgroup"
 )
@@ -155,6 +155,9 @@ type StateDB struct {
 	StorageLoaded  int          // Number of storage slots retrieved from the database during the state transition
 	StorageUpdated atomic.Int64 // Number of storage slots updated during the state transition
 	StorageDeleted atomic.Int64 // Number of storage slots deleted during the state transition
+
+	// 缓存的 deleteKVList，用于 PollCacheTire
+	cachedDeleteKVList *cacheTrie.DeleteKVList
 }
 
 // New creates a new state from a given trie.
@@ -874,64 +877,14 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	}
 
 	// 如果启用了cacheTrie，处理删除的键值对并刷新到主MPT树
-	if cacheDB, ok := s.db.(database.CacheNodeDatabase); ok && cacheDB.CacheTrie() != nil {
+	tdb := s.db.TrieDB()
+	if tdb.CacheTrie() != nil {
 		// 计算缓存树的哈希，这将触发缓存清理，并返回被删除的键值对
-		_, deleteKVList := cacheDB.CacheTrie().Hash()
+		_, deleteKVList := tdb.CacheTrie().Hash()
 
-		// 记录哪些账户的状态被改变了
-		modifiedAccounts := make(map[common.Address]bool)
-
-		// 第一步：先处理所有状态（存储槽）
-		for _, kv := range deleteKVList.Data {
-			// 通过Address区分是否有地址，如果地址非空，则是存储槽
-			if (kv.Address != common.Address{}) && len(kv.Key) > 0 {
-				// 有地址且有键，说明是存储槽
-				addr := kv.Address
-				key := kv.Key
-
-				if obj := s.getStateObject(addr); obj != nil && obj.trie != nil {
-					// 将存储数据写入账户的存储trie
-					obj.SetState(common.BytesToHash(key), common.BytesToHash(kv.Value))
-					// 标记这个账户的状态被修改
-					modifiedAccounts[addr] = true
-				}
-			}
-		}
-
-		// 第二步：更新所有状态被修改的账户的root
-		for addr := range modifiedAccounts {
-			if obj := s.getStateObject(addr); obj != nil {
-				// 更新账户的root
-				obj.updateRoot()
-				// 标记状态对象需要更新
-				s.markUpdate(addr)
-			}
-		}
-
-		// 第三步：处理所有账户
-		for _, kv := range deleteKVList.Data {
-			// 地址为空且键存在，说明是账户
-			if (kv.Address == common.Address{}) && len(kv.Key) > 0 {
-				addr := common.BytesToAddress(kv.Key)
-				// 解析账户数据
-				account := new(types.StateAccount)
-				if err := rlp.DecodeBytes(kv.Value, account); err != nil {
-					s.setError(fmt.Errorf("failed to decode account RLP: %v", err))
-					continue
-				}
-
-				// 当s.trie是StateTrie类型时，使用直接写入trie的方法
-				if secureTrie, ok := s.trie.(*trie.StateTrie); ok {
-					if err := secureTrie.UpdateAccountDirectToTrie(addr, account); err != nil {
-						s.setError(fmt.Errorf("updateAccountDirectToTrie (%x) error: %v", addr[:], err))
-					}
-				} else {
-					// 如果不是StateTrie类型，使用原来的方式
-					if err := s.trie.UpdateAccountRLP(addr, kv.Value, 0); err != nil {
-						s.setError(fmt.Errorf("updateStateObject (%x) error: %v", addr[:], err))
-					}
-				}
-			}
+		if deleteKVList != nil && len(deleteKVList.Data) != 0 {
+			// 存储deleteKVList用于PollCacheTire
+			s.cachedDeleteKVList = deleteKVList
 		}
 	}
 
@@ -1172,12 +1125,6 @@ func (s *StateDB) GetTrie() Trie {
 // commit gathers the state mutations accumulated along with the associated
 // trie changes, resetting all internal flags with the new state as the base.
 func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool) (*stateUpdate, error) {
-	// Short circuit in case any database failure occurred earlier.
-	if s.dbErr != nil {
-		return nil, fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
-	}
-	// Finalize any pending changes and merge everything into the tries
-	s.IntermediateRoot(deleteEmptyObjects)
 
 	// Short circuit if any error occurs within the IntermediateRoot.
 	if s.dbErr != nil {
@@ -1251,6 +1198,9 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool) (*stateU
 	// We need to investigate what's happening as it seems something's wonky.
 	// Obviously it's not an end of the world issue, just something the original
 	// code didn't anticipate for.
+	if s.cachedDeleteKVList != nil {
+		s.PollCacheTire(s.cachedDeleteKVList.BlockNum)
+	}
 	workers.Go(func() error {
 		// Write the account trie changes, measuring the amount of wasted time
 		newroot, set := s.trie.Commit(true)
@@ -1323,6 +1273,10 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool) (*stateU
 	origin := s.originalRoot
 	s.originalRoot = root
 
+	if origin != root {
+		s.originalRoot = root
+
+	}
 	return newStateUpdate(noStorageWiping, origin, root, deletes, updates, nodes), nil
 }
 
@@ -1386,12 +1340,30 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 // Since self-destruction was deprecated with the Cancun fork and there are
 // no empty accounts left that could be deleted by EIP-158, storage wiping
 // should not occur.
-func (s *StateDB) Commit(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (common.Hash, error) {
+func (s *StateDB) PreCommit(deleteEmptyObjects bool) error {
+	// Short circuit in case any database failure occurred earlier.
+	if s.dbErr != nil {
+		return fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
+	}
+	// Finalize any pending changes and merge everything into the tries
+	s.IntermediateRoot(deleteEmptyObjects)
+	return nil
+}
+
+func (s *StateDB) PostCommit(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (common.Hash, error) {
 	ret, err := s.commitAndFlush(block, deleteEmptyObjects, noStorageWiping)
 	if err != nil {
 		return common.Hash{}, err
 	}
 	return ret.root, nil
+}
+
+func (s *StateDB) Commit(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (common.Hash, error) {
+	err := s.PreCommit(deleteEmptyObjects)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	return s.PostCommit(block, deleteEmptyObjects, noStorageWiping)
 }
 
 // Prepare handles the preparatory steps for executing a state transition with.
@@ -1512,5 +1484,89 @@ func mustCopyTrie(t Trie) Trie {
 		return t.Copy()
 	default:
 		panic(fmt.Errorf("unknown trie type %T", t))
+	}
+}
+
+// PostCommit 异步处理缓存中的deleteKVList，并在处理完成后更新缓存树
+// 此函数应该在Commit之后调用
+func (s *StateDB) PollCacheTire(blockNum uint64) {
+	// 如果没有缓存的deleteKVList，直接返回
+	if s.cachedDeleteKVList == nil || len(s.cachedDeleteKVList.Data) == 0 {
+		return
+	}
+
+	// 获取CacheTrie实例
+	var cacheTrie = s.db.TrieDB().CacheTrie()
+
+	// 如果无法获取CacheTrie，直接返回
+	if cacheTrie == nil {
+		return
+	}
+
+	// 记录deleteKVList以便在goroutine中使用
+	deleteKVList := s.cachedDeleteKVList
+
+	// 记录哪些账户的状态被改变了
+	modifiedAccounts := make(map[common.Address]bool)
+
+	// 第一步：先处理所有状态（存储槽）
+	for _, kv := range deleteKVList.Data {
+		// 通过Address区分是否有地址，如果地址非空，则是存储槽
+		if (kv.Address != common.Address{}) && len(kv.Key) > 0 {
+			// 有地址且有键，说明是存储槽
+			addr := kv.Address
+			key := kv.Key
+
+			if obj := s.getStateObject(addr); obj != nil && obj.trie != nil {
+				// 将存储数据写入账户的存储trie
+				obj.SetState(common.BytesToHash(key), common.BytesToHash(kv.Value))
+				// 标记这个账户的状态被修改
+				modifiedAccounts[addr] = true
+			}
+		}
+	}
+
+	// 第二步：更新所有状态被修改的账户的root
+	for addr := range modifiedAccounts {
+		if obj := s.getStateObject(addr); obj != nil {
+			// 更新账户的root
+			obj.updateRoot()
+			// 标记状态对象需要更新
+			s.markUpdate(addr)
+		}
+	}
+
+	// 第三步：处理所有账户
+	for _, kv := range deleteKVList.Data {
+		// 地址为空且键存在，说明是账户
+		if (kv.Address == common.Address{}) && len(kv.Key) > 0 {
+			addr := common.BytesToAddress(kv.Key)
+			// 解析账户数据
+			account := new(types.StateAccount)
+			if err := rlp.DecodeBytes(kv.Value, account); err != nil {
+				s.setError(fmt.Errorf("failed to decode account RLP: %v", err))
+				continue
+			}
+
+			// 当s.trie是StateTrie类型时，使用直接写入trie的方法
+			if secureTrie, ok := s.trie.(*trie.StateTrie); ok {
+				if err := secureTrie.UpdateAccountDirectToTrie(addr, account); err != nil {
+					s.setError(fmt.Errorf("updateAccountDirectToTrie (%x) error: %v", addr[:], err))
+				}
+			} else {
+				// 如果不是StateTrie类型，使用原来的方式
+				if err := s.trie.UpdateAccountRLP(addr, kv.Value, 0); err != nil {
+					s.setError(fmt.Errorf("updateStateObject (%x) error: %v", addr[:], err))
+				}
+			}
+		}
+	}
+
+	// 计算新的根哈希
+	s.trie.Hash()
+
+	// If witness building is enabled, gather the account trie witness
+	if s.witness != nil {
+		s.witness.AddState(s.trie.Witness())
 	}
 }

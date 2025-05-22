@@ -161,7 +161,7 @@ func (t *StateTrie) GetAccount(address common.Address) (*types.StateAccount, err
 	cacheDb, hasCacheDb := t.db.(database.CacheNodeDatabase)
 
 	// 如果启用了缓存且cacheTrie不为空，优先从缓存中获取
-	if hasCacheDb && cacheDb.ReadCache() && cacheDb.CacheTrie() != nil {
+	if hasCacheDb && cacheDb.CacheTrie() != nil {
 		// 从缓存中获取
 		cacheNode, err := cacheDb.CacheTrie().Get(address.Bytes())
 		if err == nil && cacheNode != nil {
