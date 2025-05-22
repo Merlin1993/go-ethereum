@@ -572,6 +572,9 @@ func (s *StateDB) deleteStateObject(addr common.Address) {
 // getStateObject retrieves a state object given by the address, returning nil if
 // the object is not found or was deleted in this execution context.
 func (s *StateDB) getStateObject(addr common.Address) *stateObject {
+	//if addr == common.HexToAddress("0x5Fe5B7546D1628f7348B023A0393de1FC825A4fD") {
+	//	addr = common.HexToAddress("0x5Fe5B7546D1628f7348B023A0393de1FC825A4fD")
+	//}
 	// Prefer live objects if any is available
 	if obj := s.stateObjects[addr]; obj != nil {
 		return obj
@@ -1543,6 +1546,9 @@ func (s *StateDB) PollCacheTire(blockNum uint64) {
 		// 地址为空且键存在，说明是账户
 		if (kv.Address == common.Address{}) && len(kv.Key) > 0 {
 			addr := common.BytesToAddress(kv.Key)
+			//if addr == common.HexToAddress("0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825") {
+			//	addr = common.HexToAddress("0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825")
+			//}
 			// 解析账户数据
 			account := new(types.StateAccount)
 			if err := rlp.DecodeBytes(kv.Value, account); err != nil {

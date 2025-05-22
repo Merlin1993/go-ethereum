@@ -14,8 +14,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 
-	"github.com/ethereum/go-ethereum/core/state/snapshot"
-
 	"github.com/ethereum/go-ethereum/core/tracing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -985,8 +983,8 @@ func TestProcessTransactions(t *testing.T) {
 		ReadCache: false,
 		HashDB:    hashdb.Defaults,
 	})
-	snaps, _ := snapshot.New(snapshot.Config{CacheSize: 10}, db, trieDB, types.EmptyRootHash)
-	sdb := state.NewDatabase(trieDB, snaps)
+	//snaps, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
+	sdb := state.NewDatabase(trieDB, nil)
 
 	// 创建genesis区块和区块链
 	gspec := &Genesis{
@@ -1230,6 +1228,12 @@ func TestProcessTransactions(t *testing.T) {
 
 			// 为所有发送方预分配余额
 			for _, msg := range msgsByBlock[blockNum] {
+				//if msg.From == common.HexToAddress("0x8bae48F227d978d084B009b775222BAaF61ed9fe") && msg.Nonce >= 20 {
+				//	currentNonce := countingStateDB.GetNonce(msg.From)
+				//	t.Logf("cn : %v, msgn: %v", currentNonce, msg.Nonce)
+				//
+				//	//s.trie.GetAccount(common.HexToAddress("0xFD2605a2bF58fDbB90db1Da55dF61628B47F9e8c"))
+				//}
 				countingStateDB.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
 			}
 
@@ -1287,6 +1291,9 @@ func TestProcessTransactions(t *testing.T) {
 
 					// 如果交易成功，记录创建的合约地址
 					if result != nil && result.ContractAddress != (common.Address{}) {
+						//if result.ContractAddress == common.HexToAddress("0xa50156cF80fa9eC2e16899E4fb7e072300787417") {
+						//	result.ContractAddress = common.HexToAddress("0xa50156cF80fa9eC2e16899E4fb7e072300787417")
+						//}
 						counter.ContractAddresses[result.ContractAddress] = true
 					}
 				} else if counter.ContractAddresses[*msg.To] && len(msg.Data) > 0 {
@@ -1319,7 +1326,7 @@ func TestProcessTransactions(t *testing.T) {
 						errorReasons[errReason]++
 					}
 
-					if isContractTx && errReason == "fail get code" {
+					if isContractTx && errReason == "fail get code" && 1 == 0 {
 						// 打印失败的合约地址及其codeHash情况
 						var contractAddr common.Address
 						if msg.To != nil {
