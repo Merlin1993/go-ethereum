@@ -66,6 +66,8 @@ type CacheTrie struct {
 	isCleaningUp        bool             // 是否正在清理
 
 	hrw *HeightRangeWindow //拥塞控制
+
+	codes map[common.Hash][]byte
 }
 
 // -----------------------------------------------------------------------------
@@ -265,6 +267,7 @@ func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 	trie := &CacheTrie{
 		blockNum: 0,
 	}
+	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewHeightRangeWindow(startNum, multiple, maxSize)
 	return trie
 }
@@ -455,6 +458,7 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 		return nil
 	}
 
+	fmt.Println("start prune")
 	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
 	t.StartCleanup()
 
@@ -619,7 +623,7 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 				return shortNode, nil
 			} else {
 				//更新子节点
-				childNode, err := t.insert(n.Val, key[prefixLength+1:], value, bitPos)
+				childNode, err := t.insert(n.Val, key[prefixLength:], value, bitPos)
 				if err != nil {
 					return nil, err
 				}
@@ -637,39 +641,18 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 		//首先把旧的数据取出来，放到fullNode的位置
 		// 处理旧的shortNode，允许shortNode的key是空数组
 		// 创建一个带有键剩余部分的短节点
-		var child *ShortNode
-		if prefixLength < len(n.Key) {
-			child = &ShortNode{
-				Key:   n.Key[prefixLength+1:],
-				Val:   n.Val,
-				flags: n.flags,
-			}
-		} else {
-			child = &ShortNode{
-				Key:   make([]byte, 0),
-				Val:   n.Val,
-				flags: n.flags,
-			}
-		}
-		if prefixLength == 1 && len(n.Key) == 1 {
-			prefixLength = 1
+		var child = &ShortNode{
+			Key:   n.Key[prefixLength+1:],
+			Val:   n.Val,
+			flags: n.flags,
 		}
 		branch.Children[n.Key[prefixLength]] = child
 
 		// 创建一个新的节点
-		var child2 *ShortNode
-		if prefixLength < len(key) {
-			child2 = &ShortNode{
-				Key:   key[prefixLength+1:],
-				Val:   value,
-				flags: t.newNodeFlag(),
-			}
-		} else {
-			child2 = &ShortNode{
-				Key:   make([]byte, 0),
-				Val:   value,
-				flags: t.newNodeFlag(),
-			}
+		var child2 = &ShortNode{
+			Key:   key[prefixLength+1:],
+			Val:   value,
+			flags: t.newNodeFlag(),
 		}
 		child2.updateFlag(bitPos)
 		branch.Children[key[prefixLength]] = child2
@@ -864,4 +847,14 @@ func (t *CacheTrie) GetCleanupResult() common.Hash {
 
 	// 既不在清理中，也没有结果，返回空哈希
 	return common.Hash{}
+}
+
+func (t *CacheTrie) AddCode(codeHash common.Hash, code []byte) {
+	t.codes[codeHash] = code
+}
+
+func (t *CacheTrie) PopCodes() map[common.Hash][]byte {
+	tc := t.codes
+	t.codes = make(map[common.Hash][]byte)
+	return tc
 }

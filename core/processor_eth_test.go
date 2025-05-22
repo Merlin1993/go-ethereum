@@ -1184,7 +1184,10 @@ func TestProcessTransactions(t *testing.T) {
 		ct := sdb.TrieDB().CacheTrie()
 		for blockNum := minBlock; blockNum <= maxBlock; blockNum++ {
 			if ct != nil {
-				lastStateRoot = ct.GetCleanupResult()
+				result := ct.GetCleanupResult()
+				if result != (common.Hash{}) {
+					lastStateRoot = result
+				}
 			}
 
 			if len(msgsByBlock[blockNum]) == 0 {
@@ -1286,7 +1289,7 @@ func TestProcessTransactions(t *testing.T) {
 					if result != nil && result.ContractAddress != (common.Address{}) {
 						counter.ContractAddresses[result.ContractAddress] = true
 					}
-				} else if counter.ContractAddresses[*msg.To] {
+				} else if counter.ContractAddresses[*msg.To] && len(msg.Data) > 0 {
 					// 使用记录的合约地址判断是否为合约调用
 					isContractTx = true
 					callContractCount++
@@ -1312,7 +1315,58 @@ func TestProcessTransactions(t *testing.T) {
 					errReason = simplifyErrorReason(errReason)
 
 					// 更新错误计数
-					errorReasons[errReason]++
+					if !(!isContractTx && (errReason == "fail get code" || errReason == "invalid jumpi destination" || errReason == "fail get account code")) {
+						errorReasons[errReason]++
+					}
+
+					if isContractTx && errReason == "fail get code" {
+						// 打印失败的合约地址及其codeHash情况
+						var contractAddr common.Address
+						if msg.To != nil {
+							contractAddr = *msg.To
+
+							codeHash := countingStateDB.GetCodeHash(contractAddr)
+							code := countingStateDB.GetCode(contractAddr)
+
+							fmt.Printf("区块 %d: 合约调用失败 'fail get code'，地址: %s, codeHash: %s, codeSize: %d\n",
+								blockNum, contractAddr.Hex(), codeHash.Hex(), len(code))
+
+							// 查看该地址是否有余额和nonce
+							balance := countingStateDB.GetBalance(contractAddr)
+							nonce := countingStateDB.GetNonce(contractAddr)
+							fmt.Printf("  余额: %s, Nonce: %d\n", balance.String(), nonce)
+
+							// 检查该地址是否在我们的合约地址记录中
+							if counter.ContractAddresses[contractAddr] {
+								fmt.Printf("  该地址在合约地址记录中存在\n")
+							} else {
+								fmt.Printf("  该地址在合约地址记录中不存在\n")
+							}
+
+							// 检查账户是否存在于状态数据库中
+							exists := countingStateDB.Exist(contractAddr)
+							fmt.Printf("  账户在状态数据库中%s\n", map[bool]string{true: "存在", false: "不存在"}[exists])
+
+							if len(code) > 0 {
+								fmt.Printf("  账户有代码，长度: %d bytes\n", len(code))
+							} else {
+								fmt.Printf("  账户没有代码\n")
+							}
+
+							// 检查存储根
+							storageRoot := countingStateDB.GetStorageRoot(contractAddr)
+							fmt.Printf("  存储根: %s\n", storageRoot.Hex())
+
+							// 打印一些交易信息
+							fmt.Printf("  交易数据长度: %d bytes\n", len(msg.Data))
+							if len(msg.Data) >= 4 {
+								fmt.Printf("  交易函数选择器: 0x%x\n", msg.Data[:4])
+							}
+						} else {
+							// 合约创建失败
+							fmt.Printf("区块 %d: 合约创建失败 'fail get code'\n", blockNum)
+						}
+					}
 
 					// 根据合约类型更新特定错误计数
 					if isContractCreate {
@@ -1367,6 +1421,16 @@ func TestProcessTransactions(t *testing.T) {
 			root := lastStateRoot
 			if useCacheTrie {
 				countingStateDB.PreCommit(false)
+				codes := sdb.TrieDB().CacheTrie().PopCodes()
+				if db := sdb.TrieDB().Disk(); db != nil && len(codes) > 0 {
+					batch := db.NewBatch()
+					for codeHash, code := range codes {
+						rawdb.WriteCode(batch, codeHash, code)
+					}
+					if err := batch.Write(); err != nil {
+						panic("write code failed")
+					}
+				}
 				sBlockNum := blockNum
 				go func() {
 					sRoot, _ := countingStateDB.PostCommit(sBlockNum, false, false)

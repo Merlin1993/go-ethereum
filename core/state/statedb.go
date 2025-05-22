@@ -809,12 +809,14 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			continue
 		}
 		obj := s.stateObjects[addr] // closure for the task runner below
+		if s.db.TrieDB().CacheTrie() != nil && obj.code != nil && len(obj.code) > 0 {
+			s.db.TrieDB().CacheTrie().AddCode(common.BytesToHash(obj.CodeHash()), obj.code)
+		}
 		workers.Go(func() error {
 			if s.db.TrieDB().IsVerkle() {
 				obj.updateTrie()
 			} else {
 				obj.updateRoot()
-
 				// If witness building is enabled and the state object has a trie,
 				// gather the witnesses for its specific storage trie
 				if s.witness != nil && obj.trie != nil {
@@ -876,18 +878,6 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		}
 	}
 
-	// 如果启用了cacheTrie，处理删除的键值对并刷新到主MPT树
-	tdb := s.db.TrieDB()
-	if tdb.CacheTrie() != nil {
-		// 计算缓存树的哈希，这将触发缓存清理，并返回被删除的键值对
-		_, deleteKVList := tdb.CacheTrie().Hash()
-
-		if deleteKVList != nil && len(deleteKVList.Data) != 0 {
-			// 存储deleteKVList用于PollCacheTire
-			s.cachedDeleteKVList = deleteKVList
-		}
-	}
-
 	// Perform updates before deletions.  This prevents resolution of unnecessary trie nodes
 	// in circumstances similar to the following:
 	//
@@ -927,6 +917,18 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	}
 	// Track the amount of time wasted on hashing the account trie
 	defer func(start time.Time) { s.AccountHashes += time.Since(start) }(time.Now())
+
+	// 如果启用了cacheTrie，处理删除的键值对并刷新到主MPT树
+	tdb := s.db.TrieDB()
+	if tdb.CacheTrie() != nil {
+		// 计算缓存树的哈希，这将触发缓存清理，并返回被删除的键值对
+		_, deleteKVList := tdb.CacheTrie().Hash()
+
+		if deleteKVList != nil && len(deleteKVList.Data) != 0 {
+			// 存储deleteKVList用于PollCacheTire
+			s.cachedDeleteKVList = deleteKVList
+		}
+	}
 
 	hash := s.trie.Hash()
 

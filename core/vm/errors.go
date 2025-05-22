@@ -35,6 +35,7 @@ var (
 	ErrMaxCodeSizeExceeded      = errors.New("max code size exceeded")
 	ErrMaxInitCodeSizeExceeded  = errors.New("max initcode size exceeded")
 	ErrInvalidJump              = errors.New("invalid jump destination")
+	ErrInvalidJumpi             = errors.New("invalid jumpi destination")
 	ErrWriteProtection          = errors.New("write protection")
 	ErrReturnDataOutOfBounds    = errors.New("return data out of bounds")
 	ErrGasUintOverflow          = errors.New("gas uint64 overflow")

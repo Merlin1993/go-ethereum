@@ -552,7 +552,7 @@ func opJumpi(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]by
 	pos, cond := scope.Stack.pop(), scope.Stack.pop()
 	if !cond.IsZero() {
 		if !scope.Contract.validJumpdest(&pos) {
-			return nil, ErrInvalidJump
+			return nil, ErrInvalidJumpi
 		}
 		*pc = pos.Uint64() - 1 // pc will be increased by the interpreter loop
 	}

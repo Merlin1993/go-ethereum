@@ -431,6 +431,14 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		floorDataGas     uint64
 	)
 
+	var contractAddr common.Address
+	if contractCreation {
+		contractAddr = crypto.CreateAddress(msg.From, msg.Nonce)
+		if contractAddr == common.HexToAddress("0x1702C089c3D4B2b8e09232F36114E41c214D6939") {
+			contractAddr = common.HexToAddress("0x1702C089c3D4B2b8e09232F36114E41c214D6939")
+		}
+	}
+
 	// Check clauses 4-5, subtract intrinsic gas if everything is correct
 	gas, err := IntrinsicGas(msg.Data, msg.AccessList, msg.SetCodeAuthorizations, contractCreation, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai)
 	if err != nil {
@@ -549,11 +557,6 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		if rules.IsEIP4762 && fee.Sign() != 0 {
 			st.evm.AccessEvents.AddAccount(st.evm.Context.Coinbase, true)
 		}
-	}
-
-	var contractAddr common.Address
-	if contractCreation {
-		contractAddr = crypto.CreateAddress(msg.From, msg.Nonce)
 	}
 
 	return &ExecutionResult{
