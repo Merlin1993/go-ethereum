@@ -942,6 +942,227 @@ func DefaultProcessConfig() ProcessConfig {
 	}
 }
 
+// 自然数字排序函数，保证文件按照数字顺序排序（如：1, 2, ..., 10, 11，而不是1, 10, 11, 2, ...）
+func naturalSort(files []string) {
+	sort.Slice(files, func(i, j int) bool {
+		// 提取文件名
+		fileNameI := filepath.Base(files[i])
+		fileNameJ := filepath.Base(files[j])
+
+		// 从文件名中提取数字部分
+		numStrI := ""
+		numStrJ := ""
+
+		// 提取transactions_或blocks_后面的数字部分
+		if idx := strings.Index(fileNameI, "transactions_"); idx >= 0 {
+			numStrI = fileNameI[idx+len("transactions_"):]
+		} else if idx := strings.Index(fileNameI, "blocks_"); idx >= 0 {
+			numStrI = fileNameI[idx+len("blocks_"):]
+		}
+		if idx := strings.Index(fileNameJ, "transactions_"); idx >= 0 {
+			numStrJ = fileNameJ[idx+len("transactions_"):]
+		} else if idx := strings.Index(fileNameJ, "blocks_"); idx >= 0 {
+			numStrJ = fileNameJ[idx+len("blocks_"):]
+		}
+
+		// 去掉.csv后缀
+		numStrI = strings.TrimSuffix(numStrI, ".csv")
+		numStrJ = strings.TrimSuffix(numStrJ, ".csv")
+
+		// 如果没有数字部分，按原始文件名排序
+		if numStrI == "" || numStrJ == "" {
+			return files[i] < files[j]
+		}
+
+		// 将数字部分转换为整数进行比较
+		numI, errI := strconv.Atoi(numStrI)
+		numJ, errJ := strconv.Atoi(numStrJ)
+
+		// 如果无法转换为数字，按原始文件名排序
+		if errI != nil || errJ != nil {
+			return files[i] < files[j]
+		}
+
+		// 按数字大小排序
+		return numI < numJ
+	})
+}
+
+// 存储区块高度到时间戳的映射
+var blockTimestamps = make(map[uint64]uint64)
+
+// 从对应的区块文件中加载时间戳
+func loadBlockTimestampsFromFile(dataDir string, fileIndex string) error {
+	// 构建区块文件路径
+	var blockFile string
+	if fileIndex == "" {
+		blockFile = filepath.Join(dataDir, "blocks.csv")
+	} else {
+		blockFile = filepath.Join(dataDir, fmt.Sprintf("blocks_%s.csv", fileIndex))
+	}
+
+	// 检查文件是否存在
+	if _, err := os.Stat(blockFile); os.IsNotExist(err) {
+		return fmt.Errorf("区块文件不存在: %s", blockFile)
+	}
+
+	// 打开CSV文件
+	csvFile, err := os.Open(blockFile)
+	if err != nil {
+		return fmt.Errorf("无法打开区块CSV文件 %s: %v", blockFile, err)
+	}
+	defer csvFile.Close()
+
+	// 解析CSV数据
+	reader := csv.NewReader(csvFile)
+	// 读取标题行
+	headers, err := reader.Read()
+	if err != nil {
+		return fmt.Errorf("读取区块CSV头失败: %v", err)
+	}
+
+	// 查找number和timestamp字段的索引
+	var numberIdx, timestampIdx int = -1, -1
+	for i, header := range headers {
+		if header == "number" {
+			numberIdx = i
+		} else if header == "timestamp" {
+			timestampIdx = i
+		}
+	}
+
+	if numberIdx == -1 || timestampIdx == -1 {
+		return fmt.Errorf("区块CSV文件 %s 缺少必要的字段", blockFile)
+	}
+
+	// 读取CSV数据并提取区块高度和时间戳
+	for {
+		record, err := reader.Read()
+		if err != nil {
+			break
+		}
+
+		// 解析区块高度
+		num, err := strconv.ParseUint(record[numberIdx], 10, 64)
+		if err != nil {
+			continue
+		}
+
+		// 解析时间戳
+		timestamp, err := strconv.ParseUint(record[timestampIdx], 10, 64)
+		if err != nil {
+			continue
+		}
+
+		// 存储区块高度和时间戳的映射
+		blockTimestamps[num] = timestamp
+	}
+
+	return nil
+}
+
+// 获取交易文件的索引部分
+func getFileIndex(filePath string) string {
+	fileName := filepath.Base(filePath)
+
+	// 如果是没有索引的文件（如transactions.csv, blocks.csv）
+	if !strings.Contains(fileName, "_") {
+		return ""
+	}
+
+	// 提取索引部分
+	parts := strings.Split(fileName, "_")
+	if len(parts) < 2 {
+		return ""
+	}
+
+	// 移除.csv后缀
+	return strings.TrimSuffix(parts[1], ".csv")
+}
+
+// 获取指定区块的时间戳
+func getBlockTimestamp(dataDir string, blockNum uint64) (uint64, error) {
+	// 如果已经缓存了该区块的时间戳，直接返回
+	if timestamp, ok := blockTimestamps[blockNum]; ok {
+		return timestamp, nil
+	}
+
+	// 查找所有blocks*.csv文件
+	pattern := filepath.Join(dataDir, "blocks*.csv")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		return 0, fmt.Errorf("查找区块CSV文件失败: %v", err)
+	}
+
+	if len(files) == 0 {
+		return 0, fmt.Errorf("未找到任何区块文件")
+	}
+
+	// 按自然数排序文件
+	naturalSort(files)
+
+	// 逐个文件查找区块
+	for _, file := range files {
+		// 打开CSV文件
+		csvFile, err := os.Open(file)
+		if err != nil {
+			continue // 跳过无法打开的文件
+		}
+		defer csvFile.Close()
+
+		// 解析CSV数据
+		reader := csv.NewReader(csvFile)
+		// 读取标题行
+		headers, err := reader.Read()
+		if err != nil {
+			continue // 跳过无法读取标题的文件
+		}
+
+		// 查找number和timestamp字段的索引
+		var numberIdx, timestampIdx int = -1, -1
+		for i, header := range headers {
+			if header == "number" {
+				numberIdx = i
+			} else if header == "timestamp" {
+				timestampIdx = i
+			}
+		}
+
+		if numberIdx == -1 || timestampIdx == -1 {
+			continue // 跳过缺少必要字段的文件
+		}
+
+		// 读取CSV数据并查找目标区块
+		for {
+			record, err := reader.Read()
+			if err != nil {
+				break
+			}
+
+			// 解析区块高度
+			num, err := strconv.ParseUint(record[numberIdx], 10, 64)
+			if err != nil {
+				continue
+			}
+
+			// 找到目标区块
+			if num == blockNum {
+				// 解析时间戳
+				timestamp, err := strconv.ParseUint(record[timestampIdx], 10, 64)
+				if err != nil {
+					return 0, err
+				}
+				// 缓存时间戳
+				blockTimestamps[blockNum] = timestamp
+				return timestamp, nil
+			}
+		}
+	}
+
+	// 没有找到区块，返回默认时间戳
+	return blockNum * 15, nil
+}
+
 // 查找所有匹配的CSV文件并按顺序排序
 func findTransactionFiles(dataDir string) ([]string, error) {
 	// 使用通配符匹配所有transactions_*.csv文件
@@ -951,8 +1172,8 @@ func findTransactionFiles(dataDir string) ([]string, error) {
 		return nil, fmt.Errorf("查找CSV文件失败: %v", err)
 	}
 
-	// 按文件名排序
-	sort.Strings(files)
+	// 按自然数排序
+	naturalSort(files)
 	return files, nil
 }
 
@@ -979,7 +1200,7 @@ func TestProcessTransactions(t *testing.T) {
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
 		Preimages: false,
 		IsVerkle:  false,
-		CacheTrie: useCacheTrie,
+		CacheTrie: common.UseCacheTrie,
 		ReadCache: false,
 		HashDB:    hashdb.Defaults,
 	})
@@ -1008,8 +1229,7 @@ func TestProcessTransactions(t *testing.T) {
 	counter := NewStateAccessCounter(160) // 记录最近50个区块
 
 	// 使用新的数据文件路径
-	pattern := filepath.Join(dataDir, "transactions_*.csv")
-	files, err := filepath.Glob(pattern)
+	files, err := findTransactionFiles(dataDir)
 	if err != nil {
 		t.Fatalf("查找CSV文件失败: %v", err)
 	}
@@ -1017,9 +1237,6 @@ func TestProcessTransactions(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatalf("未找到任何交易文件")
 	}
-
-	// 按文件名排序
-	sort.Strings(files)
 
 	t.Logf("找到 %d 个交易文件", len(files))
 	for i, file := range files {
@@ -1029,6 +1246,18 @@ func TestProcessTransactions(t *testing.T) {
 	// 依次处理每个文件
 	for i, file := range files {
 		t.Logf("开始处理第 %d/%d 个文件: %s", i+1, len(files), file)
+
+		// 获取文件索引，用于加载对应的区块文件
+		fileIndex := getFileIndex(file)
+
+		// 加载对应的区块时间戳
+		err := loadBlockTimestampsFromFile(dataDir, fileIndex)
+		if err != nil {
+			t.Logf("加载区块时间戳失败: %v", err)
+			t.Logf("将使用默认时间戳计算方式")
+		} else {
+			t.Logf("成功加载区块时间戳，当前缓存区块数: %d", len(blockTimestamps))
+		}
 
 		// 打开CSV文件
 		csvFile, err := os.Open(file)
@@ -1126,8 +1355,9 @@ func TestProcessTransactions(t *testing.T) {
 			var data []byte
 			if record[10] != "" && record[10] != "null" {
 				data = common.FromHex(record[10])
-				if gasLimit > 30000 {
-					gasLimit *= 3
+				// 不知道为啥，合约创建的时候，code的大小乘以200的gas消耗老是超
+				if gasLimit > 30000 && to == nil {
+					gasLimit *= 10
 				}
 			}
 
@@ -1195,12 +1425,18 @@ func TestProcessTransactions(t *testing.T) {
 			// 计数器进入新区块
 			counter.NextBlock(blockNum)
 
+			// 获取区块时间戳，如果没有则使用默认计算方式
+			blockTime := uint64(blockNum * 15)
+			if timestamp, ok := blockTimestamps[blockNum]; ok {
+				blockTime = timestamp
+			}
+
 			// 创建新的区块
 			header := &types.Header{
 				ParentHash: parent.Hash(),
 				Number:     new(big.Int).SetUint64(blockNum),
-				GasLimit:   30000000,
-				Time:       uint64(blockNum * 15),
+				GasLimit:   300000000,
+				Time:       blockTime,
 				Difficulty: big.NewInt(1),
 				BaseFee:    big.NewInt(0),
 			}
@@ -1228,12 +1464,12 @@ func TestProcessTransactions(t *testing.T) {
 
 			// 为所有发送方预分配余额
 			for _, msg := range msgsByBlock[blockNum] {
-				//if msg.From == common.HexToAddress("0x8bae48F227d978d084B009b775222BAaF61ed9fe") && msg.Nonce >= 20 {
-				//	currentNonce := countingStateDB.GetNonce(msg.From)
-				//	t.Logf("cn : %v, msgn: %v", currentNonce, msg.Nonce)
-				//
-				//	//s.trie.GetAccount(common.HexToAddress("0xFD2605a2bF58fDbB90db1Da55dF61628B47F9e8c"))
-				//}
+				if common.DebugFlag && msg.From == common.HexToAddress("0x4962f6533141e9e12B9e1846AB549c7042A40098") && msg.Nonce >= 6 {
+					//currentNonce := countingStateDB.GetNonce(msg.From)
+					//t.Logf("cn : %v, msgn: %v", currentNonce, msg.Nonce)
+
+					//s.trie.GetAccount(common.HexToAddress("0xFD2605a2bF58fDbB90db1Da55dF61628B47F9e8c"))
+				}
 				countingStateDB.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
 			}
 
@@ -1272,7 +1508,7 @@ func TestProcessTransactions(t *testing.T) {
 			}
 
 			// 使用countingStateDB作为vm.StateDB
-			vmenv := vm.NewEVM(blockContext, countingStateDB, params.TestChainConfig, vm.Config{})
+			vmenv := vm.NewEVM(blockContext, countingStateDB, params.MainnetChainConfig, vm.Config{})
 
 			for _, msg := range msgsByBlock[blockNum] {
 
@@ -1326,7 +1562,7 @@ func TestProcessTransactions(t *testing.T) {
 						errorReasons[errReason]++
 					}
 
-					if isContractTx && errReason == "fail get code" && 1 == 0 {
+					if common.DebugFlag && isContractTx && errReason == "fail get code" {
 						// 打印失败的合约地址及其codeHash情况
 						var contractAddr common.Address
 						if msg.To != nil {
@@ -1426,7 +1662,7 @@ func TestProcessTransactions(t *testing.T) {
 			rootGenStart := time.Now()
 			var commitDuration time.Duration
 			root := lastStateRoot
-			if useCacheTrie {
+			if common.UseCacheTrie {
 				countingStateDB.PreCommit(false)
 				codes := sdb.TrieDB().CacheTrie().PopCodes()
 				if db := sdb.TrieDB().Disk(); db != nil && len(codes) > 0 {

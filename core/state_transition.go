@@ -434,9 +434,13 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	var contractAddr common.Address
 	if contractCreation {
 		contractAddr = crypto.CreateAddress(msg.From, msg.Nonce)
-		if contractAddr == common.HexToAddress("0x1702C089c3D4B2b8e09232F36114E41c214D6939") {
-			contractAddr = common.HexToAddress("0x1702C089c3D4B2b8e09232F36114E41c214D6939")
+		if common.DebugFlag && contractAddr == common.HexToAddress("0x506F4b138E30f4ed0b9511d4D676EAaECa466983") {
+			contractAddr = common.HexToAddress("0x506F4b138E30f4ed0b9511d4D676EAaECa466983")
 		}
+	}
+
+	if common.DebugFlag && msg.To != nil && (*msg.To) == common.HexToAddress("0xe119f17B2B0B8c10c0182f191F227f959b9FCBeE") {
+		common.HexToAddress("0xe119f17B2B0B8c10c0182f191F227f959b9FCBeE")
 	}
 
 	// Check clauses 4-5, subtract intrinsic gas if everything is correct

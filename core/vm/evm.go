@@ -242,6 +242,9 @@ func (evm *EVM) Call(caller common.Address, addr common.Address, input []byte, g
 			contract.IsSystemCall = isSystemCall(caller)
 			contract.SetCallCode(evm.resolveCodeHash(addr), code)
 			ret, err = evm.interpreter.Run(contract, input, false)
+			if err == ErrInvalidJumpi && len(input) != 0 {
+				err = ErrInvalidJumpi
+			}
 			gas = contract.Gas
 		}
 	}

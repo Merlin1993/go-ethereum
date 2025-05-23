@@ -458,7 +458,7 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 		return nil
 	}
 
-	fmt.Println("start prune")
+	fmt.Println(fmt.Sprintf("start prune, size : %v , window end : %v ,sshresh : %v ", t.root.size(), windowBits, t.hrw.currentSsthresh))
 	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
 	t.StartCleanup()
 

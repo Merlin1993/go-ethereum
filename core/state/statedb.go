@@ -559,6 +559,10 @@ func (s *StateDB) updateStateObject(obj *stateObject) {
 	}
 	if obj.dirtyCode {
 		s.trie.UpdateContractCode(obj.Address(), common.BytesToHash(obj.CodeHash()), obj.code)
+
+		if s.db.TrieDB().CacheTrie() != nil {
+			s.db.TrieDB().CacheTrie().AddCode(common.BytesToHash(obj.CodeHash()), obj.code)
+		}
 	}
 }
 
