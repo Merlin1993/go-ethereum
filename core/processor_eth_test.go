@@ -334,7 +334,6 @@ type BlockStats struct {
 	CallErrorReasons   map[string]int // 合约调用错误原因统计
 
 	// 使用TrieBlockStats包含状态树相关统计
-	TrieStats TrieBlockStats // 状态树统计数据
 }
 
 // 统计聚合结构
@@ -397,7 +396,6 @@ func (s *StatsAggregator) AddBlockStats(stats BlockStats) {
 	s.TotalContractSuccess += stats.ContractSuccessCount
 
 	// 同时记录到TrieStatsAggregator
-	s.TrieStatsAgg.AddBlockStats(stats.TrieStats)
 
 	// 检查是否需要打印统计信息
 	if stats.BlockNum-s.LastOutputBlock >= s.BlockWindow {

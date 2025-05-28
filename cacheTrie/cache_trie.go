@@ -76,7 +76,6 @@ type CacheTrie struct {
 	// 命中/未命中统计
 	hitCount        uint64     // Get/GetWithAddress 操作命中次数
 	missCount       uint64     // Get/GetWithAddress 操作未命中次数
-	updateCount     uint64     // Update/UpdateWithAddress 操作总次数
 	updateHitCount  uint64     // Update/UpdateWithAddress 操作命中次数（更新已存在的键）
 	updateMissCount uint64     // Update/UpdateWithAddress 操作未命中次数（插入新键）
 	statsMu         sync.Mutex // 统计操作的互斥锁
@@ -410,7 +409,6 @@ func (t *CacheTrie) Update(key, value []byte, isNew bool) error {
 
 	// 更新统计信息
 	t.statsMu.Lock()
-	t.updateCount++
 	if nodeExists { // 键已存在，是更新操作
 		t.updateHitCount++
 	} else { // 键不存在，是插入操作
@@ -433,7 +431,6 @@ func (t *CacheTrie) UpdateWithAddress(address common.Address, key, value []byte,
 
 	// 更新统计信息
 	t.statsMu.Lock()
-	t.updateCount++
 	if nodeExists { // 键已存在，是更新操作
 		t.updateHitCount++
 	} else { // 键不存在，是插入操作
@@ -452,7 +449,6 @@ func (t *CacheTrie) Delete(key []byte) error {
 
 	// 更新统计信息 - 删除也是一种更新操作
 	t.statsMu.Lock()
-	t.updateCount++
 	if nodeExists { // 键已存在，是删除操作
 		t.updateHitCount++
 	} else { // 键不存在，是无效删除
@@ -471,7 +467,6 @@ func (t *CacheTrie) DeleteWithAddress(address common.Address, key []byte) error 
 
 	// 更新统计信息 - 删除也是一种更新操作
 	t.statsMu.Lock()
-	t.updateCount++
 	if nodeExists { // 键已存在，是删除操作
 		t.updateHitCount++
 	} else { // 键不存在，是无效删除
@@ -989,12 +984,13 @@ func (t *CacheTrie) GetHitRate() (uint64, uint64, uint64, float64, uint64, uint6
 	}
 
 	var updateHitRate float64 = 0
-	if t.updateCount > 0 {
-		updateHitRate = float64(t.updateHitCount) / float64(t.updateCount)
+	totalUpdateRequests := t.updateHitCount + t.updateMissCount
+	if totalUpdateRequests > 0 {
+		updateHitRate = float64(t.updateHitCount) / float64(totalUpdateRequests)
 	}
 
 	return totalGetRequests, t.hitCount, t.missCount, getHitRate,
-		t.updateCount, t.updateHitCount, t.updateMissCount, updateHitRate
+		totalUpdateRequests, t.updateHitCount, t.updateMissCount, updateHitRate
 }
 
 // ResetStats 重置所有命中/未命中统计数据以及清理统计数据
@@ -1004,7 +1000,6 @@ func (t *CacheTrie) ResetStats() {
 
 	t.hitCount = 0
 	t.missCount = 0
-	t.updateCount = 0
 	t.updateHitCount = 0
 	t.updateMissCount = 0
 

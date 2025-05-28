@@ -25,7 +25,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -55,92 +54,39 @@ const (
 	VerkleTrie
 )
 
-// TrieBlockStats 记录每个区块的状态树统计数据
-type TrieBlockStats struct {
-	BlockNum            uint64        // 区块号
-	WrittenStates       int           // 写入的状态总数量
-	ReadStates          int           // 读取的状态总数量
-	TransactionCount    int           // 交易量
-	TransactionExecTime time.Duration // 交易运行花费时间
-	RootGenTime         time.Duration // 树根生成花费时间
-	DataSizeDelta       int64         // 整个10万区块窗口期内数据目录的总变化量(字节)
-	TrieType            TrieType      // 树类型
-
-	// CacheTrie特有数据
-	CacheHitRate   float64       // 缓存命中率
-	MemorySizeMB   float64       // 内存大小(MB)
-	CacheSize      int           // CacheTrie的size
-	CacheThreshold int           // CacheTrie的阈值
-	CleanupTime    time.Duration // 清理时间
-	CleanupCount   int           // 清理次数
-	MaxCleanupTime time.Duration // 最大清理时间
-
-	// 新增字段: 详细的命中率数据
-	GetHitCount     uint64  // Get操作命中次数
-	GetMissCount    uint64  // Get操作未命中次数
-	GetHitRate      float64 // Get操作命中率
-	UpdateHitCount  uint64  // Update操作命中次数
-	UpdateMissCount uint64  // Update操作未命中次数
-	UpdateHitRate   float64 // Update操作命中率
-}
-
 // TrieStatsAggregator 状态树统计数据聚合器
 type TrieStatsAggregator struct {
-	mu sync.Mutex // 保护内部状态的互斥锁
-	// Stats删除，不再需要
-	OutputDir    string   // 输出目录
-	Window       uint64   // 统计窗口(10w区块)
-	LastOutput   uint64   // 上次输出统计的区块号
-	TrieType     TrieType // 树类型
-	LastDataSize int64    // 上次记录的数据大小
-	DataPath     string   // 数据路径(用于计算数据大小变化)
-
-	// 新增字段用于跟踪命中率重置
-	LastHitRateReset        uint64       // 上次重置命中率的区块号
-	HitRateResetWindow      uint64       // 命中率重置窗口(默认与Window相同)
-	AccumulatedHitRateStats HitRateStats // 累积的命中率统计，在重置窗口后输出
+	mu           sync.Mutex // 保护内部状态的互斥锁
+	OutputDir    string     // 输出目录
+	Window       uint64     // 统计窗口(10w区块)
+	LastOutput   uint64     // 上次输出统计的区块号
+	TrieType     TrieType   // 树类型
+	LastDataSize int64      // 上次记录的数据大小
+	DataPath     string     // 数据路径(用于计算数据大小变化)
 
 	// 累计统计数据
 	WindowStats struct {
+		// 第一类统计：需要累加的数据
 		TotalWrittenStates  int64         // 窗口内写入状态总数
 		TotalReadStates     int64         // 窗口内读取状态总数
 		TotalExecTime       time.Duration // 窗口内交易执行总时间
 		TotalRootGenTime    time.Duration // 窗口内根生成总时间
-		TotalCacheHitRate   float64       // 窗口内缓存命中率总和
 		TotalMemorySize     float64       // 窗口内内存大小总和
 		TotalCacheSize      int64         // 窗口内缓存大小总和
 		TotalCacheThreshold int64         // 窗口内缓存阈值总和
-		TotalCleanupTime    time.Duration // 窗口内清理时间总和
-		TotalCleanupCount   int           // 窗口内清理次数总和
-		MaxCleanupTime      time.Duration // 窗口内最大清理时间
+		MaxMemorySize       float64       // 最大内存使用量
+		MaxCacheSize        int           // 最大缓存大小
+		TotalTxCount        int64         // 总交易数
 		SampleCount         int           // 窗口内样本数量
 		CacheSampleCount    int           // 窗口内缓存样本数量
 
-		// 命中率详细统计
-		TotalGetHits      uint64  // Get命中总数
-		TotalGetMisses    uint64  // Get未命中总数
-		TotalUpdateHits   uint64  // Update命中总数
-		TotalUpdateMisses uint64  // Update未命中总数
-		MaxMemorySize     float64 // 最大内存使用量
-
-		// 新增字段
-		TotalTxCount  int64  // 总交易数
-		StartBlock    uint64 // 窗口起始区块
-		EndBlock      uint64 // 窗口结束区块
-		DataSizeDelta int64  // 数据大小变化
+		// 区块范围记录
+		StartBlock uint64 // 窗口起始区块
+		EndBlock   uint64 // 窗口结束区块
 	}
-}
 
-// HitRateStats 存储命中率统计数据
-type HitRateStats struct {
-	GetHits       uint64  // Get命中次数
-	GetMisses     uint64  // Get未命中次数
-	GetHitRate    float64 // Get命中率
-	UpdateHits    uint64  // Update命中次数
-	UpdateMisses  uint64  // Update未命中次数
-	UpdateHitRate float64 // Update命中率
-	StartBlock    uint64  // 起始区块号
-	EndBlock      uint64  // 结束区块号
+	// CacheTrie实例的引用，用于在输出时获取命中率和清理统计
+	CacheTrieRef *cacheTrie.CacheTrie
 }
 
 // NewTrieStatsAggregator 创建一个新的状态树统计聚合器
@@ -156,157 +102,124 @@ func NewTrieStatsAggregator(outputDir string, dataPath string, trieType TrieType
 		initialSize, _ = CalculateDirSize(dataPath)
 	}
 
-	// 查找最新的区块号，以支持断点续跑
-	lastBlock := findLastOutputBlock(outputDir, trieType)
-
 	return &TrieStatsAggregator{
-		// Stats不再需要
-		OutputDir:          outputDir,
-		Window:             StatsWindow,
-		LastOutput:         lastBlock,
-		TrieType:           trieType,
-		LastDataSize:       initialSize,
-		DataPath:           dataPath,
-		LastHitRateReset:   lastBlock,
-		HitRateResetWindow: StatsWindow, // 默认与统计窗口相同
+		OutputDir:    outputDir,
+		Window:       StatsWindow,
+		LastOutput:   0,
+		TrieType:     trieType,
+		LastDataSize: initialSize,
+		DataPath:     dataPath,
+		CacheTrieRef: nil,
 	}
-}
-
-// 查找最后一次输出的区块号，用于断点续跑
-func findLastOutputBlock(outputDir string, trieType TrieType) uint64 {
-	var prefix string
-	switch trieType {
-	case StandardTrie:
-		prefix = TriePrefix
-	case CacheTrie:
-		prefix = CacheTriePrefix
-	case VerkleTrie:
-		prefix = VerkleTriePrefix
-	}
-
-	// 查找窗口CSV文件
-	pattern := filepath.Join(outputDir, fmt.Sprintf("%s_*.csv", prefix))
-	files, _ := filepath.Glob(pattern)
-
-	var lastBlock uint64
-
-	// 从文件名中提取最后的区块号
-	if len(files) > 0 {
-		// 解析文件名格式：prefix_startBlock_endBlock.csv 或 prefix_range.csv
-		for _, file := range files {
-			base := filepath.Base(file)
-			parts := strings.Split(base, "_")
-			if len(parts) >= 3 {
-				// 获取结束区块号或区块范围
-				endPart := strings.TrimSuffix(parts[len(parts)-1], ".csv")
-
-				// 处理 "startBlock-endBlock" 格式
-				if strings.Contains(endPart, "-") {
-					rangeParts := strings.Split(endPart, "-")
-					if len(rangeParts) == 2 {
-						endBlock, err := strconv.ParseUint(rangeParts[1], 10, 64)
-						if err == nil && endBlock > lastBlock {
-							lastBlock = endBlock
-						}
-					}
-				} else {
-					// 处理纯数字格式
-					endBlock, err := strconv.ParseUint(endPart, 10, 64)
-					if err == nil && endBlock > lastBlock {
-						lastBlock = endBlock
-					}
-				}
-			}
-		}
-	}
-
-	return lastBlock
 }
 
 // AddBlockStats 添加一个区块的统计数据
-func (s *TrieStatsAggregator) AddBlockStats(stats TrieBlockStats) {
+func (s *TrieStatsAggregator) AddBlockStats(blockNum uint64, writtenStates, readStates, txCount int, txExecTime, rootGenTime time.Duration, memorySizeMB float64, cacheSize, cacheThreshold int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 检查是否跳过了10万的整数倍高度
+	// 例如：上次统计是在95000，当前区块是105000，中间跳过了100000这个整数倍高度
+	if s.LastOutput > 0 && blockNum >= (s.LastOutput+s.Window)/s.Window*s.Window &&
+		(blockNum/s.Window) > (s.LastOutput/s.Window) {
+		// 已跳过了至少一个10万整数倍的高度，先输出上一个窗口的统计
+		if s.WindowStats.SampleCount > 0 {
+			s.OutputStats()
+		}
+
+		// 将LastOutput设为最近一个被跳过的10万整数倍
+		// 计算当前区块所在的10万整数倍的前一个10万整数倍
+		s.LastOutput = (blockNum / s.Window) * s.Window
+
+		// 重置窗口统计
+		s.resetWindowStats()
+	}
+
 	// 记录区块范围
 	if s.WindowStats.StartBlock == 0 {
-		s.WindowStats.StartBlock = stats.BlockNum
+		s.WindowStats.StartBlock = blockNum
 	}
-	s.WindowStats.EndBlock = stats.BlockNum
+	s.WindowStats.EndBlock = blockNum
 
-	// 更新窗口累计统计
-	s.WindowStats.TotalWrittenStates += int64(stats.WrittenStates)
-	s.WindowStats.TotalReadStates += int64(stats.ReadStates)
-	s.WindowStats.TotalExecTime += stats.TransactionExecTime
-	s.WindowStats.TotalRootGenTime += stats.RootGenTime
-	s.WindowStats.TotalTxCount += int64(stats.TransactionCount) // 记录总交易数
+	// 更新第一类统计：需要累加的数据
+	s.WindowStats.TotalWrittenStates += int64(writtenStates)
+	s.WindowStats.TotalReadStates += int64(readStates)
+	s.WindowStats.TotalExecTime += txExecTime
+	s.WindowStats.TotalRootGenTime += rootGenTime
+	s.WindowStats.TotalTxCount += int64(txCount)
 	s.WindowStats.SampleCount++
 
 	// 如果是CacheTrie，更新缓存统计
-	if stats.TrieType == CacheTrie {
-		s.WindowStats.TotalCacheHitRate += stats.CacheHitRate
-		s.WindowStats.TotalMemorySize += stats.MemorySizeMB
-		s.WindowStats.TotalCacheSize += int64(stats.CacheSize)
-		s.WindowStats.TotalCacheThreshold += int64(stats.CacheThreshold)
-		s.WindowStats.TotalCleanupTime += stats.CleanupTime
-		s.WindowStats.TotalCleanupCount += stats.CleanupCount
+	if s.TrieType == CacheTrie {
+		s.WindowStats.TotalMemorySize += memorySizeMB
+		s.WindowStats.TotalCacheSize += int64(cacheSize)
+		s.WindowStats.TotalCacheThreshold += int64(cacheThreshold)
 		s.WindowStats.CacheSampleCount++
 
-		// 更新最大清理时间
-		if stats.MaxCleanupTime > s.WindowStats.MaxCleanupTime {
-			s.WindowStats.MaxCleanupTime = stats.MaxCleanupTime
+		// 更新最大值
+		if memorySizeMB > s.WindowStats.MaxMemorySize {
+			s.WindowStats.MaxMemorySize = memorySizeMB
 		}
 
-		// 更新命中率详细统计
-		s.WindowStats.TotalGetHits += stats.GetHitCount
-		s.WindowStats.TotalGetMisses += stats.GetMissCount
-		s.WindowStats.TotalUpdateHits += stats.UpdateHitCount
-		s.WindowStats.TotalUpdateMisses += stats.UpdateMissCount
-
-		// 更新最大内存使用量
-		if stats.MemorySizeMB > s.WindowStats.MaxMemorySize {
-			s.WindowStats.MaxMemorySize = stats.MemorySizeMB
+		if cacheSize > s.WindowStats.MaxCacheSize {
+			s.WindowStats.MaxCacheSize = cacheSize
 		}
 	}
 
-	// 检查是否需要输出窗口统计
-	if stats.BlockNum-s.LastOutput >= s.Window {
-		// 计算数据大小变化
-		if s.DataPath != "" {
-			currentSize := s.GetCurrentDataSize()
-			s.WindowStats.DataSizeDelta = currentSize - s.LastDataSize
-			s.LastDataSize = currentSize
-		}
-
+	// 检查当前区块是否是10万的整数倍
+	if blockNum >= s.Window && blockNum%s.Window == 0 {
 		// 输出统计
-		s.OutputStatsOptimized()
-		s.LastOutput = stats.BlockNum
+		s.OutputStats()
+		s.LastOutput = blockNum
 
 		// 重置窗口统计
+		s.resetWindowStats()
+	} else if blockNum-s.LastOutput >= s.Window {
+		// 处理非10万整数倍但已超过10万区块的情况
+		// 这种情况不应该发生，因为我们在上面已经处理了跳过的情况
+		// 但为了健壮性保留此逻辑
+		s.OutputStats()
+		s.LastOutput = blockNum
 		s.resetWindowStats()
 	}
 }
 
 // OutputStats 输出窗口(10万区块)统计数据
 func (s *TrieStatsAggregator) OutputStats() {
-	// 使用优化后的输出方法
-	s.OutputStatsOptimized()
-}
+	// 获取第三类统计：数据大小变化
+	var dataSizeDelta int64
+	if s.DataPath != "" {
+		currentSize := s.GetCurrentDataSize()
+		dataSizeDelta = currentSize - s.LastDataSize
+		s.LastDataSize = currentSize
+	}
 
-// printWindowStats 打印窗口统计信息
-func (s *TrieStatsAggregator) printWindowStats() {
-	// 使用优化后的打印方法
-	s.printWindowStatsOptimized()
-}
+	// 获取第二类统计：CacheTrie的命中率和清理统计
+	var getHitRate, updateHitRate float64
+	var cleanupCount int
+	var totalCleanupTime, maxCleanupTime time.Duration
+	var getHits, getMisses, updateHits, updateMisses uint64
 
-// outputCSV 输出CSV文件
-func (s *TrieStatsAggregator) outputCSV(startBlock, endBlock uint64) {
-	// 使用优化后的CSV输出方法
-	s.outputCSVOptimized()
+	if s.TrieType == CacheTrie && s.CacheTrieRef != nil {
+		// 获取命中率
+		getHits, getMisses, _, getHitRate, updateHits, updateMisses, _, updateHitRate = s.CacheTrieRef.GetHitRate()
+
+		// 获取清理统计
+		cleanupCount = s.CacheTrieRef.GetCleanupCount()
+		totalCleanupTime, maxCleanupTime = s.CacheTrieRef.GetCleanupTimes()
+
+		// 重置统计数据
+		s.CacheTrieRef.ResetStats()
+	}
+
+	// 打印统计信息到控制台
+	s.printWindowStats(dataSizeDelta, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime)
+
+	// 输出CSV文件
+	s.outputCSV(dataSizeDelta, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime)
 }
 
 // GetCurrentDataSize 获取当前数据目录大小
-// 注意：此方法会执行文件系统操作，应当只在窗口统计周期结束时（每10万区块）调用一次，以减少IO开销
 func (s *TrieStatsAggregator) GetCurrentDataSize() int64 {
 	if s.DataPath == "" {
 		return 0
@@ -334,14 +247,12 @@ func getTrieTypeName(trieType TrieType) string {
 	}
 }
 
-// 以下是用于实际实现的支持函数
-
 // CreateTrieStatsRecorder 创建一个状态树统计记录器
 func CreateTrieStatsRecorder(outputDir, dataPath string, trieType TrieType) *TrieStatsAggregator {
 	return NewTrieStatsAggregator(outputDir, dataPath, trieType)
 }
 
-// RecordTrieStats 记录状态树统计数据
+// RecordTrieStats 记录标准Trie的状态树统计数据
 func RecordTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writtenStates, readStates, txCount int,
 	txExecTime, rootGenTime time.Duration) {
 
@@ -350,31 +261,8 @@ func RecordTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writtenStat
 		os.MkdirAll(recorder.OutputDir, 0755)
 	}
 
-	// 只在窗口统计周期结束时（每10万区块）计算数据大小变化
-	// DataSizeDelta表示整个10万区块窗口期内数据目录的总变化量，单位为字节
-	var dataSizeDelta int64
-	if (blockNum - recorder.LastOutput) >= recorder.Window-1 {
-		// 获取当前数据大小
-		currentSize := recorder.GetCurrentDataSize()
-		dataSizeDelta = currentSize - recorder.LastDataSize
-		// 更新LastDataSize用于下一个窗口周期
-		recorder.LastDataSize = currentSize
-	}
-
-	// 创建基础统计数据
-	stats := TrieBlockStats{
-		BlockNum:            blockNum,
-		WrittenStates:       writtenStates,
-		ReadStates:          readStates,
-		TransactionCount:    txCount,
-		TransactionExecTime: txExecTime,
-		RootGenTime:         rootGenTime,
-		DataSizeDelta:       dataSizeDelta, // 整个窗口期的总变化量(字节)
-		TrieType:            recorder.TrieType,
-	}
-
-	// 添加统计数据
-	recorder.AddBlockStats(stats)
+	// 添加基本统计数据
+	recorder.AddBlockStats(blockNum, writtenStates, readStates, txCount, txExecTime, rootGenTime, 0, 0, 0)
 }
 
 // RecordCacheTrieStats 记录 CacheTrie 的状态树统计数据
@@ -386,112 +274,24 @@ func RecordCacheTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writte
 		os.MkdirAll(recorder.OutputDir, 0755)
 	}
 
-	// 只在窗口统计周期结束时（每10万区块）计算数据大小变化
-	// DataSizeDelta表示整个10万区块窗口期内数据目录的总变化量，单位为字节
-	var dataSizeDelta int64
-	if (blockNum - recorder.LastOutput) >= recorder.Window-1 {
-		// 获取当前数据大小
-		currentSize := recorder.GetCurrentDataSize()
-		dataSizeDelta = currentSize - recorder.LastDataSize
-		// 更新LastDataSize用于下一个窗口周期
-		recorder.LastDataSize = currentSize
-	}
+	// 保存CacheTrie实例的引用，用于在输出时获取命中率和清理统计
+	recorder.mu.Lock()
+	recorder.CacheTrieRef = cacheTrie
+	recorder.mu.Unlock()
 
-	// 创建基础统计数据
-	stats := TrieBlockStats{
-		BlockNum:            blockNum,
-		WrittenStates:       writtenStates,
-		ReadStates:          readStates,
-		TransactionCount:    txCount,
-		TransactionExecTime: txExecTime,
-		RootGenTime:         rootGenTime,
-		DataSizeDelta:       dataSizeDelta, // 整个窗口期的总变化量(字节)
-		TrieType:            CacheTrie,
-	}
+	// 获取当前的内存大小和缓存大小
+	var memorySizeMB float64
+	var cacheSize, cacheThreshold int
 
-	// 如果提供了 CacheTrie 实例，获取额外的缓存统计信息
 	if cacheTrie != nil {
-		// 检查是否需要获取命中率并重置
-		needResetStats := (blockNum-recorder.LastHitRateReset >= recorder.HitRateResetWindow)
-
-		// 获取当前的内存大小和缓存大小
 		memorySize := cacheTrie.GetMemorySize()
-		memorySizeMB := float64(memorySize) / MBSize
-		stats.MemorySizeMB = memorySizeMB
-		stats.CacheSize = cacheTrie.GetSize()
-
-		// 如果达到了命中率重置窗口，获取并重置统计
-		if needResetStats {
-			// 获取详细命中率
-			getHit, getMiss, _, getHitRate, updateHit, updateMiss, _, updateHitRate := cacheTrie.GetHitRate()
-
-			// 获取清理统计
-			cleanupCount := cacheTrie.GetCleanupCount()
-			totalCleanupTime, maxCleanupTime := cacheTrie.GetCleanupTimes()
-
-			// 更新累积的命中率统计
-			recorder.mu.Lock()
-			recorder.AccumulatedHitRateStats = HitRateStats{
-				GetHits:       getHit,
-				GetMisses:     getMiss,
-				GetHitRate:    getHitRate * 100, // 转换为百分比
-				UpdateHits:    updateHit,
-				UpdateMisses:  updateMiss,
-				UpdateHitRate: updateHitRate * 100, // 转换为百分比
-				StartBlock:    recorder.LastHitRateReset,
-				EndBlock:      blockNum,
-			}
-
-			// 设置详细的命中率数据
-			stats.GetHitCount = getHit
-			stats.GetMissCount = getMiss
-			stats.GetHitRate = getHitRate * 100 // 转换为百分比
-			stats.UpdateHitCount = updateHit
-			stats.UpdateMissCount = updateMiss
-			stats.UpdateHitRate = updateHitRate * 100 // 转换为百分比
-
-			// 设置清理统计数据
-			stats.CleanupCount = cleanupCount
-			stats.CleanupTime = totalCleanupTime
-			stats.MaxCleanupTime = maxCleanupTime
-
-			// 综合命中率 (原有逻辑保留)
-			hitRate := (getHitRate + updateHitRate) * 50 // 两者各占50%
-			stats.CacheHitRate = hitRate
-
-			// 更新上次重置的区块号
-			recorder.LastHitRateReset = blockNum
-			recorder.mu.Unlock()
-
-			// 重置命中率和清理统计
-			cacheTrie.ResetStats()
-
-			fmt.Printf("在区块 %d 获取并重置CacheTrie命中率和清理统计\n", blockNum)
-		} else {
-			// 如果不需要重置，使用累积的统计数据（如果有）
-			recorder.mu.Lock()
-			if recorder.AccumulatedHitRateStats.EndBlock > 0 {
-				stats.GetHitCount = recorder.AccumulatedHitRateStats.GetHits
-				stats.GetMissCount = recorder.AccumulatedHitRateStats.GetMisses
-				stats.GetHitRate = recorder.AccumulatedHitRateStats.GetHitRate
-				stats.UpdateHitCount = recorder.AccumulatedHitRateStats.UpdateHits
-				stats.UpdateMissCount = recorder.AccumulatedHitRateStats.UpdateMisses
-				stats.UpdateHitRate = recorder.AccumulatedHitRateStats.UpdateHitRate
-				stats.CacheHitRate = (stats.GetHitRate + stats.UpdateHitRate) / 2
-			}
-
-			// 获取当前的清理统计
-			stats.CleanupCount = cacheTrie.GetCleanupCount()
-			totalTime, maxTime := cacheTrie.GetCleanupTimes()
-			stats.CleanupTime = totalTime
-			stats.MaxCleanupTime = maxTime
-
-			recorder.mu.Unlock()
-		}
+		memorySizeMB = float64(memorySize) / MBSize
+		cacheSize = cacheTrie.GetSize()
+		cacheThreshold = cacheTrie.GetHRW().GetThreshold()
 	}
 
 	// 添加统计数据
-	recorder.AddBlockStats(stats)
+	recorder.AddBlockStats(blockNum, writtenStates, readStates, txCount, txExecTime, rootGenTime, memorySizeMB, cacheSize, cacheThreshold)
 }
 
 // RecordVerkleTrieStats 记录 VerkleTrie 的状态树统计数据
@@ -503,90 +303,38 @@ func RecordVerkleTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writt
 		os.MkdirAll(recorder.OutputDir, 0755)
 	}
 
-	// 只在窗口统计周期结束时（每10万区块）计算数据大小变化
-	// DataSizeDelta表示整个10万区块窗口期内数据目录的总变化量，单位为字节
-	var dataSizeDelta int64
-	if (blockNum - recorder.LastOutput) >= recorder.Window-1 {
-		// 获取当前数据大小
-		currentSize := recorder.GetCurrentDataSize()
-		dataSizeDelta = currentSize - recorder.LastDataSize
-		// 更新LastDataSize用于下一个窗口周期
-		recorder.LastDataSize = currentSize
-	}
-
-	// 创建基础统计数据
-	stats := TrieBlockStats{
-		BlockNum:            blockNum,
-		WrittenStates:       writtenStates,
-		ReadStates:          readStates,
-		TransactionCount:    txCount,
-		TransactionExecTime: txExecTime,
-		RootGenTime:         rootGenTime,
-		DataSizeDelta:       dataSizeDelta, // 整个窗口期的总变化量(字节)
-		TrieType:            VerkleTrie,
-	}
-
-	// 添加统计数据
-	recorder.AddBlockStats(stats)
-}
-
-// SetCacheTrieExtraStats 设置CacheTrie的额外统计信息
-func SetCacheTrieExtraStats(recorder *TrieStatsAggregator, threshold int, cleanupTime time.Duration, cleanupCount int) {
-	// 锁定以确保线程安全
-	recorder.mu.Lock()
-	defer recorder.mu.Unlock()
-
-	// 直接更新WindowStats中的相关字段
-	if recorder.TrieType == CacheTrie {
-		recorder.WindowStats.TotalCacheThreshold += int64(threshold)
-		recorder.WindowStats.TotalCleanupTime += cleanupTime
-		recorder.WindowStats.TotalCleanupCount += cleanupCount
-	}
-}
-
-// OutputStatsOptimized 输出优化后的窗口统计数据
-func (s *TrieStatsAggregator) OutputStatsOptimized() {
-	// 打印统计信息到控制台
-	s.printWindowStatsOptimized()
-
-	// 输出CSV文件
-	s.outputCSVOptimized()
+	// 添加基本统计数据
+	recorder.AddBlockStats(blockNum, writtenStates, readStates, txCount, txExecTime, rootGenTime, 0, 0, 0)
 }
 
 // resetWindowStats 重置窗口统计数据
 func (s *TrieStatsAggregator) resetWindowStats() {
 	s.WindowStats = struct {
+		// 第一类统计：需要累加的数据
 		TotalWrittenStates  int64
 		TotalReadStates     int64
 		TotalExecTime       time.Duration
 		TotalRootGenTime    time.Duration
-		TotalCacheHitRate   float64
 		TotalMemorySize     float64
 		TotalCacheSize      int64
 		TotalCacheThreshold int64
-		TotalCleanupTime    time.Duration
-		TotalCleanupCount   int
-		MaxCleanupTime      time.Duration
+		MaxMemorySize       float64
+		MaxCacheSize        int
+		TotalTxCount        int64
 		SampleCount         int
 		CacheSampleCount    int
 
-		// 命中率详细统计
-		TotalGetHits      uint64
-		TotalGetMisses    uint64
-		TotalUpdateHits   uint64
-		TotalUpdateMisses uint64
-		MaxMemorySize     float64
-
-		// 新增字段
-		TotalTxCount  int64
-		StartBlock    uint64
-		EndBlock      uint64
-		DataSizeDelta int64
+		// 区块范围记录
+		StartBlock uint64
+		EndBlock   uint64
 	}{}
 }
 
-// printWindowStatsOptimized 打印优化后的窗口统计信息
-func (s *TrieStatsAggregator) printWindowStatsOptimized() {
+// printWindowStats 打印窗口统计信息
+func (s *TrieStatsAggregator) printWindowStats(dataSizeDelta int64, getHitRate, updateHitRate float64,
+	getHits, getMisses, updateHits, updateMisses uint64,
+	cleanupCount int, totalCleanupTime, maxCleanupTime time.Duration) {
+
 	var typeStr string
 	switch s.TrieType {
 	case StandardTrie:
@@ -622,47 +370,29 @@ func (s *TrieStatsAggregator) printWindowStatsOptimized() {
 
 	// CacheTrie特有统计
 	if s.TrieType == CacheTrie && s.WindowStats.CacheSampleCount > 0 {
-		// 计算命中率
-		var getHitRate, updateHitRate float64
-		getTotalOps := s.WindowStats.TotalGetHits + s.WindowStats.TotalGetMisses
-		updateTotalOps := s.WindowStats.TotalUpdateHits + s.WindowStats.TotalUpdateMisses
-
-		if getTotalOps > 0 {
-			getHitRate = float64(s.WindowStats.TotalGetHits) / float64(getTotalOps) * 100
-		}
-
-		if updateTotalOps > 0 {
-			updateHitRate = float64(s.WindowStats.TotalUpdateHits) / float64(updateTotalOps) * 100
-		}
-
-		// 检查阈值
+		// 计算平均值
+		avgMemorySize := s.WindowStats.TotalMemorySize / float64(s.WindowStats.CacheSampleCount)
+		avgCacheSize := float64(s.WindowStats.TotalCacheSize) / float64(s.WindowStats.CacheSampleCount)
 		avgThreshold := float64(s.WindowStats.TotalCacheThreshold) / float64(s.WindowStats.CacheSampleCount)
-		thresholdComment := ""
-		if avgThreshold <= 0 {
-			thresholdComment = " (警告: 阈值为0，可能是HRW未正确初始化或GetThreshold未实现)"
-		}
 
 		fmt.Printf("\n----- CacheTrie特有统计 -----\n")
 		fmt.Printf("Get命中率: %.2f%% (命中: %d, 未命中: %d, 总数: %d)\n",
-			getHitRate, s.WindowStats.TotalGetHits, s.WindowStats.TotalGetMisses, getTotalOps)
+			getHitRate*100, getHits, getMisses, getHits+getMisses)
 		fmt.Printf("Update命中率: %.2f%% (命中: %d, 未命中: %d, 总数: %d)\n",
-			updateHitRate, s.WindowStats.TotalUpdateHits, s.WindowStats.TotalUpdateMisses, updateTotalOps)
+			updateHitRate*100, updateHits, updateMisses, updateHits+updateMisses)
 
-		fmt.Printf("最大内存使用: %.2f MB\n", s.WindowStats.MaxMemorySize)
-		fmt.Printf("平均缓存大小: %.2f, 平均阈值: %.2f%s\n",
-			float64(s.WindowStats.TotalCacheSize)/float64(s.WindowStats.CacheSampleCount),
-			avgThreshold, thresholdComment)
+		fmt.Printf("平均内存使用: %.2f MB, 最大内存使用: %.2f MB\n", avgMemorySize, s.WindowStats.MaxMemorySize)
+		fmt.Printf("平均缓存大小: %.2f, 最大缓存大小: %d, 平均阈值: %.2f\n",
+			avgCacheSize, s.WindowStats.MaxCacheSize, avgThreshold)
 
 		// 显示总清理时间和总清理次数
 		fmt.Printf("总清理时间: %d 微秒, 总清理次数: %d, 最大单次清理时间: %d 微秒\n",
-			s.WindowStats.TotalCleanupTime.Microseconds(),
-			s.WindowStats.TotalCleanupCount,
-			s.WindowStats.MaxCleanupTime.Microseconds())
+			totalCleanupTime.Microseconds(), cleanupCount, maxCleanupTime.Microseconds())
 	}
 
 	// 数据大小变化
 	if s.DataPath != "" {
-		dataSizeDeltaMB := float64(s.WindowStats.DataSizeDelta) / MBSize
+		dataSizeDeltaMB := float64(dataSizeDelta) / MBSize
 
 		fmt.Printf("\n----- 数据大小统计 -----\n")
 		fmt.Printf("数据大小总变化: %.2f MB\n", dataSizeDeltaMB)
@@ -671,8 +401,11 @@ func (s *TrieStatsAggregator) printWindowStatsOptimized() {
 	fmt.Println("=======================================")
 }
 
-// outputCSVOptimized 输出优化后的CSV文件，只包含10万区块的汇总统计
-func (s *TrieStatsAggregator) outputCSVOptimized() {
+// outputCSV 输出CSV文件
+func (s *TrieStatsAggregator) outputCSV(dataSizeDelta int64, getHitRate, updateHitRate float64,
+	getHits, getMisses, updateHits, updateMisses uint64,
+	cleanupCount int, totalCleanupTime, maxCleanupTime time.Duration) {
+
 	var prefix string
 	switch s.TrieType {
 	case StandardTrie:
@@ -712,9 +445,10 @@ func (s *TrieStatsAggregator) outputCSVOptimized() {
 	// 如果是CacheTrie，添加额外的列
 	if s.TrieType == CacheTrie {
 		headers = append(headers,
-			"AvgCacheHitRate(%)",
+			"AvgMemorySize(MB)",
 			"MaxMemorySize(MB)",
 			"AvgCacheSize",
+			"MaxCacheSize",
 			"AvgCacheThreshold",
 			"TotalCleanupTime(us)",
 			"TotalCleanupCount",
@@ -733,7 +467,7 @@ func (s *TrieStatsAggregator) outputCSVOptimized() {
 	}
 
 	// 数据大小变化（MB）
-	dataSizeDeltaMB := float64(s.WindowStats.DataSizeDelta) / MBSize
+	dataSizeDeltaMB := float64(dataSizeDelta) / MBSize
 
 	// 只写入一行汇总数据
 	record := []string{
@@ -748,28 +482,22 @@ func (s *TrieStatsAggregator) outputCSVOptimized() {
 
 	// 如果是CacheTrie，添加额外的统计
 	if s.TrieType == CacheTrie && s.WindowStats.CacheSampleCount > 0 {
-		var getHitRate, updateHitRate float64
-		getTotalOps := s.WindowStats.TotalGetHits + s.WindowStats.TotalGetMisses
-		updateTotalOps := s.WindowStats.TotalUpdateHits + s.WindowStats.TotalUpdateMisses
-
-		if getTotalOps > 0 {
-			getHitRate = float64(s.WindowStats.TotalGetHits) / float64(getTotalOps) * 100
-		}
-
-		if updateTotalOps > 0 {
-			updateHitRate = float64(s.WindowStats.TotalUpdateHits) / float64(updateTotalOps) * 100
-		}
+		// 计算平均值
+		avgMemorySize := s.WindowStats.TotalMemorySize / float64(s.WindowStats.CacheSampleCount)
+		avgCacheSize := float64(s.WindowStats.TotalCacheSize) / float64(s.WindowStats.CacheSampleCount)
+		avgThreshold := float64(s.WindowStats.TotalCacheThreshold) / float64(s.WindowStats.CacheSampleCount)
 
 		record = append(record,
-			strconv.FormatFloat(s.WindowStats.TotalCacheHitRate/float64(s.WindowStats.CacheSampleCount), 'f', 2, 64),
+			strconv.FormatFloat(avgMemorySize, 'f', 2, 64),
 			strconv.FormatFloat(s.WindowStats.MaxMemorySize, 'f', 2, 64),
-			strconv.FormatFloat(float64(s.WindowStats.TotalCacheSize)/float64(s.WindowStats.CacheSampleCount), 'f', 2, 64),
-			strconv.FormatFloat(float64(s.WindowStats.TotalCacheThreshold)/float64(s.WindowStats.CacheSampleCount), 'f', 2, 64),
-			strconv.FormatInt(s.WindowStats.TotalCleanupTime.Microseconds(), 10),
-			strconv.Itoa(s.WindowStats.TotalCleanupCount),
-			strconv.FormatInt(s.WindowStats.MaxCleanupTime.Microseconds(), 10),
-			strconv.FormatFloat(getHitRate, 'f', 2, 64),
-			strconv.FormatFloat(updateHitRate, 'f', 2, 64))
+			strconv.FormatFloat(avgCacheSize, 'f', 2, 64),
+			strconv.Itoa(s.WindowStats.MaxCacheSize),
+			strconv.FormatFloat(avgThreshold, 'f', 2, 64),
+			strconv.FormatInt(totalCleanupTime.Microseconds(), 10),
+			strconv.Itoa(cleanupCount),
+			strconv.FormatInt(maxCleanupTime.Microseconds(), 10),
+			strconv.FormatFloat(getHitRate*100, 'f', 2, 64),
+			strconv.FormatFloat(updateHitRate*100, 'f', 2, 64))
 	}
 
 	writer.Write(record)

@@ -1366,16 +1366,6 @@ func TestCompareProcessTransactions(t *testing.T) {
 				RecordCacheTrieStats(cacheTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
 					len(msgsByBlock[blockNum]), processDuration, rootGenDuration, ct)
 
-				// 获取清理次数
-				cleanupCount := ct.GetCleanupCount()
-
-				// 设置额外的CacheTrie统计信息
-				threshold := 0
-				if hrw := ct.GetHRW(); hrw != nil {
-					threshold = int(hrw.GetThreshold())
-				}
-
-				SetCacheTrieExtraStats(cacheTrieRecorder, threshold, commitDuration, cleanupCount)
 			} else if trieDB.IsVerkle() {
 				// 记录VerkleTrie统计
 				RecordVerkleTrieStats(verkleTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
