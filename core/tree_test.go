@@ -506,7 +506,7 @@ func testKVTreePerformance(t *testing.T, dbPath string, totalEntries, entriesPer
 			runtime.ReadMemStats(&m)
 
 			// 获取数据库大小
-			dbSize, _ := getDirSize(dbPath)
+			dbSize, _ := GetDirSize(dbPath)
 			totalBytesWritten = dbSize
 
 			// 记录性能数据点
@@ -536,7 +536,7 @@ func testKVTreePerformance(t *testing.T, dbPath string, totalEntries, entriesPer
 			lastReportTime = time.Now()
 
 			// 获取数据库大小
-			dbSize, _ := getDirSize(dbPath)
+			dbSize, _ := GetDirSize(dbPath)
 			totalBytesWritten = dbSize
 
 			// 获取内存使用
@@ -743,7 +743,7 @@ func testTriePerformance(t *testing.T, dbPath string, totalEntries, entriesPerCo
 			runtime.ReadMemStats(&m)
 
 			// 获取数据库大小
-			dbSize, _ := getDirSize(dbPath)
+			dbSize, _ := GetDirSize(dbPath)
 			totalBytesWritten = dbSize
 
 			// 记录性能数据点
@@ -773,7 +773,7 @@ func testTriePerformance(t *testing.T, dbPath string, totalEntries, entriesPerCo
 			lastReportTime = time.Now()
 
 			// 获取数据库大小
-			dbSize, _ := getDirSize(dbPath)
+			dbSize, _ := GetDirSize(dbPath)
 			totalBytesWritten = dbSize
 
 			// 获取内存使用
@@ -989,7 +989,7 @@ func testVerkleTreePerformance(t *testing.T, dbPath string, totalEntries, entrie
 			runtime.ReadMemStats(&m)
 
 			// 获取数据库大小
-			dbSize, _ := getDirSize(dbPath)
+			dbSize, _ := GetDirSize(dbPath)
 			totalBytesWritten = dbSize
 
 			// 记录性能数据点
@@ -1019,7 +1019,7 @@ func testVerkleTreePerformance(t *testing.T, dbPath string, totalEntries, entrie
 			lastReportTime = time.Now()
 
 			// 获取数据库大小
-			dbSize, _ := getDirSize(dbPath)
+			dbSize, _ := GetDirSize(dbPath)
 			totalBytesWritten = dbSize
 
 			// 获取内存使用
@@ -1085,7 +1085,7 @@ func openDatabase(path string, namespace string) (ethdb.Database, error) {
 }
 
 // 获取目录大小（以字节为单位）
-func getDirSize(path string) (int64, error) {
+func GetDirSize(path string) (int64, error) {
 	var size int64
 	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {

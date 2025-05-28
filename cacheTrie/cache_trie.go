@@ -64,6 +64,7 @@ type CacheTrie struct {
 	cleanupResults      common.Hash      // 清理结果缓存
 	cleanupChan         chan common.Hash // 清理结果通知通道
 	isCleaningUp        bool             // 是否正在清理
+	cleanupCount        int              // 清理次数统计
 
 	hrw *HeightRangeWindow //拥塞控制
 
@@ -548,7 +549,7 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 		return nil
 	}
 
-	fmt.Println(fmt.Sprintf("start prune, size : %v , window end : %v ,sshresh : %v ", t.root.size(), windowBits, t.hrw.currentSsthresh))
+	//fmt.Println(fmt.Sprintf("start prune, size : %v , window end : %v ,sshresh : %v ", t.root.size(), windowBits, t.hrw.currentSsthresh))
 	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
 	t.StartCleanup()
 
@@ -871,6 +872,7 @@ func (t *CacheTrie) StartCleanup() bool {
 	// 记录当前清理的区块号并设置清理标志
 	t.currentCleanupBlock = t.blockNum
 	t.isCleaningUp = true
+	t.cleanupCount++ // 增加清理次数计数
 
 	// 确保通道已初始化
 	if t.cleanupChan == nil {
@@ -1115,4 +1117,28 @@ func (t *CacheTrie) calculateNodeSize(n cacheNode) int64 {
 	}
 
 	return size
+}
+
+// 添加 GetCleanupCount 方法获取清理次数
+func (t *CacheTrie) GetCleanupCount() int {
+	t.cleanupMu.Lock()
+	defer t.cleanupMu.Unlock()
+	return t.cleanupCount
+}
+
+// 添加 ResetCleanupCount 方法重置清理次数
+func (t *CacheTrie) ResetCleanupCount() {
+	t.cleanupMu.Lock()
+	defer t.cleanupMu.Unlock()
+	t.cleanupCount = 0
+}
+
+// 添加 GetHRW 方法获取 HeightRangeWindow
+func (t *CacheTrie) GetHRW() *HeightRangeWindow {
+	return t.hrw
+}
+
+// 为 HeightRangeWindow 添加 GetThreshold 方法
+func (h *HeightRangeWindow) GetThreshold() int {
+	return int(h.currentSsthresh)
 }
