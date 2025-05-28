@@ -30,6 +30,7 @@ type cacheNode interface {
 	fstring(string) string
 	window() int
 	size() int
+	memorySize() int64
 	updateFlag(int)
 	updateCache([]byte)
 }
@@ -60,10 +61,11 @@ type (
 
 // 节点标志，用于存储节点的哈希和状态
 type nodeFlag struct {
-	hash   []byte // 缓存的哈希值，只在需要时计算
-	window int    // 窗口标记，用于标识节点在哪些区块被访问
-	size   int    // 节点大小
-	dirty  bool   // 标记节点是否被修改过
+	hash       []byte // 缓存的哈希值，只在需要时计算
+	window     int    // 窗口标记，用于标识节点在哪些区块被访问
+	size       int    // 节点大小
+	memorySize int64  // 节点及其子节点的内存占用大小(字节)
+	dirty      bool   // 标记节点是否被修改过
 }
 
 // 返回节点的哈希值和dirty标志
@@ -85,6 +87,15 @@ func (n ValueNode) size() int {
 		return 1
 	}
 	return 0 // 空值节点（墓碑），不计入size
+}
+
+// 内存大小访问方法
+func (n *FullNode) memorySize() int64  { return n.flags.memorySize }
+func (n *ShortNode) memorySize() int64 { return n.flags.memorySize }
+func (n ValueNode) memorySize() int64 {
+	// 计算值节点内存大小
+	// ValueNode结构体基本大小 + Data大小 + RawKey大小
+	return valueNodeBaseSize + int64(len(n.Data)) + int64(len(n.RawKey))
 }
 
 // 节点的字符串表示
@@ -119,24 +130,45 @@ var NilValueNode = ValueNode{Data: nil, New: false, RawKey: nil, Address: common
 func (n *FullNode) updateFlag(bitPos int) {
 	n.flags.window = 0
 	n.flags.size = 0
+	n.flags.memorySize = fullNodeBaseSize + nodeFlagSize // 基本大小
+
 	for _, node := range &n.Children {
 		if node != nil {
 			n.flags.window |= node.window()
 			n.flags.size += node.size()
+			n.flags.memorySize += pointerSize + node.memorySize() // 指针大小 + 子节点大小
 		}
+	}
+
+	// 如果有哈希缓存，加上它的大小
+	if n.flags.hash != nil {
+		n.flags.memorySize += int64(len(n.flags.hash))
 	}
 }
 
 func (n *ShortNode) updateFlag(bitPos int) {
+	// 基本大小：ShortNode结构 + Key + nodeFlag
+	n.flags.memorySize = shortNodeBaseSize + int64(len(n.Key)) + pointerSize
+
 	if _, ok := n.Val.(ValueNode); ok {
 		// 这是叶子节点，设置当前区块对应的位
 		n.flags.window = 1 << bitPos
 		n.flags.size = 1
+		// 加上值节点的大小
+		n.flags.memorySize += n.Val.memorySize()
 	} else {
 		n.flags.window = n.Val.window()
 		n.flags.size = n.Val.size()
+		// 加上子节点的大小
+		n.flags.memorySize += n.Val.memorySize()
+	}
+
+	// 如果有哈希缓存，加上它的大小
+	if n.flags.hash != nil {
+		n.flags.memorySize += int64(len(n.flags.hash))
 	}
 }
+
 func (n ValueNode) updateFlag(w int) {} // 值节点不设置窗口
 
 func (n *FullNode) updateCache(hash []byte)  { n.flags.hash = hash; n.flags.dirty = false }

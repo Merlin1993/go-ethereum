@@ -155,10 +155,6 @@ type CompareBlockStats struct {
 
 	UniqueReads  int // 唯一读状态数
 	UniqueWrites int // 唯一写状态数
-
-	// CacheTrie内存统计
-	CacheTrieMemoryBytes int64 // CacheTrie内存占用(字节)
-	CacheTrieNodeCount   int   // CacheTrie节点数量
 }
 
 // 统计聚合结构
@@ -1109,8 +1105,6 @@ func TestCompareProcessTransactions(t *testing.T) {
 				RootGenTimePercent:    rootGenPercent,
 				UniqueReads:           counter.UniqueReads,
 				UniqueWrites:          counter.UniqueWrites,
-				CacheTrieMemoryBytes:  0,
-				CacheTrieNodeCount:    0,
 			}
 
 			// 添加到统计聚合器
@@ -1119,8 +1113,8 @@ func TestCompareProcessTransactions(t *testing.T) {
 			// 记录状态树统计
 			if common.UseCacheTrie && ct != nil {
 				// 记录CacheTrie统计
-				//RecordCacheTrieStats(cacheTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
-				//	len(msgsByBlock[blockNum]), processDuration, rootGenDuration, ct)
+				RecordCacheTrieStats(cacheTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
+					len(msgsByBlock[blockNum]), processDuration, rootGenDuration, ct)
 
 			} else if trieDB.IsVerkle() {
 				// 记录VerkleTrie统计
@@ -1143,13 +1137,6 @@ func TestCompareProcessTransactions(t *testing.T) {
 	statsAgg.PrintStats()
 
 	// 在函数结束前输出最终状态树统计
-
-	standardTrieRecorder.OutputStats()
-
-	cacheTrieRecorder.OutputStats()
-
-	verkleTrieRecorder.OutputStats()
-
 	t.Logf("文件范围 %d 到 %d 处理完成，最终状态根: %s", startFileIdx, endFileIdx, lastStateRoot.String())
 }
 

@@ -79,6 +79,9 @@ type CacheTrie struct {
 	updateHitCount  uint64     // Update/UpdateWithAddress 操作命中次数（更新已存在的键）
 	updateMissCount uint64     // Update/UpdateWithAddress 操作未命中次数（插入新键）
 	statsMu         sync.Mutex // 统计操作的互斥锁
+
+	memorySize int64 // 整个树的内存占用大小(字节)
+	nodeCount  uint64
 }
 
 // -----------------------------------------------------------------------------
@@ -1017,7 +1020,7 @@ const (
 	fullNodeBaseSize  = 24 // FullNode结构体基本大小（不含子节点指针）
 	shortNodeBaseSize = 40 // ShortNode结构体基本大小（不含Key、Val）
 	valueNodeBaseSize = 32 // ValueNode结构体基本大小（不含Data、RawKey）
-	nodeFlagSize      = 32 // nodeFlag结构体大小
+	nodeFlagSize      = 40 // nodeFlag结构体大小（包含memorySize字段）
 	pointerSize       = 8  // 指针大小
 )
 
@@ -1027,11 +1030,14 @@ func (t *CacheTrie) GetMemorySize() int64 {
 		return 0
 	}
 
-	// CacheTrie基本结构大小
-	size := int64(96) // CacheTrie结构体基本大小
+	// 直接使用根节点的memorySize()方法
+	rootMemory := t.root.memorySize()
 
-	// 递归计算节点树的大小
-	size += t.calculateNodeSize(t.root)
+	// 添加额外的内存占用 (非节点树部分)
+	size := rootMemory
+
+	//size := int64(96) // CacheTrie结构体基本大小
+	//size += t.calculateNodeSize(t.root)
 
 	// 计算缓存映射的大小
 	t.cacheMu.RLock()
@@ -1073,6 +1079,9 @@ func (t *CacheTrie) GetMemorySize() int64 {
 	if t.hrw != nil {
 		size += int64(200) // HeightRangeWindow的大致大小
 	}
+
+	// 更新内存大小到结构字段，方便其他地方访问
+	t.memorySize = size
 
 	return size
 }
