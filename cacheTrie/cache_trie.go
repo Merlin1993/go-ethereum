@@ -549,7 +549,7 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 
 	//fmt.Println(fmt.Sprintf("start prune, size : %v , window end : %v ,sshresh : %v ", t.root.size(), windowBits, t.hrw.currentSsthresh))
 	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
-	t.StartCleanup()
+	t.startCleanup()
 
 	// 记录清理开始时间
 	startTime := time.Now()
@@ -865,10 +865,10 @@ func (t *CacheTrie) GetDeletedValueWithAddress(address common.Address, key []byt
 	return nil
 }
 
-// StartCleanup 启动某区块号的清理操作
+// startCleanup 启动某区块号的清理操作
 // 此接口支持异步调用，但会进行锁，保证不同区块号的清理操作会排队执行
 // 返回是否成功获取到锁
-func (t *CacheTrie) StartCleanup() bool {
+func (t *CacheTrie) startCleanup() bool {
 	// 尝试获取锁
 	t.cleanupMu.Lock()
 
