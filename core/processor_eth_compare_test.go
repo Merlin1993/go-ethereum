@@ -166,35 +166,16 @@ type CompareStatsAggregator struct {
 	Stats                []CompareBlockStats // 所有区块的统计数据
 	OutputDir            string              // 输出目录
 	BlockWindow          uint64              // 统计窗口大小(每隔多少区块打印一次)
-	CsvWindow            uint64              // CSV输出窗口大小(每隔多少区块生成一个CSV)
 	LastOutputBlock      uint64              // 上次输出统计的区块号
-	LastCsvBlock         uint64              // 上次输出CSV的区块号
 	TotalProcessed       int                 // 总处理区块数
 	TotalTransaction     int                 // 总交易数
 	TotalSuccess         int                 // 总成功交易数
 	TotalContractTx      int                 // 总合约交易数
 	TotalContractSuccess int                 // 总成功的合约交易数
-
-	MaxProcessTime  time.Duration // 最大处理时间
-	MaxRootGenTime  time.Duration // 最大根哈希生成时间
-	MaxCommitTime   time.Duration // 最大提交时间
-	MaxTotalTime    time.Duration // 最大总时间
-	MaxTxCount      int           // 最大交易数
-	MaxReadStates   int           // 最大读状态数
-	MaxWriteStates  int           // 最大写状态数
-	MaxUniqueReads  int           // 最大唯一读状态数
-	MaxUniqueWrites int           // 最大唯一写状态数
-
-	// CacheTrie内存统计
-	MaxCacheTrieMemory          int64 // CacheTrie最大内存占用(字节)
-	MaxCacheTrieNodes           int   // CacheTrie最大节点数
-	TotalCacheTrieMemorySamples int64 // 内存采样总和(用于计算平均值)
-	TotalCacheTrieNodesSamples  int   // 节点数采样总和(用于计算平均值)
-	MemorySampleCount           int   // 内存采样次数
 }
 
 // 创建新的统计聚合器
-func NewCompareStatsAggregator(outputDir string, blockWindow, csvWindow uint64) *CompareStatsAggregator {
+func NewCompareStatsAggregator(outputDir string, blockWindow uint64) *CompareStatsAggregator {
 	// 确保输出目录存在
 	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
 		os.MkdirAll(outputDir, 0755)
@@ -204,19 +185,12 @@ func NewCompareStatsAggregator(outputDir string, blockWindow, csvWindow uint64) 
 		Stats:                make([]CompareBlockStats, 0),
 		OutputDir:            outputDir,
 		BlockWindow:          blockWindow,
-		CsvWindow:            csvWindow,
 		LastOutputBlock:      0,
-		LastCsvBlock:         0,
 		TotalProcessed:       0,
 		TotalTransaction:     0,
 		TotalSuccess:         0,
 		TotalContractTx:      0,
 		TotalContractSuccess: 0,
-		MaxUniqueReads:       0,
-		MaxUniqueWrites:      0,
-		MaxCacheTrieMemory:   0,
-		MaxCacheTrieNodes:    0,
-		MemorySampleCount:    0,
 	}
 }
 
@@ -229,94 +203,11 @@ func (s *CompareStatsAggregator) AddBlockStats(stats CompareBlockStats) {
 	s.TotalContractTx += stats.ContractTxCount
 	s.TotalContractSuccess += stats.ContractSuccessCount
 
-	// 更新最大值
-	if stats.ProcessTime > s.MaxProcessTime {
-		s.MaxProcessTime = stats.ProcessTime
-	}
-	if stats.RootGenTime > s.MaxRootGenTime {
-		s.MaxRootGenTime = stats.RootGenTime
-	}
-	if stats.CommitTime > s.MaxCommitTime {
-		s.MaxCommitTime = stats.CommitTime
-	}
-	if stats.TotalTime > s.MaxTotalTime {
-		s.MaxTotalTime = stats.TotalTime
-	}
-	if stats.TransactionCount > s.MaxTxCount {
-		s.MaxTxCount = stats.TransactionCount
-	}
-	if stats.UniqueReads > s.MaxUniqueReads {
-		s.MaxUniqueReads = stats.UniqueReads
-	}
-	if stats.UniqueWrites > s.MaxUniqueWrites {
-		s.MaxUniqueWrites = stats.UniqueWrites
-	}
-
-	// 更新CacheTrie内存统计
-	if stats.CacheTrieMemoryBytes > 0 {
-		// 更新采样总和和计数
-		s.TotalCacheTrieMemorySamples += stats.CacheTrieMemoryBytes
-		s.TotalCacheTrieNodesSamples += stats.CacheTrieNodeCount
-		s.MemorySampleCount++
-
-		// 更新最大值
-		if stats.CacheTrieMemoryBytes > s.MaxCacheTrieMemory {
-			s.MaxCacheTrieMemory = stats.CacheTrieMemoryBytes
-		}
-		if stats.CacheTrieNodeCount > s.MaxCacheTrieNodes {
-			s.MaxCacheTrieNodes = stats.CacheTrieNodeCount
-		}
-	}
-
 	// 检查是否需要打印统计信息
 	if stats.BlockNum-s.LastOutputBlock >= s.BlockWindow {
 		s.PrintStats()
 		s.LastOutputBlock = stats.BlockNum
 	}
-
-	// 检查是否需要输出CSV
-	if stats.BlockNum-s.LastCsvBlock >= s.CsvWindow {
-		s.OutputCSV()
-		s.LastCsvBlock = stats.BlockNum
-		// 清空统计数据，释放内存
-		s.Stats = make([]CompareBlockStats, 0)
-	}
-}
-
-// 计算平均值
-func (s *CompareStatsAggregator) CalculateAvg() (avgProcessTime, avgRootGenTime, avgCommitTime, avgTotalTime time.Duration,
-	avgProcessPercent, avgRootGenPercent, avgCommitPercent float64,
-	avgTxCount, avgReadStates, avgWriteStates float64) {
-
-	if len(s.Stats) == 0 {
-		return
-	}
-
-	var totalProcessTime, totalRootGenTime, totalCommitTime, totalTotalTime time.Duration
-	var totalProcessPercent, totalRootGenPercent float64
-	var totalTxCount, totalReadStates, totalWriteStates int
-
-	for _, stat := range s.Stats {
-		totalProcessTime += stat.ProcessTime
-		totalRootGenTime += stat.RootGenTime
-		totalCommitTime += stat.CommitTime
-		totalTotalTime += stat.TotalTime
-		totalProcessPercent += stat.ProcessTimePercent
-		totalRootGenPercent += stat.RootGenTimePercent
-		totalTxCount += stat.TransactionCount
-	}
-
-	count := float64(len(s.Stats))
-	avgProcessTime = time.Duration(float64(totalProcessTime) / count)
-	avgRootGenTime = time.Duration(float64(totalRootGenTime) / count)
-	avgTotalTime = time.Duration(float64(totalTotalTime) / count)
-	avgProcessPercent = totalProcessPercent / count
-	avgRootGenPercent = totalRootGenPercent / count
-	avgTxCount = float64(totalTxCount) / count
-	avgReadStates = float64(totalReadStates) / count
-	avgWriteStates = float64(totalWriteStates) / count
-
-	return
 }
 
 // 打印统计信息
@@ -333,194 +224,59 @@ func (s *CompareStatsAggregator) PrintStats() {
 	recentStats := s.Stats[startIdx:]
 
 	// 计算这部分的统计数据
-	var totalProcessTime, totalRootGenTime, totalCommitTime, totalTotalTime time.Duration
-	var totalProcessPercent, totalRootGenPercent float64
 	var totalTxCount, totalSuccessCount, totalContractTxCount, totalContractSuccessCount int
-	var totalUniqueReads, totalUniqueWrites int
-	var totalErrorCount int
-
-	var maxProcessTime, maxRootGenTime, maxCommitTime, maxTotalTime time.Duration
-	var maxTxCount, maxUniqueReads, maxUniqueWrites int
+	var totalCreateContractCount, totalCreateSuccessCount int
+	var totalCallContractCount, totalCallSuccessCount int
 
 	// 交易统计
 	var totalSuccessRate, totalContractTxPercent, totalContractSuccessRate float64
-	var totalErrorRate float64
 
 	for _, stat := range recentStats {
-		totalProcessTime += stat.ProcessTime
-		totalRootGenTime += stat.RootGenTime
-		totalCommitTime += stat.CommitTime
-		totalTotalTime += stat.TotalTime
-		totalProcessPercent += stat.ProcessTimePercent
-		totalRootGenPercent += stat.RootGenTimePercent
 		totalTxCount += stat.TransactionCount
 		totalSuccessCount += stat.SuccessCount
 		totalContractTxCount += stat.ContractTxCount
 		totalContractSuccessCount += stat.ContractSuccessCount
-		totalUniqueReads += stat.UniqueReads
-		totalUniqueWrites += stat.UniqueWrites
+		totalCreateContractCount += stat.CreateContractCount
+		totalCreateSuccessCount += stat.CreateSuccessCount
+		totalCallContractCount += stat.CallContractCount
+		totalCallSuccessCount += stat.CallSuccessCount
+
 		totalSuccessRate += stat.SuccessRate
 		totalContractTxPercent += stat.ContractTxPercent
 		totalContractSuccessRate += stat.ContractSuccessRate
-		totalErrorCount += stat.ErrorCount
-		totalErrorRate += stat.ErrorRate
-
-		// 计算最大值
-		if stat.ProcessTime > maxProcessTime {
-			maxProcessTime = stat.ProcessTime
-		}
-		if stat.RootGenTime > maxRootGenTime {
-			maxRootGenTime = stat.RootGenTime
-		}
-		if stat.CommitTime > maxCommitTime {
-			maxCommitTime = stat.CommitTime
-		}
-		if stat.TotalTime > maxTotalTime {
-			maxTotalTime = stat.TotalTime
-		}
-		if stat.TransactionCount > maxTxCount {
-			maxTxCount = stat.TransactionCount
-		}
-		if stat.UniqueReads > maxUniqueReads {
-			maxUniqueReads = stat.UniqueReads
-		}
-		if stat.UniqueWrites > maxUniqueWrites {
-			maxUniqueWrites = stat.UniqueWrites
-		}
 	}
 
 	// 计算基于区块的平均值
 	count := float64(len(recentStats))
-	avgProcessTime := time.Duration(float64(totalProcessTime) / count)
-	avgRootGenTime := time.Duration(float64(totalRootGenTime) / count)
-	avgTotalTime := time.Duration(float64(totalProcessTime+totalRootGenTime) / count)
-	// 只计算处理和根哈希的时间百分比
-	avgProcessPercent := float64(totalProcessTime) / float64(totalProcessTime+totalRootGenTime) * 100
-	avgRootGenPercent := float64(totalRootGenTime) / float64(totalProcessTime+totalRootGenTime) * 100
-
-	avgTxCount := float64(totalTxCount) / count
 	avgSuccessRate := totalSuccessRate / count
 	avgContractTxPercent := totalContractTxPercent / count
 	avgContractSuccessRate := float64(totalContractSuccessCount) / float64(totalContractTxCount)
-	avgUniqueReads := float64(totalUniqueReads) / count
-	avgUniqueWrites := float64(totalUniqueWrites) / count
-	avgErrorRate := totalErrorRate / count
 
+	// 计算创建合约和调用合约的成功率
+	avgCreateSuccessRate := 0.0
+	if totalCreateContractCount > 0 {
+		avgCreateSuccessRate = float64(totalCreateSuccessCount) / float64(totalCreateContractCount) * 100
+	}
+
+	avgCallSuccessRate := 0.0
+	if totalCallContractCount > 0 {
+		avgCallSuccessRate = float64(totalCallSuccessCount) / float64(totalCallContractCount) * 100
+	}
+
+	if !common.DebugFlag {
+		return
+	}
 	fmt.Printf("===== [对比测试] 区块统计 (区块范围: %d - %d) =====\n",
 		recentStats[0].BlockNum, recentStats[len(recentStats)-1].BlockNum)
 	fmt.Printf("处理区块数: %d, 总交易数: %d, 成功交易数: %d, 成功率: %.2f%%\n",
 		len(recentStats), totalTxCount, totalSuccessCount, avgSuccessRate*100)
 	fmt.Printf("合约交易: %d (%.2f%%), 成功合约交易: %d, 合约成功率: %.2f%%\n",
 		totalContractTxCount, avgContractTxPercent*100, totalContractSuccessCount, avgContractSuccessRate*100)
-	fmt.Printf("交易数 - 平均: %.1f, 最大: %d\n",
-		avgTxCount, maxTxCount)
-
-	// 简化错误统计信息
-	fmt.Printf("错误总数: %d (平均错误率: %.2f%%)\n",
-		totalErrorCount, avgErrorRate*100)
-
-	fmt.Println("\n----- 状态访问统计 -----")
-	fmt.Printf("总唯一读状态数: %d, 平均每区块: %.1f, 最大: %d\n",
-		totalUniqueReads, avgUniqueReads, maxUniqueReads)
-	fmt.Printf("总唯一写状态数: %d, 平均每区块: %.1f, 最大: %d\n",
-		totalUniqueWrites, avgUniqueWrites, maxUniqueWrites)
-	fmt.Printf("总状态访问数: %d, 平均每区块: %.1f\n",
-		totalUniqueReads+totalUniqueWrites, avgUniqueReads+avgUniqueWrites)
-
-	// 添加CacheTrie内存统计
-	if s.MemorySampleCount > 0 {
-		avgMemory := float64(s.TotalCacheTrieMemorySamples) / float64(s.MemorySampleCount)
-		avgNodes := float64(s.TotalCacheTrieNodesSamples) / float64(s.MemorySampleCount)
-
-		fmt.Println("\n----- CacheTrie内存统计 -----")
-
-		// 计算每节点平均内存
-		var memoryPerNode float64
-		if avgNodes > 0 {
-			memoryPerNode = avgMemory / avgNodes
-		}
-
-		fmt.Printf("平均内存占用: %.2f MB (%.2f 字节/节点)\n",
-			avgMemory/1024/1024, memoryPerNode)
-		fmt.Printf("最大内存占用: %.2f MB\n", float64(s.MaxCacheTrieMemory)/1024/1024)
-		fmt.Printf("平均节点数: %.1f, 最大节点数: %d\n",
-			avgNodes, s.MaxCacheTrieNodes)
-	}
-
-	fmt.Println("\n----- 性能统计 -----")
-	fmt.Printf("平均时间 - 交易处理: %v (%.1f%%), 根哈希: %v (%.1f%%), 总计: %v\n",
-		avgProcessTime, avgProcessPercent, avgRootGenTime, avgRootGenPercent, avgTotalTime)
-	fmt.Printf("最大时间 - 交易处理: %v, 根哈希: %v, 总计: %v\n",
-		maxProcessTime, maxRootGenTime, maxTotalTime)
+	fmt.Printf("合约创建: %d, 成功: %d, 成功率: %.2f%%\n",
+		totalCreateContractCount, totalCreateSuccessCount, avgCreateSuccessRate)
+	fmt.Printf("合约调用: %d, 成功: %d, 成功率: %.2f%%\n",
+		totalCallContractCount, totalCallSuccessCount, avgCallSuccessRate)
 	fmt.Println("=======================================")
-}
-
-// 输出CSV文件
-func (s *CompareStatsAggregator) OutputCSV() {
-	if len(s.Stats) == 0 {
-		return
-	}
-
-	filename := fmt.Sprintf("%s/compare_block_stats_%d_to_%d.csv",
-		s.OutputDir, s.Stats[0].BlockNum, s.Stats[len(s.Stats)-1].BlockNum)
-
-	file, err := os.Create(filename)
-	if err != nil {
-		fmt.Printf("创建CSV文件失败: %v\n", err)
-		return
-	}
-	defer file.Close()
-
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	// 写入CSV头
-	headers := []string{
-		"BlockNum", "TransactionCount", "SuccessCount", "SuccessRate",
-		"ContractTxCount", "ContractTxPercent", "ContractSuccessCount", "ContractSuccessRate",
-		"ProcessTime(ms)", "RootGenTime(ms)", "TotalTime(ms)",
-		"ProcessPercent", "RootGenPercent",
-		"UniqueReads", "UniqueWrites", "TotalUniqueStates",
-		"ErrorCount", "ErrorRate",
-		"CacheTrieMemoryMB", "CacheTrieNodeCount", "MemoryPerNode",
-	}
-	writer.Write(headers)
-
-	// 写入每个区块的统计数据
-	for _, stat := range s.Stats {
-		// 计算每节点内存占用
-		memoryPerNode := 0.0
-		if stat.CacheTrieNodeCount > 0 {
-			memoryPerNode = float64(stat.CacheTrieMemoryBytes) / float64(stat.CacheTrieNodeCount)
-		}
-
-		record := []string{
-			strconv.FormatUint(stat.BlockNum, 10),
-			strconv.Itoa(stat.TransactionCount),
-			strconv.Itoa(stat.SuccessCount),
-			strconv.FormatFloat(stat.SuccessRate, 'f', 4, 64),
-			strconv.Itoa(stat.ContractTxCount),
-			strconv.FormatFloat(stat.ContractTxPercent, 'f', 4, 64),
-			strconv.Itoa(stat.ContractSuccessCount),
-			strconv.FormatFloat(stat.ContractSuccessRate, 'f', 4, 64),
-			strconv.FormatInt(stat.ProcessTime.Milliseconds(), 10),
-			strconv.FormatInt(stat.RootGenTime.Milliseconds(), 10),
-			strconv.FormatInt(stat.TotalTime.Milliseconds(), 10),
-			strconv.FormatFloat(stat.ProcessTimePercent, 'f', 2, 64),
-			strconv.FormatFloat(stat.RootGenTimePercent, 'f', 2, 64),
-			strconv.Itoa(stat.UniqueReads),
-			strconv.Itoa(stat.UniqueWrites),
-			strconv.Itoa(stat.UniqueReads + stat.UniqueWrites),
-			strconv.Itoa(stat.ErrorCount),
-			strconv.FormatFloat(stat.ErrorRate, 'f', 4, 64),
-			strconv.FormatFloat(float64(stat.CacheTrieMemoryBytes)/1024/1024, 'f', 2, 64),
-			strconv.Itoa(stat.CacheTrieNodeCount),
-			strconv.FormatFloat(memoryPerNode, 'f', 2, 64),
-		}
-		writer.Write(record)
-	}
-
-	fmt.Printf("已输出CSV文件: %s\n", filename)
 }
 
 // 处理配置
@@ -790,7 +546,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 	var startNum uint64 = 46147
 
 	// 创建统计聚合器
-	statsAgg := NewCompareStatsAggregator(statsDir, CompareSmallStatsWindow, CompareLargeStatsWindow)
+	statsAgg := NewCompareStatsAggregator(statsDir, 100000) // 使用直接数值替代常量
 
 	// 添加: 创建状态树统计记录器
 	trieStatsDir := filepath.Join(statsDir, "trie_stats")
@@ -1385,11 +1141,6 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 	// 处理完成后输出最终统计信息
 	statsAgg.PrintStats()
-
-	// 保存最后一批统计数据
-	if len(statsAgg.Stats) > 0 {
-		statsAgg.OutputCSV()
-	}
 
 	// 在函数结束前输出最终状态树统计
 

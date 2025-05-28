@@ -118,10 +118,17 @@ func (s *TrieStatsAggregator) AddBlockStats(blockNum uint64, writtenStates, read
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 特殊处理：如果这是第一个区块且恰好是10万的整数倍，我们不希望统计它
+	// 只记录LastOutput，等待下一个区块开始统计
+	if s.LastOutput == 0 && s.WindowStats.SampleCount == 0 && blockNum%s.Window == 0 {
+		s.LastOutput = blockNum
+		return
+	}
+
 	// 检查是否跳过了10万的整数倍高度
 	// 例如：上次统计是在95000，当前区块是105000，中间跳过了100000这个整数倍高度
-	if s.LastOutput > 0 && blockNum >= (s.LastOutput+s.Window)/s.Window*s.Window &&
-		(blockNum/s.Window) > (s.LastOutput/s.Window) {
+	if blockNum >= (s.LastOutput+s.Window)/s.Window*s.Window &&
+		(blockNum/s.Window) > (s.LastOutput/s.Window) && blockNum%s.Window != 0 {
 		// 已跳过了至少一个10万整数倍的高度，先输出上一个窗口的统计
 		if s.WindowStats.SampleCount > 0 {
 			s.OutputStats()
@@ -174,13 +181,6 @@ func (s *TrieStatsAggregator) AddBlockStats(blockNum uint64, writtenStates, read
 
 		// 重置窗口统计
 		s.resetWindowStats()
-	} else if blockNum-s.LastOutput >= s.Window {
-		// 处理非10万整数倍但已超过10万区块的情况
-		// 这种情况不应该发生，因为我们在上面已经处理了跳过的情况
-		// 但为了健壮性保留此逻辑
-		s.OutputStats()
-		s.LastOutput = blockNum
-		s.resetWindowStats()
 	}
 }
 
@@ -202,7 +202,7 @@ func (s *TrieStatsAggregator) OutputStats() {
 
 	if s.TrieType == CacheTrie && s.CacheTrieRef != nil {
 		// 获取命中率
-		getHits, getMisses, _, getHitRate, updateHits, updateMisses, _, updateHitRate = s.CacheTrieRef.GetHitRate()
+		_, getHits, getMisses, getHitRate, _, updateHits, updateMisses, updateHitRate = s.CacheTrieRef.GetHitRate()
 
 		// 获取清理统计
 		cleanupCount = s.CacheTrieRef.GetCleanupCount()
@@ -355,8 +355,11 @@ func (s *TrieStatsAggregator) printWindowStats(dataSizeDelta int64, getHitRate, 
 		avgRootGenTimeMicros = totalRootGenTimeMicros / int64(s.WindowStats.SampleCount)
 	}
 
-	fmt.Printf("\n===== [%s] 区块统计 (区块范围: %d - %d) =====\n",
-		typeStr, s.WindowStats.StartBlock, s.WindowStats.EndBlock)
+	// 计算窗口编号
+	windowNumber := s.WindowStats.EndBlock / s.Window
+
+	fmt.Printf("\n===== [%s] 窗口 #%d 统计 (区块范围: %d - %d) =====\n",
+		typeStr, windowNumber, s.WindowStats.StartBlock, s.WindowStats.EndBlock)
 
 	fmt.Printf("总写入状态数: %d, 总读取状态数: %d\n",
 		s.WindowStats.TotalWrittenStates, s.WindowStats.TotalReadStates)
@@ -416,25 +419,59 @@ func (s *TrieStatsAggregator) outputCSV(dataSizeDelta int64, getHitRate, updateH
 		prefix = VerkleTriePrefix
 	}
 
-	filename := fmt.Sprintf("%s_%d_%d.csv",
-		prefix, s.WindowStats.StartBlock, s.WindowStats.EndBlock)
-
+	// 使用固定文件名
+	filename := fmt.Sprintf("%s.csv", prefix)
 	filePath := filepath.Join(s.OutputDir, filename)
 
-	file, err := os.Create(filePath)
-	if err != nil {
-		fmt.Printf("创建CSV文件失败: %v\n", err)
-		return
+	// 确定当前数据行号 - 第几个窗口
+	windowNumber := s.WindowStats.EndBlock / s.Window
+
+	// 准备当前数据记录
+	// 计算平均值
+	var avgExecTime, avgRootGenTime int64
+	if s.WindowStats.SampleCount > 0 {
+		avgExecTime = s.WindowStats.TotalExecTime.Microseconds() / int64(s.WindowStats.SampleCount)
+		avgRootGenTime = s.WindowStats.TotalRootGenTime.Microseconds() / int64(s.WindowStats.SampleCount)
 	}
-	defer file.Close()
 
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
+	// 数据大小变化（MB）
+	dataSizeDeltaMB := float64(dataSizeDelta) / MBSize
 
-	// 写入CSV头
+	// 准备当前记录，第一个字段改为窗口编号
+	currentRecord := []string{
+		fmt.Sprintf("%d", windowNumber), // 第几个10万区块，从0开始
+		strconv.FormatInt(s.WindowStats.TotalWrittenStates, 10),
+		strconv.FormatInt(s.WindowStats.TotalReadStates, 10),
+		strconv.FormatInt(s.WindowStats.TotalTxCount, 10),
+		strconv.FormatInt(avgExecTime, 10),
+		strconv.FormatInt(avgRootGenTime, 10),
+		strconv.FormatFloat(dataSizeDeltaMB, 'f', 2, 64),
+	}
+
+	// 如果是CacheTrie，添加额外的统计
+	if s.TrieType == CacheTrie && s.WindowStats.CacheSampleCount > 0 {
+		// 计算平均值
+		avgMemorySize := s.WindowStats.TotalMemorySize / float64(s.WindowStats.CacheSampleCount)
+		avgCacheSize := float64(s.WindowStats.TotalCacheSize) / float64(s.WindowStats.CacheSampleCount)
+		avgThreshold := float64(s.WindowStats.TotalCacheThreshold) / float64(s.WindowStats.CacheSampleCount)
+
+		currentRecord = append(currentRecord,
+			strconv.FormatFloat(avgMemorySize, 'f', 2, 64),
+			strconv.FormatFloat(s.WindowStats.MaxMemorySize, 'f', 2, 64),
+			strconv.FormatFloat(avgCacheSize, 'f', 2, 64),
+			strconv.Itoa(s.WindowStats.MaxCacheSize),
+			strconv.FormatFloat(avgThreshold, 'f', 2, 64),
+			strconv.FormatInt(totalCleanupTime.Microseconds(), 10),
+			strconv.Itoa(cleanupCount),
+			strconv.FormatInt(maxCleanupTime.Microseconds(), 10),
+			strconv.FormatFloat(getHitRate*100, 'f', 2, 64),
+			strconv.FormatFloat(updateHitRate*100, 'f', 2, 64))
+	}
+
+	// 准备头部记录，更新第一个字段名称
 	var headers []string
 	headers = append(headers,
-		"BlockRange",
+		"WindowNumber", // 第几个10万区块
 		"TotalWrittenStates",
 		"TotalReadStates",
 		"TotalTransactionCount",
@@ -457,49 +494,88 @@ func (s *TrieStatsAggregator) outputCSV(dataSizeDelta int64, getHitRate, updateH
 			"UpdateHitRate(%)")
 	}
 
-	writer.Write(headers)
-
-	// 计算平均值
-	var avgExecTime, avgRootGenTime int64
-	if s.WindowStats.SampleCount > 0 {
-		avgExecTime = s.WindowStats.TotalExecTime.Microseconds() / int64(s.WindowStats.SampleCount)
-		avgRootGenTime = s.WindowStats.TotalRootGenTime.Microseconds() / int64(s.WindowStats.SampleCount)
+	// 检查文件是否存在
+	fileExists := false
+	if _, err := os.Stat(filePath); err == nil {
+		fileExists = true
 	}
 
-	// 数据大小变化（MB）
-	dataSizeDeltaMB := float64(dataSizeDelta) / MBSize
+	if !fileExists {
+		// 文件不存在，创建新文件
+		file, err := os.Create(filePath)
+		if err != nil {
+			fmt.Printf("创建CSV文件失败: %v\n", err)
+			return
+		}
+		defer file.Close()
 
-	// 只写入一行汇总数据
-	record := []string{
-		fmt.Sprintf("%d-%d", s.WindowStats.StartBlock, s.WindowStats.EndBlock),
-		strconv.FormatInt(s.WindowStats.TotalWrittenStates, 10),
-		strconv.FormatInt(s.WindowStats.TotalReadStates, 10),
-		strconv.FormatInt(s.WindowStats.TotalTxCount, 10),
-		strconv.FormatInt(avgExecTime, 10),
-		strconv.FormatInt(avgRootGenTime, 10),
-		strconv.FormatFloat(dataSizeDeltaMB, 'f', 2, 64),
+		writer := csv.NewWriter(file)
+		defer writer.Flush()
+
+		// 写入头部
+		writer.Write(headers)
+		// 写入当前记录
+		writer.Write(currentRecord)
+		fmt.Printf("已创建CSV文件: %s\n", filePath)
+	} else {
+		// 文件已存在，读取现有记录
+		allRecords, err := readCSVRecords(filePath)
+		if err != nil {
+			fmt.Printf("读取CSV文件失败: %v\n", err)
+			return
+		}
+
+		// 确保records数组有足够的长度容纳当前窗口
+		targetLength := int(windowNumber) + 2 // +1是因为窗口编号从0开始，+1是因为第一行是表头
+		if len(allRecords) < targetLength {
+			// 扩展数组长度
+			oldLength := len(allRecords)
+			for i := oldLength; i < targetLength; i++ {
+				if i == 0 {
+					// 如果没有表头，添加表头
+					allRecords = append(allRecords, headers)
+				} else {
+					// 添加空记录占位
+					allRecords = append(allRecords, make([]string, len(headers)))
+				}
+			}
+		}
+
+		// 更新或添加当前窗口的记录
+		allRecords[windowNumber+1] = currentRecord // +1是因为第一行是表头
+
+		// 重写文件
+		file, err := os.Create(filePath)
+		if err != nil {
+			fmt.Printf("创建CSV文件失败: %v\n", err)
+			return
+		}
+		defer file.Close()
+
+		writer := csv.NewWriter(file)
+		defer writer.Flush()
+
+		// 写入所有非空记录
+		for i, record := range allRecords {
+			// 跳过空记录
+			if i > 0 && len(record[0]) == 0 {
+				continue
+			}
+			writer.Write(record)
+		}
+
+		fmt.Printf("已更新CSV文件: %s (窗口 #%d)\n", filePath, windowNumber)
 	}
+}
 
-	// 如果是CacheTrie，添加额外的统计
-	if s.TrieType == CacheTrie && s.WindowStats.CacheSampleCount > 0 {
-		// 计算平均值
-		avgMemorySize := s.WindowStats.TotalMemorySize / float64(s.WindowStats.CacheSampleCount)
-		avgCacheSize := float64(s.WindowStats.TotalCacheSize) / float64(s.WindowStats.CacheSampleCount)
-		avgThreshold := float64(s.WindowStats.TotalCacheThreshold) / float64(s.WindowStats.CacheSampleCount)
-
-		record = append(record,
-			strconv.FormatFloat(avgMemorySize, 'f', 2, 64),
-			strconv.FormatFloat(s.WindowStats.MaxMemorySize, 'f', 2, 64),
-			strconv.FormatFloat(avgCacheSize, 'f', 2, 64),
-			strconv.Itoa(s.WindowStats.MaxCacheSize),
-			strconv.FormatFloat(avgThreshold, 'f', 2, 64),
-			strconv.FormatInt(totalCleanupTime.Microseconds(), 10),
-			strconv.Itoa(cleanupCount),
-			strconv.FormatInt(maxCleanupTime.Microseconds(), 10),
-			strconv.FormatFloat(getHitRate*100, 'f', 2, 64),
-			strconv.FormatFloat(updateHitRate*100, 'f', 2, 64))
+// readCSVRecords 读取CSV文件中的所有记录
+func readCSVRecords(filePath string) ([][]string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
 	}
+	defer file.Close()
 
-	writer.Write(record)
-	fmt.Printf("已输出CSV文件: %s\n", filePath)
+	reader := csv.NewReader(file)
+	return reader.ReadAll()
 }
