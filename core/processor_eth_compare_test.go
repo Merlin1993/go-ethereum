@@ -1119,8 +1119,8 @@ func TestCompareProcessTransactions(t *testing.T) {
 			// 记录状态树统计
 			if common.UseCacheTrie && ct != nil {
 				// 记录CacheTrie统计
-				RecordCacheTrieStats(cacheTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
-					len(msgsByBlock[blockNum]), processDuration, rootGenDuration, ct)
+				//RecordCacheTrieStats(cacheTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
+				//	len(msgsByBlock[blockNum]), processDuration, rootGenDuration, ct)
 
 			} else if trieDB.IsVerkle() {
 				// 记录VerkleTrie统计

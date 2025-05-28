@@ -554,9 +554,9 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 	// 记录清理开始时间
 	startTime := time.Now()
 
-	// 执行循环操作，直到根节点size数量小于2/3的maxSize且window位数等于8bit
+	// 执行循环操作，直到根节点size数量小于80%的maxSize且window位数等于8bit
 	// 使用2/3作为阈值
-	targetSize := t.hrw.maxTotalAllowedSize * 2 / 3
+	targetSize := t.hrw.maxTotalAllowedSize * 9 / 10
 	if targetSize <= 0 {
 		targetSize = 1 // 确保至少有一个目标大小
 	}
@@ -566,8 +566,8 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 	}
 	// 循环直到满足条件
 	for {
-		// 检查是否已经满足条件：size小于目标值，且window位数大于等于16bit
-		if t.root == nil || (t.root.size() <= targetSize && windowBits >= WindowLeft+8) {
+		// 检查是否已经满足条件：size小于目标值，且window位数大于等于12bit
+		if t.root == nil || (t.root.size() <= targetSize && windowBits >= WindowLeft+4) {
 			break
 		}
 

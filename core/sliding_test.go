@@ -26,7 +26,7 @@ const (
 
 	// 方法二配置
 	method2BatchSize  = 5000 // 每批次写入的数据量
-	method2Iterations = 100  // 迭代次数
+	method2Iterations = 2000 // 迭代次数
 
 	mptDir = "F:\\ethdata\\stree\\mpt"
 )
@@ -206,6 +206,11 @@ func TestMethod2(t *testing.T) {
 		rootTimes   []time.Duration
 	)
 
+	// 准备CSV数据
+	csvRecords := [][]string{
+		{"迭代", "写入耗时(ns)", "生成根耗时(ns)", "提交耗时(ns)", "根哈希"},
+	}
+
 	// 进行多次小批量写入测试
 	for i := 0; i < method2Iterations; i++ {
 		// 写入数据
@@ -240,6 +245,15 @@ func TestMethod2(t *testing.T) {
 		commitTime := time.Since(commitStart)
 		commitTimes = append(commitTimes, commitTime)
 
+		// 将数据添加到CSV记录
+		csvRecords = append(csvRecords, []string{
+			strconv.Itoa(i + 1),
+			strconv.FormatInt(writeTime.Nanoseconds(), 10),
+			strconv.FormatInt(rootTime.Nanoseconds(), 10),
+			strconv.FormatInt(commitTime.Nanoseconds(), 10),
+			root.Hex(),
+		})
+
 		// 创建新的Trie继续写入
 		tr, err = trie.New(trie.TrieID(root), trieDB)
 		if err != nil {
@@ -263,6 +277,10 @@ func TestMethod2(t *testing.T) {
 
 	t.Logf("方法二测试完成，平均耗时 - 写入: %v，生成根: %v，提交: %v",
 		avgWrite, avgRoot, avgCommit)
+
+	// 将结果写入CSV文件
+	csvFileName := fmt.Sprintf("mpt_method2_batch%d_iter%d.csv", method2BatchSize, method2Iterations)
+	writeCSVFile(t, csvFileName, csvRecords)
 }
 
 // TestMPTProof 测试MPT树的证明功能

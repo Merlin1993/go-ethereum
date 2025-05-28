@@ -18,9 +18,13 @@ package cacheTrie
 
 import (
 	"bytes"
+	"encoding/csv"
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -1165,6 +1169,11 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 
 	stats := make([]IterationStats, iterationCount)
 
+	// 准备CSV数据
+	csvRecords := [][]string{
+		{"迭代", "写入耗时(ns)", "哈希耗时(ns)", "写入速度(状态/秒)", "Size", "Threshold", "是否清理", "清理耗时(ns)"},
+	}
+
 	// 重置清理时间统计
 	cacheTrie.ResetCleanupTimes()
 
@@ -1237,6 +1246,18 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 			CleanupTime:     cleanupTime,
 		}
 
+		// 添加到CSV记录
+		csvRecords = append(csvRecords, []string{
+			strconv.Itoa(i + 1),
+			strconv.FormatInt(writeTime.Nanoseconds(), 10),
+			strconv.FormatInt(hashTime.Nanoseconds(), 10),
+			strconv.FormatFloat(writeSpeed, 'f', 2, 64),
+			strconv.Itoa(currentSize),
+			strconv.Itoa(currentThreshold),
+			strconv.FormatBool(cleanupOccurred),
+			strconv.FormatInt(cleanupTime.Nanoseconds(), 10),
+		})
+
 		// 输出当前迭代的统计信息
 		cleanupStatus := "无"
 		if cleanupOccurred {
@@ -1244,7 +1265,7 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 		}
 
 		t.Logf("迭代 %d/%d: 写入耗时=%v, 速度=%.2f 状态/秒, 哈希耗时=%v, Size=%d, Threshold=%d, 清理: %s",
-			i+1, iterationCount, writeTime, writeSpeed, hashTime.Milliseconds(), currentSize, currentThreshold, cleanupStatus)
+			i+1, iterationCount, writeTime, writeSpeed, hashTime.String(), currentSize, currentThreshold, cleanupStatus)
 	}
 
 	// 计算平均统计数据
@@ -1295,4 +1316,120 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 	// 获取内存占用信息
 	memSize := cacheTrie.GetMemorySize()
 	t.Logf("内存占用: %d 字节 (%.2f MB)", memSize, float64(memSize)/(1024*1024))
+
+	// 将结果写入CSV文件
+	csvFileName := fmt.Sprintf("cacheTrie_states%d_iter%d_window%d_maxsize%d.csv",
+		stateCount, iterationCount, windowMultiple, maxSize)
+	writeCSVFile(t, csvFileName, csvRecords)
+
+	// 汇总统计添加到摘要CSV
+	writeCSVSummary(t, stateCount, iterationCount, windowMultiple, maxSize,
+		avgWriteTime, avgHashTime, avgWriteSpeed, cleanupCount,
+		avgCleanupTime, getHitRate, updateHitRate, uint64(memSize))
+}
+
+// 将测试结果写入CSV文件
+func writeCSVFile(t *testing.T, fileName string, records [][]string) {
+	// 确保结果目录存在
+	resultsDir := "results"
+	if _, err := os.Stat(resultsDir); os.IsNotExist(err) {
+		if err := os.Mkdir(resultsDir, 0755); err != nil {
+			t.Logf("创建结果目录失败: %v", err)
+			return
+		}
+	}
+
+	// 创建CSV文件
+	filePath := filepath.Join(resultsDir, fileName)
+	file, err := os.Create(filePath)
+	if err != nil {
+		t.Logf("创建CSV文件失败: %v", err)
+		return
+	}
+	defer file.Close()
+
+	// 创建CSV写入器
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// 写入数据
+	if err := writer.WriteAll(records); err != nil {
+		t.Logf("写入CSV数据失败: %v", err)
+		return
+	}
+
+	t.Logf("测试结果已写入CSV文件: %s", filePath)
+}
+
+// 将汇总统计写入摘要CSV文件
+func writeCSVSummary(t *testing.T, stateCount, iterationCount, windowMultiple, maxSize int,
+	avgWriteTime, avgHashTime time.Duration, avgWriteSpeed float64,
+	cleanupCount int, avgCleanupTime time.Duration,
+	getHitRate, updateHitRate float64, memSize uint64) {
+
+	// 确保结果目录存在
+	resultsDir := "results"
+	if _, err := os.Stat(resultsDir); os.IsNotExist(err) {
+		if err := os.Mkdir(resultsDir, 0755); err != nil {
+			t.Logf("创建结果目录失败: %v", err)
+			return
+		}
+	}
+
+	// 摘要文件名
+	summaryFile := filepath.Join(resultsDir, "cacheTrie_summary.csv")
+
+	// 检查文件是否存在，决定是否需要写入标题行
+	fileExists := false
+	if _, err := os.Stat(summaryFile); err == nil {
+		fileExists = true
+	}
+
+	// 打开文件用于追加
+	file, err := os.OpenFile(summaryFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Logf("打开摘要文件失败: %v", err)
+		return
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// 如果文件不存在，先写入标题行
+	if !fileExists {
+		headers := []string{
+			"状态数", "迭代次数", "窗口乘数", "最大大小",
+			"平均写入耗时(ns)", "平均哈希耗时(ns)", "平均写入速度(状态/秒)",
+			"清理次数", "平均清理耗时(ns)",
+			"Get命中率(%)", "Update命中率(%)", "内存占用(MB)",
+		}
+		if err := writer.Write(headers); err != nil {
+			t.Logf("写入摘要标题失败: %v", err)
+			return
+		}
+	}
+
+	// 写入当前测试的摘要数据
+	record := []string{
+		strconv.Itoa(stateCount),
+		strconv.Itoa(iterationCount),
+		strconv.Itoa(windowMultiple),
+		strconv.Itoa(maxSize),
+		strconv.FormatInt(avgWriteTime.Nanoseconds(), 10),
+		strconv.FormatInt(avgHashTime.Nanoseconds(), 10),
+		strconv.FormatFloat(avgWriteSpeed, 'f', 2, 64),
+		strconv.Itoa(cleanupCount),
+		strconv.FormatInt(avgCleanupTime.Nanoseconds(), 10),
+		strconv.FormatFloat(getHitRate*100, 'f', 2, 64),
+		strconv.FormatFloat(updateHitRate*100, 'f', 2, 64),
+		strconv.FormatFloat(float64(memSize)/(1024*1024), 'f', 2, 64),
+	}
+
+	if err := writer.Write(record); err != nil {
+		t.Logf("写入摘要数据失败: %v", err)
+		return
+	}
+
+	t.Logf("测试摘要已添加到: %s", summaryFile)
 }

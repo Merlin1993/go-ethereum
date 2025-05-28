@@ -1,7 +1,11 @@
 package core
 
 import (
+	"encoding/csv"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -145,6 +149,11 @@ func TestVerkleMethod2(t *testing.T) {
 		rootTimes   []time.Duration
 	)
 
+	// 准备CSV数据
+	csvRecords := [][]string{
+		{"迭代", "写入耗时(ns)", "生成根耗时(ns)", "提交耗时(ns)", "根哈希"},
+	}
+
 	// 使用固定的地址进行测试
 	testAddr := common.Address{}
 
@@ -188,6 +197,15 @@ func TestVerkleMethod2(t *testing.T) {
 		commitTime := time.Since(commitStart)
 		commitTimes = append(commitTimes, commitTime)
 
+		// 将数据添加到CSV记录
+		csvRecords = append(csvRecords, []string{
+			strconv.Itoa(i + 1),
+			strconv.FormatInt(writeTime.Nanoseconds(), 10),
+			strconv.FormatInt(rootTime.Nanoseconds(), 10),
+			strconv.FormatInt(commitTime.Nanoseconds(), 10),
+			root.Hex(),
+		})
+
 		// 创建新的Verkle Trie继续写入
 		vt, err = trie.NewVerkleTrie(root, trieDB, pointCache)
 		if err != nil {
@@ -211,6 +229,10 @@ func TestVerkleMethod2(t *testing.T) {
 
 	t.Logf("方法二测试完成，平均耗时 - 写入: %v，生成根: %v，提交: %v",
 		avgWrite, avgRoot, avgCommit)
+
+	// 将结果写入CSV文件
+	csvFileName := fmt.Sprintf("verkle_method2_batch%d_iter%d.csv", method2BatchSize, method2Iterations)
+	writeCSVFile(t, csvFileName, csvRecords)
 }
 
 // BenchmarkVT_Update 测试Verkle树插入性能
@@ -223,11 +245,8 @@ func BenchmarkVT_Update(b *testing.B) {
 	cacheConfig.SnapshotLimit = 0
 	trieDB := triedb.NewDatabase(memDB, cacheConfig.triedbConfig(true))
 
-	// 创建point cache
-	pointCache := utils.NewPointCache(1024)
-
-	// 创建新的Verkle Trie
-	vt, err := trie.NewVerkleTrie(common.Hash{}, trieDB, pointCache)
+	// 创建新的Verkle Trie (不使用point cache)
+	vt, err := trie.NewVerkleTrie(common.Hash{}, trieDB, nil)
 	if err != nil {
 		b.Fatalf("创建新Verkle Trie失败: %v", err)
 	}
@@ -253,4 +272,37 @@ func BenchmarkVT_Update(b *testing.B) {
 
 	b.Logf("插入 %d 个键值对耗时: %v (平均每个: %v), 最终根哈希: %x",
 		b.N, insertDuration, insertDuration/time.Duration(b.N), root)
+}
+
+// 将测试结果写入CSV文件
+func writeCSVFile(t *testing.T, fileName string, records [][]string) {
+	// 确保结果目录存在
+	resultsDir := "results"
+	if _, err := os.Stat(resultsDir); os.IsNotExist(err) {
+		if err := os.Mkdir(resultsDir, 0755); err != nil {
+			t.Logf("创建结果目录失败: %v", err)
+			return
+		}
+	}
+
+	// 创建CSV文件
+	filePath := filepath.Join(resultsDir, fileName)
+	file, err := os.Create(filePath)
+	if err != nil {
+		t.Logf("创建CSV文件失败: %v", err)
+		return
+	}
+	defer file.Close()
+
+	// 创建CSV写入器
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// 写入数据
+	if err := writer.WriteAll(records); err != nil {
+		t.Logf("写入CSV数据失败: %v", err)
+		return
+	}
+
+	t.Logf("测试结果已写入CSV文件: %s", filePath)
 }

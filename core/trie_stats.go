@@ -127,7 +127,7 @@ func (s *TrieStatsAggregator) AddBlockStats(blockNum uint64, writtenStates, read
 
 	// 检查是否跳过了10万的整数倍高度
 	// 例如：上次统计是在95000，当前区块是105000，中间跳过了100000这个整数倍高度
-	if blockNum >= (s.LastOutput+s.Window)/s.Window*s.Window &&
+	if blockNum > (s.LastOutput+s.Window)/s.Window*s.Window &&
 		(blockNum/s.Window) > (s.LastOutput/s.Window) && blockNum%s.Window != 0 {
 		// 已跳过了至少一个10万整数倍的高度，先输出上一个窗口的统计
 		if s.WindowStats.SampleCount > 0 {
@@ -174,7 +174,7 @@ func (s *TrieStatsAggregator) AddBlockStats(blockNum uint64, writtenStates, read
 	}
 
 	// 检查当前区块是否是10万的整数倍
-	if blockNum >= s.Window && blockNum%s.Window == 0 {
+	if blockNum > s.LastOutput && blockNum >= s.Window && blockNum%s.Window == 0 {
 		// 输出统计
 		s.OutputStats()
 		s.LastOutput = blockNum
@@ -356,7 +356,7 @@ func (s *TrieStatsAggregator) printWindowStats(dataSizeDelta int64, getHitRate, 
 	}
 
 	// 计算窗口编号
-	windowNumber := s.WindowStats.EndBlock / s.Window
+	windowNumber := (s.WindowStats.EndBlock - 1) / s.Window
 
 	fmt.Printf("\n===== [%s] 窗口 #%d 统计 (区块范围: %d - %d) =====\n",
 		typeStr, windowNumber, s.WindowStats.StartBlock, s.WindowStats.EndBlock)
@@ -424,7 +424,7 @@ func (s *TrieStatsAggregator) outputCSV(dataSizeDelta int64, getHitRate, updateH
 	filePath := filepath.Join(s.OutputDir, filename)
 
 	// 确定当前数据行号 - 第几个窗口
-	windowNumber := s.WindowStats.EndBlock / s.Window
+	windowNumber := (s.WindowStats.EndBlock - 1) / s.Window
 
 	// 准备当前数据记录
 	// 计算平均值
