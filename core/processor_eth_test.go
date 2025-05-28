@@ -1185,6 +1185,7 @@ func TestProcessTransactions(t *testing.T) {
 	dataDir := "E:\\ethdata"
 
 	var maxBlockNum uint64 = 5000000
+	var startNum uint64 = 46147
 
 	// 创建统计聚合器，每100,000个区块打印一次统计，每1,000,000个区块生成一个CSV
 	statsAgg := NewStatsAggregator(statsDir, 100000, 1000000)
@@ -1202,6 +1203,7 @@ func TestProcessTransactions(t *testing.T) {
 		IsVerkle:  false,
 		CacheTrie: common.UseCacheTrie,
 		ReadCache: false,
+		StartNum:  startNum,
 		HashDB:    hashdb.Defaults,
 	})
 	//snaps, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)

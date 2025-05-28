@@ -68,6 +68,14 @@ type CacheTrie struct {
 	hrw *HeightRangeWindow //拥塞控制
 
 	codes map[common.Hash][]byte
+
+	// 命中/未命中统计
+	hitCount        uint64     // Get/GetWithAddress 操作命中次数
+	missCount       uint64     // Get/GetWithAddress 操作未命中次数
+	updateCount     uint64     // Update/UpdateWithAddress 操作总次数
+	updateHitCount  uint64     // Update/UpdateWithAddress 操作命中次数（更新已存在的键）
+	updateMissCount uint64     // Update/UpdateWithAddress 操作未命中次数（插入新键）
+	statsMu         sync.Mutex // 统计操作的互斥锁
 }
 
 // -----------------------------------------------------------------------------
@@ -111,7 +119,10 @@ func (t *CacheTrie) getInternal(hexKey []byte) (cacheNode, error) {
 }
 
 // updateInternal 是Update和UpdateWithAddress的内部实现
-func (t *CacheTrie) updateInternal(hexKey []byte, value []byte, isNew bool, originalKey []byte, address ...common.Address) error {
+// 返回:
+//   - error: 操作错误
+//   - bool: 如果为true表示更新已存在键，false表示插入新键
+func (t *CacheTrie) updateInternal(hexKey []byte, value []byte, isNew bool, originalKey []byte, address ...common.Address) (error, bool) {
 	// 设置当前位置
 	bitPos := t.getCacheBitPosition()
 
@@ -127,18 +138,21 @@ func (t *CacheTrie) updateInternal(hexKey []byte, value []byte, isNew bool, orig
 		valueNode.Address = address[0]
 	}
 
-	root, err := t.insert(t.root, hexKey, valueNode, bitPos)
+	root, nodeExists, err := t.insert(t.root, hexKey, valueNode, bitPos)
 	if err != nil {
-		return err
+		return err, nodeExists
 	}
 
 	// 更新根节点
 	t.root = root
-	return nil
+	return nil, nodeExists
 }
 
 // deleteInternal 是Delete和DeleteWithAddress的内部实现
-func (t *CacheTrie) deleteInternal(hexKey []byte, originalKey []byte, address ...common.Address) error {
+// 返回:
+//   - error: 操作错误
+//   - bool: 如果为true表示删除已存在键，false表示删除不存在键
+func (t *CacheTrie) deleteInternal(hexKey []byte, originalKey []byte, address ...common.Address) (error, bool) {
 	// 创建一个特殊的标记值作为"墓碑"
 	// 使用一个空的ValueNode作为墓碑标记，并设置New为true
 	tombstone := ValueNode{
@@ -156,13 +170,13 @@ func (t *CacheTrie) deleteInternal(hexKey []byte, originalKey []byte, address ..
 	bitPos := t.getCacheBitPosition()
 
 	// 使用insert方法插入墓碑标记，而不是真正删除
-	newroot, err := t.insert(t.root, hexKey, tombstone, bitPos)
+	newroot, nodeExists, err := t.insert(t.root, hexKey, tombstone, bitPos)
 	if err != nil {
-		return err
+		return err, nodeExists
 	}
 
 	t.root = newroot
-	return nil
+	return nil, nodeExists
 }
 
 // getNodeForPathRecursive 是getNodeForPath的递归实现
@@ -311,6 +325,11 @@ func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
 	// 如果在树中找不到，则尝试从删除缓存中查找
 	if node == nil && err == nil && t.deletedCache != nil {
 		if value := t.GetDeletedValue(key); value != nil {
+			// 更新统计信息 - 命中
+			t.statsMu.Lock()
+			t.hitCount++
+			t.statsMu.Unlock()
+
 			return ValueNode{
 				Data:   value,
 				New:    false,
@@ -318,6 +337,15 @@ func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
 			}, nil
 		}
 	}
+
+	// 更新统计信息 - 命中或未命中
+	t.statsMu.Lock()
+	if node != nil {
+		t.hitCount++
+	} else {
+		t.missCount++
+	}
+	t.statsMu.Unlock()
 
 	return node, err
 }
@@ -340,6 +368,11 @@ func (t *CacheTrie) GetWithAddress(address common.Address, key []byte) (cacheNod
 	// 如果在树中找不到，则尝试从删除缓存中查找
 	if node == nil && err == nil {
 		if value := t.GetDeletedValueWithAddress(address, key); value != nil {
+			// 更新统计信息 - 命中
+			t.statsMu.Lock()
+			t.hitCount++
+			t.statsMu.Unlock()
+
 			return ValueNode{
 				Data:    value,
 				New:     false,
@@ -348,6 +381,15 @@ func (t *CacheTrie) GetWithAddress(address common.Address, key []byte) (cacheNod
 			}, nil
 		}
 	}
+
+	// 更新统计信息 - 命中或未命中
+	t.statsMu.Lock()
+	if node != nil {
+		t.hitCount++
+	} else {
+		t.missCount++
+	}
+	t.statsMu.Unlock()
 
 	return node, err
 }
@@ -360,7 +402,19 @@ func (t *CacheTrie) Update(key, value []byte, isNew bool) error {
 	}
 
 	hexKey := t.prepareKey(key)
-	return t.updateInternal(hexKey, value, isNew, key)
+	err, nodeExists := t.updateInternal(hexKey, value, isNew, key)
+
+	// 更新统计信息
+	t.statsMu.Lock()
+	t.updateCount++
+	if nodeExists { // 键已存在，是更新操作
+		t.updateHitCount++
+	} else { // 键不存在，是插入操作
+		t.updateMissCount++
+	}
+	t.statsMu.Unlock()
+
+	return err
 }
 
 // UpdateWithAddress 将带有地址前缀的键值对添加到trie中
@@ -371,21 +425,57 @@ func (t *CacheTrie) UpdateWithAddress(address common.Address, key, value []byte,
 	}
 
 	hexKey := t.prepareKey(key, address)
-	return t.updateInternal(hexKey, value, isNew, key, address)
+	err, nodeExists := t.updateInternal(hexKey, value, isNew, key, address)
+
+	// 更新统计信息
+	t.statsMu.Lock()
+	t.updateCount++
+	if nodeExists { // 键已存在，是更新操作
+		t.updateHitCount++
+	} else { // 键不存在，是插入操作
+		t.updateMissCount++
+	}
+	t.statsMu.Unlock()
+
+	return err
 }
 
 // Delete 从trie中删除key
 // 内部实现使用"墓碑"标记(空值节点)替代真正的删除
 func (t *CacheTrie) Delete(key []byte) error {
 	hexKey := t.prepareKey(key)
-	return t.deleteInternal(hexKey, key)
+	err, nodeExists := t.deleteInternal(hexKey, key)
+
+	// 更新统计信息 - 删除也是一种更新操作
+	t.statsMu.Lock()
+	t.updateCount++
+	if nodeExists { // 键已存在，是删除操作
+		t.updateHitCount++
+	} else { // 键不存在，是无效删除
+		t.updateMissCount++
+	}
+	t.statsMu.Unlock()
+
+	return err
 }
 
 // DeleteWithAddress 从trie中删除带有地址前缀的key
 // 内部实现使用"墓碑"标记(空值节点)替代真正的删除
 func (t *CacheTrie) DeleteWithAddress(address common.Address, key []byte) error {
 	hexKey := t.prepareKey(key, address)
-	return t.deleteInternal(hexKey, key, address)
+	err, nodeExists := t.deleteInternal(hexKey, key, address)
+
+	// 更新统计信息 - 删除也是一种更新操作
+	t.statsMu.Lock()
+	t.updateCount++
+	if nodeExists { // 键已存在，是删除操作
+		t.updateHitCount++
+	} else { // 键不存在，是无效删除
+		t.updateMissCount++
+	}
+	t.statsMu.Unlock()
+
+	return err
 }
 
 // Hash 返回trie的根哈希
@@ -590,11 +680,11 @@ func hexToKeybytes(hex []byte) []byte {
 //   - key: 十六进制格式的键
 //   - value: 要插入的值节点
 //   - bitPos: 当前区块在window中的位置
-func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int) (cacheNode, error) {
+func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int) (cacheNode, bool, error) {
 	if len(key) == 0 {
 		// 值节点只能在路径末尾插入
 		if _, ok := value.(ValueNode); ok {
-			return value, nil
+			return value, false, nil
 		}
 		panic("Invalid attempt to insert non-value node at the end of a path")
 	}
@@ -620,15 +710,15 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 
 				// 更新window属性
 				shortNode.updateFlag(bitPos)
-				return shortNode, nil
+				return shortNode, true, nil
 			} else {
 				//更新子节点
-				childNode, err := t.insert(n.Val, key[prefixLength:], value, bitPos)
+				childNode, exist, err := t.insert(n.Val, key[prefixLength:], value, bitPos)
 				if err != nil {
-					return nil, err
+					return nil, exist, err
 				}
 				n.Val = childNode
-				return n, nil
+				return n, exist, nil
 			}
 		}
 
@@ -665,22 +755,22 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 				flags: t.newNodeFlag(),
 			}
 			parentNode.updateFlag(bitPos)
-			return parentNode, nil
+			return parentNode, false, nil
 		} else {
 			branch.updateFlag(bitPos)
-			return branch, nil
+			return branch, false, nil
 		}
 	case *FullNode:
 		// 更新特定分支
 		var err error
-
-		n.Children[key[0]], err = t.insert(n.Children[key[0]], key[1:], value, bitPos)
+		var exist bool
+		n.Children[key[0]], exist, err = t.insert(n.Children[key[0]], key[1:], value, bitPos)
 		if err != nil {
-			return nil, err
+			return nil, exist, err
 		}
 		n.updateFlag(bitPos)
 
-		return n, nil
+		return n, exist, nil
 	case nil:
 		// 如果当前节点为空，创建一个新的短节点
 		shortNode := &ShortNode{
@@ -689,7 +779,7 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 			flags: t.newNodeFlag(),
 		}
 		shortNode.updateFlag(bitPos)
-		return shortNode, nil
+		return shortNode, false, nil
 	default:
 		panic(fmt.Sprintf("%T: invalid node: %v", n, n))
 	}
@@ -857,4 +947,172 @@ func (t *CacheTrie) PopCodes() map[common.Hash][]byte {
 	tc := t.codes
 	t.codes = make(map[common.Hash][]byte)
 	return tc
+}
+
+// -----------------------------------------------------------------------------
+// 命中率统计方法 - 公共API
+
+// GetHitRate 返回当前的命中率统计信息
+// 返回:
+//   - 总Get请求数
+//   - Get命中次数
+//   - Get未命中次数
+//   - Get命中率 (命中次数占总Get请求的百分比，范围0.0-1.0)
+//   - 总Update请求数
+//   - Update命中次数（更新已存在的键）
+//   - Update未命中次数（插入新键）
+//   - Update命中率 (已存在键的更新次数占总Update请求的百分比，范围0.0-1.0)
+func (t *CacheTrie) GetHitRate() (uint64, uint64, uint64, float64, uint64, uint64, uint64, float64) {
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+
+	totalGetRequests := t.hitCount + t.missCount
+	var getHitRate float64 = 0
+	if totalGetRequests > 0 {
+		getHitRate = float64(t.hitCount) / float64(totalGetRequests)
+	}
+
+	var updateHitRate float64 = 0
+	if t.updateCount > 0 {
+		updateHitRate = float64(t.updateHitCount) / float64(t.updateCount)
+	}
+
+	return totalGetRequests, t.hitCount, t.missCount, getHitRate,
+		t.updateCount, t.updateHitCount, t.updateMissCount, updateHitRate
+}
+
+// ResetStats 重置所有命中/未命中统计数据
+func (t *CacheTrie) ResetStats() {
+	t.statsMu.Lock()
+	defer t.statsMu.Unlock()
+
+	t.hitCount = 0
+	t.missCount = 0
+	t.updateCount = 0
+	t.updateHitCount = 0
+	t.updateMissCount = 0
+}
+
+// -----------------------------------------------------------------------------
+// 内存大小计算方法
+
+// 计算不同节点类型的内存占用基础值（字节）
+const (
+	fullNodeBaseSize  = 24 // FullNode结构体基本大小（不含子节点指针）
+	shortNodeBaseSize = 40 // ShortNode结构体基本大小（不含Key、Val）
+	valueNodeBaseSize = 32 // ValueNode结构体基本大小（不含Data、RawKey）
+	nodeFlagSize      = 32 // nodeFlag结构体大小
+	pointerSize       = 8  // 指针大小
+)
+
+// GetMemorySize 计算当前CacheTrie占用的内存大小（字节）
+func (t *CacheTrie) GetMemorySize() int64 {
+	if t.root == nil {
+		return 0
+	}
+
+	// CacheTrie基本结构大小
+	size := int64(96) // CacheTrie结构体基本大小
+
+	// 递归计算节点树的大小
+	size += t.calculateNodeSize(t.root)
+
+	// 计算缓存映射的大小
+	t.cacheMu.RLock()
+	if t.deletedCache != nil {
+		// map结构本身的大小
+		size += int64(48)
+		// 所有键值对的大小
+		for k, v := range t.deletedCache {
+			size += int64(len(k)) + int64(len(v)) + 2*pointerSize
+		}
+	}
+
+	if t.deletedByAddress != nil {
+		// 外层map基本大小
+		size += int64(48)
+		// 所有地址映射的大小
+		for _, addrCache := range t.deletedByAddress {
+			// 每个地址条目的基本开销
+			size += int64(common.AddressLength + pointerSize + 48) // 地址 + 指针 + 内部map大小
+			// 地址内所有键值对
+			for k, v := range addrCache {
+				size += int64(len(k)) + int64(len(v)) + 2*pointerSize
+			}
+		}
+	}
+	t.cacheMu.RUnlock()
+
+	// 计算代码缓存的大小
+	if t.codes != nil {
+		// map结构本身的大小
+		size += int64(48)
+		// 所有代码条目的大小
+		for _, code := range t.codes {
+			size += int64(common.HashLength + len(code) + pointerSize)
+		}
+	}
+
+	// 拥塞控制窗口大小
+	if t.hrw != nil {
+		size += int64(200) // HeightRangeWindow的大致大小
+	}
+
+	return size
+}
+
+// calculateNodeSize 递归计算节点及其子节点的内存占用大小
+func (t *CacheTrie) calculateNodeSize(n cacheNode) int64 {
+	if n == nil {
+		return 0
+	}
+
+	var size int64
+
+	switch node := n.(type) {
+	case *FullNode:
+		// 基本结构大小
+		size = fullNodeBaseSize + nodeFlagSize
+
+		// 子节点大小
+		for _, child := range node.Children {
+			if child != nil {
+				size += pointerSize // 子节点指针
+				size += t.calculateNodeSize(child)
+			}
+		}
+
+		// hash缓存大小
+		if hash, _ := node.cache(); hash != nil {
+			size += int64(len(hash))
+		}
+
+	case *ShortNode:
+		// 基本结构大小
+		size = shortNodeBaseSize + nodeFlagSize
+
+		// Key的大小
+		size += int64(len(node.Key))
+
+		// Val的大小
+		size += pointerSize // Val指针
+		size += t.calculateNodeSize(node.Val)
+
+		// hash缓存大小
+		if hash, _ := node.cache(); hash != nil {
+			size += int64(len(hash))
+		}
+
+	case ValueNode:
+		// 基本结构大小
+		size = valueNodeBaseSize
+
+		// Data的大小
+		size += int64(len(node.Data))
+
+		// RawKey的大小
+		size += int64(len(node.RawKey))
+	}
+
+	return size
 }

@@ -19,6 +19,7 @@ package cacheTrie
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -894,4 +895,138 @@ func TestPerformance(t *testing.T) {
 		t.Logf("总Hash计算时间: %v", time.Duration(totalHashTime))
 		t.Logf("总处理时间: %v", time.Duration(totalBlockTime+totalHashTime))
 	})
+}
+
+func TestHitRateStatistics(t *testing.T) {
+	// 创建一个缓存树
+	trie := NewCacheTrie(0, 1, 0)
+
+	// 插入10个键值对
+	for i := 0; i < 10; i++ {
+		key := []byte(fmt.Sprintf("key%d", i))
+		value := []byte(fmt.Sprintf("value%d", i))
+		err := trie.Update(key, value, true)
+		if err != nil {
+			t.Fatalf("Update failed: %v", err)
+		}
+	}
+
+	// 读取存在的键（命中）
+	for i := 0; i < 5; i++ {
+		key := []byte(fmt.Sprintf("key%d", i))
+		node, err := trie.Get(key)
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if node == nil {
+			t.Fatalf("Expected node for key%d, got nil", i)
+		}
+	}
+
+	// 读取不存在的键（未命中）
+	for i := 10; i < 15; i++ {
+		key := []byte(fmt.Sprintf("key%d", i))
+		node, err := trie.Get(key)
+		if err != nil {
+			t.Fatalf("Get failed: %v", err)
+		}
+		if node != nil {
+			t.Fatalf("Expected nil for key%d, got %v", i, node)
+		}
+	}
+
+	// 更新已存在的键（update命中）
+	for i := 0; i < 4; i++ {
+		key := []byte(fmt.Sprintf("key%d", i))
+		value := []byte(fmt.Sprintf("updated-value%d", i))
+		err := trie.Update(key, value, true)
+		if err != nil {
+			t.Fatalf("Update failed: %v", err)
+		}
+	}
+
+	// 新增不存在的键（update未命中）
+	for i := 20; i < 24; i++ {
+		key := []byte(fmt.Sprintf("key%d", i))
+		value := []byte(fmt.Sprintf("value%d", i))
+		err := trie.Update(key, value, true)
+		if err != nil {
+			t.Fatalf("Update failed: %v", err)
+		}
+	}
+
+	// 删除存在的键（delete命中）
+	for i := 4; i < 6; i++ {
+		key := []byte(fmt.Sprintf("key%d", i))
+		err := trie.Delete(key)
+		if err != nil {
+			t.Fatalf("Delete failed: %v", err)
+		}
+	}
+
+	// 删除不存在的键（delete未命中）
+	for i := 30; i < 32; i++ {
+		key := []byte(fmt.Sprintf("key%d", i))
+		err := trie.Delete(key)
+		if err != nil {
+			t.Fatalf("Delete failed: %v", err)
+		}
+	}
+
+	// 验证Get命中率统计
+	totalGetRequests, hitCount, missCount, getHitRate,
+		updateCount, updateHitCount, updateMissCount, updateHitRate := trie.GetHitRate()
+
+	// 验证Get统计
+	if totalGetRequests != 10 {
+		t.Errorf("Expected 10 total Get requests, got %d", totalGetRequests)
+	}
+	if hitCount != 5 {
+		t.Errorf("Expected 5 Get hits, got %d", hitCount)
+	}
+	if missCount != 5 {
+		t.Errorf("Expected 5 Get misses, got %d", missCount)
+	}
+	if getHitRate != 0.5 {
+		t.Errorf("Expected 0.5 Get hit rate, got %f", getHitRate)
+	}
+
+	// 验证Update统计
+	// 初始10个插入 + 4个更新 + 4个新增 + 2个删除命中 + 2个删除未命中 = 22个update操作
+	expectedUpdateCount := 10 + 4 + 4 + 2 + 2
+	if updateCount != uint64(expectedUpdateCount) {
+		t.Errorf("Expected %d total Update operations, got %d", expectedUpdateCount, updateCount)
+	}
+
+	// 4个更新操作 + 2个删除操作命中 = 6个命中
+	expectedUpdateHits := 4 + 2
+	if updateHitCount != uint64(expectedUpdateHits) {
+		t.Errorf("Expected %d Update hits, got %d", expectedUpdateHits, updateHitCount)
+	}
+
+	// 10个初始插入 + 4个新增 + 2个删除未命中 = 16个未命中
+	expectedUpdateMisses := 10 + 4 + 2
+	if updateMissCount != uint64(expectedUpdateMisses) {
+		t.Errorf("Expected %d Update misses, got %d", expectedUpdateMisses, updateMissCount)
+	}
+
+	// 命中率应该是 6/22 ≈ 0.273
+	expectedUpdateHitRate := float64(expectedUpdateHits) / float64(expectedUpdateCount)
+	if math.Abs(updateHitRate-expectedUpdateHitRate) > 0.001 {
+		t.Errorf("Expected %.3f Update hit rate, got %.3f", expectedUpdateHitRate, updateHitRate)
+	}
+
+	// 重置统计
+	trie.ResetStats()
+
+	// 验证重置后的统计
+	totalGetRequests, hitCount, missCount, getHitRate,
+		updateCount, updateHitCount, updateMissCount, updateHitRate = trie.GetHitRate()
+
+	if totalGetRequests != 0 || hitCount != 0 || missCount != 0 || getHitRate != 0 ||
+		updateCount != 0 || updateHitCount != 0 || updateMissCount != 0 || updateHitRate != 0 {
+		t.Errorf("Stats not reset properly: Get(total=%d, hits=%d, misses=%d, rate=%f), Update(total=%d, hits=%d, misses=%d, rate=%f)",
+			totalGetRequests, hitCount, missCount, getHitRate,
+			updateCount, updateHitCount, updateMissCount, updateHitRate)
+	}
 }

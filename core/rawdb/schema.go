@@ -46,6 +46,9 @@ var (
 	// persistentStateIDKey tracks the id of latest stored state(for path-based only).
 	persistentStateIDKey = []byte("LastStateID")
 
+	// lastRunStateRootKey tracks the last state root used for comparison tests
+	lastRunStateRootKey = []byte("LastRunStateRoot")
+
 	// lastPivotKey tracks the last pivot block used by fast sync (to reenable on sethead).
 	lastPivotKey = []byte("LastPivot")
 

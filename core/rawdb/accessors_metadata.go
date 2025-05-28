@@ -187,3 +187,19 @@ func WriteTransitionStatus(db ethdb.KeyValueWriter, data []byte) {
 		log.Crit("Failed to store the eth2 transition status", "err", err)
 	}
 }
+
+// WriteLastRunStateRoot stores the hash of the last run's state root.
+func WriteLastRunStateRoot(db ethdb.KeyValueWriter, hash common.Hash) {
+	if err := db.Put(lastRunStateRootKey, hash.Bytes()); err != nil {
+		log.Crit("Failed to store last run state root", "err", err)
+	}
+}
+
+// ReadLastRunStateRoot retrieves the hash of the last run's state root.
+func ReadLastRunStateRoot(db ethdb.Reader) common.Hash {
+	data, _ := db.Get(lastRunStateRootKey)
+	if len(data) == 0 {
+		return common.Hash{}
+	}
+	return common.BytesToHash(data)
+}

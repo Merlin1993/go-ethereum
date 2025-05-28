@@ -36,6 +36,7 @@ type Config struct {
 	IsVerkle  bool           // Flag whether the db is holding a verkle tree
 	CacheTrie bool           // Flag whether to use CacheTrie instead of normal Trie
 	ReadCache bool           // Flag whether to enable reading from cache
+	StartNum  uint64         // Start number for CacheTrie
 	HashDB    *hashdb.Config // Configs for hash-based scheme
 	PathDB    *pathdb.Config // Configs for experimental path-based scheme
 }
@@ -130,7 +131,7 @@ func NewDatabase(diskdb ethdb.Database, config *Config) *Database {
 
 	// Initialize the cache trie if enabled
 	if config.CacheTrie {
-		db.cacheTrie = cacheTrie.NewCacheTrie(46147, 1024, 500000)
+		db.cacheTrie = cacheTrie.NewCacheTrie(config.StartNum, 1024, 500000)
 	}
 
 	return db
