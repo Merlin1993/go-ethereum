@@ -1402,17 +1402,12 @@ func TestCompareProcessTransactions(t *testing.T) {
 	}
 
 	// 在函数结束前输出最终状态树统计
-	if len(standardTrieRecorder.Stats) > 0 {
-		standardTrieRecorder.OutputStats()
-	}
 
-	if len(cacheTrieRecorder.Stats) > 0 {
-		cacheTrieRecorder.OutputStats()
-	}
+	standardTrieRecorder.OutputStats()
 
-	if len(verkleTrieRecorder.Stats) > 0 {
-		verkleTrieRecorder.OutputStats()
-	}
+	cacheTrieRecorder.OutputStats()
+
+	verkleTrieRecorder.OutputStats()
 
 	t.Logf("文件范围 %d 到 %d 处理完成，最终状态根: %s", startFileIdx, endFileIdx, lastStateRoot.String())
 }

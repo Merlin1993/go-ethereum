@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -65,6 +66,8 @@ type CacheTrie struct {
 	cleanupChan         chan common.Hash // 清理结果通知通道
 	isCleaningUp        bool             // 是否正在清理
 	cleanupCount        int              // 清理次数统计
+	totalCleanupTime    time.Duration    // 清理总时间
+	maxCleanupTime      time.Duration    // 最大清理时间
 
 	hrw *HeightRangeWindow //拥塞控制
 
@@ -553,6 +556,9 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
 	t.StartCleanup()
 
+	// 记录清理开始时间
+	startTime := time.Now()
+
 	// 执行循环操作，直到根节点size数量小于2/3的maxSize且window位数等于8bit
 	// 使用2/3作为阈值
 	targetSize := t.hrw.maxTotalAllowedSize * 2 / 3
@@ -583,6 +589,14 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 		// 重新计算windowBits
 		windowBits = t.hrw.getWindowPosition()
 	}
+
+	// 计算清理时间并更新统计
+	cleanupTime := time.Since(startTime)
+	t.totalCleanupTime += cleanupTime
+	if cleanupTime > t.maxCleanupTime {
+		t.maxCleanupTime = cleanupTime
+	}
+
 	return deleteKVList
 }
 
@@ -983,7 +997,7 @@ func (t *CacheTrie) GetHitRate() (uint64, uint64, uint64, float64, uint64, uint6
 		t.updateCount, t.updateHitCount, t.updateMissCount, updateHitRate
 }
 
-// ResetStats 重置所有命中/未命中统计数据
+// ResetStats 重置所有命中/未命中统计数据以及清理统计数据
 func (t *CacheTrie) ResetStats() {
 	t.statsMu.Lock()
 	defer t.statsMu.Unlock()
@@ -993,6 +1007,11 @@ func (t *CacheTrie) ResetStats() {
 	t.updateCount = 0
 	t.updateHitCount = 0
 	t.updateMissCount = 0
+
+	// 同时重置清理统计
+	t.cleanupCount = 0
+	t.totalCleanupTime = 0
+	t.maxCleanupTime = 0
 }
 
 // -----------------------------------------------------------------------------
@@ -1121,16 +1140,23 @@ func (t *CacheTrie) calculateNodeSize(n cacheNode) int64 {
 
 // 添加 GetCleanupCount 方法获取清理次数
 func (t *CacheTrie) GetCleanupCount() int {
-	t.cleanupMu.Lock()
-	defer t.cleanupMu.Unlock()
 	return t.cleanupCount
+}
+
+// 获取清理时间统计
+func (t *CacheTrie) GetCleanupTimes() (time.Duration, time.Duration) {
+	return t.totalCleanupTime, t.maxCleanupTime
 }
 
 // 添加 ResetCleanupCount 方法重置清理次数
 func (t *CacheTrie) ResetCleanupCount() {
-	t.cleanupMu.Lock()
-	defer t.cleanupMu.Unlock()
 	t.cleanupCount = 0
+}
+
+// 重置清理时间统计
+func (t *CacheTrie) ResetCleanupTimes() {
+	t.totalCleanupTime = 0
+	t.maxCleanupTime = 0
 }
 
 // 添加 GetHRW 方法获取 HeightRangeWindow
