@@ -1123,6 +1123,7 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 		}
 
 		// 获取哈希，这会触发清理机制
+		cacheTrie.Prune()
 		hash, kvList := cacheTrie.Hash()
 
 		if kvList != nil && len(kvList.Data) > 0 {
@@ -1202,6 +1203,7 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 
 		// 获取哈希，这会触发清理机制
 		hashStart := time.Now()
+		cacheTrie.Prune()
 		hash, kvList := cacheTrie.Hash()
 		hashTime := time.Since(hashStart)
 

@@ -34,7 +34,6 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/utils"
@@ -929,6 +928,7 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	tdb := s.db.TrieDB()
 	if tdb.CacheTrie() != nil {
 		// 计算缓存树的哈希，这将触发缓存清理，并返回被删除的键值对
+		tdb.CacheTrie().Prune()
 		_, deleteKVList := tdb.CacheTrie().Hash()
 
 		if deleteKVList != nil && len(deleteKVList.Data) != 0 {
@@ -1553,23 +1553,9 @@ func (s *StateDB) PollCacheTire(blockNum uint64) {
 			//if addr == common.HexToAddress("0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825") {
 			//	addr = common.HexToAddress("0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825")
 			//}
-			// 解析账户数据
-			account := new(types.StateAccount)
-			if err := rlp.DecodeBytes(kv.Value, account); err != nil {
-				s.setError(fmt.Errorf("failed to decode account RLP: %v", err))
-				continue
-			}
-
-			// 当s.trie是StateTrie类型时，使用直接写入trie的方法
-			if secureTrie, ok := s.trie.(*trie.StateTrie); ok {
-				if err := secureTrie.UpdateAccountDirectToTrie(addr, account); err != nil {
-					s.setError(fmt.Errorf("updateAccountDirectToTrie (%x) error: %v", addr[:], err))
-				}
-			} else {
-				// 如果不是StateTrie类型，使用原来的方式
-				if err := s.trie.UpdateAccountRLP(addr, kv.Value, 0); err != nil {
-					s.setError(fmt.Errorf("updateStateObject (%x) error: %v", addr[:], err))
-				}
+			// 如果不是StateTrie类型，使用原来的方式
+			if err := s.trie.UpdateAccountRLP(addr, kv.Value, 0); err != nil {
+				s.setError(fmt.Errorf("updateStateObject (%x) error: %v", addr[:], err))
 			}
 		}
 	}

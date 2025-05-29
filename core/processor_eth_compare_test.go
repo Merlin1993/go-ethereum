@@ -537,7 +537,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 	// 指定文件范围，硬编码方式指定起始和结束文件索引
 	startFileIdx := 1 // 起始文件索引（从1开始）
-	endFileIdx := 2   // 结束文件索引
+	endFileIdx := 11  // 结束文件索引
 	//46147
 	var startNum uint64 = 46147
 
@@ -560,7 +560,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 	db := rawdb.NewDatabase(ldb)
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
 		Preimages: false,
-		IsVerkle:  false,
+		IsVerkle:  common.UserVerkle,
 		CacheTrie: common.UseCacheTrie,
 		ReadCache: false,
 		StartNum:  startNum,
