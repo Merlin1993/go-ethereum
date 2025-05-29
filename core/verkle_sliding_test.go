@@ -46,6 +46,7 @@ func TestVerkleMethod1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取最后一个根哈希失败: %v", err)
 	}
+	t.Logf("读取最后一个根哈希：%v", lastRoot.String())
 
 	// 创建point cache
 	pointCache := utils.NewPointCache(1024)

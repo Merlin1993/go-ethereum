@@ -20,6 +20,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"github.com/ethereum/go-ethereum/rlp"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -405,6 +406,23 @@ func (s *StateDB) HasSelfDestructed(addr common.Address) bool {
 /*
  * SETTERS
  */
+
+// AddBalance adds amount to the account associated with addr.
+func (s *StateDB) SetAccount(addr common.Address, data []byte, reason tracing.BalanceChangeReason) {
+
+	stateObject := s.getOrNewStateObject(addr)
+	if len(data) == 0 {
+		s.journal.destruct(addr)
+		stateObject.markSelfdestructed()
+		return
+	}
+	ret := new(types.StateAccount)
+	if err := rlp.DecodeBytes(data, ret); err != nil {
+		fmt.Println("decode data fail", addr)
+	}
+	s.journal.changeObject(addr)
+	stateObject.data = *ret
+}
 
 // AddBalance adds amount to the account associated with addr.
 func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
@@ -1207,9 +1225,6 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool) (*stateU
 	// We need to investigate what's happening as it seems something's wonky.
 	// Obviously it's not an end of the world issue, just something the original
 	// code didn't anticipate for.
-	if s.cachedDeleteKVList != nil {
-		s.PollCacheTire(s.cachedDeleteKVList.BlockNum)
-	}
 	workers.Go(func() error {
 		// Write the account trie changes, measuring the amount of wasted time
 		newroot, set := s.trie.Commit(true)
@@ -1282,10 +1297,9 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool) (*stateU
 	origin := s.originalRoot
 	s.originalRoot = root
 
-	if origin != root {
-		s.originalRoot = root
-
-	}
+	//if origin != root {
+	//	s.originalRoot = root
+	//}
 	return newStateUpdate(noStorageWiping, origin, root, deletes, updates, nodes), nil
 }
 
@@ -1496,75 +1510,7 @@ func mustCopyTrie(t Trie) Trie {
 	}
 }
 
-// PostCommit 异步处理缓存中的deleteKVList，并在处理完成后更新缓存树
-// 此函数应该在Commit之后调用
-func (s *StateDB) PollCacheTire(blockNum uint64) {
-	// 如果没有缓存的deleteKVList，直接返回
-	if s.cachedDeleteKVList == nil || len(s.cachedDeleteKVList.Data) == 0 {
-		return
-	}
-
-	// 获取CacheTrie实例
-	var cacheTrie = s.db.TrieDB().CacheTrie()
-
-	// 如果无法获取CacheTrie，直接返回
-	if cacheTrie == nil {
-		return
-	}
-
-	// 记录deleteKVList以便在goroutine中使用
-	deleteKVList := s.cachedDeleteKVList
-
-	// 记录哪些账户的状态被改变了
-	modifiedAccounts := make(map[common.Address]bool)
-
-	// 第一步：先处理所有状态（存储槽）
-	for _, kv := range deleteKVList.Data {
-		// 通过Address区分是否有地址，如果地址非空，则是存储槽
-		if (kv.Address != common.Address{}) && len(kv.Key) > 0 {
-			// 有地址且有键，说明是存储槽
-			addr := kv.Address
-			key := kv.Key
-
-			if obj := s.getStateObject(addr); obj != nil && obj.trie != nil {
-				// 将存储数据写入账户的存储trie
-				obj.SetState(common.BytesToHash(key), common.BytesToHash(kv.Value))
-				// 标记这个账户的状态被修改
-				modifiedAccounts[addr] = true
-			}
-		}
-	}
-
-	// 第二步：更新所有状态被修改的账户的root
-	for addr := range modifiedAccounts {
-		if obj := s.getStateObject(addr); obj != nil {
-			// 更新账户的root
-			obj.updateRoot()
-			// 标记状态对象需要更新
-			s.markUpdate(addr)
-		}
-	}
-
-	// 第三步：处理所有账户
-	for _, kv := range deleteKVList.Data {
-		// 地址为空且键存在，说明是账户
-		if (kv.Address == common.Address{}) && len(kv.Key) > 0 {
-			addr := common.BytesToAddress(kv.Key)
-			//if addr == common.HexToAddress("0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825") {
-			//	addr = common.HexToAddress("0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825")
-			//}
-			// 如果不是StateTrie类型，使用原来的方式
-			if err := s.trie.UpdateAccountRLP(addr, kv.Value, 0); err != nil {
-				s.setError(fmt.Errorf("updateStateObject (%x) error: %v", addr[:], err))
-			}
-		}
-	}
-
-	// 计算新的根哈希
-	s.trie.Hash()
-
-	// If witness building is enabled, gather the account trie witness
-	if s.witness != nil {
-		s.witness.AddState(s.trie.Witness())
-	}
+// GetCachedDeleteKVList 获取缓存的deleteKVList
+func (s *StateDB) GetCachedDeleteKVList() *cacheTrie.DeleteKVList {
+	return s.cachedDeleteKVList
 }

@@ -152,6 +152,10 @@ func (j *journal) logChange(txHash common.Hash) {
 	j.append(addLogChange{txhash: txHash})
 }
 
+func (j *journal) changeObject(addr common.Address) {
+	j.append(changeObjectChange{account: addr})
+}
+
 func (j *journal) createObject(addr common.Address) {
 	j.append(createObjectChange{account: addr})
 }
@@ -232,6 +236,9 @@ type (
 	// Changes to the account trie.
 	createObjectChange struct {
 		account common.Address
+	} // Changes to the account trie.
+	changeObjectChange struct {
+		account common.Address
 	}
 	// createContractChange represents an account becoming a contract-account.
 	// This event happens prior to executing initcode. The journal-event simply
@@ -300,6 +307,19 @@ func (ch createObjectChange) dirtied() *common.Address {
 
 func (ch createObjectChange) copy() journalEntry {
 	return createObjectChange{
+		account: ch.account,
+	}
+}
+
+func (ch changeObjectChange) revert(s *StateDB) {
+}
+
+func (ch changeObjectChange) dirtied() *common.Address {
+	return &ch.account
+}
+
+func (ch changeObjectChange) copy() journalEntry {
+	return changeObjectChange{
 		account: ch.account,
 	}
 }

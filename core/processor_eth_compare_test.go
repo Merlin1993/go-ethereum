@@ -569,6 +569,19 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 	// 使用正确的state包API
 	sdb := state.NewDatabase(trieDB, nil)
+	var preTrieDB *triedb.Database
+	var preSdb *state.CachingDB
+	if common.UseCacheTrie {
+		preTrieDB = triedb.NewDatabase(db, &triedb.Config{
+			Preimages: false,
+			IsVerkle:  common.UserVerkle,
+			CacheTrie: false,
+			ReadCache: false,
+			StartNum:  startNum,
+			HashDB:    hashdb.Defaults,
+		})
+		preSdb = state.NewDatabase(preTrieDB, nil)
+	}
 
 	// 创建genesis区块和区块链
 	gspec := &Genesis{
@@ -966,25 +979,63 @@ func TestCompareProcessTransactions(t *testing.T) {
 						panic("write code failed")
 					}
 				}
-				sBlockNum := blockNum
-				go func() {
-					sRoot, _ := countingStateDB.PostCommit(sBlockNum, false, false)
-					// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
+				// 记录deleteKVList以便在处理中使用
+				deleteKVList := countingStateDB.GetCachedDeleteKVList()
+				go func(root common.Hash, sBlockNum uint64) {
 					commitStart := time.Now()
-					err = trieDB.Commit(sRoot, false)
+					if deleteKVList == nil || len(deleteKVList.Data) == 0 {
+						trieDB.CacheTrie().FinishCleanup(sBlockNum, root)
+						return
+					}
+					// 使用当前状态根创建新的stateDB
+					cleanStateDB, err := state.New(root, preSdb)
 
-					// 完成清理操作，设置结果哈希
-					trieDB.CacheTrie().FinishCleanup(sBlockNum, sRoot)
+					// 第二步：处理所有账户
+					for _, kv := range deleteKVList.Data {
+						// 地址为空且键存在，说明是账户
+						if (kv.Address == common.Address{}) && len(kv.Key) > 0 {
+							addr := common.BytesToAddress(kv.Key)
+							cleanStateDB.SetAccount(addr, kv.Value, 0)
+						}
+					}
+
+					// 第一步：处理所有状态（存储槽）
+					for _, kv := range deleteKVList.Data {
+						// 通过Address区分是否有地址，如果地址非空，则是存储槽
+						if (kv.Address != common.Address{}) && len(kv.Key) > 0 {
+							// 有地址且有键，说明是存储槽
+							addr := kv.Address
+							key := common.BytesToHash(kv.Key)
+							value := common.BytesToHash(kv.Value)
+
+							// 将存储数据写入新stateDB
+							cleanStateDB.SetState(addr, key, value)
+						}
+					}
+
+					// 第三步：对新stateDB进行commit
+					newRoot, err := cleanStateDB.Commit(sBlockNum, false, false)
+					if err != nil {
+						t.Fatalf("提交无cache stateDB失败: %v", err)
+					}
+
+					// 第四步：将结果提交到数据库
+					err = preTrieDB.Commit(newRoot, false)
+					if err != nil {
+						t.Fatalf("提交trieDB失败: %v", err)
+					}
+
+					trieDB.CacheTrie().FinishCleanup(sBlockNum, newRoot)
 					commitDuration = time.Since(commitStart)
-					lastCommitBlock = sBlockNum
 
 					if err != nil {
 						t.Fatalf("提交状态失败，区块 %d: %v", sBlockNum, err)
 					}
 
 					// 刷新数据库，避免内存占用过大
-					trieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
-				}()
+					preTrieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
+
+				}(root, blockNum)
 			} else {
 				root, _ = countingStateDB.Commit(blockNum, false, false)
 				// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
