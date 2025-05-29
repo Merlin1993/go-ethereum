@@ -21,8 +21,8 @@ import (
 // 测试配置
 const (
 	// 方法一配置
-	method1BatchSize = 1000000    // 每批次处理的数据量
-	method1TotalData = 1000000000 // 总数据量（可以根据需要调整到10亿）
+	method1BatchSize = 1000000   // 每批次处理的数据量
+	method1TotalData = 627000000 // 总数据量（可以根据需要调整到10亿）
 
 	// 方法二配置
 	method2BatchSize  = 5000 // 每批次写入的数据量

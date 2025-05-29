@@ -18,6 +18,7 @@ package state
 
 import (
 	"errors"
+
 	"github.com/ethereum/go-ethereum/cacheTrie"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -124,29 +125,18 @@ func (r *cachingCodeReader) CodeSize(addr common.Address, codeHash common.Hash) 
 	return len(code), nil
 }
 
-// flatReader wraps a database state reader.
-type flatReader struct {
-	ct     *cacheTrie.CacheTrie
-	reader database.StateReader
-	buff   crypto.KeccakState
+type CacheTrieReader struct {
+	ct *cacheTrie.CacheTrie
 }
 
 // newFlatReader constructs a state reader with on the given state root.
-func newFlatReader(reader database.StateReader, ct *cacheTrie.CacheTrie) *flatReader {
-	return &flatReader{
-		ct:     ct,
-		reader: reader,
-		buff:   crypto.NewKeccakState(),
+func newCacheReader(ct *cacheTrie.CacheTrie) *CacheTrieReader {
+	return &CacheTrieReader{
+		ct: ct,
 	}
 }
 
-// Account implements StateReader, retrieving the account specified by the address.
-//
-// An error will be returned if the associated snapshot is already stale or
-// the requested account is not yet covered by the snapshot.
-//
-// The returned account might be nil if it's not existent.
-func (r *flatReader) Account(addr common.Address) (*types.StateAccount, error) {
+func (r *CacheTrieReader) Account(addr common.Address) (*types.StateAccount, error) {
 	if r.ct != nil {
 		// 从缓存中获取
 		cacheNode, err := r.ct.Get(addr.Bytes())
@@ -160,6 +150,59 @@ func (r *flatReader) Account(addr common.Address) (*types.StateAccount, error) {
 		}
 	}
 
+	return nil, nil
+}
+
+// Storage implements StateReader, retrieving the storage slot specified by the
+// address and slot key.
+//
+// An error will be returned if the associated snapshot is already stale or
+// the requested storage slot is not yet covered by the snapshot.
+//
+// The returned storage slot might be empty if it's not existent.
+func (r *CacheTrieReader) Storage(addr common.Address, key common.Hash) (common.Hash, error) {
+	if r.ct != nil {
+		// 从缓存中获取
+		cacheNode, err := r.ct.GetWithAddress(addr, key.Bytes())
+		if err == nil && cacheNode != nil {
+			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok && len(valueNode.Data) > 0 {
+				content := valueNode.Data
+				// 如果需要将RLP编码的数据提取出实际内容
+				_, actualContent, _, err := rlp.Split(content)
+				if err != nil {
+					return common.Hash{}, err // 如果解码失败，直接返回原始内容
+				}
+				var value common.Hash
+				value.SetBytes(actualContent)
+				return value, nil
+			}
+		}
+	}
+
+	return common.Hash{}, nil
+}
+
+// flatReader wraps a database state reader.
+type flatReader struct {
+	reader database.StateReader
+	buff   crypto.KeccakState
+}
+
+// newFlatReader constructs a state reader with on the given state root.
+func newFlatReader(reader database.StateReader) *flatReader {
+	return &flatReader{
+		reader: reader,
+		buff:   crypto.NewKeccakState(),
+	}
+}
+
+// Account implements StateReader, retrieving the account specified by the address.
+//
+// An error will be returned if the associated snapshot is already stale or
+// the requested account is not yet covered by the snapshot.
+//
+// The returned account might be nil if it's not existent.
+func (r *flatReader) Account(addr common.Address) (*types.StateAccount, error) {
 	account, err := r.reader.Account(crypto.HashData(r.buff, addr.Bytes()))
 	if err != nil {
 		return nil, err
@@ -190,23 +233,6 @@ func (r *flatReader) Account(addr common.Address) (*types.StateAccount, error) {
 //
 // The returned storage slot might be empty if it's not existent.
 func (r *flatReader) Storage(addr common.Address, key common.Hash) (common.Hash, error) {
-	if r.ct != nil {
-		// 从缓存中获取
-		cacheNode, err := r.ct.GetWithAddress(addr, key.Bytes())
-		if err == nil && cacheNode != nil {
-			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok && len(valueNode.Data) > 0 {
-				content := valueNode.Data
-				// 如果需要将RLP编码的数据提取出实际内容
-				_, actualContent, _, err := rlp.Split(content)
-				if err != nil {
-					return common.Hash{}, err // 如果解码失败，直接返回原始内容
-				}
-				var value common.Hash
-				value.SetBytes(actualContent)
-				return value, nil
-			}
-		}
-	}
 	addrHash := crypto.HashData(r.buff, addr.Bytes())
 	slotHash := crypto.HashData(r.buff, key.Bytes())
 	ret, err := r.reader.Storage(addrHash, slotHash)

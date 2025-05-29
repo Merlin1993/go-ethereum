@@ -180,6 +180,12 @@ func (db *CachingDB) SetBlockNum(num uint64) {
 func (db *CachingDB) Reader(stateRoot common.Hash) (Reader, error) {
 	var readers []StateReader
 
+	// 首先检查是否有 cache reader 可用，如果有则作为最高优先级
+	if cacheTrie := db.triedb.CacheTrie(); cacheTrie != nil {
+		// 创建 cache reader 作为最高优先级
+		readers = append(readers, newCacheReader(cacheTrie))
+	}
+
 	// Set up the state snapshot reader if available. This feature
 	// is optional and may be partially useful if it's not fully
 	// generated.
@@ -188,14 +194,14 @@ func (db *CachingDB) Reader(stateRoot common.Hash) (Reader, error) {
 		// then construct the legacy snap reader.
 		snap := db.snap.Snapshot(stateRoot)
 		if snap != nil {
-			readers = append(readers, newFlatReader(snap, db.triedb.CacheTrie()))
+			readers = append(readers, newFlatReader(snap))
 		}
 	} else {
 		// If standalone state snapshot is not available, try to construct
 		// the state reader with database.
 		reader, err := db.triedb.StateReader(stateRoot)
 		if err == nil {
-			readers = append(readers, newFlatReader(reader, db.triedb.CacheTrie())) // state reader is optional
+			readers = append(readers, newFlatReader(reader)) // state reader is optional
 		}
 	}
 	// Set up the trie reader, which is expected to always be available
@@ -215,14 +221,27 @@ func (db *CachingDB) Reader(stateRoot common.Hash) (Reader, error) {
 
 // OpenTrie opens the main account trie at a specific root hash.
 func (db *CachingDB) OpenTrie(root common.Hash) (Trie, error) {
+	var baseTrie Trie
+	var err error
+
+	// 创建底层trie
 	if db.triedb.IsVerkle() {
-		return trie.NewVerkleTrie(root, db.triedb, db.pointCache)
+		baseTrie, err = trie.NewVerkleTrie(root, db.triedb, db.pointCache)
+	} else {
+		baseTrie, err = trie.NewStateTrie(trie.StateTrieID(root), db.triedb)
 	}
-	tr, err := trie.NewStateTrie(trie.StateTrieID(root), db.triedb)
+
 	if err != nil {
 		return nil, err
 	}
-	return tr, nil
+
+	// 检查是否需要包装缓存代理
+	if cacheTrie := db.triedb.CacheTrie(); cacheTrie != nil {
+		// 包装为缓存代理trie
+		return trie.NewCacheProxyTrie(baseTrie, cacheTrie), nil
+	}
+
+	return baseTrie, nil
 }
 
 // OpenStorageTrie opens the storage trie of an account.
@@ -233,11 +252,20 @@ func (db *CachingDB) OpenStorageTrie(stateRoot common.Hash, address common.Addre
 	if db.triedb.IsVerkle() {
 		return self, nil
 	}
-	tr, err := trie.NewStateTrie(trie.StorageTrieID(stateRoot, crypto.Keccak256Hash(address.Bytes()), root), db.triedb)
+
+	// 创建底层存储trie
+	baseTrie, err := trie.NewStateTrie(trie.StorageTrieID(stateRoot, crypto.Keccak256Hash(address.Bytes()), root), db.triedb)
 	if err != nil {
 		return nil, err
 	}
-	return tr, nil
+
+	// 检查是否需要包装缓存代理
+	if cacheTrie := db.triedb.CacheTrie(); cacheTrie != nil {
+		// 包装为缓存代理trie
+		return trie.NewCacheProxyTrie(baseTrie, cacheTrie), nil
+	}
+
+	return baseTrie, nil
 }
 
 // ContractCodeWithPrefix retrieves a particular contract's code. If the
