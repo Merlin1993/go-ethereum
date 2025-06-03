@@ -156,7 +156,7 @@ type StateDB struct {
 	StorageUpdated atomic.Int64 // Number of storage slots updated during the state transition
 	StorageDeleted atomic.Int64 // Number of storage slots deleted during the state transition
 
-	// 缓存的 deleteKVList，用于 PollCacheTire
+	// 缓存的 deleteKVList
 	cachedDeleteKVList *cacheTrie.DeleteKVList
 }
 
@@ -576,10 +576,6 @@ func (s *StateDB) updateStateObject(obj *stateObject) {
 	}
 	if obj.dirtyCode {
 		s.trie.UpdateContractCode(obj.Address(), common.BytesToHash(obj.CodeHash()), obj.code)
-
-		if s.db.TrieDB().CacheTrie() != nil {
-			s.db.TrieDB().CacheTrie().AddCode(common.BytesToHash(obj.CodeHash()), obj.code)
-		}
 	}
 }
 
@@ -833,7 +829,7 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 			continue
 		}
 		obj := s.stateObjects[addr] // closure for the task runner below
-		if s.db.TrieDB().CacheTrie() != nil && obj.code != nil && len(obj.code) > 0 {
+		if s.db.TrieDB().CacheTrie() != nil && obj.code != nil && len(obj.code) > 0 && obj.dirtyCode {
 			s.db.TrieDB().CacheTrie().AddCode(common.BytesToHash(obj.CodeHash()), obj.code)
 		}
 		workers.Go(func() error {
@@ -948,11 +944,7 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		// 计算缓存树的哈希，这将触发缓存清理，并返回被删除的键值对
 		tdb.CacheTrie().Prune()
 		_, deleteKVList := tdb.CacheTrie().Hash()
-
-		if deleteKVList != nil && len(deleteKVList.Data) != 0 {
-			// 存储deleteKVList用于PollCacheTire
-			s.cachedDeleteKVList = deleteKVList
-		}
+		s.cachedDeleteKVList = deleteKVList
 	}
 
 	hash := s.trie.Hash()

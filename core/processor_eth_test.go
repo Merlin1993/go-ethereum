@@ -12,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/cacheTrie"
+	"github.com/ethereum/go-ethereum/core/state/snapshot"
+
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -1197,6 +1200,7 @@ func TestProcessTransactions(t *testing.T) {
 	}
 	defer ldb.Close()
 
+	//cacheConfig := DefaultCacheConfigWithScheme(rawdb.PathScheme)
 	db := rawdb.NewDatabase(ldb)
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
 		Preimages: false,
@@ -1206,8 +1210,9 @@ func TestProcessTransactions(t *testing.T) {
 		StartNum:  startNum,
 		HashDB:    hashdb.Defaults,
 	})
-	//snaps, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
-	sdb := state.NewDatabase(trieDB, nil)
+	var snaps *snapshot.Tree
+	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
+	sdb := state.NewDatabase(trieDB, snaps)
 	var preTrieDB *triedb.Database
 	var preSdb *state.CachingDB
 	if common.UseCacheTrie {
@@ -1219,12 +1224,12 @@ func TestProcessTransactions(t *testing.T) {
 			StartNum:  startNum,
 			HashDB:    hashdb.Defaults,
 		})
-		preSdb = state.NewDatabase(preTrieDB, nil)
+		preSdb = state.NewDatabase(preTrieDB, snaps)
 	}
 
 	// 创建genesis区块和区块链
 	gspec := &Genesis{
-		Config: params.TestChainConfig,
+		Config: params.MainnetChainConfig,
 		Alloc:  GenesisAlloc{},
 	}
 	genesis := gspec.MustCommit(db, trieDB)
@@ -1572,6 +1577,10 @@ func TestProcessTransactions(t *testing.T) {
 					// 简化错误原因，提取主要错误类型
 					errReason = simplifyErrorReason(errReason)
 
+					if isContractCreate && strings.Contains(result.Err.Error(), "out of gas") {
+						t.Logf("find a fail contract : %v, err: %v, limit: %v, gas: %v.", result.ContractAddress, errReason, msg.GasLimit, result.UsedGas)
+					}
+
 					// 更新错误计数
 					if !(!isContractTx && (errReason == "fail get code" || errReason == "invalid jumpi destination" || errReason == "fail get account code")) {
 						errorReasons[errReason]++
@@ -1691,10 +1700,12 @@ func TestProcessTransactions(t *testing.T) {
 				}
 				// 记录deleteKVList以便在处理中使用
 				deleteKVList := countingStateDB.GetCachedDeleteKVList()
-
-				go func(root common.Hash, sBlockNum uint64) {
+				go func(root common.Hash, sBlockNum uint64, deleteKVList *cacheTrie.DeleteKVList) {
 					commitStart := time.Now()
-					if deleteKVList == nil || len(deleteKVList.Data) == 0 {
+					if deleteKVList == nil {
+						return
+					}
+					if len(deleteKVList.Data) == 0 {
 						trieDB.CacheTrie().FinishCleanup(sBlockNum, root)
 						return
 					}
@@ -1746,7 +1757,7 @@ func TestProcessTransactions(t *testing.T) {
 					// 刷新数据库，避免内存占用过大
 					preTrieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
 
-				}(root, blockNum)
+				}(root, blockNum, deleteKVList)
 			} else {
 				root, _ = countingStateDB.Commit(blockNum, false, false)
 				// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交

@@ -103,7 +103,7 @@ func (t *CacheTrie) prepareKey(key []byte, address ...common.Address) []byte {
 	// 如果提供了地址，将地址与键组合
 	if len(address) > 0 {
 		dataToHash = append(address[0].Bytes(), key...)
-		dataToHash = hashKey(key)
+		dataToHash = hashKey(dataToHash)
 	} else {
 		dataToHash = hashKey(key)
 	}
@@ -561,11 +561,18 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 		t.maxCleanupTime = cleanupTime
 	}
 
+	if len(deleteKVList.Data) == 0 {
+		fmt.Println("delete data is 0")
+	}
+
 	return deleteKVList
 }
 
 func (t *CacheTrie) pruneNode() {
 	bitCount := t.pruneBitCount
+	if bitCount > 0 {
+		//fmt.Println("prune node")
+	}
 	for bitCount > 0 {
 		if t.root == nil {
 			break
@@ -827,6 +834,7 @@ func (t *CacheTrie) FinishCleanup(blockNum uint64, resultHash common.Hash) {
 	}
 	defer t.cleanupMu.Unlock()
 
+	fmt.Println(fmt.Sprintf("finsh clean : %v at %v", resultHash, blockNum))
 	// 缓存清理结果
 	t.cleanupResults = resultHash
 	// 重置清理状态

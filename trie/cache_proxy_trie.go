@@ -233,11 +233,6 @@ func (t *CacheProxyTrie) UpdateContractCode(address common.Address, codeHash com
 		return err
 	}
 
-	// 如果启用缓存，将代码添加到缓存中
-	if t.useCache && t.cache != nil {
-		t.cache.AddCode(codeHash, code)
-	}
-
 	return nil
 }
 

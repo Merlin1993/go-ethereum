@@ -129,6 +129,8 @@ type CacheTrieReader struct {
 	ct *cacheTrie.CacheTrie
 }
 
+var CacheNilErr = errors.New("cache trie not find")
+
 // newFlatReader constructs a state reader with on the given state root.
 func newCacheReader(ct *cacheTrie.CacheTrie) *CacheTrieReader {
 	return &CacheTrieReader{
@@ -150,7 +152,7 @@ func (r *CacheTrieReader) Account(addr common.Address) (*types.StateAccount, err
 		}
 	}
 
-	return nil, nil
+	return nil, CacheNilErr
 }
 
 // Storage implements StateReader, retrieving the storage slot specified by the
@@ -179,7 +181,7 @@ func (r *CacheTrieReader) Storage(addr common.Address, key common.Hash) (common.
 		}
 	}
 
-	return common.Hash{}, nil
+	return common.Hash{}, CacheNilErr
 }
 
 // flatReader wraps a database state reader.

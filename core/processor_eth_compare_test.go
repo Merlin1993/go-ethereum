@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"github.com/ethereum/go-ethereum/cacheTrie"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -425,89 +426,6 @@ func compareGetFileIndex(filePath string) string {
 	return strings.TrimSuffix(parts[1], ".csv")
 }
 
-// 获取指定区块的时间戳
-func compareGetBlockTimestamp(dataDir string, blockNum uint64) (uint64, error) {
-	// 如果已经缓存了该区块的时间戳，直接返回
-	if timestamp, ok := compareBlockTimestamps[blockNum]; ok {
-		return timestamp, nil
-	}
-
-	// 查找所有blocks*.csv文件
-	pattern := filepath.Join(dataDir, "blocks*.csv")
-	files, err := filepath.Glob(pattern)
-	if err != nil {
-		return 0, fmt.Errorf("查找区块CSV文件失败: %v", err)
-	}
-
-	if len(files) == 0 {
-		return 0, fmt.Errorf("未找到任何区块文件")
-	}
-
-	// 按自然数排序文件
-	compareNaturalSort(files)
-
-	// 逐个文件查找区块
-	for _, file := range files {
-		// 打开CSV文件
-		csvFile, err := os.Open(file)
-		if err != nil {
-			continue // 跳过无法打开的文件
-		}
-		defer csvFile.Close()
-
-		// 解析CSV数据
-		reader := csv.NewReader(csvFile)
-		// 读取标题行
-		headers, err := reader.Read()
-		if err != nil {
-			continue // 跳过无法读取标题的文件
-		}
-
-		// 查找number和timestamp字段的索引
-		var numberIdx, timestampIdx int = -1, -1
-		for i, header := range headers {
-			if header == "number" {
-				numberIdx = i
-			} else if header == "timestamp" {
-				timestampIdx = i
-			}
-		}
-
-		if numberIdx == -1 || timestampIdx == -1 {
-			continue // 跳过缺少必要字段的文件
-		}
-
-		// 读取CSV数据并查找目标区块
-		for {
-			record, err := reader.Read()
-			if err != nil {
-				break
-			}
-
-			// 解析区块高度
-			num, err := strconv.ParseUint(record[numberIdx], 10, 64)
-			if err != nil {
-				continue
-			}
-
-			// 找到目标区块
-			if num == blockNum {
-				// 解析时间戳
-				timestamp, err := strconv.ParseUint(record[timestampIdx], 10, 64)
-				if err != nil {
-					return 0, err
-				}
-				// 缓存时间戳
-				compareBlockTimestamps[blockNum] = timestamp
-				return timestamp, nil
-			}
-		}
-	}
-
-	// 没有找到区块，返回默认时间戳
-	return blockNum * 15, nil
-}
-
 // 查找所有匹配的CSV文件并按顺序排序
 func compareFindTransactionFiles(dataDir string) ([]string, error) {
 	// 使用通配符匹配所有transactions_*.csv文件
@@ -521,12 +439,6 @@ func compareFindTransactionFiles(dataDir string) ([]string, error) {
 	compareNaturalSort(files)
 	return files, nil
 }
-
-// 记录上次统计CacheTrie命中率的区块号
-var lastCacheTrieStatsBlock uint64
-
-// 记录上次统计CacheTrie内存大小的区块号
-var lastCacheTrieMemoryStatsBlock uint64
 
 // TestCompareProcessTransactions 测试处理CSV中的交易
 func TestCompareProcessTransactions(t *testing.T) {
@@ -981,9 +893,12 @@ func TestCompareProcessTransactions(t *testing.T) {
 				}
 				// 记录deleteKVList以便在处理中使用
 				deleteKVList := countingStateDB.GetCachedDeleteKVList()
-				go func(root common.Hash, sBlockNum uint64) {
+				go func(root common.Hash, sBlockNum uint64, deleteKVList *cacheTrie.DeleteKVList) {
 					commitStart := time.Now()
-					if deleteKVList == nil || len(deleteKVList.Data) == 0 {
+					if deleteKVList == nil {
+						return
+					}
+					if len(deleteKVList.Data) == 0 {
 						trieDB.CacheTrie().FinishCleanup(sBlockNum, root)
 						return
 					}
@@ -1035,7 +950,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 					// 刷新数据库，避免内存占用过大
 					preTrieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
 
-				}(root, blockNum)
+				}(root, blockNum, deleteKVList)
 			} else {
 				root, _ = countingStateDB.Commit(blockNum, false, false)
 				// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
