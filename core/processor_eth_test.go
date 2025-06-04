@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/csv"
 	"fmt"
+	"github.com/ethereum/go-ethereum/rlp"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -1728,10 +1729,16 @@ func TestProcessTransactions(t *testing.T) {
 							// 有地址且有键，说明是存储槽
 							addr := kv.Address
 							key := common.BytesToHash(kv.Key)
-							value := common.BytesToHash(kv.Value)
+							if common.BytesToHash(kv.Value) == (common.Hash{}) {
+								cleanStateDB.SetState(addr, key, common.Hash{})
+							} else {
+								_, vc, _, _ := rlp.Split(kv.Value)
 
-							// 将存储数据写入新stateDB
-							cleanStateDB.SetState(addr, key, value)
+								value := common.BytesToHash(vc)
+
+								// 将存储数据写入新stateDB
+								cleanStateDB.SetState(addr, key, value)
+							}
 						}
 					}
 

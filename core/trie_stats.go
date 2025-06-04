@@ -21,7 +21,9 @@ package core
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -56,13 +58,12 @@ const (
 
 // TrieStatsAggregator 状态树统计数据聚合器
 type TrieStatsAggregator struct {
-	mu           sync.Mutex // 保护内部状态的互斥锁
-	OutputDir    string     // 输出目录
-	Window       uint64     // 统计窗口(10w区块)
-	LastOutput   uint64     // 上次输出统计的区块号
-	TrieType     TrieType   // 树类型
-	LastDataSize int64      // 上次记录的数据大小
-	DataPath     string     // 数据路径(用于计算数据大小变化)
+	mu         sync.Mutex // 保护内部状态的互斥锁
+	OutputDir  string     // 输出目录
+	Window     uint64     // 统计窗口(10w区块)
+	LastOutput uint64     // 上次输出统计的区块号
+	TrieType   TrieType   // 树类型
+	DataPath   string     // 数据路径(用于计算数据大小变化)
 
 	// 累计统计数据
 	WindowStats struct {
@@ -96,18 +97,11 @@ func NewTrieStatsAggregator(outputDir string, dataPath string, trieType TrieType
 		os.MkdirAll(outputDir, 0755)
 	}
 
-	// 获取初始数据大小
-	var initialSize int64
-	if dataPath != "" {
-		initialSize, _ = CalculateDirSize(dataPath)
-	}
-
 	return &TrieStatsAggregator{
 		OutputDir:    outputDir,
 		Window:       StatsWindow,
 		LastOutput:   0,
 		TrieType:     trieType,
-		LastDataSize: initialSize,
 		DataPath:     dataPath,
 		CacheTrieRef: nil,
 	}
@@ -187,11 +181,10 @@ func (s *TrieStatsAggregator) AddBlockStats(blockNum uint64, writtenStates, read
 // OutputStats 输出窗口(10万区块)统计数据
 func (s *TrieStatsAggregator) OutputStats() {
 	// 获取第三类统计：数据大小变化
-	var dataSizeDelta int64
+	var dataSize int64
 	if s.DataPath != "" {
 		currentSize := s.GetCurrentDataSize()
-		dataSizeDelta = currentSize - s.LastDataSize
-		s.LastDataSize = currentSize
+		dataSize = currentSize
 	}
 
 	// 获取第二类统计：CacheTrie的命中率和清理统计
@@ -213,10 +206,10 @@ func (s *TrieStatsAggregator) OutputStats() {
 	}
 
 	// 打印统计信息到控制台
-	s.printWindowStats(dataSizeDelta, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime)
+	s.printWindowStats(dataSize, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime)
 
 	// 输出CSV文件
-	s.outputCSV(dataSizeDelta, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime)
+	s.outputCSV(dataSize, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime)
 }
 
 // GetCurrentDataSize 获取当前数据目录大小
@@ -261,6 +254,11 @@ func RecordTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writtenStat
 		os.MkdirAll(recorder.OutputDir, 0755)
 	}
 
+	//记录并比较统计数据
+	//if blockNum > 700000 && blockNum < 800000 {
+	//	globalComparator.recordAndCompareStats(blockNum, "StandardTrie", writtenStates, readStates)
+	//}
+
 	// 添加基本统计数据
 	recorder.AddBlockStats(blockNum, writtenStates, readStates, txCount, txExecTime, rootGenTime, 0, 0, 0)
 }
@@ -273,6 +271,11 @@ func RecordCacheTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writte
 	if _, err := os.Stat(recorder.OutputDir); os.IsNotExist(err) {
 		os.MkdirAll(recorder.OutputDir, 0755)
 	}
+
+	//// 记录并比较统计数据
+	//if blockNum > 700000 && blockNum < 800000 {
+	//	globalComparator.recordAndCompareStats(blockNum, "CacheTrie", writtenStates, readStates)
+	//}
 
 	// 保存CacheTrie实例的引用，用于在输出时获取命中率和清理统计
 	recorder.mu.Lock()
@@ -331,7 +334,7 @@ func (s *TrieStatsAggregator) resetWindowStats() {
 }
 
 // printWindowStats 打印窗口统计信息
-func (s *TrieStatsAggregator) printWindowStats(dataSizeDelta int64, getHitRate, updateHitRate float64,
+func (s *TrieStatsAggregator) printWindowStats(dataSize int64, getHitRate, updateHitRate float64,
 	getHits, getMisses, updateHits, updateMisses uint64,
 	cleanupCount int, totalCleanupTime, maxCleanupTime time.Duration) {
 
@@ -395,17 +398,17 @@ func (s *TrieStatsAggregator) printWindowStats(dataSizeDelta int64, getHitRate, 
 
 	// 数据大小变化
 	if s.DataPath != "" {
-		dataSizeDeltaMB := float64(dataSizeDelta) / MBSize
+		dataSizeMB := float64(dataSize) / MBSize
 
 		fmt.Printf("\n----- 数据大小统计 -----\n")
-		fmt.Printf("数据大小总变化: %.2f MB\n", dataSizeDeltaMB)
+		fmt.Printf("数据大小: %.2f MB\n", dataSizeMB)
 	}
 
 	fmt.Println("=======================================")
 }
 
 // outputCSV 输出CSV文件
-func (s *TrieStatsAggregator) outputCSV(dataSizeDelta int64, getHitRate, updateHitRate float64,
+func (s *TrieStatsAggregator) outputCSV(dataSize int64, getHitRate, updateHitRate float64,
 	getHits, getMisses, updateHits, updateMisses uint64,
 	cleanupCount int, totalCleanupTime, maxCleanupTime time.Duration) {
 
@@ -435,7 +438,7 @@ func (s *TrieStatsAggregator) outputCSV(dataSizeDelta int64, getHitRate, updateH
 	}
 
 	// 数据大小变化（MB）
-	dataSizeDeltaMB := float64(dataSizeDelta) / MBSize
+	dataSizeMB := float64(dataSize) / MBSize
 
 	// 准备当前记录，第一个字段改为窗口编号
 	currentRecord := []string{
@@ -445,7 +448,7 @@ func (s *TrieStatsAggregator) outputCSV(dataSizeDelta int64, getHitRate, updateH
 		strconv.FormatInt(s.WindowStats.TotalTxCount, 10),
 		strconv.FormatInt(avgExecTime, 10),
 		strconv.FormatInt(avgRootGenTime, 10),
-		strconv.FormatFloat(dataSizeDeltaMB, 'f', 2, 64),
+		strconv.FormatFloat(dataSizeMB, 'f', 2, 64),
 	}
 
 	// 如果是CacheTrie，添加额外的统计
@@ -477,7 +480,7 @@ func (s *TrieStatsAggregator) outputCSV(dataSizeDelta int64, getHitRate, updateH
 		"TotalTransactionCount",
 		"AvgTransactionExecTime(us)",
 		"AvgRootGenTime(us)",
-		"DataSizeDelta(MB)")
+		"DataSize(MB)")
 
 	// 如果是CacheTrie，添加额外的列
 	if s.TrieType == CacheTrie {
@@ -578,4 +581,196 @@ func readCSVRecords(filePath string) ([][]string, error) {
 
 	reader := csv.NewReader(file)
 	return reader.ReadAll()
+}
+
+// TrieStatsComparator 用于比较不同 Trie 类型的统计差异
+type TrieStatsComparator struct {
+	dataFile string // 统计数据文件路径
+	mu       sync.Mutex
+}
+
+var globalComparator = &TrieStatsComparator{
+	dataFile: "trie_stats_compare.json",
+}
+
+// TrieCompareStats 存储单个区块的统计数据
+type TrieCompareStats struct {
+	StandardTrieWrites int `json:"standard_trie_writes"`
+	StandardTrieReads  int `json:"standard_trie_reads"`
+	CacheTrieWrites    int `json:"cache_trie_writes"`
+	CacheTrieReads     int `json:"cache_trie_reads"`
+}
+
+// loadBlockStats 从文件加载区块统计数据
+func (c *TrieStatsComparator) loadBlockStats(blockNum uint64) (*TrieCompareStats, error) {
+	filename := fmt.Sprintf("block_%d_stats.json", blockNum)
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &TrieCompareStats{}, nil // 文件不存在返回空统计
+		}
+		return nil, err
+	}
+
+	var stats TrieCompareStats
+	err = json.Unmarshal(data, &stats)
+	return &stats, err
+}
+
+// saveBlockStats 保存区块统计数据到文件
+func (c *TrieStatsComparator) saveBlockStats(blockNum uint64, stats *TrieCompareStats) error {
+	filename := fmt.Sprintf("block_%d_stats.json", blockNum)
+	data, err := json.Marshal(stats)
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(filename, data, 0644)
+}
+
+// recordAndCompareStats 记录并比较统计数据
+func (c *TrieStatsComparator) recordAndCompareStats(blockNum uint64, trieType string, uniqueWrites, uniqueReads int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 从文件加载现有统计数据
+	stats, err := c.loadBlockStats(blockNum)
+	if err != nil {
+		fmt.Printf("⚠️  [警告] 加载区块 %d 统计数据失败: %v\n", blockNum, err)
+		return
+	}
+
+	// 检查是否存在差异并更新统计
+	var hasOtherData bool
+	var otherTrieType string
+
+	if trieType == "StandardTrie" {
+		// 检查是否已有 CacheTrie 的数据
+		if stats.CacheTrieWrites != 0 || stats.CacheTrieReads != 0 {
+			hasOtherData = true
+			otherTrieType = "CacheTrie"
+			// 比较差异
+			if stats.CacheTrieWrites != uniqueWrites {
+				fmt.Printf("🔍 [差异检测] 区块 %d: %s UniqueWrites=%d, %s UniqueWrites=%d, 差异=%d\n",
+					blockNum, trieType, uniqueWrites, otherTrieType, stats.CacheTrieWrites, uniqueWrites-stats.CacheTrieWrites)
+			}
+			if stats.CacheTrieReads != uniqueReads {
+				fmt.Printf("🔍 [差异检测] 区块 %d: %s UniqueReads=%d, %s UniqueReads=%d, 差异=%d\n",
+					blockNum, trieType, uniqueReads, otherTrieType, stats.CacheTrieReads, uniqueReads-stats.CacheTrieReads)
+			}
+		}
+		// 更新 StandardTrie 数据
+		stats.StandardTrieWrites = uniqueWrites
+		stats.StandardTrieReads = uniqueReads
+
+	} else if trieType == "CacheTrie" {
+		// 检查是否已有 StandardTrie 的数据
+		if stats.StandardTrieWrites != 0 || stats.StandardTrieReads != 0 {
+			hasOtherData = true
+			otherTrieType = "StandardTrie"
+			// 比较差异
+			if stats.StandardTrieWrites != uniqueWrites {
+				fmt.Printf("🔍 [差异检测] 区块 %d: %s UniqueWrites=%d, %s UniqueWrites=%d, 差异=%d\n",
+					blockNum, trieType, uniqueWrites, otherTrieType, stats.StandardTrieWrites, uniqueWrites-stats.StandardTrieWrites)
+			}
+			if stats.StandardTrieReads != uniqueReads {
+				fmt.Printf("🔍 [差异检测] 区块 %d: %s UniqueReads=%d, %s UniqueReads=%d, 差异=%d\n",
+					blockNum, trieType, uniqueReads, otherTrieType, stats.StandardTrieReads, uniqueReads-stats.StandardTrieReads)
+			}
+		}
+		// 更新 CacheTrie 数据
+		stats.CacheTrieWrites = uniqueWrites
+		stats.CacheTrieReads = uniqueReads
+	}
+
+	// 保存更新后的统计数据
+	if err := c.saveBlockStats(blockNum, stats); err != nil {
+		fmt.Printf("⚠️  [警告] 保存区块 %d 统计数据失败: %v\n", blockNum, err)
+		return
+	}
+
+	// 如果没有其他类型的数据，输出提示信息
+	if !hasOtherData {
+		fmt.Printf("📝 [记录] 区块 %d: 首次记录 %s 数据 (UniqueWrites=%d, UniqueReads=%d)\n",
+			blockNum, trieType, uniqueWrites, uniqueReads)
+	}
+}
+
+// CleanupOldStatsFiles 清理旧的统计文件（保留最近的N个区块）
+func CleanupOldStatsFiles(keepRecentBlocks uint64) error {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		return err
+	}
+
+	var maxBlockNum uint64
+	var statsFiles []string
+
+	// 找到所有统计文件和最大区块号
+	for _, entry := range entries {
+		if !entry.IsDir() && len(entry.Name()) > 6 && entry.Name()[:6] == "block_" {
+			var blockNum uint64
+			if n, err := fmt.Sscanf(entry.Name(), "block_%d_stats.json", &blockNum); n == 1 && err == nil {
+				statsFiles = append(statsFiles, entry.Name())
+				if blockNum > maxBlockNum {
+					maxBlockNum = blockNum
+				}
+			}
+		}
+	}
+
+	// 删除过期文件
+	threshold := uint64(0)
+	if maxBlockNum > keepRecentBlocks {
+		threshold = maxBlockNum - keepRecentBlocks
+	}
+
+	deletedCount := 0
+	for _, filename := range statsFiles {
+		var blockNum uint64
+		if n, err := fmt.Sscanf(filename, "block_%d_stats.json", &blockNum); n == 1 && err == nil {
+			if blockNum < threshold {
+				if err := os.Remove(filename); err == nil {
+					deletedCount++
+				}
+			}
+		}
+	}
+
+	if deletedCount > 0 {
+		fmt.Printf("🧹 [清理] 删除了 %d 个过期的统计文件 (保留最近 %d 个区块)\n", deletedCount, keepRecentBlocks)
+	}
+
+	return nil
+}
+
+// GetStatsFileInfo 获取统计文件信息
+func GetStatsFileInfo() (int, uint64, uint64, error) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	var minBlockNum, maxBlockNum uint64 = ^uint64(0), 0
+	fileCount := 0
+
+	for _, entry := range entries {
+		if !entry.IsDir() && len(entry.Name()) > 6 && entry.Name()[:6] == "block_" {
+			var blockNum uint64
+			if n, err := fmt.Sscanf(entry.Name(), "block_%d_stats.json", &blockNum); n == 1 && err == nil {
+				fileCount++
+				if blockNum < minBlockNum {
+					minBlockNum = blockNum
+				}
+				if blockNum > maxBlockNum {
+					maxBlockNum = blockNum
+				}
+			}
+		}
+	}
+
+	if fileCount == 0 {
+		return 0, 0, 0, nil
+	}
+
+	return fileCount, minBlockNum, maxBlockNum, nil
 }

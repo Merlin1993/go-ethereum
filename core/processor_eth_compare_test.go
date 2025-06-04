@@ -48,15 +48,6 @@ import (
 而合约存储的操作则可能是"只读"或"只写"模式。
 */
 
-// 自定义区块数量维度配置，用于缓存命中率统计
-var CompareCacheBlockSizes = []uint64{10, 40, 160}
-
-// 新增统计维度常量
-const (
-	CompareSmallStatsWindow = 100000  // 10万次统计窗口
-	CompareLargeStatsWindow = 1000000 // 100万次统计窗口
-)
-
 // CompareStateAccessCounter 用于记录状态访问信息
 type CompareStateAccessCounter struct {
 	BlockNum uint64 // 当前区块号
@@ -925,12 +916,16 @@ func TestCompareProcessTransactions(t *testing.T) {
 							// 有地址且有键，说明是存储槽
 							addr := kv.Address
 							key := common.BytesToHash(kv.Key)
+							if common.BytesToHash(kv.Value) == (common.Hash{}) {
+								cleanStateDB.SetState(addr, key, common.Hash{})
+							} else {
+								_, vc, _, _ := rlp.Split(kv.Value)
 
-							_, vc, _, _ := rlp.Split(kv.Value)
-							value := common.BytesToHash(vc)
+								value := common.BytesToHash(vc)
 
-							// 将存储数据写入新stateDB
-							cleanStateDB.SetState(addr, key, value)
+								// 将存储数据写入新stateDB
+								cleanStateDB.SetState(addr, key, value)
+							}
 						}
 					}
 
