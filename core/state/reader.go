@@ -166,8 +166,11 @@ func (r *CacheTrieReader) Storage(addr common.Address, key common.Hash) (common.
 	if r.ct != nil {
 		// 从缓存中获取
 		cacheNode, err := r.ct.GetWithAddress(addr, key.Bytes())
-		if err == nil && cacheNode != nil {
-			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok && len(valueNode.Data) > 0 {
+		if err != nil || cacheNode == nil {
+			return common.Hash{}, CacheNilErr
+		}
+		if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok {
+			if len(valueNode.Data) > 0 {
 				content := valueNode.Data
 				// 如果需要将RLP编码的数据提取出实际内容
 				_, actualContent, _, err := rlp.Split(content)
@@ -177,10 +180,12 @@ func (r *CacheTrieReader) Storage(addr common.Address, key common.Hash) (common.
 				var value common.Hash
 				value.SetBytes(actualContent)
 				return value, nil
+			} else {
+				//已被删除了
+				return common.Hash{}, nil
 			}
 		}
 	}
-
 	return common.Hash{}, CacheNilErr
 }
 

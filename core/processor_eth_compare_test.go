@@ -3,6 +3,8 @@ package core
 import (
 	"fmt"
 	"github.com/ethereum/go-ethereum/cacheTrie"
+	"github.com/ethereum/go-ethereum/core/state/snapshot"
+	"github.com/ethereum/go-ethereum/rlp"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -480,7 +482,9 @@ func TestCompareProcessTransactions(t *testing.T) {
 	})
 
 	// 使用正确的state包API
-	sdb := state.NewDatabase(trieDB, nil)
+	var snaps *snapshot.Tree
+	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
+	sdb := state.NewDatabase(trieDB, snaps)
 	var preTrieDB *triedb.Database
 	var preSdb *state.CachingDB
 	if common.UseCacheTrie {
@@ -492,7 +496,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 			StartNum:  startNum,
 			HashDB:    hashdb.Defaults,
 		})
-		preSdb = state.NewDatabase(preTrieDB, nil)
+		preSdb = state.NewDatabase(preTrieDB, snaps)
 	}
 
 	// 创建genesis区块和区块链
@@ -921,7 +925,9 @@ func TestCompareProcessTransactions(t *testing.T) {
 							// 有地址且有键，说明是存储槽
 							addr := kv.Address
 							key := common.BytesToHash(kv.Key)
-							value := common.BytesToHash(kv.Value)
+
+							_, vc, _, _ := rlp.Split(kv.Value)
+							value := common.BytesToHash(vc)
 
 							// 将存储数据写入新stateDB
 							cleanStateDB.SetState(addr, key, value)
