@@ -966,7 +966,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 					}
 
 					// 刷新数据库，避免内存占用过大
-					trieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
+					trieDB.Cap(10 * 1024 * 1024 * 1024) // 1GB内存限制
 				}
 			}
 			rootGenDuration := time.Since(rootGenStart)
@@ -982,7 +982,6 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 			// 将状态根写入数据库
 			rawdb.WriteCanonicalHash(db, block.Hash(), blockNum)
-			rawdb.WriteHeadBlockHash(db, block.Hash())
 
 			// 计算总时间和百分比
 			totalTime := processDuration + rootGenDuration
@@ -1116,26 +1115,46 @@ type CompareCountingStateDB struct {
 // GetState 重写GetState方法，增加计数
 func (db *CompareCountingStateDB) GetState(addr common.Address, key common.Hash) common.Hash {
 	// 记录对存储槽位的读取
+
 	stateKey := addr.Hex() + ":" + key.Hex()
 	db.counter.RecordStateRead(stateKey)
 
 	// 同时记录对账户地址的读取
 	addrStr := addr.Hex()
 	db.counter.RecordStateRead(addrStr)
+	//if db.counter.BlockNum >= 160489 && addr.Hex() == "0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825" && key.Hex() == "0x0000000000000000000000000000000000000000000000000000000000000004" {
+	//	addr.Hex()
+	//}
 
-	return db.StateDB.GetState(addr, key)
+	value := db.StateDB.GetState(addr, key)
+	//if addr.Hex() == "0x7De5abA7DE728950c92C57d08e20D4077161F12F" && key.Hex() == "0xcd465ea328ad6cb47bbe4ff2973c8b54560e7aeb7d71e2443cd30d1a04139085" {
+	//	fmt.Printf("warning read: %v , value ： %v \n", db.counter.BlockNum, value.String())
+	//}
+	//if db.counter.BlockNum == 755990 {
+	//	fmt.Printf("addresss %v 读取：%v ： %v \n", addr, key, value)
+	//}
+	return value
 }
 
 // SetState 重写SetState方法，增加计数
 func (db *CompareCountingStateDB) SetState(addr common.Address, key, value common.Hash) common.Hash {
 	// 记录对存储槽位的写入
 	stateKey := addr.Hex() + ":" + key.Hex()
+	//if addr.Hex() == "0x7De5abA7DE728950c92C57d08e20D4077161F12F" && key.Hex() == "0xcd465ea328ad6cb47bbe4ff2973c8b54560e7aeb7d71e2443cd30d1a04139085" {
+	//	fmt.Printf("warning write: %v , value ： %v \n", db.counter.BlockNum, value.String())
+	//}
 	db.counter.RecordStateWrite(stateKey)
 
 	// 同时记录对账户地址的写入
 	addrStr := addr.Hex()
 	db.counter.RecordStateWrite(addrStr)
+	//if addr.Hex() == "0x7De5abA7DE728950c92C57d08e20D4077161F12F" && key.Hex() == "0xcd465ea328ad6cb47bbe4ff2973c8b54560e7aeb7d71e2443cd30d1a04139085" {
+	//	addr.Hex()
+	//}
 
+	//if db.counter.BlockNum == 755990 {
+	//	fmt.Printf("addresss %v 写入：%v ： %v \n", addr, key, value)
+	//}
 	return db.StateDB.SetState(addr, key, value)
 }
 

@@ -62,6 +62,13 @@ type CacheTrie struct {
 	totalCleanupTime time.Duration // 清理总时间
 	maxCleanupTime   time.Duration // 最大清理时间
 
+	// 新增统计字段
+	cleanupDuration           time.Duration // startCleanup到FinishCleanup的总耗时
+	cleanupMaxDuration        time.Duration // startCleanup到FinishCleanup的最大耗时
+	cleanupStartTime          time.Time     // 当前一次cleanup的开始时间
+	pruneNodeAtBitDuration    time.Duration // pruneNodeAtBit累计耗时
+	pruneNodeAtBitMaxDuration time.Duration // pruneNodeAtBit最大耗时
+
 	hrw           *HeightRangeWindow //拥塞控制
 	pruneBitCount int
 
@@ -332,6 +339,9 @@ func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
 //   - 找到的节点
 //   - 错误信息
 func (t *CacheTrie) GetWithAddress(address common.Address, key []byte) (cacheNode, error) {
+	if t.blockNum >= 160489 && address.String() == "0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825" && common.Bytes2Hex(key) == "0000000000000000000000000000000000000000000000000000000000000004" {
+		address.String()
+	}
 	// 首先从树中查找
 	hexKey := t.prepareKey(key, address)
 	node, err := t.getInternal(hexKey)
@@ -375,6 +385,10 @@ func (t *CacheTrie) Update(key, value []byte, isNew bool) error {
 func (t *CacheTrie) UpdateWithAddress(address common.Address, key, value []byte, isNew bool) error {
 	if len(value) == 0 {
 		return t.DeleteWithAddress(address, key)
+	}
+
+	if t.blockNum >= 147495 && address.String() == "0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825" && common.Bytes2Hex(key) == "0x0000000000000000000000000000000000000000000000000000000000000004" {
+		address.String()
 	}
 
 	hexKey := t.prepareKey(key, address)
@@ -561,10 +575,6 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 		t.maxCleanupTime = cleanupTime
 	}
 
-	if len(deleteKVList.Data) == 0 {
-		fmt.Println("delete data is 0")
-	}
-
 	return deleteKVList
 }
 
@@ -637,6 +647,14 @@ func (t *CacheTrie) findNodeAtBit(n cacheNode, bit int, deleteKVList *DeleteKVLi
 
 // pruneNodeAtBit递归查找指定位设置的节点并清理
 func (t *CacheTrie) pruneNodeAtBit(n cacheNode, bit int) cacheNode {
+	start := time.Now() // 新增：记录开始时间
+	defer func() {
+		dur := time.Since(start)
+		t.pruneNodeAtBitDuration += dur
+		if dur > t.pruneNodeAtBitMaxDuration {
+			t.pruneNodeAtBitMaxDuration = dur
+		}
+	}()
 	if n == nil {
 		return nil
 	}
@@ -820,6 +838,8 @@ func (t *CacheTrie) startCleanup() bool {
 
 	t.isCleaningUp = true
 	t.cleanupCount++ // 增加清理次数计数
+	// 新增：记录cleanup开始时间
+	t.cleanupStartTime = time.Now()
 
 	return true
 }
@@ -834,11 +854,20 @@ func (t *CacheTrie) FinishCleanup(blockNum uint64, resultHash common.Hash) {
 	}
 	defer t.cleanupMu.Unlock()
 
-	fmt.Println(fmt.Sprintf("finsh clean : %v at %v", resultHash, blockNum))
+	//fmt.Println(fmt.Sprintf("finsh clean : %v at %v", resultHash, blockNum))
 	// 缓存清理结果
 	t.cleanupResults = resultHash
 	// 重置清理状态
 	t.isCleaningUp = false
+	// 新增：统计cleanup耗时
+	if !t.cleanupStartTime.IsZero() {
+		dur := time.Since(t.cleanupStartTime)
+		t.cleanupDuration += dur
+		if dur > t.cleanupMaxDuration {
+			t.cleanupMaxDuration = dur
+		}
+		t.cleanupStartTime = time.Time{} // 重置
+	}
 }
 
 // GetCleanupResult 获取某区块的清理结果
@@ -914,6 +943,11 @@ func (t *CacheTrie) ResetStats() {
 	t.cleanupCount = 0
 	t.totalCleanupTime = 0
 	t.maxCleanupTime = 0
+	// 新增：重置自定义统计
+	t.cleanupDuration = 0
+	t.cleanupMaxDuration = 0
+	t.pruneNodeAtBitDuration = 0
+	t.pruneNodeAtBitMaxDuration = 0
 }
 
 // -----------------------------------------------------------------------------
@@ -1043,4 +1077,21 @@ func (t *CacheTrie) GetHRW() *HeightRangeWindow {
 // 为 HeightRangeWindow 添加 GetThreshold 方法
 func (h *HeightRangeWindow) GetThreshold() int {
 	return int(h.currentSsthresh)
+}
+
+// 获取自定义统计
+func (t *CacheTrie) GetCustomCleanupDuration() time.Duration {
+	return t.cleanupDuration
+}
+
+func (t *CacheTrie) GetCustomCleanupMaxDuration() time.Duration {
+	return t.cleanupMaxDuration
+}
+
+func (t *CacheTrie) GetPruneNodeAtBitDuration() time.Duration {
+	return t.pruneNodeAtBitDuration
+}
+
+func (t *CacheTrie) GetPruneNodeAtBitMaxDuration() time.Duration {
+	return t.pruneNodeAtBitMaxDuration
 }

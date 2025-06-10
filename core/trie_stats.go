@@ -200,9 +200,6 @@ func (s *TrieStatsAggregator) OutputStats() {
 		// 获取清理统计
 		cleanupCount = s.CacheTrieRef.GetCleanupCount()
 		totalCleanupTime, maxCleanupTime = s.CacheTrieRef.GetCleanupTimes()
-
-		// 重置统计数据
-		s.CacheTrieRef.ResetStats()
 	}
 
 	// 打印统计信息到控制台
@@ -210,6 +207,11 @@ func (s *TrieStatsAggregator) OutputStats() {
 
 	// 输出CSV文件
 	s.outputCSV(dataSize, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime)
+
+	if s.TrieType == CacheTrie && s.CacheTrieRef != nil {
+		// 重置统计数据
+		s.CacheTrieRef.ResetStats()
+	}
 }
 
 // GetCurrentDataSize 获取当前数据目录大小
@@ -394,6 +396,16 @@ func (s *TrieStatsAggregator) printWindowStats(dataSize int64, getHitRate, updat
 		// 显示总清理时间和总清理次数
 		fmt.Printf("总清理时间: %d 微秒, 总清理次数: %d, 最大单次清理时间: %d 微秒\n",
 			totalCleanupTime.Microseconds(), cleanupCount, maxCleanupTime.Microseconds())
+
+		// 新增：输出自定义统计
+		if s.CacheTrieRef != nil {
+			cleanupDuration := s.CacheTrieRef.GetCustomCleanupDuration().Microseconds()
+			pruneNodeAtBitDuration := s.CacheTrieRef.GetPruneNodeAtBitDuration().Microseconds()
+			cleanupMaxDuration := s.CacheTrieRef.GetCustomCleanupMaxDuration().Microseconds()
+			pruneNodeAtBitMaxDuration := s.CacheTrieRef.GetPruneNodeAtBitMaxDuration().Microseconds()
+			fmt.Printf("startCleanup到FinishCleanup总耗时: %d 微秒, 最大: %d 微秒\n", cleanupDuration, cleanupMaxDuration)
+			fmt.Printf("pruneNodeAtBit累计耗时: %d 微秒, 最大: %d 微秒\n", pruneNodeAtBitDuration, pruneNodeAtBitMaxDuration)
+		}
 	}
 
 	// 数据大小变化
@@ -458,6 +470,13 @@ func (s *TrieStatsAggregator) outputCSV(dataSize int64, getHitRate, updateHitRat
 		avgCacheSize := float64(s.WindowStats.TotalCacheSize) / float64(s.WindowStats.CacheSampleCount)
 		avgThreshold := float64(s.WindowStats.TotalCacheThreshold) / float64(s.WindowStats.CacheSampleCount)
 
+		var cleanupDuration, pruneNodeAtBitDuration, cleanupMaxDuration, pruneNodeAtBitMaxDuration int64
+		if s.CacheTrieRef != nil {
+			cleanupDuration = s.CacheTrieRef.GetCustomCleanupDuration().Microseconds()
+			pruneNodeAtBitDuration = s.CacheTrieRef.GetPruneNodeAtBitDuration().Microseconds()
+			cleanupMaxDuration = s.CacheTrieRef.GetCustomCleanupMaxDuration().Microseconds()
+			pruneNodeAtBitMaxDuration = s.CacheTrieRef.GetPruneNodeAtBitMaxDuration().Microseconds()
+		}
 		currentRecord = append(currentRecord,
 			strconv.FormatFloat(avgMemorySize, 'f', 2, 64),
 			strconv.FormatFloat(s.WindowStats.MaxMemorySize, 'f', 2, 64),
@@ -468,7 +487,12 @@ func (s *TrieStatsAggregator) outputCSV(dataSize int64, getHitRate, updateHitRat
 			strconv.Itoa(cleanupCount),
 			strconv.FormatInt(maxCleanupTime.Microseconds(), 10),
 			strconv.FormatFloat(getHitRate*100, 'f', 2, 64),
-			strconv.FormatFloat(updateHitRate*100, 'f', 2, 64))
+			strconv.FormatFloat(updateHitRate*100, 'f', 2, 64),
+			strconv.FormatInt(cleanupDuration, 10),
+			strconv.FormatInt(cleanupMaxDuration, 10),
+			strconv.FormatInt(pruneNodeAtBitDuration, 10),
+			strconv.FormatInt(pruneNodeAtBitMaxDuration, 10),
+		)
 	}
 
 	// 准备头部记录，更新第一个字段名称
@@ -494,7 +518,12 @@ func (s *TrieStatsAggregator) outputCSV(dataSize int64, getHitRate, updateHitRat
 			"TotalCleanupCount",
 			"MaxCleanupTime(us)",
 			"GetHitRate(%)",
-			"UpdateHitRate(%)")
+			"UpdateHitRate(%)",
+			"CleanupDuration(us)",
+			"CleanupMaxDuration(us)",
+			"PruneNodeAtBitDuration(us)",
+			"PruneNodeAtBitMaxDuration(us)",
+		)
 	}
 
 	// 检查文件是否存在
