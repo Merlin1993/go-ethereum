@@ -214,15 +214,62 @@ func (s *TrieStatsAggregator) OutputStats() {
 	}
 }
 
+// CalculateDirSizeWithRetry 带重试机制的目录大小计算
+func CalculateDirSizeWithRetry(path string) (int64, error) {
+	var totalSize int64
+	maxRetries := 3
+	retryDelay := 100 * time.Millisecond
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		size, err := calculateDirSizeSafe(path)
+		if err == nil {
+			return size, nil
+		}
+
+		if attempt < maxRetries {
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // 指数退避
+			continue
+		}
+		return size, fmt.Errorf("计算目录大小失败（重试%d次）: %v", maxRetries, err)
+	}
+	return totalSize, nil
+}
+
+// calculateDirSizeSafe 安全的目录大小计算
+func calculateDirSizeSafe(path string) (int64, error) {
+	var size int64
+	err := filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			// 记录错误但继续执行
+			fmt.Printf("警告: 访问路径 %s 时出错: %v\n", filePath, err)
+			return nil
+		}
+		if !info.IsDir() {
+			// 尝试打开文件以确保可以访问
+			file, err := os.Open(filePath)
+			if err != nil {
+				// 记录错误但继续执行
+				fmt.Printf("警告: 无法打开文件 %s: %v\n", filePath, err)
+				return nil
+			}
+			file.Close()
+			size += info.Size()
+		}
+		return nil
+	})
+	return size, err
+}
+
 // GetCurrentDataSize 获取当前数据目录大小
 func (s *TrieStatsAggregator) GetCurrentDataSize() int64 {
 	if s.DataPath == "" {
 		return 0
 	}
 
-	size, err := CalculateDirSize(s.DataPath)
+	size, err := CalculateDirSizeWithRetry(s.DataPath)
 	if err != nil {
-		fmt.Printf("计算目录大小出错: %v\n", err)
+		fmt.Printf("获取数据目录大小出错（将返回0）: %v\n", err)
 		return 0
 	}
 	return size
@@ -274,7 +321,7 @@ func RecordCacheTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writte
 		os.MkdirAll(recorder.OutputDir, 0755)
 	}
 
-	//// 记录并比较统计数据
+	// 记录并比较统计数据
 	//if blockNum > 700000 && blockNum < 800000 {
 	//	globalComparator.recordAndCompareStats(blockNum, "CacheTrie", writtenStates, readStates)
 	//}

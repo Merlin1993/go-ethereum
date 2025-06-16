@@ -583,8 +583,10 @@ func GenerateVerkleChainWithGenesis(genesis *Genesis, engine consensus.Engine, n
 func (cm *chainMaker) makeHeader(parent *types.Block, state *state.StateDB, engine consensus.Engine) *types.Header {
 	time := parent.Time() + 10 // block time is fixed at 10 seconds
 	parentHeader := parent.Header()
+
+	_, hash := state.IntermediateRoot(cm.config.IsEIP158(parent.Number()))
 	header := &types.Header{
-		Root:       state.IntermediateRoot(cm.config.IsEIP158(parent.Number())),
+		Root:       hash,
 		ParentHash: parent.Hash(),
 		Coinbase:   parent.Coinbase(),
 		Difficulty: engine.CalcDifficulty(cm, time, parentHeader),

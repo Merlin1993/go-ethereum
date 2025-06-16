@@ -114,7 +114,7 @@ func TestBasicOperations(t *testing.T) {
 	}
 
 	// 测试哈希计算
-	hash, _ := trie.Hash()
+	hash, _, _ := trie.Hash()
 	t.Logf("Trie root hash: %x", hash)
 	if hash == (common.Hash{}) {
 		t.Error("Hash returned empty hash")
@@ -513,7 +513,7 @@ func TestValueNodeNewField(t *testing.T) {
 	}
 
 	// 触发Hash计算和pruneCache
-	_, deletedKVs := trie.Hash()
+	_, _, deletedKVs := trie.Hash()
 
 	// 检查删除的键值对
 	if deletedKVs == nil {
@@ -560,7 +560,7 @@ func TestPruneCacheDeleteKVNewField(t *testing.T) {
 	trie.SetBlockNum(131)
 
 	// 触发Hash计算和pruneCache
-	_, deletedKVs := trie.Hash()
+	_, _, deletedKVs := trie.Hash()
 
 	// 验证pruneCache结果
 	if deletedKVs == nil {
@@ -612,7 +612,7 @@ func TestPruneCacheDeleteKVNewField(t *testing.T) {
 	trie.SetBlockNum(180)
 
 	// 再次触发Hash和pruneCache
-	_, deletedKVs = trie.Hash()
+	_, _, deletedKVs = trie.Hash()
 
 	// 由于hashKey的原因，我们无法直接通过值内容判断，这里只记录日志
 	if deletedKVs != nil && len(deletedKVs.Data) > 0 {
@@ -683,7 +683,7 @@ func TestNewNodesRetentionAfterPrune(t *testing.T) {
 	}
 
 	// 触发Hash计算和pruneCache
-	_, deletedKVs := trie.Hash()
+	_, _, deletedKVs := trie.Hash()
 
 	// 验证pruneCache结果
 	if deletedKVs == nil {
@@ -815,7 +815,7 @@ func TestPerformance(t *testing.T) {
 
 			// 生成Hash并记录时间
 			hashStart := time.Now()
-			_, deletedKVs := trie.Hash()
+			_, _, deletedKVs := trie.Hash()
 			hashDuration := time.Since(hashStart)
 			totalHashTime += hashDuration.Nanoseconds()
 
@@ -872,7 +872,7 @@ func TestPerformance(t *testing.T) {
 
 			// 生成Hash并记录时间
 			hashStart := time.Now()
-			_, deletedKVs := trie.Hash()
+			_, _, deletedKVs := trie.Hash()
 			hashDuration := time.Since(hashStart)
 			totalHashTime += hashDuration.Nanoseconds()
 
@@ -1123,8 +1123,7 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 		}
 
 		// 获取哈希，这会触发清理机制
-		cacheTrie.Prune()
-		hash, kvList := cacheTrie.Hash()
+		hash, _, kvList := cacheTrie.Hash()
 
 		if kvList != nil && len(kvList.Data) > 0 {
 			go func() {
@@ -1203,8 +1202,7 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 
 		// 获取哈希，这会触发清理机制
 		hashStart := time.Now()
-		cacheTrie.Prune()
-		hash, kvList := cacheTrie.Hash()
+		hash, _, kvList := cacheTrie.Hash()
 		hashTime := time.Since(hashStart)
 
 		if kvList != nil && len(kvList.Data) > 0 {

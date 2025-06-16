@@ -306,6 +306,13 @@ func (in *EVMInterpreter) Run(contract *Contract, input []byte, readOnly bool) (
 			mem.Resize(memorySize)
 		}
 
+		//if contract.address == common.HexToAddress("0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825") {
+		//	fmt.Println(fmt.Sprintf("pc:%v, op:%v, stack: %v ", pc, op.String(), stack.data))
+		//	if pc == 97 {
+		//		fmt.Println(fmt.Sprintf("pc:%v, op:%v ", pc, op.String()))
+		//	}
+		//}
+
 		// execute the operation
 		res, err = operation.execute(&pc, in, callContext)
 		if err != nil {

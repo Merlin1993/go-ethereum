@@ -373,7 +373,7 @@ func (beacon *Beacon) FinalizeAndAssemble(chain consensus.ChainHeaderReader, hea
 	beacon.Finalize(chain, header, state, body)
 
 	// Assign the final state root to header.
-	header.Root = state.IntermediateRoot(true)
+	_, header.Root = state.IntermediateRoot(true)
 
 	// Assemble the final block.
 	block := types.NewBlock(header, body, receipts, trie.NewStackTrie(nil))

@@ -151,7 +151,8 @@ func ApplyTransactionWithEVM(msg *Message, gp *GasPool, statedb *state.StateDB, 
 	if evm.ChainConfig().IsByzantium(blockNumber) {
 		evm.StateDB.Finalise(true)
 	} else {
-		root = statedb.IntermediateRoot(evm.ChainConfig().IsEIP158(blockNumber)).Bytes()
+		_, r := statedb.IntermediateRoot(evm.ChainConfig().IsEIP158(blockNumber))
+		root = r.Bytes()
 	}
 	*usedGas += result.UsedGas
 

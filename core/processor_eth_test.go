@@ -1430,15 +1430,7 @@ func TestProcessTransactions(t *testing.T) {
 		parent := lastProcessedBlock
 		var lastCommitBlock uint64 = 0 // 记录上次提交的区块号
 
-		ct := sdb.TrieDB().CacheTrie()
 		for blockNum := minBlock; blockNum <= maxBlock; blockNum++ {
-			if ct != nil {
-				result := ct.GetCleanupResult()
-				if result != (common.Hash{}) {
-					lastStateRoot = result
-				}
-			}
-
 			if len(msgsByBlock[blockNum]) == 0 {
 				continue
 			}
@@ -1687,8 +1679,13 @@ func TestProcessTransactions(t *testing.T) {
 			rootGenStart := time.Now()
 			var commitDuration time.Duration
 			root := lastStateRoot
+			var cHash common.Hash
+			var resultHash common.Hash
 			if common.UseCacheTrie {
-				countingStateDB.PreCommit(false)
+				cHash, resultHash, _ = countingStateDB.PreCommit(false)
+				if resultHash != (common.Hash{}) {
+					root = resultHash
+				}
 				codes := sdb.TrieDB().CacheTrie().PopCodes()
 				if db := sdb.TrieDB().Disk(); db != nil && len(codes) > 0 {
 					batch := db.NewBatch()
@@ -1745,7 +1742,7 @@ func TestProcessTransactions(t *testing.T) {
 					// 第三步：对新stateDB进行commit
 					newRoot, err := cleanStateDB.Commit(sBlockNum, false, false)
 					if err != nil {
-						t.Fatalf("提交无cache stateDB失败: %v", err)
+						t.Fatalf("提交无cache stateDB失败: %v, cHash : %v", err, cHash)
 					}
 
 					// 第四步：将结果提交到数据库

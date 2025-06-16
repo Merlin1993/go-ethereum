@@ -796,7 +796,7 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 // IntermediateRoot computes the current root hash of the state trie.
 // It is called in between transactions to get the root hash that
 // goes into transaction receipts.
-func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
+func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common.Hash) {
 	// Finalise all the dirty storage states and write them into the tries
 	s.Finalise(deleteEmptyObjects)
 
@@ -940,11 +940,11 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 
 	// 如果启用了cacheTrie，处理删除的键值对并刷新到主MPT树
 	tdb := s.db.TrieDB()
+	var resultHash common.Hash
+	var cHash common.Hash
 	if tdb.CacheTrie() != nil {
 		// 计算缓存树的哈希，这将触发缓存清理，并返回被删除的键值对
-		tdb.CacheTrie().Prune()
-		_, deleteKVList := tdb.CacheTrie().Hash()
-		s.cachedDeleteKVList = deleteKVList
+		cHash, resultHash, s.cachedDeleteKVList = tdb.CacheTrie().Hash()
 	}
 
 	hash := s.trie.Hash()
@@ -953,7 +953,10 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	if s.witness != nil {
 		s.witness.AddState(s.trie.Witness())
 	}
-	return hash
+	if tdb.CacheTrie() != nil {
+		return cHash, resultHash
+	}
+	return common.Hash{}, hash
 }
 
 // SetTxContext sets the current transaction hash and index which are
@@ -1355,14 +1358,14 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 // Since self-destruction was deprecated with the Cancun fork and there are
 // no empty accounts left that could be deleted by EIP-158, storage wiping
 // should not occur.
-func (s *StateDB) PreCommit(deleteEmptyObjects bool) error {
+func (s *StateDB) PreCommit(deleteEmptyObjects bool) (common.Hash, common.Hash, error) {
 	// Short circuit in case any database failure occurred earlier.
 	if s.dbErr != nil {
-		return fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
+		return common.Hash{}, common.Hash{}, fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
 	}
 	// Finalize any pending changes and merge everything into the tries
-	s.IntermediateRoot(deleteEmptyObjects)
-	return nil
+	cHash, hash := s.IntermediateRoot(deleteEmptyObjects)
+	return cHash, hash, nil
 }
 
 func (s *StateDB) PostCommit(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (common.Hash, error) {
@@ -1374,7 +1377,7 @@ func (s *StateDB) PostCommit(block uint64, deleteEmptyObjects bool, noStorageWip
 }
 
 func (s *StateDB) Commit(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (common.Hash, error) {
-	err := s.PreCommit(deleteEmptyObjects)
+	_, _, err := s.PreCommit(deleteEmptyObjects)
 	if err != nil {
 		return common.Hash{}, err
 	}

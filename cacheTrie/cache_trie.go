@@ -34,7 +34,7 @@ import (
 // EmptyRoot是一个特殊的根哈希，表示空树
 var EmptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 
-const WindowLeft = 4
+const WindowLeft = 2
 
 // -----------------------------------------------------------------------------
 // 数据结构定义
@@ -339,9 +339,9 @@ func (t *CacheTrie) Get(key []byte) (cacheNode, error) {
 //   - 找到的节点
 //   - 错误信息
 func (t *CacheTrie) GetWithAddress(address common.Address, key []byte) (cacheNode, error) {
-	if t.blockNum >= 160489 && address.String() == "0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825" && common.Bytes2Hex(key) == "0000000000000000000000000000000000000000000000000000000000000004" {
-		address.String()
-	}
+	//if t.blockNum >= 757462 && address.String() == "0x7De5abA7DE728950c92C57d08e20D4077161F12F" && common.Bytes2Hex(key) == "23b9648796b3c6214e5a66544bfc6d76a8c3a8ebe1a6720267b443cee4302a5f" {
+	//	address.String()
+	//}
 	// 首先从树中查找
 	hexKey := t.prepareKey(key, address)
 	node, err := t.getInternal(hexKey)
@@ -387,9 +387,9 @@ func (t *CacheTrie) UpdateWithAddress(address common.Address, key, value []byte,
 		return t.DeleteWithAddress(address, key)
 	}
 
-	if t.blockNum >= 147495 && address.String() == "0xdf373f3Dab2561668e239cA6e43a8c6aaeB3f825" && common.Bytes2Hex(key) == "0x0000000000000000000000000000000000000000000000000000000000000004" {
-		address.String()
-	}
+	//if t.blockNum >= 757462 && address.String() == "0x7De5abA7DE728950c92C57d08e20D4077161F12F" && common.Bytes2Hex(key) == "23b9648796b3c6214e5a66544bfc6d76a8c3a8ebe1a6720267b443cee4302a5f" {
+	//	address.String()
+	//}
 
 	hexKey := t.prepareKey(key, address)
 	err, nodeExists := t.updateInternal(hexKey, value, isNew, key, address)
@@ -427,6 +427,9 @@ func (t *CacheTrie) Delete(key []byte) error {
 // DeleteWithAddress 从trie中删除带有地址前缀的key
 // 内部实现使用"墓碑"标记(空值节点)替代真正的删除
 func (t *CacheTrie) DeleteWithAddress(address common.Address, key []byte) error {
+	//if t.blockNum >= 757462 && address.String() == "0x7De5abA7DE728950c92C57d08e20D4077161F12F" && common.Bytes2Hex(key) == "23b9648796b3c6214e5a66544bfc6d76a8c3a8ebe1a6720267b443cee4302a5f" {
+	//	address.String()
+	//}
 	hexKey := t.prepareKey(key, address)
 	err, nodeExists := t.deleteInternal(hexKey, key, address)
 
@@ -442,23 +445,16 @@ func (t *CacheTrie) DeleteWithAddress(address common.Address, key []byte) error 
 	return err
 }
 
-func (t *CacheTrie) Prune() {
-	if t.isCleaningUp {
-		return
-	}
-	t.pruneNode()
-}
-
 // Hash 返回trie的根哈希
 // 同时执行必要的缓存清理
 // 返回trie的根哈希和在pruneCache过程中删除的键值对
-func (t *CacheTrie) Hash() (common.Hash, *DeleteKVList) {
+func (t *CacheTrie) Hash() (common.Hash, common.Hash, *DeleteKVList) {
 	if t.root == nil {
-		return EmptyRoot, nil
+		return EmptyRoot, common.Hash{}, nil
 	}
 
 	// 如果设置了最大大小且超出限制，或window的位数不足，清理不常用的缓存
-	deleteKeyValues := t.pruneCache()
+	deleteKeyValues, resultHash := t.pruneCache()
 
 	// 缓存删除的键值对
 	if deleteKeyValues != nil && len(deleteKeyValues.Data) > 0 {
@@ -475,11 +471,11 @@ func (t *CacheTrie) Hash() (common.Hash, *DeleteKVList) {
 	defer returnHasherToPool(h)
 
 	if t.root == nil {
-		return EmptyRoot, deleteKeyValues
+		return EmptyRoot, resultHash, deleteKeyValues
 	}
 	rootHash := h.hash(t.root)
 
-	return common.BytesToHash(rootHash), deleteKeyValues
+	return common.BytesToHash(rootHash), resultHash, deleteKeyValues
 }
 
 type DeleteKV struct {
@@ -495,52 +491,58 @@ type DeleteKVList struct {
 
 // pruneCache清理不常用的缓存节点
 // 返回在清理过程中删除的键值对列表
-func (t *CacheTrie) pruneCache() *DeleteKVList {
+func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 	// 计算当前window的可用位数
 	// 当前位置表示已经使用了多少位
 	windowBits := t.hrw.getWindowPosition()
 
 	// 判断是否需要清理
-	needPrune := false
+	needStartPrune := false
+	doPrune := false
 
-	if t.isCleaningUp {
+	//当存在未清除的数据时，如果不超过最大限制，那么就先往前继续推进
+	if t.pruneBitCount > 0 {
 		//如果已经在清理了，那除非没有空间了，不然继续使用
 		if windowBits == 0 {
-			needPrune = true
+			doPrune = true
 		}
 
-		if t.hrw.CheckAndTriggerCongestionControl(t.root.size() / 2) {
-			needPrune = true
+		if t.hrw.CheckAndTriggerCongestionControl(t.root.size()) {
+			doPrune = true
 		}
 
 	} else {
 		// 条件1：当window的位数只剩下WindowLeft bit，触发清理
-		if windowBits <= WindowLeft {
-			needPrune = true
+		if windowBits <= WindowLeft-1 {
+			needStartPrune = true
 		}
 
 		// 条件2：size大于MaxSize时，触发清理
-		if t.hrw.CheckAndTriggerCongestionControl(t.root.size()) {
-			needPrune = true
+		if t.hrw.CheckAndTriggerCongestionControl(t.root.size() * 105 / 100) {
+			needStartPrune = true
 		}
 	}
 
 	// 如果不需要清理，直接返回
-	if !needPrune {
-		return nil
+	if !needStartPrune && !doPrune {
+		return nil, common.Hash{}
 	}
 
-	//fmt.Println(fmt.Sprintf("start prune, size : %v , window end : %v ,sshresh : %v ", t.root.size(), windowBits, t.hrw.currentSsthresh))
+	//如果需要进行删除操作，先删除，再裁剪
+	if doPrune {
+		resultHash = t.GetCleanupResult()
+		//fmt.Println(fmt.Sprintf("start prune node : %v , window : %v ,sshresh : %v， result： %v ", t.root.size(), windowBits, t.hrw.currentSsthresh, resultHash))
+		t.pruneNode()
+	}
+	//fmt.Println(fmt.Sprintf("start prune, size : %v , window end : %v ,sshresh : %v ", t.root.size(), t.hrw.getWindowPosition(), t.hrw.currentSsthresh))
 	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
-	t.pruneNode()
 	t.startCleanup()
-
 	// 记录清理开始时间
 	startTime := time.Now()
 
 	// 执行循环操作，直到根节点size数量小于80%的maxSize且window位数等于8bit
 	// 使用2/3作为阈值
-	targetSize := t.hrw.maxTotalAllowedSize * 9 / 10
+	targetSize := t.hrw.maxTotalAllowedSize * 95 / 100
 	if targetSize <= 0 {
 		targetSize = 1 // 确保至少有一个目标大小
 	}
@@ -554,10 +556,13 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 	// 循环直到满足条件
 	for {
 		// 检查是否已经满足条件：size小于目标值，且window位数大于等于12bit
-		if t.root == nil || ((t.root.size()-len(deleteKVList.Data) <= targetSize) && windowBits >= WindowLeft+4) {
+		if t.root == nil || ((t.root.size()-len(deleteKVList.Data) <= targetSize) && windowBits >= WindowLeft) {
 			break
 		}
 
+		if lowestBit+bitCount == 16 && t.blockNum >= 756962 {
+			t.root.size()
+		}
 		// 从根节点递归查找所有节点，对于所有最低一位的叶子节点进行查找
 		t.findNodeAtBit(t.root, (lowestBit+bitCount)%32, deleteKVList)
 
@@ -575,7 +580,7 @@ func (t *CacheTrie) pruneCache() *DeleteKVList {
 		t.maxCleanupTime = cleanupTime
 	}
 
-	return deleteKVList
+	return deleteKVList, resultHash
 }
 
 func (t *CacheTrie) pruneNode() {
@@ -611,10 +616,16 @@ func (t *CacheTrie) findNodeAtBit(n cacheNode, bit int, deleteKVList *DeleteKVLi
 	switch node := n.(type) {
 	case *ShortNode:
 		// 检查这个节点是否有指定的位设置
+		if common.Bytes2Hex(node.Key) == "0b010f03070e0d010c08070f0d060d08080f0d0d020001040f0006090406040a0d060f08050b01090d07040f0206060c030f0f0a0d080a070b0010" {
+			node.String()
+		}
 		if (node.window() & (1 << bit)) != 0 {
 			// 如果是叶子节点（Val是ValueNode）
 			if valueNode, isValueNode := node.Val.(ValueNode); isValueNode {
 				// 只有当ValueNode.New为true时才添加到deleteKeyValue
+				if valueNode.Address.String() == "0x7De5abA7DE728950c92C57d08e20D4077161F12F" && common.Bytes2Hex(valueNode.RawKey) == "23b9648796b3c6214e5a66544bfc6d76a8c3a8ebe1a6720267b443cee4302a5f" {
+					valueNode.Address.String()
+				}
 				if valueNode.New {
 					deleteKVList.Data = append(deleteKVList.Data, &DeleteKV{
 						Key:     valueNode.RawKey,
@@ -667,6 +678,9 @@ func (t *CacheTrie) pruneNodeAtBit(n cacheNode, bit int) cacheNode {
 		if (node.window() & (1 << bit)) != 0 {
 			// 如果是叶子节点（Val是ValueNode）且window变为0，则清除此节点
 			if _, isValueNode := node.Val.(ValueNode); isValueNode {
+				//if valueNode.Address.String() == "0x7De5abA7DE728950c92C57d08e20D4077161F12F" && common.Bytes2Hex(valueNode.RawKey) == "23b9648796b3c6214e5a66544bfc6d76a8c3a8ebe1a6720267b443cee4302a5f" {
+				//	valueNode.Address.String()
+				//}
 				return nil
 			} else {
 				newVal := t.pruneNodeAtBit(node.Val, bit)
@@ -756,6 +770,7 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 					return nil, exist, err
 				}
 				n.Val = childNode
+				n.updateFlag(bitPos)
 				return n, exist, nil
 			}
 		}
@@ -787,6 +802,7 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 
 		// 然后在分支节点中插入新的shortNode
 		if prefixLength != 0 {
+			branch.updateFlag(bitPos)
 			parentNode := &ShortNode{
 				Key:   n.Key[:prefixLength],
 				Val:   branch,
