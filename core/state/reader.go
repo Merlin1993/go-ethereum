@@ -143,10 +143,15 @@ func (r *CacheTrieReader) Account(addr common.Address) (*types.StateAccount, err
 		// 从缓存中获取
 		cacheNode, err := r.ct.Get(addr.Bytes())
 		if err == nil && cacheNode != nil {
-			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok && len(valueNode.Data) > 0 {
-				ret := new(types.StateAccount)
-				if err := rlp.DecodeBytes(valueNode.Data, ret); err == nil {
-					return ret, nil
+			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok {
+				if len(valueNode.Data) > 0 {
+
+					ret := new(types.StateAccount)
+					if err := rlp.DecodeBytes(valueNode.Data, ret); err == nil {
+						return ret, nil
+					}
+				} else {
+					return nil, nil
 				}
 			}
 		}

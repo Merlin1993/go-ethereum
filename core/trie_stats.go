@@ -716,13 +716,11 @@ func (c *TrieStatsComparator) recordAndCompareStats(blockNum uint64, trieType st
 	}
 
 	// 检查是否存在差异并更新统计
-	var hasOtherData bool
 	var otherTrieType string
 
 	if trieType == "StandardTrie" {
 		// 检查是否已有 CacheTrie 的数据
 		if stats.CacheTrieWrites != 0 || stats.CacheTrieReads != 0 {
-			hasOtherData = true
 			otherTrieType = "CacheTrie"
 			// 比较差异
 			if stats.CacheTrieWrites != uniqueWrites {
@@ -741,7 +739,6 @@ func (c *TrieStatsComparator) recordAndCompareStats(blockNum uint64, trieType st
 	} else if trieType == "CacheTrie" {
 		// 检查是否已有 StandardTrie 的数据
 		if stats.StandardTrieWrites != 0 || stats.StandardTrieReads != 0 {
-			hasOtherData = true
 			otherTrieType = "StandardTrie"
 			// 比较差异
 			if stats.StandardTrieWrites != uniqueWrites {
@@ -762,12 +759,6 @@ func (c *TrieStatsComparator) recordAndCompareStats(blockNum uint64, trieType st
 	if err := c.saveBlockStats(blockNum, stats); err != nil {
 		fmt.Printf("⚠️  [警告] 保存区块 %d 统计数据失败: %v\n", blockNum, err)
 		return
-	}
-
-	// 如果没有其他类型的数据，输出提示信息
-	if !hasOtherData {
-		fmt.Printf("📝 [记录] 区块 %d: 首次记录 %s 数据 (UniqueWrites=%d, UniqueReads=%d)\n",
-			blockNum, trieType, uniqueWrites, uniqueReads)
 	}
 }
 

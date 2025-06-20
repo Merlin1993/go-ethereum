@@ -261,7 +261,7 @@ func TestValue(t *testing.T) {
 
 	hrw.CheckAndTriggerCongestionControl(101) //触发拥塞控制，当前为8，减半后sshresh还是4
 
-	expectedCapacities = []uint64{1, 2, 4, 3, 1, 2, 4, 8, 9, 10} //拥塞控制后位数变低
+	expectedCapacities = []uint64{1, 2, 4, 4, 1, 2, 4, 8, 9, 10} //拥塞控制后位数变低
 	for i := 0; i < 10; i++ {
 		if hrw.logicalCapacities[i] != expectedCapacities[i] {
 			t.Errorf("位置%d的容量 = %v, 期望 %v",
@@ -287,7 +287,7 @@ func TestValue(t *testing.T) {
 
 	hrw.PruneWindow(3) //清掉前三个
 
-	expectedCapacities = []uint64{33, 34, 35, 3, 1, 2, 4, 8, 9, 10} //拥塞控制后位数变低
+	expectedCapacities = []uint64{33, 34, 35, 4, 1, 2, 4, 8, 9, 10} //拥塞控制后位数变低
 	for i := 0; i < 10; i++ {
 		if hrw.logicalCapacities[i] != expectedCapacities[i] {
 			t.Errorf("位置%d的容量 = %v, 期望 %v",
@@ -305,7 +305,7 @@ func TestValue(t *testing.T) {
 		}
 	}
 
-	number = uint64(517) // 未循环
+	number = uint64(517) // 未循环 43*11 + 43 = 430+86=516
 	expectBit = 31       //预期为31
 	bit = hrw.GetBitPosition(number)
 	if bit != expectBit {

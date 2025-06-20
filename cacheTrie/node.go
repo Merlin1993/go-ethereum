@@ -132,11 +132,12 @@ func (n *FullNode) updateFlag(bitPos int) {
 	n.flags.size = 0
 	n.flags.memorySize = fullNodeBaseSize + nodeFlagSize // 基本大小
 
-	for _, node := range &n.Children {
-		if node != nil {
-			n.flags.window |= node.window()
-			n.flags.size += node.size()
-			n.flags.memorySize += pointerSize + node.memorySize() // 指针大小 + 子节点大小
+	// 使用range遍历，避免并发修改导致的竞态条件
+	for _, child := range n.Children {
+		if child != nil {
+			n.flags.window |= child.window()
+			n.flags.size += child.size()
+			n.flags.memorySize += pointerSize + child.memorySize() // 指针大小 + 子节点大小
 		}
 	}
 
