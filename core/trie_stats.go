@@ -242,7 +242,7 @@ func calculateDirSizeSafe(path string) (int64, error) {
 	err := filepath.Walk(path, func(filePath string, info os.FileInfo, err error) error {
 		if err != nil {
 			// 记录错误但继续执行
-			fmt.Printf("警告: 访问路径 %s 时出错: %v\n", filePath, err)
+			//fmt.Printf("警告: 访问路径 %s 时出错: %v\n", filePath, err)
 			return nil
 		}
 		if !info.IsDir() {
@@ -250,7 +250,7 @@ func calculateDirSizeSafe(path string) (int64, error) {
 			file, err := os.Open(filePath)
 			if err != nil {
 				// 记录错误但继续执行
-				fmt.Printf("警告: 无法打开文件 %s: %v\n", filePath, err)
+				//fmt.Printf("警告: 无法打开文件 %s: %v\n", filePath, err)
 				return nil
 			}
 			file.Close()

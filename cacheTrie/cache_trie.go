@@ -561,6 +561,9 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 			break
 		}
 
+		//if (lowestBit+bitCount)%32 == 30 {
+		//	t.root.size()
+		//}
 		// 从根节点递归查找所有节点，对于所有最低一位的叶子节点进行查找
 		t.findNodeAtBit(t.root, (lowestBit+bitCount)%32, deleteKVList)
 
@@ -582,6 +585,14 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 }
 
 func (t *CacheTrie) pruneNode() {
+	start := time.Now() // 新增：记录开始时间
+	defer func() {
+		dur := time.Since(start)
+		t.pruneNodeAtBitDuration += dur
+		if dur > t.pruneNodeAtBitMaxDuration {
+			t.pruneNodeAtBitMaxDuration = dur
+		}
+	}()
 	bitCount := t.pruneBitCount
 	if bitCount > 0 {
 		//fmt.Println("prune node")
@@ -617,6 +628,9 @@ func (t *CacheTrie) findNodeAtBit(n cacheNode, bit int, deleteKVList *DeleteKVLi
 		if (node.window() & (1 << bit)) != 0 {
 			// 如果是叶子节点（Val是ValueNode）
 			if valueNode, isValueNode := node.Val.(ValueNode); isValueNode {
+				//if valueNode.Address.Hex() == "0xcd134CE565e6b7f7CEfE2122A07A2e56D6ECbB26" && common.Bytes2Hex(valueNode.RawKey) == "0000000000000000000000000000000000000000000000000000000000000105" {
+				//	valueNode.Address.Hex()
+				//}
 				// 只有当ValueNode.New为true时才添加到deleteKeyValue
 				if valueNode.New {
 					deleteKVList.Data = append(deleteKVList.Data, &DeleteKV{
@@ -650,18 +664,14 @@ func (t *CacheTrie) findNodeAtBit(n cacheNode, bit int, deleteKVList *DeleteKVLi
 
 // pruneNodeAtBit递归查找指定位设置的节点并清理
 func (t *CacheTrie) pruneNodeAtBit(n cacheNode, bit int) cacheNode {
-	start := time.Now() // 新增：记录开始时间
-	defer func() {
-		dur := time.Since(start)
-		t.pruneNodeAtBitDuration += dur
-		if dur > t.pruneNodeAtBitMaxDuration {
-			t.pruneNodeAtBitMaxDuration = dur
-		}
-	}()
 	if n == nil {
 		return nil
 	}
 
+	//如果只有这个，那么就快速截断就好了
+	if n.window() == 1<<bit {
+		return nil
+	}
 	//首先需要向下查找，然后删除对应的值。
 	//然后回到父节点，重新计算window和size
 	switch node := n.(type) {
@@ -670,6 +680,9 @@ func (t *CacheTrie) pruneNodeAtBit(n cacheNode, bit int) cacheNode {
 		if (node.window() & (1 << bit)) != 0 {
 			// 如果是叶子节点（Val是ValueNode）且window变为0，则清除此节点
 			if _, isValueNode := node.Val.(ValueNode); isValueNode {
+				//if valueNode.Address.Hex() == "0xcd134CE565e6b7f7CEfE2122A07A2e56D6ECbB26" && common.Bytes2Hex(valueNode.RawKey) == "0000000000000000000000000000000000000000000000000000000000000105" {
+				//	valueNode.Address.Hex()
+				//}
 				return nil
 			} else {
 				newVal := t.pruneNodeAtBit(node.Val, bit)
@@ -759,6 +772,7 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 					return nil, exist, err
 				}
 				n.Val = childNode
+				n.updateFlag(bitPos)
 				return n, exist, nil
 			}
 		}
@@ -787,6 +801,7 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 		}
 		child2.updateFlag(bitPos)
 		branch.Children[key[prefixLength]] = child2
+		branch.updateFlag(bitPos)
 
 		// 然后在分支节点中插入新的shortNode
 		if prefixLength != 0 {
@@ -798,7 +813,6 @@ func (t *CacheTrie) insert(n cacheNode, key []byte, value cacheNode, bitPos int)
 			parentNode.updateFlag(bitPos)
 			return parentNode, false, nil
 		} else {
-			branch.updateFlag(bitPos)
 			return branch, false, nil
 		}
 	case *FullNode:
