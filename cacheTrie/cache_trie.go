@@ -527,6 +527,8 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 	if !needStartPrune && !doPrune {
 		return nil, common.Hash{}
 	}
+	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
+	t.startCleanup()
 
 	//如果需要进行删除操作，先删除，再裁剪
 	if doPrune {
@@ -535,8 +537,7 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 		t.pruneNode()
 	}
 	//fmt.Println(fmt.Sprintf("start prune, size : %v , window end : %v ,sshresh : %v ", t.root.size(), t.hrw.getWindowPosition(), t.hrw.currentSsthresh))
-	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
-	t.startCleanup()
+
 	// 记录清理开始时间
 	startTime := time.Now()
 
