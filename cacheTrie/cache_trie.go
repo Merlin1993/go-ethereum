@@ -34,7 +34,7 @@ import (
 // EmptyRoot是一个特殊的根哈希，表示空树
 var EmptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 
-const WindowLeft = 2
+const WindowLeft = 4
 
 // -----------------------------------------------------------------------------
 // 数据结构定义
@@ -503,7 +503,7 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 	//当存在未清除的数据时，如果不超过最大限制，那么就先往前继续推进
 	if t.pruneBitCount > 0 {
 		//如果已经在清理了，那除非没有空间了，不然继续使用
-		if windowBits == 0 {
+		if windowBits <= 1 {
 			doPrune = true
 		}
 
@@ -513,7 +513,7 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 
 	} else {
 		// 条件1：当window的位数只剩下WindowLeft bit，触发清理
-		if windowBits <= WindowLeft-1 {
+		if windowBits <= WindowLeft-2 {
 			needStartPrune = true
 		}
 

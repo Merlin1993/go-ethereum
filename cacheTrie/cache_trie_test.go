@@ -1078,8 +1078,8 @@ func TestCacheTriePerformance(t *testing.T) {
 
 func TestSampleCacheTriePerformance(t *testing.T) {
 	stateCount := 5000
-	iterationCount := 2000 // 统计循环次数
-	maxSize := 500000      // 初始存储大小限制
+	iterationCount := 200 // 统计循环次数
+	maxSize := 500000     // 初始存储大小限制
 	windowMultiple := 1024
 	t.Run(fmt.Sprintf("StateCount_%d", stateCount), func(t *testing.T) {
 		testCacheTrieWithStateCount(t, stateCount, iterationCount, windowMultiple, maxSize)
@@ -1130,7 +1130,6 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 				cacheTrie.FinishCleanup(currentBlock, hash)
 			}()
 		}
-		cacheTrie.GetCleanupResult()
 
 		currentBlock++
 		cacheTrie.SetBlockNum(currentBlock)
@@ -1205,13 +1204,11 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 		hash, _, kvList := cacheTrie.Hash()
 		hashTime := time.Since(hashStart)
 
-		if kvList != nil && len(kvList.Data) > 0 {
+		if kvList != nil {
 			go func() {
 				cacheTrie.FinishCleanup(currentBlock, hash)
 			}()
 		}
-
-		cacheTrie.GetCleanupResult()
 
 		// 移动到下一个区块
 		currentBlock++

@@ -93,8 +93,8 @@ func (hrw *HeightRangeWindow) GetBitPosition(number uint64) int {
 func (hrw *HeightRangeWindow) CheckAndTriggerCongestionControl(currentUsedSize int) bool {
 	if currentUsedSize > hrw.maxTotalAllowedSize {
 		newSsthresh := hrw.logicalCapacities[hrw.GetBitPosition(hrw.windowEndNumber)] / 2
-		if newSsthresh == 0 {
-			newSsthresh = 1 // sshresh 至少为1
+		if newSsthresh < 8 {
+			newSsthresh = 8 // sshresh 至少为1
 		}
 		hrw.currentSsthresh = newSsthresh
 		hrw.recalculateLogicalCapacities()
