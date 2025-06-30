@@ -5,6 +5,7 @@ import (
 	"github.com/ethereum/go-ethereum/cacheTrie"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -23,7 +24,6 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
-	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/holiman/uint256"
 
 	"encoding/csv"
@@ -469,7 +469,8 @@ func TestCompareProcessTransactions(t *testing.T) {
 		CacheTrie: common.UseCacheTrie,
 		ReadCache: false,
 		StartNum:  startNum,
-		HashDB:    hashdb.Defaults,
+		PathDB:    pathdb.Defaults,
+		//HashDB:    hashdb.Defaults,
 	})
 
 	// 使用正确的state包API
@@ -485,7 +486,8 @@ func TestCompareProcessTransactions(t *testing.T) {
 			CacheTrie: false,
 			ReadCache: false,
 			StartNum:  startNum,
-			HashDB:    hashdb.Defaults,
+			PathDB:    pathdb.Defaults,
+			//HashDB:    hashdb.Defaults,
 		})
 		preSdb = state.NewDatabase(preTrieDB, snaps)
 	}
@@ -959,7 +961,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 			} else {
 				root, _ = countingStateDB.Commit(blockNum, false, false)
 				// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
-				if blockNum-lastCommitBlock >= 8000 { // 每1000个区块提交一次
+				if blockNum-lastCommitBlock >= 5000 { // 每1000个区块提交一次
 					commitStart := time.Now()
 					err = trieDB.Commit(root, false)
 					commitDuration = time.Since(commitStart)

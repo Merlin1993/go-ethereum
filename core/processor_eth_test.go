@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -15,8 +16,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/cacheTrie"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
-
-	"github.com/ethereum/go-ethereum/triedb/hashdb"
 
 	"github.com/ethereum/go-ethereum/core/tracing"
 
@@ -1205,11 +1204,11 @@ func TestProcessTransactions(t *testing.T) {
 	db := rawdb.NewDatabase(ldb)
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
 		Preimages: false,
-		IsVerkle:  common.UserVerkle,
-		CacheTrie: common.UseCacheTrie,
+		IsVerkle:  true,
+		CacheTrie: true,
 		ReadCache: false,
 		StartNum:  startNum,
-		HashDB:    hashdb.Defaults,
+		PathDB:    pathdb.Defaults,
 	})
 	var snaps *snapshot.Tree
 	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
@@ -1217,14 +1216,14 @@ func TestProcessTransactions(t *testing.T) {
 	var preTrieDB *triedb.Database
 	var preSdb *state.CachingDB
 	if common.UseCacheTrie {
-		preTrieDB = triedb.NewDatabase(db, &triedb.Config{
+		preTrieDB = triedb.NewDatabase2(db, &triedb.Config{
 			Preimages: false,
-			IsVerkle:  common.UserVerkle,
+			IsVerkle:  true,
 			CacheTrie: false,
 			ReadCache: false,
 			StartNum:  startNum,
-			HashDB:    hashdb.Defaults,
-		})
+			PathDB:    pathdb.Defaults,
+		}, trieDB.GetBackend())
 		preSdb = state.NewDatabase(preTrieDB, snaps)
 	}
 
@@ -1759,7 +1758,7 @@ func TestProcessTransactions(t *testing.T) {
 					}
 
 					// 刷新数据库，避免内存占用过大
-					preTrieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
+					//preTrieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
 
 				}(root, blockNum, deleteKVList)
 			} else {

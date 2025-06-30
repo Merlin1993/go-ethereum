@@ -57,7 +57,7 @@ func TestVerkleMethod1(t *testing.T) {
 		t.Fatalf("创建Verkle Trie失败: %v", err)
 	}
 
-	var finalRoot common.Hash
+	var finalRoot common.Hash = lastRoot
 	totalStart := time.Now()
 
 	// 使用固定的地址进行测试

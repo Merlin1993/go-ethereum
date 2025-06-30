@@ -1,7 +1,7 @@
 package common
 
 const (
-	UserVerkle   = false
+	UserVerkle   = true
 	UseCacheTrie = true
 	DebugFlag    = false
 )
