@@ -3,8 +3,6 @@ package core
 import (
 	"encoding/csv"
 	"fmt"
-	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -14,8 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/triedb/hashdb"
+
 	"github.com/ethereum/go-ethereum/cacheTrie"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
+	"github.com/ethereum/go-ethereum/rlp"
 
 	"github.com/ethereum/go-ethereum/core/tracing"
 
@@ -71,6 +72,12 @@ type StateAccessCounter struct {
 
 	// 新增字段，记录所有部署的合约地址
 	ContractAddresses map[common.Address]bool // 记录所有部署的合约地址
+
+	// 新增字段用于单笔交易的统计
+	TxVisitedReads  map[string]bool // 本次交易内已经读取过的状态
+	TxVisitedWrites map[string]bool // 本次交易内已经写入过的状态
+	TxUniqueReads   int             // 本次交易唯一的读操作数量
+	TxUniqueWrites  int             // 本次交易唯一的写操作数量
 }
 
 // NewStateAccessCounter 创建一个新的状态访问计数器
@@ -86,12 +93,16 @@ func NewStateAccessCounter(maxHistorySize uint64) *StateAccessCounter {
 		ReadThenWritten:   make(map[string]bool),
 		WritesOnly:        make(map[string]bool),
 		ContractAddresses: make(map[common.Address]bool), // 初始化合约地址map
+		TxVisitedReads:    make(map[string]bool),
+		TxVisitedWrites:   make(map[string]bool),
+		TxUniqueReads:     0,
+		TxUniqueWrites:    0,
 	}
 }
 
 // RecordStateRead 记录状态读取
 func (c *StateAccessCounter) RecordStateRead(key string) {
-	// 如果该键尚未被读取过且尚未被写入过，增加唯一读取计数
+	// 区块级别的统计
 	if !c.VisitedReads[key] && !c.VisitedWrites[key] {
 		c.UniqueReads++
 		c.VisitedReads[key] = true
@@ -102,6 +113,12 @@ func (c *StateAccessCounter) RecordStateRead(key string) {
 		}
 	}
 
+	// 交易级别的统计
+	if !c.TxVisitedReads[key] && !c.TxVisitedWrites[key] {
+		c.TxUniqueReads++
+		c.TxVisitedReads[key] = true
+	}
+
 	if c.RecentAccess[c.BlockNum] == nil {
 		c.RecentAccess[c.BlockNum] = make(map[string]bool)
 	}
@@ -110,7 +127,7 @@ func (c *StateAccessCounter) RecordStateRead(key string) {
 
 // RecordStateWrite 记录状态写入
 func (c *StateAccessCounter) RecordStateWrite(key string) {
-	// 如果该键尚未被写入过，增加唯一写入计数
+	// 区块级别的统计
 	if !c.VisitedWrites[key] {
 		c.UniqueWrites++
 		c.VisitedWrites[key] = true
@@ -126,10 +143,29 @@ func (c *StateAccessCounter) RecordStateWrite(key string) {
 		}
 	}
 
+	// 交易级别的统计
+	if !c.TxVisitedWrites[key] {
+		c.TxUniqueWrites++
+		c.TxVisitedWrites[key] = true
+	}
+
 	if c.RecentAccess[c.BlockNum] == nil {
 		c.RecentAccess[c.BlockNum] = make(map[string]bool)
 	}
 	c.RecentAccess[c.BlockNum][key] = true
+}
+
+// ResetTransactionCounters 重置交易级别的计数器
+func (c *StateAccessCounter) ResetTransactionCounters() {
+	c.TxVisitedReads = make(map[string]bool)
+	c.TxVisitedWrites = make(map[string]bool)
+	c.TxUniqueReads = 0
+	c.TxUniqueWrites = 0
+}
+
+// GetTransactionStats 获取当前交易的状态访问统计
+func (c *StateAccessCounter) GetTransactionStats() (reads, writes int) {
+	return c.TxUniqueReads, c.TxUniqueWrites
 }
 
 // NextBlock 进入下一个区块，清除旧的状态记录
@@ -1193,6 +1229,19 @@ func TestProcessTransactions(t *testing.T) {
 	// 创建统计聚合器，每100,000个区块打印一次统计，每1,000,000个区块生成一个CSV
 	statsAgg := NewStatsAggregator(statsDir, 100000, 1000000)
 
+	// 创建慢交易监控器
+	slowTxConfig := SlowTransactionConfig{
+		Threshold:       10 * time.Millisecond, // 100ms阈值
+		DetailedLogging: true,
+		LogToFile:       true,
+		OutputDir:       statsDir,
+		MonitorBlockRanges: []BlockRange{
+			{Start: 2700000, End: 2800000}, // 270万-280万
+		},
+	}
+	slowTxMonitor := NewSlowTransactionMonitor(slowTxConfig)
+	defer slowTxMonitor.Close()
+
 	// 创建或打开持久化数据库
 	ldb, err := leveldb.New(dbDir, 1024, 1024, "eth-process-test", false)
 	if err != nil {
@@ -1204,26 +1253,37 @@ func TestProcessTransactions(t *testing.T) {
 	db := rawdb.NewDatabase(ldb)
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
 		Preimages: false,
-		IsVerkle:  true,
+		IsVerkle:  false,
 		CacheTrie: true,
 		ReadCache: false,
 		StartNum:  startNum,
-		PathDB:    pathdb.Defaults,
+		//PathDB:    pathdb.Defaults,
+		HashDB: hashdb.Defaults,
 	})
+
 	var snaps *snapshot.Tree
 	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
 	sdb := state.NewDatabase(trieDB, snaps)
 	var preTrieDB *triedb.Database
 	var preSdb *state.CachingDB
 	if common.UseCacheTrie {
-		preTrieDB = triedb.NewDatabase2(db, &triedb.Config{
+		preTrieDB = triedb.NewDatabase(db, &triedb.Config{
 			Preimages: false,
-			IsVerkle:  true,
+			IsVerkle:  common.UserVerkle,
 			CacheTrie: false,
 			ReadCache: false,
 			StartNum:  startNum,
-			PathDB:    pathdb.Defaults,
-		}, trieDB.GetBackend())
+			//PathDB:    pathdb.Defaults,
+			HashDB: hashdb.Defaults,
+		})
+		//preTrieDB = triedb.NewDatabase2(db, &triedb.Config{
+		//	Preimages: false,
+		//	IsVerkle:  true,
+		//	CacheTrie: false,
+		//	ReadCache: false,
+		//	StartNum:  startNum,
+		//	PathDB:    pathdb.Defaults,
+		//}, trieDB.GetBackend())
 		preSdb = state.NewDatabase(preTrieDB, snaps)
 	}
 
@@ -1434,6 +1494,12 @@ func TestProcessTransactions(t *testing.T) {
 				continue
 			}
 
+			// 检查是否需要监控此区块
+			shouldMonitor := slowTxMonitor.ShouldMonitorBlock(blockNum)
+			if shouldMonitor {
+				t.Logf("开始监控区块 %d 的慢交易", blockNum)
+			}
+
 			// 计数器进入新区块
 			counter.NextBlock(blockNum)
 
@@ -1522,15 +1588,30 @@ func TestProcessTransactions(t *testing.T) {
 			// 使用countingStateDB作为vm.StateDB
 			vmenv := vm.NewEVM(blockContext, countingStateDB, params.MainnetChainConfig, vm.Config{})
 
-			for _, msg := range msgsByBlock[blockNum] {
+			for txIndex, msg := range msgsByBlock[blockNum] {
+				// 重置交易级别的状态访问计数器
+				counter.ResetTransactionCounters()
+
+				// 记录交易开始时间
+				txStart := time.Now()
 
 				// 处理交易
 				result, err := ApplyMessage(vmenv, msg, gp)
+
+				// 计算交易执行时间
+
+				txDuration := time.Since(txStart)
+				if msg.To != nil {
+					txDuration = 0
+				}
+
 				var receipt *types.Receipt
 
 				// 判断是否为合约交易
 				isContractTx := false
 				isContractCreate := false
+				var contractAddress common.Address
+
 				if msg.To == nil {
 					// 合约创建
 					isContractTx = true
@@ -1539,9 +1620,7 @@ func TestProcessTransactions(t *testing.T) {
 
 					// 如果交易成功，记录创建的合约地址
 					if result != nil && result.ContractAddress != (common.Address{}) {
-						//if result.ContractAddress == common.HexToAddress("0xa50156cF80fa9eC2e16899E4fb7e072300787417") {
-						//	result.ContractAddress = common.HexToAddress("0xa50156cF80fa9eC2e16899E4fb7e072300787417")
-						//}
+						contractAddress = result.ContractAddress
 						counter.ContractAddresses[result.ContractAddress] = true
 					}
 				} else if counter.ContractAddresses[*msg.To] && len(msg.Data) > 0 {
@@ -1552,6 +1631,51 @@ func TestProcessTransactions(t *testing.T) {
 
 				if isContractTx {
 					contractTxCount++
+				}
+
+				// 获取本次交易的状态访问次数
+				txReads, txWrites := counter.GetTransactionStats()
+
+				// 检查是否为慢交易
+				if shouldMonitor && txDuration > slowTxConfig.Threshold {
+					// 提取函数选择器
+					functionSelector := ""
+					if len(msg.Data) >= 4 {
+						functionSelector = fmt.Sprintf("0x%x", msg.Data[:4])
+					}
+
+					// 记录慢交易信息
+					slowTx := SlowTransaction{
+						BlockNum:         blockNum,
+						TransactionIndex: txIndex,
+						From:             msg.From,
+						To:               msg.To,
+						ContractAddress:  contractAddress,
+						IsContractCall:   isContractTx && !isContractCreate,
+						IsContractCreate: isContractCreate,
+						ExecutionTime:    txDuration,
+						GasLimit:         msg.GasLimit,
+						DataSize:         len(msg.Data),
+						StateReads:       txReads,
+						StateWrites:      txWrites,
+						FunctionSelector: functionSelector,
+					}
+
+					// 设置交易结果信息
+					if err != nil || result.Err != nil {
+						slowTx.Success = false
+						if err != nil {
+							slowTx.Error = err.Error()
+						} else if result.Err != nil {
+							slowTx.Error = result.Err.Error()
+						}
+						slowTx.GasUsed = 0
+					} else {
+						slowTx.Success = true
+						slowTx.GasUsed = result.UsedGas
+					}
+
+					slowTxMonitor.RecordSlowTransaction(slowTx)
 				}
 
 				if err != nil || result.Err != nil {
@@ -1933,12 +2057,40 @@ func TestProcessTransactions(t *testing.T) {
 
 			// 添加到统计聚合器
 			statsAgg.AddBlockStats(blockStats)
+
+			// 对于监控的区块范围，输出详细的区块统计
+			if shouldMonitor {
+				blockProcessTime := processDuration + rootGenDuration
+				avgTxTime := time.Duration(0)
+				if len(msgsByBlock[blockNum]) > 0 {
+					avgTxTime = blockProcessTime / time.Duration(len(msgsByBlock[blockNum]))
+				}
+
+				fmt.Printf("\n📊 区块 %d 详细统计:\n", blockNum)
+				fmt.Printf("  交易总数: %d (成功: %d, 失败: %d)\n",
+					len(msgsByBlock[blockNum]), successCount, errorCount)
+				fmt.Printf("  合约交易: %d (创建: %d, 调用: %d)\n",
+					contractTxCount, createContractCount, callContractCount)
+				fmt.Printf("  区块处理时间: %v (平均每笔交易: %v)\n",
+					blockProcessTime, avgTxTime)
+				fmt.Printf("  状态访问: 读%d次, 写%d次\n",
+					counter.UniqueReads, counter.UniqueWrites)
+
+				// 如果区块处理时间超过阈值，特别标注
+				if blockProcessTime > 5*time.Second {
+					fmt.Printf("  ⚠️  注意: 此区块处理时间异常长 (%v)\n", blockProcessTime)
+				}
+				fmt.Println()
+			}
 		}
 		t.Logf("完成处理文件: %s", file)
 	}
 
 	// 处理完成后输出最终统计信息
 	statsAgg.PrintStats()
+
+	// 输出慢交易统计
+	slowTxMonitor.PrintSummary()
 
 	// 保存最后一批统计数据
 	if len(statsAgg.Stats) > 0 {
@@ -2122,4 +2274,312 @@ func simplifyErrorReason(errMsg string) string {
 func ProcessDeleteKVList(stateDB *state.StateDB, blockNum uint64) error {
 
 	return nil
+}
+
+// 新增慢交易检测配置
+type SlowTransactionConfig struct {
+	Threshold          time.Duration // 慢交易阈值，超过此时间的交易会被记录
+	DetailedLogging    bool          // 是否启用详细日志
+	LogToFile          bool          // 是否输出到文件
+	OutputDir          string        // 输出目录
+	MonitorBlockRanges []BlockRange  // 监控的区块范围
+}
+
+type BlockRange struct {
+	Start uint64
+	End   uint64
+}
+
+// 慢交易记录
+type SlowTransaction struct {
+	BlockNum         uint64          // 区块号
+	TransactionIndex int             // 交易在区块中的索引
+	From             common.Address  // 发送方地址
+	To               *common.Address // 接收方地址（可能为nil，表示合约创建）
+	ContractAddress  common.Address  // 如果是合约创建，记录创建的合约地址
+	IsContractCall   bool            // 是否为合约调用
+	IsContractCreate bool            // 是否为合约创建
+	ExecutionTime    time.Duration   // 执行时间
+	GasUsed          uint64          // 使用的燃料
+	GasLimit         uint64          // 燃料限制
+	DataSize         int             // 交易数据大小
+	Error            string          // 错误信息（如果有）
+	Success          bool            // 是否成功
+	StateReads       int             // 状态读取次数
+	StateWrites      int             // 状态写入次数
+	FunctionSelector string          // 函数选择器（前4字节）
+}
+
+// 慢交易监控器
+type SlowTransactionMonitor struct {
+	Config    SlowTransactionConfig
+	SlowTxs   []SlowTransaction
+	csvWriter *csv.Writer
+	csvFile   *os.File
+}
+
+// 创建慢交易监控器
+func NewSlowTransactionMonitor(config SlowTransactionConfig) *SlowTransactionMonitor {
+	monitor := &SlowTransactionMonitor{
+		Config:  config,
+		SlowTxs: make([]SlowTransaction, 0),
+	}
+
+	// 如果需要输出到文件，创建CSV文件
+	if config.LogToFile {
+		if config.OutputDir != "" {
+			// 确保输出目录存在
+			os.MkdirAll(config.OutputDir, 0755)
+		}
+
+		filename := filepath.Join(config.OutputDir, "slow_transactions.csv")
+		file, err := os.Create(filename)
+		if err != nil {
+			fmt.Printf("创建慢交易日志文件失败: %v\n", err)
+		} else {
+			monitor.csvFile = file
+			monitor.csvWriter = csv.NewWriter(file)
+
+			// 写入CSV头
+			headers := []string{
+				"BlockNum", "TxIndex", "From", "To", "ContractAddress",
+				"IsContractCall", "IsContractCreate", "ExecutionTime(ms)",
+				"GasUsed", "GasLimit", "DataSize", "Success", "Error",
+				"StateReads", "StateWrites", "FunctionSelector",
+			}
+			monitor.csvWriter.Write(headers)
+			monitor.csvWriter.Flush()
+		}
+	}
+
+	return monitor
+}
+
+// 检查是否应该监控此区块
+func (m *SlowTransactionMonitor) ShouldMonitorBlock(blockNum uint64) bool {
+	if len(m.Config.MonitorBlockRanges) == 0 {
+		return true // 如果没有指定范围，监控所有区块
+	}
+
+	for _, blockRange := range m.Config.MonitorBlockRanges {
+		if blockNum >= blockRange.Start && blockNum <= blockRange.End {
+			return true
+		}
+	}
+	return false
+}
+
+// 记录慢交易
+func (m *SlowTransactionMonitor) RecordSlowTransaction(slowTx SlowTransaction) {
+	m.SlowTxs = append(m.SlowTxs, slowTx)
+
+	// 输出到控制台
+	if m.Config.DetailedLogging {
+		fmt.Printf("\n🐌 检测到慢交易 (区块 %d, 索引 %d):\n", slowTx.BlockNum, slowTx.TransactionIndex)
+		fmt.Printf("  执行时间: %v (阈值: %v)\n", slowTx.ExecutionTime, m.Config.Threshold)
+		fmt.Printf("  发送方: %s\n", slowTx.From.Hex())
+		if slowTx.To != nil {
+			fmt.Printf("  接收方: %s\n", slowTx.To.Hex())
+		} else {
+			fmt.Printf("  接收方: <合约创建>\n")
+		}
+		if slowTx.IsContractCreate && slowTx.ContractAddress != (common.Address{}) {
+			fmt.Printf("  创建的合约: %s\n", slowTx.ContractAddress.Hex())
+		}
+		fmt.Printf("  类型: %s\n", func() string {
+			if slowTx.IsContractCreate {
+				return "合约创建"
+			} else if slowTx.IsContractCall {
+				return "合约调用"
+			}
+			return "普通转账"
+		}())
+		fmt.Printf("  燃料: %d/%d (%.1f%%)\n", slowTx.GasUsed, slowTx.GasLimit, float64(slowTx.GasUsed)*100/float64(slowTx.GasLimit))
+		fmt.Printf("  数据大小: %d bytes\n", slowTx.DataSize)
+		if slowTx.FunctionSelector != "" {
+			fmt.Printf("  函数选择器: %s\n", slowTx.FunctionSelector)
+		}
+		fmt.Printf("  状态访问: 读%d次, 写%d次\n", slowTx.StateReads, slowTx.StateWrites)
+		fmt.Printf("  结果: %s\n", func() string {
+			if slowTx.Success {
+				return "成功"
+			}
+			return "失败: " + slowTx.Error
+		}())
+		fmt.Println("  " + strings.Repeat("-", 50))
+	}
+
+	// 输出到CSV文件
+	if m.csvWriter != nil {
+		contractAddr := ""
+		if slowTx.ContractAddress != (common.Address{}) {
+			contractAddr = slowTx.ContractAddress.Hex()
+		}
+
+		toAddr := ""
+		if slowTx.To != nil {
+			toAddr = slowTx.To.Hex()
+		}
+
+		record := []string{
+			strconv.FormatUint(slowTx.BlockNum, 10),
+			strconv.Itoa(slowTx.TransactionIndex),
+			slowTx.From.Hex(),
+			toAddr,
+			contractAddr,
+			strconv.FormatBool(slowTx.IsContractCall),
+			strconv.FormatBool(slowTx.IsContractCreate),
+			strconv.FormatInt(slowTx.ExecutionTime.Milliseconds(), 10),
+			strconv.FormatUint(slowTx.GasUsed, 10),
+			strconv.FormatUint(slowTx.GasLimit, 10),
+			strconv.Itoa(slowTx.DataSize),
+			strconv.FormatBool(slowTx.Success),
+			slowTx.Error,
+			strconv.Itoa(slowTx.StateReads),
+			strconv.Itoa(slowTx.StateWrites),
+			slowTx.FunctionSelector,
+		}
+		m.csvWriter.Write(record)
+		m.csvWriter.Flush()
+	}
+}
+
+// 输出统计信息
+func (m *SlowTransactionMonitor) PrintSummary() {
+	if len(m.SlowTxs) == 0 {
+		fmt.Println("未检测到慢交易")
+		return
+	}
+
+	fmt.Printf("\n===== 慢交易统计汇总 =====\n")
+	fmt.Printf("总共检测到 %d 笔慢交易\n", len(m.SlowTxs))
+
+	// 按区块分组统计
+	blockCounts := make(map[uint64]int)
+	contractCalls := 0
+	contractCreates := 0
+
+	var totalTime time.Duration
+	var maxTime time.Duration
+	var maxTimeTx SlowTransaction
+
+	// 合约地址分析
+	contractCallCounts := make(map[common.Address]int)
+	contractCreateCounts := make(map[common.Address]int)
+	functionCounts := make(map[string]int)
+
+	for _, tx := range m.SlowTxs {
+		blockCounts[tx.BlockNum]++
+		if tx.IsContractCall {
+			contractCalls++
+			if tx.To != nil {
+				contractCallCounts[*tx.To]++
+			}
+		}
+		if tx.IsContractCreate {
+			contractCreates++
+			if tx.ContractAddress != (common.Address{}) {
+				contractCreateCounts[tx.ContractAddress]++
+			}
+		}
+		if tx.FunctionSelector != "" {
+			functionCounts[tx.FunctionSelector]++
+		}
+		totalTime += tx.ExecutionTime
+		if tx.ExecutionTime > maxTime {
+			maxTime = tx.ExecutionTime
+			maxTimeTx = tx
+		}
+	}
+
+	fmt.Printf("合约调用慢交易: %d, 合约创建慢交易: %d, 普通转账慢交易: %d\n",
+		contractCalls, contractCreates, len(m.SlowTxs)-contractCalls-contractCreates)
+	fmt.Printf("平均执行时间: %v\n", time.Duration(int64(totalTime)/int64(len(m.SlowTxs))))
+	fmt.Printf("最长执行时间: %v (区块 %d, 索引 %d)\n", maxTime, maxTimeTx.BlockNum, maxTimeTx.TransactionIndex)
+
+	// 输出受影响的区块
+	fmt.Printf("\n受影响的区块数: %d\n", len(blockCounts))
+
+	// 按区块号排序并输出
+	blocks := make([]uint64, 0, len(blockCounts))
+	for blockNum := range blockCounts {
+		blocks = append(blocks, blockNum)
+	}
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i] < blocks[j] })
+
+	fmt.Println("区块分布:")
+	for _, blockNum := range blocks {
+		count := blockCounts[blockNum]
+		fmt.Printf("  区块 %d: %d 笔慢交易\n", blockNum, count)
+	}
+
+	// 分析最常调用的慢合约
+	if len(contractCallCounts) > 0 {
+		fmt.Printf("\n最常出现慢交易的合约 (调用):\n")
+
+		// 按调用次数排序
+		type ContractCount struct {
+			Address common.Address
+			Count   int
+		}
+
+		callCounts := make([]ContractCount, 0, len(contractCallCounts))
+		for addr, count := range contractCallCounts {
+			callCounts = append(callCounts, ContractCount{addr, count})
+		}
+		sort.Slice(callCounts, func(i, j int) bool {
+			return callCounts[i].Count > callCounts[j].Count
+		})
+
+		// 输出前10个
+		for i, cc := range callCounts {
+			if i >= 10 {
+				break
+			}
+			fmt.Printf("  %s: %d 次慢调用\n", cc.Address.Hex(), cc.Count)
+		}
+	}
+
+	// 分析最常创建的慢合约
+	if len(contractCreateCounts) > 0 {
+		fmt.Printf("\n创建时出现慢交易的合约:\n")
+		for addr, count := range contractCreateCounts {
+			fmt.Printf("  %s: %d 次慢创建\n", addr.Hex(), count)
+		}
+	}
+
+	// 分析最常见的慢函数
+	if len(functionCounts) > 0 {
+		fmt.Printf("\n最常出现慢交易的函数选择器:\n")
+
+		type FunctionCount struct {
+			Selector string
+			Count    int
+		}
+
+		funcCounts := make([]FunctionCount, 0, len(functionCounts))
+		for selector, count := range functionCounts {
+			funcCounts = append(funcCounts, FunctionCount{selector, count})
+		}
+		sort.Slice(funcCounts, func(i, j int) bool {
+			return funcCounts[i].Count > funcCounts[j].Count
+		})
+
+		// 输出前10个
+		for i, fc := range funcCounts {
+			if i >= 10 {
+				break
+			}
+			fmt.Printf("  %s: %d 次慢调用\n", fc.Selector, fc.Count)
+		}
+	}
+
+	fmt.Println("=========================")
+}
+
+// 关闭监控器
+func (m *SlowTransactionMonitor) Close() {
+	if m.csvFile != nil {
+		m.csvFile.Close()
+	}
 }

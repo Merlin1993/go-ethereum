@@ -65,6 +65,10 @@ type TrieStatsAggregator struct {
 	TrieType   TrieType   // 树类型
 	DataPath   string     // 数据路径(用于计算数据大小变化)
 
+	// 时间统计字段
+	ProgramStartTime time.Time // 程序开始时间
+	LastStageTime    time.Time // 上一阶段时间
+
 	// 累计统计数据
 	WindowStats struct {
 		// 第一类统计：需要累加的数据
@@ -97,13 +101,16 @@ func NewTrieStatsAggregator(outputDir string, dataPath string, trieType TrieType
 		os.MkdirAll(outputDir, 0755)
 	}
 
+	now := time.Now()
 	return &TrieStatsAggregator{
-		OutputDir:    outputDir,
-		Window:       StatsWindow,
-		LastOutput:   0,
-		TrieType:     trieType,
-		DataPath:     dataPath,
-		CacheTrieRef: nil,
+		OutputDir:        outputDir,
+		Window:           StatsWindow,
+		LastOutput:       0,
+		TrieType:         trieType,
+		DataPath:         dataPath,
+		ProgramStartTime: now,
+		LastStageTime:    now,
+		CacheTrieRef:     nil,
 	}
 }
 
@@ -202,8 +209,13 @@ func (s *TrieStatsAggregator) OutputStats() {
 		totalCleanupTime, maxCleanupTime = s.CacheTrieRef.GetCleanupTimes()
 	}
 
+	// 计算时间统计
+	currentTime := time.Now()
+	totalElapsed := currentTime.Sub(s.ProgramStartTime)
+	stageElapsed := currentTime.Sub(s.LastStageTime)
+
 	// 打印统计信息到控制台
-	s.printWindowStats(dataSize, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime)
+	s.printWindowStats(dataSize, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime, totalElapsed, stageElapsed)
 
 	// 输出CSV文件
 	s.outputCSV(dataSize, getHitRate, updateHitRate, getHits, getMisses, updateHits, updateMisses, cleanupCount, totalCleanupTime, maxCleanupTime)
@@ -212,6 +224,9 @@ func (s *TrieStatsAggregator) OutputStats() {
 		// 重置统计数据
 		s.CacheTrieRef.ResetStats()
 	}
+
+	// 更新阶段时间
+	s.LastStageTime = currentTime
 }
 
 // CalculateDirSizeWithRetry 带重试机制的目录大小计算
@@ -385,7 +400,8 @@ func (s *TrieStatsAggregator) resetWindowStats() {
 // printWindowStats 打印窗口统计信息
 func (s *TrieStatsAggregator) printWindowStats(dataSize int64, getHitRate, updateHitRate float64,
 	getHits, getMisses, updateHits, updateMisses uint64,
-	cleanupCount int, totalCleanupTime, maxCleanupTime time.Duration) {
+	cleanupCount int, totalCleanupTime, maxCleanupTime time.Duration,
+	totalElapsed, stageElapsed time.Duration) {
 
 	var typeStr string
 	switch s.TrieType {
@@ -412,6 +428,10 @@ func (s *TrieStatsAggregator) printWindowStats(dataSize int64, getHitRate, updat
 
 	fmt.Printf("\n===== [%s] 窗口 #%d 统计 (区块范围: %d - %d) =====\n",
 		typeStr, windowNumber, s.WindowStats.StartBlock, s.WindowStats.EndBlock)
+
+	// 添加时间统计输出
+	fmt.Printf("⏱️  程序总耗时: %v, 本阶段耗时: %v\n",
+		totalElapsed.Round(time.Second), stageElapsed.Round(time.Second))
 
 	fmt.Printf("总写入状态数: %d, 总读取状态数: %d\n",
 		s.WindowStats.TotalWrittenStates, s.WindowStats.TotalReadStates)

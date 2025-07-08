@@ -31,6 +31,22 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
+func TestNilWindow(t *testing.T) {
+	var fn *FullNode
+	var sn *ShortNode
+	//sn = &ShortNode{
+	//	Key: nil,
+	//	Val: nil,
+	//	//flags: nodeFlag{dirty: true},
+	//}
+	fn = &FullNode{
+		Children: [16]cacheNode{},
+		flags:    nodeFlag{},
+	}
+	fn.Children[0] = sn
+	fn.updateFlag(1)
+}
+
 // 测试基本操作: 插入、查询、删除
 func TestBasicOperations(t *testing.T) {
 	trie := NewCacheTrie(0, 1, 0)

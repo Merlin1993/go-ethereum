@@ -51,6 +51,11 @@ func returnHasherToPool(h *hasher) {
 
 // hash计算节点的哈希值，保留原始节点的内存引用，并组合所有子节点的信息
 func (h *hasher) hash(n cacheNode) []byte {
+	// 如果节点为空，返回nil
+	if n == nil || n.isNil() {
+		return nil
+	}
+
 	// 如果节点已经有缓存的哈希值且不强制重新计算，直接返回
 	if hash, dirty := n.cache(); hash != nil && !dirty {
 		return hash
@@ -66,12 +71,12 @@ func (h *hasher) hash(n cacheNode) []byte {
 
 	case *FullNode:
 		// 处理子节点
-		tmp := make([]byte, 512) //todo 这样做是否会有性能消耗？
+		tmp := make([]byte, 512)
 		if h.parallel {
 			var wg sync.WaitGroup
-			wg.Add(16) // 包括值位置
+			wg.Add(16)
 			for i := 0; i < 16; i++ {
-				if child := n.Children[i]; child != nil {
+				if child := n.Children[i]; !child.isNil() {
 					go func(i int) {
 						defer wg.Done()
 						hasher := hasherPool.Get().(*hasher)
@@ -80,16 +85,14 @@ func (h *hasher) hash(n cacheNode) []byte {
 						returnHasherToPool(hasher)
 					}(i)
 				} else {
-					//todo tmp是否需要注入0？还是初始化就是0了
 					wg.Done()
 				}
-
 			}
 			wg.Wait()
 		} else {
 			// 串行处理子节点
 			for i := 0; i < 16; i++ {
-				if child := n.Children[i]; child != nil {
+				if child := n.Children[i]; !child.isNil() {
 					childHash := h.hash(child)
 					copy(tmp[i*32:], childHash[:])
 				}

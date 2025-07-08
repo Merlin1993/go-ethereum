@@ -33,6 +33,7 @@ type cacheNode interface {
 	memorySize() int64
 	updateFlag(int)
 	updateCache([]byte)
+	isNil() bool
 }
 
 // 各种节点类型
@@ -107,7 +108,7 @@ func (n ValueNode) String() string  { return n.fstring("") }
 func (n *FullNode) fstring(ind string) string {
 	resp := fmt.Sprintf("[\n%s  ", ind)
 	for i, node := range &n.Children {
-		if node == nil {
+		if node.isNil() {
 			resp += fmt.Sprintf("%s: <nil> ", nodeIndices[i])
 		} else {
 			resp += fmt.Sprintf("%s: %v", nodeIndices[i], node.fstring(ind+"  "))
@@ -134,7 +135,7 @@ func (n *FullNode) updateFlag(bitPos int) {
 
 	// 使用range遍历，避免并发修改导致的竞态条件
 	for _, child := range n.Children {
-		if child != nil {
+		if !child.isNil() {
 			n.flags.window |= child.window()
 			n.flags.size += child.size()
 			n.flags.memorySize += pointerSize + child.memorySize() // 指针大小 + 子节点大小
@@ -175,3 +176,19 @@ func (n ValueNode) updateFlag(w int) {} // 值节点不设置窗口
 func (n *FullNode) updateCache(hash []byte)  { n.flags.hash = hash; n.flags.dirty = false }
 func (n *ShortNode) updateCache(hash []byte) { n.flags.hash = hash; n.flags.dirty = false }
 func (n ValueNode) updateCache(hash []byte)  {} // 值节点不设置窗口
+
+// 实现isNil方法
+func (n *FullNode) isNil() bool {
+	if n == nil {
+		return true
+	}
+	return false
+}
+
+func (n *ShortNode) isNil() bool {
+	return n == nil
+}
+
+func (n ValueNode) isNil() bool {
+	return false
+}
