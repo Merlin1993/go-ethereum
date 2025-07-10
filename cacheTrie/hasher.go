@@ -76,7 +76,7 @@ func (h *hasher) hash(n cacheNode) []byte {
 			var wg sync.WaitGroup
 			wg.Add(16)
 			for i := 0; i < 16; i++ {
-				if child := n.Children[i]; !child.isNil() {
+				if child := n.Children[i]; child != nil && !child.isNil() {
 					go func(i int) {
 						defer wg.Done()
 						hasher := hasherPool.Get().(*hasher)
@@ -92,7 +92,7 @@ func (h *hasher) hash(n cacheNode) []byte {
 		} else {
 			// 串行处理子节点
 			for i := 0; i < 16; i++ {
-				if child := n.Children[i]; !child.isNil() {
+				if child := n.Children[i]; child != nil && !child.isNil() {
 					childHash := h.hash(child)
 					copy(tmp[i*32:], childHash[:])
 				}

@@ -44,6 +44,7 @@ func TestNilWindow(t *testing.T) {
 		flags:    nodeFlag{},
 	}
 	fn.Children[0] = sn
+	fn.Children[0].isNil()
 	fn.updateFlag(1)
 }
 

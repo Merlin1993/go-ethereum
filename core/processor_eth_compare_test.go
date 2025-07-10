@@ -1228,39 +1228,28 @@ func (db *CompareCountingStateDB) AddBalance(addr common.Address, amount *uint25
 // 确保CompareCountingStateDB实现了vm.StateDB接口
 var _ vm.StateDB = (*CompareCountingStateDB)(nil)
 
-// TestCompareProcessTransactionsSample 测试处理CSV中的交易（取样模式）
-// 只针对非cacheTrie模式，每处理499个区块后，统计第500个区块的性能
-func TestCompareProcessTransactionsSample(t *testing.T) {
+// TestCompareVerkleProcessTransactions 测试处理CSV中的交易
+func TestCompareVerkleProcessTransactions(t *testing.T) {
 	// 定义数据库路径
-	dbDir := "F:\\ethdata\\geth_compare_sample_db"
-	statsDir := "F:\\ethdata\\compare_sample_stats"
+	dbDir := "F:\\ethdata\\geth_compare_db_verkle_swmt"
+	statsDir := "F:\\ethdata\\compare_stats_swmt"
 	dataDir := "E:\\ethdata"
 
 	// 指定文件范围，硬编码方式指定起始和结束文件索引
 	startFileIdx := 1 // 起始文件索引（从1开始）
-	endFileIdx := 11  // 结束文件索引
+	endFileIdx := 2   // 结束文件索引
 	//46147
 	var startNum uint64 = 46147
 
-	// 取样配置
-	sampleInterval := uint64(100) // 每500个区块取样一次，可配置
-
-	// 检查是否为cacheTrie模式，如果是则跳过
-	if common.UseCacheTrie {
-		t.Skip("取样测试只支持非cacheTrie模式")
-		return
-	}
-
 	// 创建统计聚合器
-	statsAgg := NewCompareStatsAggregator(statsDir, 10) // 更频繁的输出，因为只统计取样区块
+	statsAgg := NewCompareStatsAggregator(statsDir, 100000) // 使用直接数值替代常量
 
 	// 添加: 创建状态树统计记录器
-	trieStatsDir := filepath.Join(statsDir, "trie_stats")
-	var standardTrieRecorder *TrieStatsAggregator
-	var verkleTrieRecorder *TrieStatsAggregator
+	trieStatsDir := filepath.Join(statsDir, "trie_stats_swmt")
+	cacheTrieRecorder := CreateTrieStatsRecorder(trieStatsDir, dbDir, CacheTrie)
 
 	// 创建或打开持久化数据库
-	ldb, err := leveldb.New(dbDir, 1024, 1024, "eth-compare-sample-test", false)
+	ldb, err := leveldb.New(dbDir, 1024, 1024, "eth-compare-process-test", false)
 	if err != nil {
 		t.Fatalf("创建数据库失败: %v", err)
 	}
@@ -1269,24 +1258,40 @@ func TestCompareProcessTransactionsSample(t *testing.T) {
 	db := rawdb.NewDatabase(ldb)
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
 		Preimages: false,
-		IsVerkle:  common.UserVerkle,
-		CacheTrie: false, // 强制非cacheTrie模式
+		IsVerkle:  true,
+		CacheTrie: true,
 		ReadCache: false,
 		StartNum:  startNum,
 		PathDB:    pathdb.Defaults,
+		//HashDB: hashdb.Defaults,
 	})
-
-	// 创建状态树统计记录器
-	if trieDB.IsVerkle() {
-		verkleTrieRecorder = CreateTrieStatsRecorder(trieStatsDir, dbDir, VerkleTrie)
-	} else {
-		standardTrieRecorder = CreateTrieStatsRecorder(trieStatsDir, dbDir, StandardTrie)
-	}
 
 	// 使用正确的state包API
 	var snaps *snapshot.Tree
 	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
 	sdb := state.NewDatabase(trieDB, snaps)
+	var preTrieDB *triedb.Database
+	var preSdb *state.CachingDB
+
+	//preTrieDB = triedb.NewDatabase(db, &triedb.Config{
+	//	Preimages: false,
+	//	IsVerkle:  true,
+	//	CacheTrie: false,
+	//	ReadCache: false,
+	//	StartNum:  startNum,
+	//	PathDB:    pathdb.Defaults,
+	//})
+	preTrieDB = triedb.NewDatabase2(db, &triedb.Config{
+		Preimages: false,
+		IsVerkle:  true,
+		CacheTrie: false,
+		ReadCache: false,
+		StartNum:  startNum,
+		PathDB:    pathdb.Defaults,
+	}, trieDB.GetBackend())
+
+	snaps2, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
+	preSdb = state.NewDatabase(preTrieDB, snaps2)
 
 	// 创建genesis区块和区块链
 	gspec := &Genesis{
@@ -1340,9 +1345,6 @@ func TestCompareProcessTransactionsSample(t *testing.T) {
 	for i, file := range selectedFiles {
 		t.Logf("选中文件 %d: %s", startFileIdx+i, file)
 	}
-
-	// 取样统计变量
-	var lastCommitBlock uint64 = 0 // 记录上次提交的区块号
 
 	// 依次处理每个选中的文件
 	for i, file := range selectedFiles {
@@ -1505,31 +1507,11 @@ func TestCompareProcessTransactionsSample(t *testing.T) {
 
 		// 处理每个区块
 		parent := lastProcessedBlock
-		var persistentStateDB *CompareCountingStateDB // 持久化的stateDB，用于前499个区块
 
+		ct := sdb.TrieDB().CacheTrie()
 		for blockNum := minBlock; blockNum <= maxBlock; blockNum++ {
 			if len(msgsByBlock[blockNum]) == 0 {
 				continue
-			}
-
-			// 检查是否需要进行取样统计
-			shouldSample := false
-			shouldCommit := false
-			shouldClearCache := false
-
-			// 检查当前区块是否为取样点（能被sampleInterval整除）
-			if blockNum%sampleInterval == 0 {
-				// 检查第499个区块是否存在（确保之前已经清理过缓存）
-				prevBlock := blockNum - 1
-				if len(msgsByBlock[prevBlock]) > 0 {
-					shouldSample = true
-					shouldCommit = true
-					//t.Logf("区块 %d 将进行取样统计", blockNum)
-				}
-			} else if (blockNum+1)%sampleInterval == 0 {
-				// 第499个区块，需要清理缓存
-				shouldClearCache = true
-				//t.Logf("区块 %d 将清理缓存，为下一个取样区块做准备", blockNum)
 			}
 
 			// 计数器进入新区块
@@ -1552,26 +1534,16 @@ func TestCompareProcessTransactionsSample(t *testing.T) {
 			}
 
 			sdb.SetBlockNum(blockNum)
+			// 创建statedb，使用上一个区块的状态根
+			statedb, err := state.New(lastStateRoot, sdb)
+			if err != nil {
+				t.Fatalf("创建状态失败: %v", err)
+			}
 
-			// 根据区块类型决定是否创建新的stateDB
-			var countingStateDB *CompareCountingStateDB
-			if shouldSample || persistentStateDB == nil {
-				// 第500个区块或第一个区块：创建新的statedb
-				statedb, err := state.New(lastStateRoot, sdb)
-				if err != nil {
-					t.Fatalf("创建状态失败: %v", err)
-				}
-				countingStateDB = &CompareCountingStateDB{
-					StateDB: statedb,
-					counter: counter,
-				}
-				if !shouldSample {
-					// 如果不是取样区块，保存为持久化stateDB
-					persistentStateDB = countingStateDB
-				}
-			} else {
-				// 前499个区块：使用持久化的stateDB
-				countingStateDB = persistentStateDB
+			// 创建带计数功能的statedb
+			countingStateDB := &CompareCountingStateDB{
+				StateDB: statedb,
+				counter: counter,
 			}
 
 			bigBalance := new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18))
@@ -1587,11 +1559,7 @@ func TestCompareProcessTransactionsSample(t *testing.T) {
 			}
 
 			// 处理区块中的所有交易
-			var processStart time.Time
-			if shouldSample {
-				processStart = time.Now()
-			}
-
+			processStart := time.Now()
 			gp := new(GasPool).AddGas(header.GasLimit)
 			var usedGas uint64
 			var receipts types.Receipts
@@ -1695,80 +1663,117 @@ func TestCompareProcessTransactionsSample(t *testing.T) {
 				}
 				receipts = append(receipts, receipt)
 			}
+			processDuration := time.Since(processStart)
 
-			var processDuration time.Duration
-			if shouldSample {
-				processDuration = time.Since(processStart)
-			}
-
-			// 生成根哈希阶段 - 只有在需要清理缓存或取样统计时才commit
-			var rootGenDuration time.Duration
-			var root common.Hash
-
-			if shouldClearCache || shouldSample {
-				var rootGenStart time.Time
-				if shouldSample {
-					rootGenStart = time.Now()
-				}
-
-				root, _ = countingStateDB.Commit(blockNum, false, false)
-
-				if shouldSample {
-					rootGenDuration = time.Since(rootGenStart)
-				}
-			} else {
-				// 前498个区块：不commit，只更新区块号但保持同一个stateDB
-				// 使用上一个区块的状态根
-				root = lastStateRoot
-			}
-
-			// 处理缓存清理和数据库提交
+			// 生成根哈希阶段
+			rootGenStart := time.Now()
 			var commitDuration time.Duration
-			if shouldClearCache {
-				// 第499个区块：清理缓存，为下一个取样区块做准备
-				//t.Logf("区块 %d: 清理缓存中...", blockNum)
-				err = trieDB.Commit(root, false)
+			root := lastStateRoot
+			var cHash common.Hash
+			var resultHash common.Hash
+			cHash, resultHash, _ = countingStateDB.PreCommit(false)
+			if resultHash != (common.Hash{}) {
+				root = resultHash
+				//fmt.Println(fmt.Sprintf("get  root : %v", root.String()))
+			}
+			codes := sdb.TrieDB().CacheTrie().PopCodes()
+			if db := sdb.TrieDB().Disk(); db != nil && len(codes) > 0 {
+				batch := db.NewBatch()
+				for codeHash, code := range codes {
+					rawdb.WriteCode(batch, codeHash, code)
+				}
+				if err := batch.Write(); err != nil {
+					panic("write code failed")
+				}
+			}
+			// 记录deleteKVList以便在处理中使用
+			deleteKVList := countingStateDB.GetCachedDeleteKVList()
+			go func(root common.Hash, sBlockNum uint64, deleteKVList *cacheTrie.DeleteKVList) {
+
+				//preTrieDB := triedb.NewDatabase(db, &triedb.Config{
+				//	Preimages: false,
+				//	IsVerkle:  true,
+				//	CacheTrie: false,
+				//	ReadCache: false,
+				//	StartNum:  startNum,
+				//	PathDB:    pathdb.Defaults,
+				//})
+				//snaps2, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
+				//preSdb := state.NewDatabase(preTrieDB, snaps2)
+
+				commitStart := time.Now()
+				if deleteKVList == nil {
+					return
+				}
+				if len(deleteKVList.Data) == 0 {
+					trieDB.CacheTrie().FinishCleanup(sBlockNum, root)
+					return
+				}
+				// 使用当前状态根创建新的stateDB
+				cleanStateDB, err := state.New(root, preSdb)
+
 				if err != nil {
-					t.Fatalf("清理缓存失败，区块 %d: %v", blockNum, err)
+					panic(err)
 				}
-				// 刷新数据库，清理内存缓存
-				trieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
-				lastCommitBlock = blockNum
-				// 清理持久化stateDB，下一轮重新开始
-				persistentStateDB = nil
-				//t.Logf("区块 %d: 缓存清理完成", blockNum)
-			} else if shouldCommit {
-				// 第500个区块：进行统计的commit
-				var commitStart time.Time
-				if shouldSample {
-					commitStart = time.Now()
+				//fmt.Println(fmt.Sprintf("start clean  root : %v", root.String()))
+
+				// 第二步：处理所有账户
+				for _, kv := range deleteKVList.Data {
+					// 地址为空且键存在，说明是账户
+					if (kv.Address == common.Address{}) && len(kv.Key) > 0 {
+						addr := common.BytesToAddress(kv.Key)
+						cleanStateDB.SetAccount(addr, kv.Value, 0)
+					}
 				}
 
-				err = trieDB.Commit(root, false)
-				lastCommitBlock = blockNum
+				// 第一步：处理所有状态（存储槽）
+				for _, kv := range deleteKVList.Data {
+					// 通过Address区分是否有地址，如果地址非空，则是存储槽
+					if (kv.Address != common.Address{}) && len(kv.Key) > 0 {
+						// 有地址且有键，说明是存储槽
+						addr := kv.Address
+						key := common.BytesToHash(kv.Key)
+						//if addr.String() == "0xcd134CE565e6b7f7CEfE2122A07A2e56D6ECbB26" && common.Bytes2Hex(kv.Key) == "0000000000000000000000000000000000000000000000000000000000000105" {
+						//	addr.String()
+						//}
+						if common.BytesToHash(kv.Value) == (common.Hash{}) {
+							cleanStateDB.SetState(addr, key, common.Hash{})
+						} else {
+							_, vc, _, _ := rlp.Split(kv.Value)
 
-				if shouldSample {
-					commitDuration = time.Since(commitStart)
+							value := common.BytesToHash(vc)
+
+							// 将存储数据写入新stateDB
+							cleanStateDB.SetState(addr, key, value)
+						}
+					}
 				}
+
+				// 第三步：对新stateDB进行commit
+				newRoot, err := cleanStateDB.Commit(sBlockNum, false, false)
+				if err != nil {
+					t.Fatalf("提交无cache stateDB失败: %v, cHash : %v", err, cHash)
+				}
+
+				// 第四步：将结果提交到数据库
+				err = preTrieDB.Commit(newRoot, false)
+				if err != nil {
+					t.Fatalf("提交trieDB失败: %v", err)
+				}
+
+				trieDB.CacheTrie().FinishCleanup(sBlockNum, newRoot)
+				commitDuration = time.Since(commitStart)
 
 				if err != nil {
-					t.Fatalf("提交状态失败，区块 %d: %v", blockNum, err)
+					t.Fatalf("提交状态失败，区块 %d: %v", sBlockNum, err)
 				}
 
 				// 刷新数据库，避免内存占用过大
-				trieDB.Cap(10 * 1024 * 1024 * 1024) // 10GB内存限制
-			} else if blockNum-lastCommitBlock >= 5000 {
-				// 常规提交：避免内存过大
-				root, _ = countingStateDB.Commit(blockNum, false, false)
-				err = trieDB.Commit(root, false)
-				lastCommitBlock = blockNum
-				if err != nil {
-					t.Fatalf("提交状态失败，区块 %d: %v", blockNum, err)
-				}
-				trieDB.Cap(10 * 1024 * 1024 * 1024) // 10GB内存限制
-				// 重置持久化stateDB
-				persistentStateDB = nil
-			}
+				preTrieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
+
+			}(root, blockNum, deleteKVList)
+
+			rootGenDuration := time.Since(rootGenStart)
 
 			// 更新区块头的状态根和保存最新状态根
 			header.Root = root
@@ -1782,125 +1787,101 @@ func TestCompareProcessTransactionsSample(t *testing.T) {
 			// 将状态根写入数据库
 			rawdb.WriteCanonicalHash(db, block.Hash(), blockNum)
 
-			// 只有取样点才进行统计
-			if shouldSample {
-				processDuration *= 500
-				rootGenDuration *= 500
-				// 计算总时间和百分比
-				totalTime := processDuration + rootGenDuration
-				var processPercent, rootGenPercent float64
+			// 计算总时间和百分比
+			totalTime := processDuration + rootGenDuration
+			var processPercent, rootGenPercent float64
 
-				// 重新计算时间百分比，只关注交易处理和根哈希计算
-				if totalTime > 0 {
-					processPercent = float64(processDuration) / float64(totalTime) * 100
-					rootGenPercent = float64(rootGenDuration) / float64(totalTime) * 100
-				} else {
-					// 时间为0时设置默认值
-					processPercent = 0
-					rootGenPercent = 0
-				}
-
-				// 计算交易成功率
-				successRate := 0.0
-				if len(msgsByBlock[blockNum]) > 0 {
-					successRate = float64(successCount) / float64(len(msgsByBlock[blockNum]))
-				}
-
-				// 计算合约交易占比
-				contractTxPercent := 0.0
-				if len(msgsByBlock[blockNum]) > 0 {
-					contractTxPercent = float64(contractTxCount) / float64(len(msgsByBlock[blockNum]))
-				}
-
-				// 计算合约交易成功率
-				contractSuccessRate := 0.0
-				if contractTxCount > 0 {
-					contractSuccessRate = float64(contractSuccessCount) / float64(contractTxCount)
-				}
-
-				// 计算合约创建占比和成功率
-				createContractPercent := 0.0
-				if len(msgsByBlock[blockNum]) > 0 {
-					createContractPercent = float64(createContractCount) / float64(len(msgsByBlock[blockNum]))
-				}
-
-				createSuccessRate := 0.0
-				if createContractCount > 0 {
-					createSuccessRate = float64(createSuccessCount) / float64(createContractCount)
-				}
-
-				// 计算合约调用占比和成功率
-				callContractPercent := 0.0
-				if len(msgsByBlock[blockNum]) > 0 {
-					callContractPercent = float64(callContractCount) / float64(len(msgsByBlock[blockNum]))
-				}
-
-				callSuccessRate := 0.0
-				if callContractCount > 0 {
-					callSuccessRate = float64(callSuccessCount) / float64(callContractCount)
-				}
-
-				// 计算错误率
-				errorRate := 0.0
-				if len(msgsByBlock[blockNum]) > 0 {
-					errorRate = float64(errorCount) / float64(len(msgsByBlock[blockNum]))
-				}
-
-				// 创建区块统计数据
-				blockStats := CompareBlockStats{
-					BlockNum:              blockNum,
-					TransactionCount:      len(msgsByBlock[blockNum]),
-					SuccessCount:          successCount,
-					SuccessRate:           successRate,
-					ContractTxCount:       contractTxCount,
-					ContractTxPercent:     contractTxPercent,
-					ContractSuccessCount:  contractSuccessCount,
-					ContractSuccessRate:   contractSuccessRate,
-					CreateContractCount:   createContractCount,
-					CreateContractPercent: createContractPercent,
-					CreateSuccessCount:    createSuccessCount,
-					CreateSuccessRate:     createSuccessRate,
-					CallContractCount:     callContractCount,
-					CallContractPercent:   callContractPercent,
-					CallSuccessCount:      callSuccessCount,
-					CallSuccessRate:       callSuccessRate,
-					ErrorCount:            errorCount,
-					ErrorRate:             errorRate,
-					ProcessTime:           processDuration,
-					RootGenTime:           rootGenDuration,
-					CommitTime:            commitDuration,
-					TotalTime:             totalTime,
-					ProcessTimePercent:    processPercent,
-					RootGenTimePercent:    rootGenPercent,
-					UniqueReads:           counter.UniqueReads,
-					UniqueWrites:          counter.UniqueWrites,
-				}
-
-				// 添加到统计聚合器
-				statsAgg.AddBlockStats(blockStats)
-
-				// 记录状态树统计 - 只有取样区块记录时间统计
-				if trieDB.IsVerkle() && verkleTrieRecorder != nil {
-					// 记录VerkleTrie统计
-					RecordVerkleTrieStats(verkleTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
-						len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
-				} else if standardTrieRecorder != nil {
-					// 记录StandardTrie统计
-					RecordTrieStats(standardTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
-						len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
-				}
+			// 重新计算时间百分比，只关注交易处理和根哈希计算
+			if totalTime > 0 {
+				processPercent = float64(processDuration) / float64(totalTime) * 100
+				rootGenPercent = float64(rootGenDuration) / float64(totalTime) * 100
 			} else {
-				// 非取样区块：只记录状态树统计中的读写数据，时间为0
-				if trieDB.IsVerkle() && verkleTrieRecorder != nil {
-					// 记录VerkleTrie统计
-					RecordVerkleTrieStats(verkleTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
-						len(msgsByBlock[blockNum]), 0, 0)
-				} else if standardTrieRecorder != nil {
-					// 记录StandardTrie统计
-					RecordTrieStats(standardTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
-						len(msgsByBlock[blockNum]), 0, 0)
-				}
+				// 时间为0时设置默认值
+				processPercent = 0
+				rootGenPercent = 0
 			}
+
+			// 计算交易成功率
+			successRate := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				successRate = float64(successCount) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			// 计算合约交易占比
+			contractTxPercent := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				contractTxPercent = float64(contractTxCount) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			// 计算合约交易成功率
+			contractSuccessRate := 0.0
+			if contractTxCount > 0 {
+				contractSuccessRate = float64(contractSuccessCount) / float64(contractTxCount)
+			}
+
+			// 计算合约创建占比和成功率
+			createContractPercent := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				createContractPercent = float64(createContractCount) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			createSuccessRate := 0.0
+			if createContractCount > 0 {
+				createSuccessRate = float64(createSuccessCount) / float64(createContractCount)
+			}
+
+			// 计算合约调用占比和成功率
+			callContractPercent := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				callContractPercent = float64(callContractCount) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			callSuccessRate := 0.0
+			if callContractCount > 0 {
+				callSuccessRate = float64(callSuccessCount) / float64(callContractCount)
+			}
+
+			// 计算错误率
+			errorRate := 0.0
+			if len(msgsByBlock[blockNum]) > 0 {
+				errorRate = float64(errorCount) / float64(len(msgsByBlock[blockNum]))
+			}
+
+			// 创建区块统计数据
+			blockStats := CompareBlockStats{
+				BlockNum:              blockNum,
+				TransactionCount:      len(msgsByBlock[blockNum]),
+				SuccessCount:          successCount,
+				SuccessRate:           successRate,
+				ContractTxCount:       contractTxCount,
+				ContractTxPercent:     contractTxPercent,
+				ContractSuccessCount:  contractSuccessCount,
+				ContractSuccessRate:   contractSuccessRate,
+				CreateContractCount:   createContractCount,
+				CreateContractPercent: createContractPercent,
+				CreateSuccessCount:    createSuccessCount,
+				CreateSuccessRate:     createSuccessRate,
+				CallContractCount:     callContractCount,
+				CallContractPercent:   callContractPercent,
+				CallSuccessCount:      callSuccessCount,
+				CallSuccessRate:       callSuccessRate,
+				ErrorCount:            errorCount,
+				ErrorRate:             errorRate,
+				ProcessTime:           processDuration,
+				RootGenTime:           rootGenDuration,
+				CommitTime:            commitDuration,
+				TotalTime:             totalTime,
+				ProcessTimePercent:    processPercent,
+				RootGenTimePercent:    rootGenPercent,
+				UniqueReads:           counter.UniqueReads,
+				UniqueWrites:          counter.UniqueWrites,
+			}
+
+			// 添加到统计聚合器
+			statsAgg.AddBlockStats(blockStats)
+
+			RecordCacheTrieStats(cacheTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
+				len(msgsByBlock[blockNum]), processDuration, rootGenDuration, ct)
 		}
 		t.Logf("完成处理文件: %s", file)
 	}
@@ -1913,5 +1894,5 @@ func TestCompareProcessTransactionsSample(t *testing.T) {
 	statsAgg.PrintStats()
 
 	// 在函数结束前输出最终状态树统计
-	t.Logf("取样测试完成，文件范围 %d 到 %d 处理完成，最终状态根: %s", startFileIdx, endFileIdx, lastStateRoot.String())
+	t.Logf("文件范围 %d 到 %d 处理完成，最终状态根: %s", startFileIdx, endFileIdx, lastStateRoot.String())
 }

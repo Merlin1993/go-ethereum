@@ -108,7 +108,7 @@ func (n ValueNode) String() string  { return n.fstring("") }
 func (n *FullNode) fstring(ind string) string {
 	resp := fmt.Sprintf("[\n%s  ", ind)
 	for i, node := range &n.Children {
-		if node.isNil() {
+		if node == nil || node.isNil() {
 			resp += fmt.Sprintf("%s: <nil> ", nodeIndices[i])
 		} else {
 			resp += fmt.Sprintf("%s: %v", nodeIndices[i], node.fstring(ind+"  "))
@@ -135,7 +135,7 @@ func (n *FullNode) updateFlag(bitPos int) {
 
 	// 使用range遍历，避免并发修改导致的竞态条件
 	for _, child := range n.Children {
-		if !child.isNil() {
+		if child != nil && !child.isNil() {
 			n.flags.window |= child.window()
 			n.flags.size += child.size()
 			n.flags.memorySize += pointerSize + child.memorySize() // 指针大小 + 子节点大小
