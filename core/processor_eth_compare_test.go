@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -437,13 +438,13 @@ func compareFindTransactionFiles(dataDir string) ([]string, error) {
 // TestCompareProcessTransactions 测试处理CSV中的交易
 func TestCompareProcessTransactions(t *testing.T) {
 	// 定义数据库路径
-	dbDir := "F:\\ethdata\\geth_compare_db_verkle"
+	dbDir := "F:\\ethdata\\geth_compare_db_swmt"
 	statsDir := "F:\\ethdata\\compare_stats"
 	dataDir := "E:\\ethdata"
 
 	// 指定文件范围，硬编码方式指定起始和结束文件索引
 	startFileIdx := 1 // 起始文件索引（从1开始）
-	endFileIdx := 11  // 结束文件索引
+	endFileIdx := 7   // 结束文件索引
 	//46147
 	var startNum uint64 = 46147
 
@@ -464,41 +465,56 @@ func TestCompareProcessTransactions(t *testing.T) {
 	defer ldb.Close()
 
 	db := rawdb.NewDatabase(ldb)
+	hashdb := hashdb.Defaults
+	pathdb := pathdb.Defaults
+	if common.UserVerkle {
+		hashdb = nil
+	} else {
+		pathdb = nil
+	}
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
 		Preimages: false,
 		IsVerkle:  common.UserVerkle,
 		CacheTrie: common.UseCacheTrie,
 		ReadCache: false,
 		StartNum:  startNum,
-		PathDB:    pathdb.Defaults,
-		//HashDB: hashdb.Defaults,
+		PathDB:    pathdb,
+		HashDB:    hashdb,
 	})
 
 	// 使用正确的state包API
 	var snaps *snapshot.Tree
-	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
+	firstRootHash := types.EmptyRootHash
+	if common.UserVerkle {
+		firstRootHash = common.Hash{}
+	}
+	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, firstRootHash)
 	sdb := state.NewDatabase(trieDB, snaps)
 	var preTrieDB *triedb.Database
 	var preSdb *state.CachingDB
 	if common.UseCacheTrie {
-		preTrieDB = triedb.NewDatabase(db, &triedb.Config{
-			Preimages: false,
-			IsVerkle:  common.UserVerkle,
-			CacheTrie: false,
-			ReadCache: false,
-			StartNum:  startNum,
-			PathDB:    pathdb.Defaults,
-			//HashDB: hashdb.Defaults,
-		})
-		//preTrieDB = triedb.NewDatabase2(db, &triedb.Config{
-		//	Preimages: false,
-		//	IsVerkle:  true,
-		//	CacheTrie: false,
-		//	ReadCache: false,
-		//	StartNum:  startNum,
-		//	PathDB:    pathdb.Defaults,
-		//}, trieDB.GetBackend())
-		//preSdb = state.NewDatabase(preTrieDB, snaps)
+		if !common.UserVerkle {
+			preTrieDB = triedb.NewDatabase(db, &triedb.Config{
+				Preimages: false,
+				IsVerkle:  common.UserVerkle,
+				CacheTrie: false,
+				ReadCache: false,
+				StartNum:  startNum,
+				PathDB:    pathdb,
+				HashDB:    hashdb,
+			})
+		} else {
+			preTrieDB = triedb.NewDatabase2(db, &triedb.Config{
+				Preimages: false,
+				IsVerkle:  true,
+				CacheTrie: false,
+				ReadCache: false,
+				StartNum:  startNum,
+				PathDB:    pathdb,
+				HashDB:    hashdb,
+			}, trieDB.GetBackend())
+		}
+		preSdb = state.NewDatabase(preTrieDB, snaps)
 	}
 
 	// 创建genesis区块和区块链
@@ -877,11 +893,15 @@ func TestCompareProcessTransactions(t *testing.T) {
 			// 生成根哈希阶段
 			rootGenStart := time.Now()
 			var commitDuration time.Duration
+
+			var rootGenDuration time.Duration
 			root := lastStateRoot
 			var cHash common.Hash
 			var resultHash common.Hash
 			if common.UseCacheTrie {
 				cHash, resultHash, _ = countingStateDB.PreCommit(false)
+
+				rootGenDuration = time.Since(rootGenStart)
 				if resultHash != (common.Hash{}) {
 					root = resultHash
 					//fmt.Println(fmt.Sprintf("get  root : %v", root.String()))
@@ -969,22 +989,25 @@ func TestCompareProcessTransactions(t *testing.T) {
 				}(root, blockNum, deleteKVList)
 			} else {
 				root, _ = countingStateDB.Commit(blockNum, false, false)
+
+				rootGenDuration = time.Since(rootGenStart)
 				// 提交状态到数据库阶段 - 只在达到配置的间隔时才提交
+				//todo 测试是不是这个导致的
 				if blockNum-lastCommitBlock >= 5000 { // 每1000个区块提交一次
-					commitStart := time.Now()
-					err = trieDB.Commit(root, false)
-					commitDuration = time.Since(commitStart)
-					lastCommitBlock = blockNum
-
-					if err != nil {
-						t.Fatalf("提交状态失败，区块 %d: %v", blockNum, err)
-					}
-
-					// 刷新数据库，避免内存占用过大
-					trieDB.Cap(10 * 1024 * 1024 * 1024) // 1GB内存限制
 				}
+				commitStart := time.Now()
+				err = trieDB.Commit(root, false)
+				commitDuration = time.Since(commitStart)
+				lastCommitBlock = blockNum
+
+				if err != nil {
+					t.Fatalf("提交状态失败，区块 %d: %v", blockNum, err)
+				}
+
+				// 刷新数据库，避免内存占用过大
+				trieDB.Cap(10 * 1024 * 1024 * 1024) // 1GB内存限制
+				//}
 			}
-			rootGenDuration := time.Since(rootGenStart)
 
 			// 更新区块头的状态根和保存最新状态根
 			header.Root = root
@@ -1090,6 +1113,10 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 			// 添加到统计聚合器
 			statsAgg.AddBlockStats(blockStats)
+
+			//if blockNum%20000 == 0 {
+			//	state.PrintStat()
+			//}
 
 			// 记录状态树统计
 			if common.UseCacheTrie && ct != nil {
@@ -1237,7 +1264,7 @@ func TestCompareVerkleProcessTransactions(t *testing.T) {
 
 	// 指定文件范围，硬编码方式指定起始和结束文件索引
 	startFileIdx := 1 // 起始文件索引（从1开始）
-	endFileIdx := 2   // 结束文件索引
+	endFileIdx := 7   // 结束文件索引
 	//46147
 	var startNum uint64 = 46147
 
@@ -1268,7 +1295,7 @@ func TestCompareVerkleProcessTransactions(t *testing.T) {
 
 	// 使用正确的state包API
 	var snaps *snapshot.Tree
-	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
+	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, common.Hash{})
 	sdb := state.NewDatabase(trieDB, snaps)
 	var preTrieDB *triedb.Database
 	var preSdb *state.CachingDB
@@ -1290,8 +1317,7 @@ func TestCompareVerkleProcessTransactions(t *testing.T) {
 		PathDB:    pathdb.Defaults,
 	}, trieDB.GetBackend())
 
-	snaps2, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
-	preSdb = state.NewDatabase(preTrieDB, snaps2)
+	preSdb = state.NewDatabase(preTrieDB, snaps)
 
 	// 创建genesis区块和区块链
 	gspec := &Genesis{
@@ -1672,6 +1698,7 @@ func TestCompareVerkleProcessTransactions(t *testing.T) {
 			var cHash common.Hash
 			var resultHash common.Hash
 			cHash, resultHash, _ = countingStateDB.PreCommit(false)
+			rootGenDuration := time.Since(rootGenStart)
 			if resultHash != (common.Hash{}) {
 				root = resultHash
 				//fmt.Println(fmt.Sprintf("get  root : %v", root.String()))
@@ -1689,18 +1716,6 @@ func TestCompareVerkleProcessTransactions(t *testing.T) {
 			// 记录deleteKVList以便在处理中使用
 			deleteKVList := countingStateDB.GetCachedDeleteKVList()
 			go func(root common.Hash, sBlockNum uint64, deleteKVList *cacheTrie.DeleteKVList) {
-
-				//preTrieDB := triedb.NewDatabase(db, &triedb.Config{
-				//	Preimages: false,
-				//	IsVerkle:  true,
-				//	CacheTrie: false,
-				//	ReadCache: false,
-				//	StartNum:  startNum,
-				//	PathDB:    pathdb.Defaults,
-				//})
-				//snaps2, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, types.EmptyRootHash)
-				//preSdb := state.NewDatabase(preTrieDB, snaps2)
-
 				commitStart := time.Now()
 				if deleteKVList == nil {
 					return
@@ -1772,8 +1787,6 @@ func TestCompareVerkleProcessTransactions(t *testing.T) {
 				preTrieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
 
 			}(root, blockNum, deleteKVList)
-
-			rootGenDuration := time.Since(rootGenStart)
 
 			// 更新区块头的状态根和保存最新状态根
 			header.Root = root

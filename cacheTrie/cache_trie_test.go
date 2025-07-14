@@ -1095,8 +1095,8 @@ func TestCacheTriePerformance(t *testing.T) {
 
 func TestSampleCacheTriePerformance(t *testing.T) {
 	stateCount := 5000
-	iterationCount := 200 // 统计循环次数
-	maxSize := 500000     // 初始存储大小限制
+	iterationCount := 200 // 统计循环次数 200000是1b
+	maxSize := 1000000    // 初始存储大小限制
 	windowMultiple := 1024
 	t.Run(fmt.Sprintf("StateCount_%d", stateCount), func(t *testing.T) {
 		testCacheTrieWithStateCount(t, stateCount, iterationCount, windowMultiple, maxSize)

@@ -338,7 +338,7 @@ func (db *Database) Commit(root common.Hash, report bool) error {
 	if err := db.modifyAllowed(); err != nil {
 		return err
 	}
-	return db.tree.cap(root, 128)
+	return db.tree.cap(root, 1)
 }
 
 // Disable deactivates the database and invalidates all available state layers
