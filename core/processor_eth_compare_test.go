@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -439,7 +440,7 @@ func compareFindTransactionFiles(dataDir string) ([]string, error) {
 func TestCompareProcessTransactions(t *testing.T) {
 	// 定义数据库路径
 	dbDir := "F:\\ethdata\\geth_compare_db_swmt"
-	statsDir := "F:\\ethdata\\compare_stats"
+	statsDir := "F:\\ethdata\\compare_stats_2"
 	dataDir := "E:\\ethdata"
 
 	// 指定文件范围，硬编码方式指定起始和结束文件索引
@@ -902,6 +903,11 @@ func TestCompareProcessTransactions(t *testing.T) {
 				cHash, resultHash, _ = countingStateDB.PreCommit(false)
 
 				rootGenDuration = time.Since(rootGenStart)
+				if cacheTrie.SStart != 0 {
+					rootGenDuration -= cacheTrie.SStart
+					cacheTrie.SStart = 0
+				}
+
 				if resultHash != (common.Hash{}) {
 					root = resultHash
 					//fmt.Println(fmt.Sprintf("get  root : %v", root.String()))
@@ -918,7 +924,8 @@ func TestCompareProcessTransactions(t *testing.T) {
 				}
 				// 记录deleteKVList以便在处理中使用
 				deleteKVList := countingStateDB.GetCachedDeleteKVList()
-				go func(root common.Hash, sBlockNum uint64, deleteKVList *cacheTrie.DeleteKVList) {
+				st := func(root common.Hash, sBlockNum uint64, deleteKVList *cacheTrie.DeleteKVList) {
+
 					commitStart := time.Now()
 					if deleteKVList == nil {
 						return
@@ -927,66 +934,89 @@ func TestCompareProcessTransactions(t *testing.T) {
 						trieDB.CacheTrie().FinishCleanup(sBlockNum, root)
 						return
 					}
+					t.Logf("提交状态开始，区块号:%d, \t 提交了:%d, 起始时间：%s", sBlockNum, len(deleteKVList.Data), time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"))
+
 					// 使用当前状态根创建新的stateDB
-					cleanStateDB, err := state.New(root, preSdb)
 
 					//fmt.Println(fmt.Sprintf("start clean  root : %v", root.String()))
 
-					// 第二步：处理所有账户
-					for _, kv := range deleteKVList.Data {
-						// 地址为空且键存在，说明是账户
-						if (kv.Address == common.Address{}) && len(kv.Key) > 0 {
-							addr := common.BytesToAddress(kv.Key)
-							cleanStateDB.SetAccount(addr, kv.Value, 0)
-						}
+					data := deleteKVList.Data
+					length := len(data)
+					chunkSize := 10000
+					if length > 500000 {
+						chunkSize = 50000
 					}
-
-					// 第一步：处理所有状态（存储槽）
-					for _, kv := range deleteKVList.Data {
-						// 通过Address区分是否有地址，如果地址非空，则是存储槽
-						if (kv.Address != common.Address{}) && len(kv.Key) > 0 {
-							// 有地址且有键，说明是存储槽
-							addr := kv.Address
-							key := common.BytesToHash(kv.Key)
-							//if addr.String() == "0xcd134CE565e6b7f7CEfE2122A07A2e56D6ECbB26" && common.Bytes2Hex(kv.Key) == "0000000000000000000000000000000000000000000000000000000000000105" {
-							//	addr.String()
-							//}
-							if common.BytesToHash(kv.Value) == (common.Hash{}) {
-								cleanStateDB.SetState(addr, key, common.Hash{})
-							} else {
-								_, vc, _, _ := rlp.Split(kv.Value)
-
-								value := common.BytesToHash(vc)
-
-								// 将存储数据写入新stateDB
-								cleanStateDB.SetState(addr, key, value)
+					var newRoot = root
+					for i := 0; i < length; i += chunkSize {
+						end := i + chunkSize
+						if end > length {
+							end = length
+						}
+						chunk := data[i:end]
+						cleanStateDB, err := state.New(newRoot, preSdb)
+						// 第二步：处理所有账户
+						for _, kv := range chunk {
+							// 地址为空且键存在，说明是账户
+							if (kv.Address == common.Address{}) && len(kv.Key) > 0 {
+								addr := common.BytesToAddress(kv.Key)
+								cleanStateDB.SetAccount(addr, kv.Value, 0)
 							}
 						}
-					}
 
-					// 第三步：对新stateDB进行commit
-					newRoot, err := cleanStateDB.Commit(sBlockNum, false, false)
-					if err != nil {
-						t.Fatalf("提交无cache stateDB失败: %v, cHash : %v", err, cHash)
-					}
+						// 第一步：处理所有状态（存储槽）
+						for _, kv := range chunk {
+							// 通过Address区分是否有地址，如果地址非空，则是存储槽
+							if (kv.Address != common.Address{}) && len(kv.Key) > 0 {
+								// 有地址且有键，说明是存储槽
+								addr := kv.Address
+								key := common.BytesToHash(kv.Key)
+								//if addr.String() == "0xcd134CE565e6b7f7CEfE2122A07A2e56D6ECbB26" && common.Bytes2Hex(kv.Key) == "0000000000000000000000000000000000000000000000000000000000000105" {
+								//	addr.String()
+								//}
+								if common.BytesToHash(kv.Value) == (common.Hash{}) {
+									cleanStateDB.SetState(addr, key, common.Hash{})
+								} else {
+									_, vc, _, _ := rlp.Split(kv.Value)
 
-					// 第四步：将结果提交到数据库
-					err = preTrieDB.Commit(newRoot, false)
-					if err != nil {
-						t.Fatalf("提交trieDB失败: %v", err)
+									value := common.BytesToHash(vc)
+
+									// 将存储数据写入新stateDB
+									cleanStateDB.SetState(addr, key, value)
+								}
+							}
+						}
+						// 第三步：对新stateDB进行commit
+						newRoot, err = cleanStateDB.Commit(sBlockNum, false, false)
+						if err != nil {
+							t.Fatalf("提交无cache stateDB失败: %v, cHash : %v", err, cHash)
+						}
+
+						// 第四步：将结果提交到数据库
+						err = preTrieDB.Commit(newRoot, false)
+						if err != nil {
+							t.Fatalf("提交trieDB失败: %v", err)
+						}
 					}
+					commitDuration = time.Since(commitStart)
 
 					trieDB.CacheTrie().FinishCleanup(sBlockNum, newRoot)
-					commitDuration = time.Since(commitStart)
 
 					if err != nil {
 						t.Fatalf("提交状态失败，区块 %d: %v", sBlockNum, err)
 					}
 
+					runtime.GC()
+					t.Logf("提交状态完成，区块号:%d, \t 提交了:%d, \t 时间:%d ", sBlockNum, len(deleteKVList.Data), commitDuration.Milliseconds())
 					// 刷新数据库，避免内存占用过大
-					preTrieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
+					//preTrieDB.Cap(1024 * 1024 * 1024) // 1GB内存限制
 
-				}(root, blockNum, deleteKVList)
+				}
+				if common.UserVerkle {
+					//目前而言，verkle树未完成并发实现，串行实现会抢占资源导致影响效率，所以这里先模拟执行。
+					st(root, blockNum, deleteKVList)
+				} else {
+					go st(root, blockNum, deleteKVList)
+				}
 			} else {
 				root, _ = countingStateDB.Commit(blockNum, false, false)
 

@@ -354,7 +354,7 @@ func RecordCacheTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writte
 		memorySize := cacheTrie.GetMemorySize()
 		memorySizeMB = float64(memorySize) / MBSize
 		cacheSize = cacheTrie.GetSize()
-		cacheThreshold = cacheTrie.GetHRW().GetThreshold()
+		cacheThreshold = cacheTrie.GetHRW().GetAllSize()
 	}
 
 	// 添加统计数据

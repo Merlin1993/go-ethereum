@@ -156,6 +156,10 @@ type CacheConfig struct {
 	SnapshotWait    bool // Wait for snapshot construction on startup. TODO(karalabe): This is a dirty hack for testing, nuke it
 }
 
+func (c *CacheConfig) TriedbConfig(isVerkle bool) *triedb.Config {
+	return c.triedbConfig(isVerkle)
+}
+
 // triedbConfig derives the configures for trie database.
 func (c *CacheConfig) triedbConfig(isVerkle bool) *triedb.Config {
 	config := &triedb.Config{

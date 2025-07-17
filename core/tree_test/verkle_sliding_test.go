@@ -1,8 +1,9 @@
-package core
+package tree_test
 
 import (
 	"encoding/csv"
 	"fmt"
+	"github.com/ethereum/go-ethereum/core"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -36,10 +37,10 @@ func TestVerkleMethod1(t *testing.T) {
 	defer ldb.Close()
 
 	// 创建Trie数据库
-	cacheConfig := DefaultCacheConfigWithScheme(rawdb.PathScheme)
+	cacheConfig := core.DefaultCacheConfigWithScheme(rawdb.PathScheme)
 	cacheConfig.SnapshotLimit = 0
 	diskDB := rawdb.NewDatabase(ldb)
-	trieDB := triedb.NewDatabase(diskDB, cacheConfig.triedbConfig(true))
+	trieDB := triedb.NewDatabase(diskDB, cacheConfig.TriedbConfig(true))
 
 	// 读取最后一个根哈希
 	lastRoot, err := loadLastRoot(diskDB)
@@ -123,10 +124,10 @@ func TestVerkleMethod2(t *testing.T) {
 	defer ldb.Close()
 
 	// 创建Trie数据库
-	cacheConfig := DefaultCacheConfigWithScheme(rawdb.PathScheme)
+	cacheConfig := core.DefaultCacheConfigWithScheme(rawdb.PathScheme)
 	cacheConfig.SnapshotLimit = 0
 	diskDB := rawdb.NewDatabase(ldb)
-	trieDB := triedb.NewDatabase(diskDB, cacheConfig.triedbConfig(true))
+	trieDB := triedb.NewDatabase(diskDB, cacheConfig.TriedbConfig(true))
 
 	// 读取最后一个根哈希
 	lastRoot, err := loadLastRoot(diskDB)
@@ -242,9 +243,9 @@ func BenchmarkVT_Update(b *testing.B) {
 	memDB := rawdb.NewMemoryDatabase()
 
 	// 创建Trie数据库配置
-	cacheConfig := DefaultCacheConfigWithScheme(rawdb.PathScheme)
+	cacheConfig := core.DefaultCacheConfigWithScheme(rawdb.PathScheme)
 	cacheConfig.SnapshotLimit = 0
-	trieDB := triedb.NewDatabase(memDB, cacheConfig.triedbConfig(true))
+	trieDB := triedb.NewDatabase(memDB, cacheConfig.TriedbConfig(true))
 
 	// 创建新的Verkle Trie (不使用point cache)
 	vt, err := trie.NewVerkleTrie(common.Hash{}, trieDB, nil)

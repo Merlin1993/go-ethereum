@@ -10,6 +10,8 @@ type HeightRangeWindow struct {
 	windowStartNumber   uint64
 	windowEndNumber     uint64
 	firstSegmentIndex   int
+
+	allSize uint64
 }
 
 // NewHeightRangeWindow 创建一个新的 HeightRangeWindow 实例。
@@ -59,7 +61,10 @@ func (hrw *HeightRangeWindow) recalculateLogicalCapacities() {
 			hrw.logicalCapacities[cIndex] = hrw.logicalCapacities[cIndex] - totalCapacity + usedCapacity
 			lastCapacity = 0
 		}
-
+	}
+	hrw.allSize = 0
+	for _, v := range hrw.logicalCapacities {
+		hrw.allSize += v
 	}
 }
 

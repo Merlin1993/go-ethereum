@@ -18,6 +18,8 @@ package state
 
 import (
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/ethereum/go-ethereum/cacheTrie"
 
@@ -361,6 +363,16 @@ func (r *trieReader) Storage(addr common.Address, key common.Hash) (common.Hash,
 	return value, nil
 }
 
+const Readers = 3
+
+var (
+	// 统计信息
+	accountHitCounts  []int64         // 每个reader的Account方法调用成功次数
+	storageHitCounts  []int64         // 每个reader的Storage方法调用成功次数
+	accountAccessTime []time.Duration // 每个reader的Account方法累计访问时间
+	storageAccessTime []time.Duration // 每个reader的Storage方法累计访问时间
+)
+
 // multiStateReader is the aggregation of a list of StateReader interface,
 // providing state access by leveraging all readers. The checking priority
 // is determined by the position in the reader list.
@@ -375,6 +387,12 @@ func newMultiStateReader(readers ...StateReader) (*multiStateReader, error) {
 	if len(readers) == 0 {
 		return nil, errors.New("empty reader set")
 	}
+	if accountHitCounts == nil && len(readers) >= Readers {
+		accountHitCounts = make([]int64, len(readers))          // 每个reader的Account方法调用成功次数
+		storageHitCounts = make([]int64, len(readers))          // 每个reader的Storage方法调用成功次数
+		accountAccessTime = make([]time.Duration, len(readers)) // 每个reader的Account方法累计访问时间
+		storageAccessTime = make([]time.Duration, len(readers)) // 每个reader的Storage方法累计访问时间
+	}
 	return &multiStateReader{
 		readers: readers,
 	}, nil
@@ -388,11 +406,22 @@ func newMultiStateReader(readers ...StateReader) (*multiStateReader, error) {
 // - The returned account is safe to modify after the call
 func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, error) {
 	var errs []error
-	for _, reader := range r.readers {
+	start := time.Now()
+	for i, reader := range r.readers {
 		acct, err := reader.Account(addr)
+		elapsed := time.Since(start)
+
+		// 更新统计信息
+		if len(r.readers) == Readers {
+			accountAccessTime[i] += elapsed
+		}
 		if err == nil {
+			if len(r.readers) == Readers {
+				accountHitCounts[i]++
+			}
 			return acct, nil
 		}
+
 		errs = append(errs, err)
 	}
 	return nil, errors.Join(errs...)
@@ -406,14 +435,77 @@ func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, er
 // - The returned storage slot is safe to modify after the call
 func (r *multiStateReader) Storage(addr common.Address, slot common.Hash) (common.Hash, error) {
 	var errs []error
-	for _, reader := range r.readers {
-		slot, err := reader.Storage(addr, slot)
-		if err == nil {
-			return slot, nil
+	start := time.Now()
+	for i, reader := range r.readers {
+		slotValue, err := reader.Storage(addr, slot)
+		elapsed := time.Since(start)
+
+		// 更新统计信息
+
+		if len(r.readers) == Readers {
+			storageAccessTime[i] += elapsed
 		}
+		if err == nil {
+			if len(r.readers) == Readers {
+				storageHitCounts[i]++
+			}
+			return slotValue, nil
+		}
+
 		errs = append(errs, err)
 	}
 	return common.Hash{}, errors.Join(errs...)
+}
+
+// PrintStat 打印multiStateReader的统计信息
+func PrintStat() {
+
+	fmt.Println("=== MultiStateReader 统计信息 ===")
+	fmt.Printf("Reader 数量: %d\n", len(accountHitCounts))
+	fmt.Println()
+
+	// 计算总数
+	var totalAccountHits, totalStorageHits int64
+	var totalAccountTime, totalStorageTime time.Duration
+
+	for i := 0; i < len(accountHitCounts); i++ {
+		totalAccountHits += accountHitCounts[i]
+		totalStorageHits += storageHitCounts[i]
+		totalAccountTime += accountAccessTime[i]
+		totalStorageTime += storageAccessTime[i]
+	}
+
+	fmt.Println("Account 方法统计:")
+	for i := 0; i < len(accountHitCounts); i++ {
+		percentage := float64(0)
+		if totalAccountHits > 0 {
+			percentage = float64(accountHitCounts[i]) * 100.0 / float64(totalAccountHits)
+		}
+		avgTime := time.Duration(0)
+		if accountHitCounts[i] > 0 {
+			avgTime = accountAccessTime[i] / time.Duration(accountHitCounts[i])
+		}
+		fmt.Printf("  Reader[%d]: 命中次数=%d (%.2f%%), 累计时间=%v, 平均时间=%v\n",
+			i, accountHitCounts[i], percentage, accountAccessTime[i], avgTime)
+	}
+	fmt.Printf("  总计: 命中次数=%d, 累计时间=%v\n", totalAccountHits, totalAccountTime)
+	fmt.Println()
+
+	fmt.Println("Storage 方法统计:")
+	for i := 0; i < len(accountHitCounts); i++ {
+		percentage := float64(0)
+		if totalStorageHits > 0 {
+			percentage = float64(storageHitCounts[i]) * 100.0 / float64(totalStorageHits)
+		}
+		avgTime := time.Duration(0)
+		if storageHitCounts[i] > 0 {
+			avgTime = storageAccessTime[i] / time.Duration(storageHitCounts[i])
+		}
+		fmt.Printf("  Reader[%d]: 命中次数=%d (%.2f%%), 累计时间=%v, 平均时间=%v\n",
+			i, storageHitCounts[i], percentage, storageAccessTime[i], avgTime)
+	}
+	fmt.Printf("  总计: 命中次数=%d, 累计时间=%v\n", totalStorageHits, totalStorageTime)
+	fmt.Println("================================")
 }
 
 // reader is the wrapper of ContractCodeReader and StateReader interface.

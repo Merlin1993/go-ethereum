@@ -846,12 +846,16 @@ func hashKey(key []byte) []byte {
 	return crypto.Keccak256(key)
 }
 
+var SStart time.Duration
+
 // startCleanup 启动某区块号的清理操作
 // 此接口支持异步调用，但会进行锁，保证不同区块号的清理操作会排队执行
 // 返回是否成功获取到锁
 func (t *CacheTrie) startCleanup() bool {
+	sStart := time.Now()
 	// 尝试获取锁
 	t.cleanupMu.Lock()
+	SStart = time.Since(sStart)
 
 	t.isCleaningUp = true
 	t.cleanupCount++ // 增加清理次数计数
@@ -1089,6 +1093,10 @@ func (t *CacheTrie) ResetCleanupTimes() {
 // 添加 GetHRW 方法获取 HeightRangeWindow
 func (t *CacheTrie) GetHRW() *HeightRangeWindow {
 	return t.hrw
+}
+
+func (h *HeightRangeWindow) GetAllSize() int {
+	return int(h.allSize)
 }
 
 // 为 HeightRangeWindow 添加 GetThreshold 方法

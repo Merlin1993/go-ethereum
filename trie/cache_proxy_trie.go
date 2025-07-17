@@ -235,12 +235,6 @@ func (t *CacheProxyTrie) DeleteStorage(addr common.Address, key []byte) error {
 
 // UpdateContractCode 更新合约代码
 func (t *CacheProxyTrie) UpdateContractCode(address common.Address, codeHash common.Hash, code []byte) error {
-	// 直接委托给底层trie
-	err := t.underlying.UpdateContractCode(address, codeHash, code)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
