@@ -11,6 +11,9 @@ type HeightRangeWindow struct {
 	windowEndNumber     uint64
 	firstSegmentIndex   int
 
+	maxBitAllowedSize int
+	logicalSize       [32]int
+
 	allSize uint64
 }
 
@@ -28,12 +31,13 @@ func NewHeightRangeWindow(startNum, defaultSsthresh uint64, defaultMaxSize int) 
 		windowStartNumber:   startNum,
 		windowEndNumber:     startNum - 1,
 		firstSegmentIndex:   0,
+		maxBitAllowedSize:   defaultMaxSize / 20,
 	}
-	hrw.recalculateLogicalCapacities()
+	hrw.recalculateLogicalCapacities(true)
 	return hrw
 }
 
-func (hrw *HeightRangeWindow) recalculateLogicalCapacities() {
+func (hrw *HeightRangeWindow) recalculateLogicalCapacities(slowStart bool) {
 	usedCapacity := hrw.windowEndNumber - hrw.windowStartNumber + 1
 	totalCapacity := uint64(0)
 	lastCapacity := hrw.logicalCapacities[hrw.firstSegmentIndex]
@@ -59,7 +63,11 @@ func (hrw *HeightRangeWindow) recalculateLogicalCapacities() {
 		lastCapacity = hrw.logicalCapacities[cIndex]
 		if totalCapacity >= usedCapacity {
 			hrw.logicalCapacities[cIndex] = hrw.logicalCapacities[cIndex] - totalCapacity + usedCapacity
-			lastCapacity = 0
+			if slowStart {
+				lastCapacity = 0
+			} else {
+				lastCapacity = hrw.logicalCapacities[cIndex]
+			}
 		}
 	}
 	hrw.allSize = 0
@@ -98,11 +106,11 @@ func (hrw *HeightRangeWindow) GetBitPosition(number uint64) int {
 func (hrw *HeightRangeWindow) CheckAndTriggerCongestionControl(currentUsedSize int) bool {
 	if currentUsedSize > hrw.maxTotalAllowedSize {
 		newSsthresh := hrw.logicalCapacities[hrw.GetBitPosition(hrw.windowEndNumber)] / 2
-		if newSsthresh < 8 {
-			newSsthresh = 8 // sshresh 至少为1
+		if newSsthresh < 1 {
+			newSsthresh = 1 // sshresh 至少为1
 		}
 		hrw.currentSsthresh = newSsthresh
-		hrw.recalculateLogicalCapacities()
+		hrw.recalculateLogicalCapacities(true)
 		return true
 	}
 	return false
@@ -131,6 +139,11 @@ func (hrw *HeightRangeWindow) PruneWindow(numberOfLogicalBitsToPrune int) {
 
 	hrw.windowStartNumber += prunedTotalCapacity
 	hrw.firstSegmentIndex = (hrw.firstSegmentIndex + numberOfLogicalBitsToPrune) % 32
+
+	hrw.allSize = 0
+	for _, v := range hrw.logicalCapacities {
+		hrw.allSize += v
+	}
 }
 
 func (hrw *HeightRangeWindow) getWindowPosition() int {
@@ -140,5 +153,18 @@ func (hrw *HeightRangeWindow) getWindowPosition() int {
 		return 32 - end + start - 1
 	} else {
 		return start - end - 1
+	}
+}
+func (hrw *HeightRangeWindow) addLogicalSize(bit int) {
+	hrw.logicalSize[bit]++
+}
+
+func (hrw *HeightRangeWindow) resetLogicalSize(bit int) {
+	hrw.logicalSize[bit] = 0
+}
+
+func (hrw *HeightRangeWindow) triggerSize(bit int) {
+	if hrw.logicalSize[bit] > hrw.maxBitAllowedSize {
+		hrw.recalculateLogicalCapacities(false)
 	}
 }

@@ -1088,23 +1088,23 @@ func TestCacheTriePerformance(t *testing.T) {
 	windowMultiple := 1024
 	for _, stateCount := range stateCounts {
 		t.Run(fmt.Sprintf("StateCount_%d", stateCount), func(t *testing.T) {
-			testCacheTrieWithStateCount(t, stateCount, iterationCount, windowMultiple, maxSize)
+			testCacheTrieWithStateCount(t, stateCount, iterationCount, windowMultiple, maxSize, 0)
 		})
 	}
 }
 
 func TestSampleCacheTriePerformance(t *testing.T) {
 	stateCount := 5000
-	iterationCount := 200 // 统计循环次数 200000是1b
-	maxSize := 1000000    // 初始存储大小限制
-	windowMultiple := 1024
+	iterationCount := 4000 // 统计循环次数
+	maxSize := 1000000     // 初始存储大小限制
+	windowMultiple := 256
 	t.Run(fmt.Sprintf("StateCount_%d", stateCount), func(t *testing.T) {
-		testCacheTrieWithStateCount(t, stateCount, iterationCount, windowMultiple, maxSize)
+		testCacheTrieWithStateCount(t, stateCount, iterationCount, windowMultiple, maxSize, 0)
 	})
 }
 
 // testCacheTrieWithStateCount 使用指定状态数进行CacheTrie测试
-func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windowMultiple, maxSize int) {
+func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windowMultiple, maxSize int, mod int) {
 	t.Logf("开始测试: 单次写入状态数=%d, 统计循环次数=%d, 初始存储大小=%d", stateCount, iterationCount, maxSize)
 
 	// 创建CacheTrie实例
@@ -1165,6 +1165,7 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 			t.Logf("预热阶段结束，未检测到清理发生，已写入状态数=%d", i+batchSize)
 		}
 	}
+	CleanupTime = 0
 
 	preWarmupDuration := time.Since(preWarmupStartTime)
 	t.Logf("预热阶段完成，耗时: %v", preWarmupDuration)
@@ -1219,7 +1220,8 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 		// 获取哈希，这会触发清理机制
 		hashStart := time.Now()
 		hash, _, kvList := cacheTrie.Hash()
-		hashTime := time.Since(hashStart)
+		hashTime := time.Since(hashStart) - CleanupTime
+		CleanupTime = 0
 
 		if kvList != nil {
 			go func() {

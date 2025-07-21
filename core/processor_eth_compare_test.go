@@ -942,9 +942,9 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 					data := deleteKVList.Data
 					length := len(data)
-					chunkSize := 10000
+					chunkSize := 5000
 					if length > 500000 {
-						chunkSize = 50000
+						chunkSize = 10000
 					}
 					var newRoot = root
 					for i := 0; i < length; i += chunkSize {

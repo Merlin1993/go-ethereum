@@ -144,6 +144,7 @@ func (t *CacheTrie) updateInternal(hexKey []byte, value []byte, isNew bool, orig
 	}
 
 	root, nodeExists, err := t.insert(t.root, hexKey, valueNode, bitPos)
+	t.hrw.addLogicalSize(t.currentBit)
 	if err != nil {
 		return err, nodeExists
 	}
@@ -176,6 +177,7 @@ func (t *CacheTrie) deleteInternal(hexKey []byte, originalKey []byte, address ..
 
 	// 使用insert方法插入墓碑标记，而不是真正删除
 	newroot, nodeExists, err := t.insert(t.root, hexKey, tombstone, bitPos)
+	t.hrw.addLogicalSize(t.currentBit)
 	if err != nil {
 		return err, nodeExists
 	}
@@ -286,6 +288,7 @@ func (t *CacheTrie) SetBlockNum(blockNum uint64) {
 	t.blockNum = blockNum
 	t.currentBit = t.hrw.GetBitPosition(blockNum)
 	if t.currentBit < 0 {
+		t.hrw.getWindowPosition()
 		panic(fmt.Sprintf("CacheTrie位置计算错误: 当前区块高度=%v, 窗口起始区块=%v, 窗口结束区块=%v, 错误码=%v (若-1则表示区块高度小于窗口起始位置; 若-2则表示区块高度超出窗口最大容量), 当前窗口位数=%v, 首段索引=%v, 慢启动阈值=%v",
 			blockNum, t.hrw.windowStartNumber, t.hrw.windowEndNumber, t.currentBit, t.hrw.getWindowPosition(), t.hrw.firstSegmentIndex, t.hrw.currentSsthresh))
 	}
@@ -455,6 +458,7 @@ func (t *CacheTrie) Hash() (common.Hash, common.Hash, *DeleteKVList) {
 
 	// 如果设置了最大大小且超出限制，或window的位数不足，清理不常用的缓存
 	deleteKeyValues, resultHash := t.pruneCache()
+	t.hrw.triggerSize(t.currentBit)
 
 	// 缓存删除的键值对
 	if deleteKeyValues != nil && len(deleteKeyValues.Data) > 0 {
@@ -488,6 +492,8 @@ type DeleteKVList struct {
 	Data     []*DeleteKV
 	BlockNum uint64 // 添加区块号字段
 }
+
+var CleanupTime time.Duration
 
 // pruneCache清理不常用的缓存节点
 // 返回在清理过程中删除的键值对列表
@@ -575,10 +581,10 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 	t.pruneBitCount = bitCount
 
 	// 计算清理时间并更新统计
-	cleanupTime := time.Since(startTime)
-	t.totalCleanupTime += cleanupTime
-	if cleanupTime > t.maxCleanupTime {
-		t.maxCleanupTime = cleanupTime
+	CleanupTime = time.Since(startTime)
+	t.totalCleanupTime += CleanupTime
+	if CleanupTime > t.maxCleanupTime {
+		t.maxCleanupTime = CleanupTime
 	}
 
 	return deleteKVList, resultHash
@@ -606,6 +612,7 @@ func (t *CacheTrie) pruneNode() {
 		lowestBit := t.hrw.firstSegmentIndex
 		// 从根节点递归查找所有节点，对于所有最低一位的叶子节点进行实际的删除
 		if t.root != nil {
+			t.hrw.resetLogicalSize(lowestBit)
 			t.root = t.pruneNodeAtBit(t.root, lowestBit)
 		}
 

@@ -167,7 +167,7 @@ func TestRecalculateLogicalCapacities(t *testing.T) {
 		hrw.windowEndNumber = 10 // 设置窗口结束为10
 
 		// 重新计算容量
-		hrw.recalculateLogicalCapacities()
+		hrw.recalculateLogicalCapacities(false)
 
 		// 验证容量是否按照预期增长
 		// 在使用了10个编号的情况下，容量应该遵循倍增规则直到达到阈值

@@ -21,12 +21,12 @@ import (
 // 测试配置
 const (
 	// 方法一配置
-	method1BatchSize = 500000   // 每批次处理的数据量
-	method1TotalData = 10000000 // 总数据量（可以根据需要调整到10亿）
+	method1BatchSize = 5000     // 每批次处理的数据量
+	method1TotalData = 20000000 // 总数据量（可以根据需要调整到10亿）
 
 	// 方法二配置
-	method2BatchSize  = 100000 // 每批次写入的数据量
-	method2Iterations = 100    // 迭代次数
+	method2BatchSize  = 5000 // 每批次写入的数据量
+	method2Iterations = 4000 // 迭代次数
 
 	mptDir = "F:\\ethdata\\stree2\\mpt"
 )
