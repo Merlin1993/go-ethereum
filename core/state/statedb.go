@@ -25,7 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ethereum/go-ethereum/cacheTrie"
+	"github.com/ethereum/go-ethereum/cachetrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -157,7 +157,7 @@ type StateDB struct {
 	StorageDeleted atomic.Int64 // Number of storage slots deleted during the state transition
 
 	// 缓存的 deleteKVList
-	cachedDeleteKVList *cacheTrie.DeleteKVList
+	cachedDeleteKVList *cachetrie.DeleteKVList
 }
 
 // New creates a new state from a given trie.
@@ -1506,6 +1506,6 @@ func mustCopyTrie(t Trie) Trie {
 }
 
 // GetCachedDeleteKVList 获取缓存的deleteKVList
-func (s *StateDB) GetCachedDeleteKVList() *cacheTrie.DeleteKVList {
+func (s *StateDB) GetCachedDeleteKVList() *cachetrie.DeleteKVList {
 	return s.cachedDeleteKVList
 }

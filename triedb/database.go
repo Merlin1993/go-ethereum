@@ -19,7 +19,7 @@ package triedb
 import (
 	"errors"
 
-	"github.com/ethereum/go-ethereum/cacheTrie"
+	"github.com/ethereum/go-ethereum/cachetrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -101,7 +101,7 @@ type Database struct {
 	config    *Config              // Configuration for trie database
 	preimages *preimageStore       // The store for caching preimages
 	backend   backend              // The backend for managing trie nodes
-	cacheTrie *cacheTrie.CacheTrie // Cache trie used for enhanced caching
+	cacheTrie *cachetrie.CacheTrie // Cache trie used for enhanced caching
 }
 
 func (db *Database) GetBackend() *pathdb.Database {
@@ -140,7 +140,7 @@ func NewDatabase2(diskdb ethdb.Database, config *Config, bd backend) *Database {
 
 	// Initialize the cache trie if enabled
 	if config.CacheTrie {
-		db.cacheTrie = cacheTrie.NewCacheTrie(config.StartNum, 256, 1000000)
+		db.cacheTrie = cachetrie.NewCacheTrie(config.StartNum, 256, 1000000)
 	}
 
 	return db
@@ -173,7 +173,7 @@ func NewDatabase(diskdb ethdb.Database, config *Config) *Database {
 
 	// Initialize the cache trie if enabled
 	if config.CacheTrie {
-		db.cacheTrie = cacheTrie.NewCacheTrie(config.StartNum, 256, 1000000)
+		db.cacheTrie = cachetrie.NewCacheTrie(config.StartNum, 256, 1000000)
 	}
 
 	return db
@@ -391,7 +391,7 @@ func (db *Database) Config() *Config {
 }
 
 // CacheTrie returns the cache trie instance.
-func (db *Database) CacheTrie() *cacheTrie.CacheTrie {
+func (db *Database) CacheTrie() *cachetrie.CacheTrie {
 	return db.cacheTrie
 }
 

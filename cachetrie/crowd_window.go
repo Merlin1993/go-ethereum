@@ -1,4 +1,4 @@
-package cacheTrie
+package cachetrie
 
 // 可能需要，用于防止溢出等
 

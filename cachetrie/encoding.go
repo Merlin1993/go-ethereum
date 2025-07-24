@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-package cacheTrie
+package cachetrie
 
 // Trie键的编码方式:
 // - 在完整节点的边缘上，使用原始的十六进制字符（例如键'abc'成为['a', 'b', 'c']）

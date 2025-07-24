@@ -1,4 +1,4 @@
-package cacheTrie
+package cachetrie
 
 import (
 	"testing"

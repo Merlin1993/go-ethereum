@@ -17,7 +17,7 @@
 package database
 
 import (
-	"github.com/ethereum/go-ethereum/cacheTrie"
+	"github.com/ethereum/go-ethereum/cachetrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 )
@@ -45,7 +45,7 @@ type CacheNodeDatabase interface {
 	NodeDatabase
 
 	// CacheTrie returns the cacheTrie instance used for caching
-	CacheTrie() *cacheTrie.CacheTrie
+	CacheTrie() *cachetrie.CacheTrie
 
 	// ReadCache returns the flag indicating whether to use cache for reading
 	ReadCache() bool

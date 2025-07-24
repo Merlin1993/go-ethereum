@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ethereum/go-ethereum/cacheTrie"
+	"github.com/ethereum/go-ethereum/cachetrie"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
@@ -128,13 +128,13 @@ func (r *cachingCodeReader) CodeSize(addr common.Address, codeHash common.Hash) 
 }
 
 type CacheTrieReader struct {
-	ct *cacheTrie.CacheTrie
+	ct *cachetrie.CacheTrie
 }
 
 var CacheNilErr = errors.New("cache trie not find")
 
 // newFlatReader constructs a state reader with on the given state root.
-func newCacheReader(ct *cacheTrie.CacheTrie) *CacheTrieReader {
+func newCacheReader(ct *cachetrie.CacheTrie) *CacheTrieReader {
 	return &CacheTrieReader{
 		ct: ct,
 	}
@@ -145,7 +145,7 @@ func (r *CacheTrieReader) Account(addr common.Address) (*types.StateAccount, err
 		// 从缓存中获取
 		cacheNode, err := r.ct.Get(addr.Bytes())
 		if err == nil && cacheNode != nil {
-			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok {
+			if valueNode, ok := cacheNode.(cachetrie.ValueNode); ok {
 				if len(valueNode.Data) > 0 {
 
 					ret := new(types.StateAccount)
@@ -176,7 +176,7 @@ func (r *CacheTrieReader) Storage(addr common.Address, key common.Hash) (common.
 		if err != nil || cacheNode == nil {
 			return common.Hash{}, CacheNilErr
 		}
-		if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok {
+		if valueNode, ok := cacheNode.(cachetrie.ValueNode); ok {
 			if len(valueNode.Data) > 0 {
 				content := valueNode.Data
 				// 如果需要将RLP编码的数据提取出实际内容

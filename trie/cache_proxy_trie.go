@@ -17,7 +17,7 @@
 package trie
 
 import (
-	"github.com/ethereum/go-ethereum/cacheTrie"
+	"github.com/ethereum/go-ethereum/cachetrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -80,12 +80,12 @@ type StateTrieInterface interface {
 // 它实现了StateTrieInterface接口，可以透明地替换底层的trie
 type CacheProxyTrie struct {
 	underlying StateTrieInterface   // 底层的trie实现（StateTrie或VerkleTrie）
-	cache      *cacheTrie.CacheTrie // 缓存层
+	cache      *cachetrie.CacheTrie // 缓存层
 	useCache   bool                 // 是否启用缓存
 }
 
 // NewCacheProxyTrie 创建一个新的缓存代理trie
-func NewCacheProxyTrie(underlying StateTrieInterface, cache *cacheTrie.CacheTrie) *CacheProxyTrie {
+func NewCacheProxyTrie(underlying StateTrieInterface, cache *cachetrie.CacheTrie) *CacheProxyTrie {
 	return &CacheProxyTrie{
 		underlying: underlying,
 		cache:      cache,
@@ -104,7 +104,7 @@ func (t *CacheProxyTrie) GetAccount(address common.Address) (*types.StateAccount
 	if t.cache != nil {
 		cacheNode, err := t.cache.Get(address.Bytes())
 		if err == nil && cacheNode != nil {
-			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok {
+			if valueNode, ok := cacheNode.(cachetrie.ValueNode); ok {
 				if len(valueNode.Data) > 0 {
 					ret := new(types.StateAccount)
 					if err := rlp.DecodeBytes(valueNode.Data, ret); err == nil {
@@ -140,7 +140,7 @@ func (t *CacheProxyTrie) GetStorage(addr common.Address, key []byte) ([]byte, er
 	if t.cache != nil {
 		cacheNode, err := t.cache.GetWithAddress(addr, key)
 		if err == nil && cacheNode != nil {
-			if valueNode, ok := cacheNode.(cacheTrie.ValueNode); ok {
+			if valueNode, ok := cacheNode.(cachetrie.ValueNode); ok {
 				if len(valueNode.Data) > 0 {
 					content := valueNode.Data
 					// 提取RLP编码中的实际内容
@@ -270,7 +270,7 @@ func (t *CacheProxyTrie) IsVerkle() bool {
 
 // Copy 返回trie的拷贝
 func (t *CacheProxyTrie) Copy() *CacheProxyTrie {
-	var cacheCopy *cacheTrie.CacheTrie
+	var cacheCopy *cachetrie.CacheTrie
 	if t.cache != nil {
 		// Note: CacheTrie目前可能没有Copy方法，这里先设为nil
 		// 在实际使用中可能需要根据具体情况处理
@@ -293,7 +293,7 @@ func (t *CacheProxyTrie) Copy() *CacheProxyTrie {
 }
 
 // GetCache 返回缓存实例（用于调试或统计）
-func (t *CacheProxyTrie) GetCache() *cacheTrie.CacheTrie {
+func (t *CacheProxyTrie) GetCache() *cachetrie.CacheTrie {
 	return t.cache
 }
 

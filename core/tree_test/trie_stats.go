@@ -17,7 +17,7 @@
 // 性能优化说明: 此文件已进行性能优化，不再保存每个区块的统计数据，只保存并输出10万区块的汇总统计。
 // 这显著减少了内存使用和计算开销，特别是在长时间运行的节点上。
 
-package core
+package tree
 
 import (
 	"encoding/csv"
@@ -30,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/cacheTrie"
+	"github.com/ethereum/go-ethereum/cachetrie"
 )
 
 // 常量定义
@@ -91,7 +91,7 @@ type TrieStatsAggregator struct {
 	}
 
 	// CacheTrie实例的引用，用于在输出时获取命中率和清理统计
-	CacheTrieRef *cacheTrie.CacheTrie
+	CacheTrieRef *cachetrie.CacheTrie
 }
 
 // NewTrieStatsAggregator 创建一个新的状态树统计聚合器
@@ -329,7 +329,7 @@ func RecordTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writtenStat
 
 // RecordCacheTrieStats 记录 CacheTrie 的状态树统计数据
 func RecordCacheTrieStats(recorder *TrieStatsAggregator, blockNum uint64, writtenStates, readStates, txCount int,
-	txExecTime, rootGenTime time.Duration, cacheTrie *cacheTrie.CacheTrie) {
+	txExecTime, rootGenTime time.Duration, cacheTrie *cachetrie.CacheTrie) {
 
 	// 确保输出目录存在
 	if _, err := os.Stat(recorder.OutputDir); os.IsNotExist(err) {

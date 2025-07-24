@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-package cacheTrie
+package cachetrie
 
 import (
 	"bytes"
@@ -30,23 +30,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 )
-
-func TestNilWindow(t *testing.T) {
-	var fn *FullNode
-	var sn *ShortNode
-	//sn = &ShortNode{
-	//	Key: nil,
-	//	Val: nil,
-	//	//flags: nodeFlag{dirty: true},
-	//}
-	fn = &FullNode{
-		Children: [16]cacheNode{},
-		flags:    nodeFlag{},
-	}
-	fn.Children[0] = sn
-	fn.Children[0].isNil()
-	fn.updateFlag(1)
-}
 
 // 测试基本操作: 插入、查询、删除
 func TestBasicOperations(t *testing.T) {

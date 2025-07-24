@@ -16,7 +16,7 @@
 
 // Package cacheTrie 提供了一个带有增强缓存功能的Merkle Patricia树实现。
 // 该实现使用位图窗口(window bitmap)跟踪不同区块高度的缓存状态。
-package cacheTrie
+package cachetrie
 
 import (
 	"bytes"
