@@ -78,15 +78,15 @@ func BenchmarkSha256(b *testing.B) {
 	}
 }
 
-// TestBasicVerkleTreeOperations 测试verkle树的基本操作，包括创建、插入、持久化和验证
+// TestBasicVerkleTreeOperations tests basic operations of the verkle tree, including creation, insertion, persistence, and verification
 func TestBasicVerkleTreeOperations(t *testing.T) {
-	// 创建临时目录用于存储数据库文件
+	// Create a temporary directory for storing database files
 	tempDir := t.TempDir()
 
-	// 创建持久化数据库，而不是内存数据库
+	// Create a persistent database instead of an in-memory database
 	ldb, err := leveldb.New(tempDir, 128, 128, "verkle_test", false)
 	if err != nil {
-		t.Fatalf("创建磁盘数据库失败: %v", err)
+		t.Fatalf("Failed to create disk database: %v", err)
 	}
 	defer ldb.Close()
 
@@ -94,13 +94,13 @@ func TestBasicVerkleTreeOperations(t *testing.T) {
 	diskDB := rawdb.NewDatabase(ldb)
 	db := triedb.NewDatabase(diskDB, cacheConfig.triedbConfig(true))
 
-	// 创建一个新的verkle树
+	// Create a new verkle tree
 	tr, err := trie.NewVerkleTrie(types.EmptyVerkleHash, db, utils.NewPointCache(100))
 	if err != nil {
-		t.Fatalf("创建verkle树失败: %v", err)
+		t.Fatalf("Failed to create verkle tree: %v", err)
 	}
 
-	// 测试账户数据
+	// Test account data
 	testAccounts := map[common.Address]*types.StateAccount{
 		common.HexToAddress("0x1111111111111111111111111111111111111111"): {
 			Nonce:    1,
@@ -114,7 +114,7 @@ func TestBasicVerkleTreeOperations(t *testing.T) {
 		},
 	}
 
-	// 测试存储数据
+	// Test storage data
 	testStorages := map[common.Address]map[common.Hash][]byte{
 		common.HexToAddress("0x1111111111111111111111111111111111111111"): {
 			common.HexToHash("0x1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"): []byte{0x1a},
@@ -126,162 +126,162 @@ func TestBasicVerkleTreeOperations(t *testing.T) {
 		},
 	}
 
-	// 测试代码数据
+	// Test code data
 	testCodes := map[common.Address][]byte{
 		common.HexToAddress("0x1111111111111111111111111111111111111111"): []byte("code1"),
 		common.HexToAddress("0x2222222222222222222222222222222222222222"): []byte("code2"),
 	}
 
-	// 将账户数据插入到verkle树中
+	// Insert account data into the verkle tree
 	for addr, acct := range testAccounts {
 		if err := tr.UpdateAccount(addr, acct, len(testCodes[addr])); err != nil {
-			t.Fatalf("更新账户失败: %v", err)
+			t.Fatalf("Failed to update account: %v", err)
 		}
 
-		// 更新合约代码
+		// Update contract code
 		codeHash := crypto.Keccak256Hash(testCodes[addr])
 		if err := tr.UpdateContractCode(addr, codeHash, testCodes[addr]); err != nil {
-			t.Fatalf("更新合约代码失败: %v", err)
+			t.Fatalf("Failed to update contract code: %v", err)
 		}
 
-		// 更新存储数据
+		// Update storage data
 		for key, val := range testStorages[addr] {
 			if err := tr.UpdateStorage(addr, key.Bytes(), val); err != nil {
-				t.Fatalf("更新存储数据失败: %v", err)
+				t.Fatalf("Failed to update storage data: %v", err)
 			}
 		}
 	}
 
-	// 获取verkle树的根哈希
+	// Get the root hash of the verkle tree
 	root, _ := tr.Commit(false)
 
-	t.Logf("Verkle树根哈希: %x", root)
+	t.Logf("Verkle tree root hash: %x", root)
 
-	// 验证账户数据
+	// Verify account data
 	for addr, expectedAcct := range testAccounts {
 		actualAcct, err := tr.GetAccount(addr)
 		if err != nil {
-			t.Fatalf("获取账户失败: %v", err)
+			t.Fatalf("Failed to get account: %v", err)
 		}
 		if actualAcct.Nonce != expectedAcct.Nonce {
-			t.Errorf("账户nonce不匹配: 期望 %d, 实际 %d", expectedAcct.Nonce, actualAcct.Nonce)
+			t.Errorf("Account nonce mismatch: expected %d, got %d", expectedAcct.Nonce, actualAcct.Nonce)
 		}
 		if !actualAcct.Balance.Eq(expectedAcct.Balance) {
-			t.Errorf("账户余额不匹配: 期望 %s, 实际 %s", expectedAcct.Balance.Dec(), actualAcct.Balance.Dec())
+			t.Errorf("Account balance mismatch: expected %s, got %s", expectedAcct.Balance.Dec(), actualAcct.Balance.Dec())
 		}
 		if !bytes.Equal(actualAcct.CodeHash, expectedAcct.CodeHash) {
-			t.Errorf("账户代码哈希不匹配: 期望 %x, 实际 %x", expectedAcct.CodeHash, actualAcct.CodeHash)
+			t.Errorf("Account code hash mismatch: expected %x, got %x", expectedAcct.CodeHash, actualAcct.CodeHash)
 		}
 	}
 
-	// 验证存储数据
+	// Verify storage data
 	for addr, storage := range testStorages {
 		for key, expectedVal := range storage {
 			actualVal, err := tr.GetStorage(addr, key.Bytes())
 			if err != nil {
-				t.Fatalf("获取存储数据失败: %v", err)
+				t.Fatalf("Failed to get storage data: %v", err)
 			}
 			if !bytes.Equal(actualVal, expectedVal) {
-				t.Errorf("存储数据不匹配: 期望 %x, 实际 %x", expectedVal, actualVal)
+				t.Errorf("Storage data mismatch: expected %x, got %x", expectedVal, actualVal)
 			}
 		}
 	}
 
-	// 将数据持久化到磁盘
+	// Persist data to disk
 	rootHash, nodeset := tr.Commit(false)
 
-	// 首先使用Update将节点集保存到数据库
+	// First, save the node set to the database using Update
 	mergedNodeset := trienode.NewWithNodeSet(nodeset)
 
-	// 使用空的StateSet（只含有Verkle树节点）
+	// Use an empty StateSet (only containing Verkle tree nodes)
 	stateSet := triedb.NewStateSet()
 
 	if err := db.Update(rootHash, common.Hash{}, 0, mergedNodeset, stateSet); err != nil {
-		t.Fatalf("更新数据库失败: %v", err)
+		t.Fatalf("Failed to update database: %v", err)
 	}
 
-	// 然后使用Commit确保数据被刷新到磁盘
+	// Then, use Commit to ensure data is flushed to disk
 	if err := db.Commit(rootHash, false); err != nil {
-		t.Fatalf("提交数据到磁盘失败: %v", err)
+		t.Fatalf("Failed to commit data to disk: %v", err)
 	}
 
-	// 验证数据已正确持久化
-	// 重新打开数据库和verkle树
+	// Verify data has been correctly persisted
+	// Reopen database and verkle tree
 	ldb.Close()
 
 	ldb2, err := leveldb.New(tempDir, 128, 128, "verkle_test", false)
 	if err != nil {
-		t.Fatalf("重新打开磁盘数据库失败: %v", err)
+		t.Fatalf("Failed to reopen disk database: %v", err)
 	}
 	defer ldb2.Close()
 
 	diskDB2 := rawdb.NewDatabase(ldb2)
 	db2 := triedb.NewDatabase(diskDB2, cacheConfig.triedbConfig(true))
 
-	// 重新加载之前的verkle树
+	// Reload the previous verkle tree
 	tr2, err := trie.NewVerkleTrie(rootHash, db2, utils.NewPointCache(100))
 	if err != nil {
-		t.Fatalf("从持久化存储加载verkle树失败: %v", err)
+		t.Fatalf("Failed to load verkle tree from persistent storage: %v", err)
 	}
 
-	// 验证持久化后的数据是否正确
+	// Verify the persisted data is correct
 	for addr, expectedAcct := range testAccounts {
 		actualAcct, err := tr2.GetAccount(addr)
 		if err != nil {
-			t.Fatalf("从持久化存储获取账户失败: %v", err)
+			t.Fatalf("Failed to get account from persistent storage: %v", err)
 		}
 		if actualAcct.Nonce != expectedAcct.Nonce {
-			t.Errorf("持久化后账户nonce不匹配: 期望 %d, 实际 %d", expectedAcct.Nonce, actualAcct.Nonce)
+			t.Errorf("Account nonce mismatch after persistence: expected %d, got %d", expectedAcct.Nonce, actualAcct.Nonce)
 		}
 		if !actualAcct.Balance.Eq(expectedAcct.Balance) {
-			t.Errorf("持久化后账户余额不匹配: 期望 %s, 实际 %s", expectedAcct.Balance.Dec(), actualAcct.Balance.Dec())
+			t.Errorf("Account balance mismatch after persistence: expected %s, got %s", expectedAcct.Balance.Dec(), actualAcct.Balance.Dec())
 		}
 		if !bytes.Equal(actualAcct.CodeHash, expectedAcct.CodeHash) {
-			t.Errorf("持久化后账户代码哈希不匹配: 期望 %x, 实际 %x", expectedAcct.CodeHash, actualAcct.CodeHash)
+			t.Errorf("Account code hash mismatch after persistence: expected %x, got %x", expectedAcct.CodeHash, actualAcct.CodeHash)
 		}
 	}
 
-	// 验证存储数据
+	// Verify storage data
 	for addr, storage := range testStorages {
 		for key, expectedVal := range storage {
 			actualVal, err := tr2.GetStorage(addr, key.Bytes())
 			if err != nil {
-				t.Fatalf("从持久化存储获取存储数据失败: %v", err)
+				t.Fatalf("Failed to get storage data from persistent storage: %v", err)
 			}
 			if !bytes.Equal(actualVal, expectedVal) {
-				t.Errorf("持久化后存储数据不匹配: 期望 %x, 实际 %x", expectedVal, actualVal)
+				t.Errorf("Storage data mismatch after persistence: expected %x, got %x", expectedVal, actualVal)
 			}
 		}
 	}
 
-	t.Logf("持久化数据验证成功!")
+	t.Logf("Persistent data verification successful!")
 }
 
-// TestVerkleTreeBenchmark 对Verkle树进行性能测试
-// 可配置循环次数，读写操作数，以及新旧数据比例
+// TestVerkleTreeBenchmark performs performance testing on the Verkle tree
+// Configurable number of cycles, read/write operations, and new/old data ratio
 func TestVerkleTreeBenchmark(t *testing.T) {
-	// 测试配置
+	// Test configuration
 	config := struct {
-		Cycles      int     // 测试循环次数
-		ReadOps     int     // 每个循环中的读取操作数
-		WriteOps    int     // 每个循环中的写入操作数
-		UpdateRatio float64 // 更新旧数据的比例，0-1之间，剩余为插入新数据
+		Cycles      int     // Number of test cycles
+		ReadOps     int     // Number of read operations per cycle
+		WriteOps    int     // Number of write operations per cycle
+		UpdateRatio float64 // Ratio of updating old data, 0-1, remaining for new data
 		Proof       bool
 	}{
 		Cycles:      2,
 		ReadOps:     0,
 		WriteOps:    3900,
-		UpdateRatio: 0.3, // 30%更新, 70%新增
+		UpdateRatio: 0.3, // 30% update, 70% new
 		Proof:       true,
 	}
 	os.MkdirAll("E:\\ethdata\\ztree\\vt", os.ModePerm)
-	// 创建临时目录
+	// Create a temporary directory
 	tempDir := "E:\\ethdata\\ztree\\vt"
 
-	// 创建数据库
+	// Create database
 	ldb, err := leveldb.New(tempDir, 128, 128, "verkle_benchmark", false)
 	if err != nil {
-		t.Fatalf("创建磁盘数据库失败: %v", err)
+		t.Fatalf("Failed to create disk database: %v", err)
 	}
 	defer ldb.Close()
 
@@ -290,16 +290,16 @@ func TestVerkleTreeBenchmark(t *testing.T) {
 	diskDB := rawdb.NewDatabase(ldb)
 	db := triedb.NewDatabase(diskDB, cacheConfig.triedbConfig(true))
 
-	// 存储所有账户地址和对应的存储键
+	// Store all account addresses and their corresponding storage keys
 	allAccounts := make([]common.Address, 0)
 	allStorageKeys := make(map[common.Address][]common.Hash)
 
-	// 创建AccessEvents实例用于跟踪访问
+	// Create AccessEvents instance for tracking access
 	pointCache := utils.NewPointCache(1024)
 	accessEvents := state.NewAccessEvents(pointCache)
 	stateSet := triedb.NewStateSet()
 
-	// 生成随机数据的帮助函数
+	// Helper function to generate random data
 	randAddr := func() common.Address {
 		return common.BytesToAddress(crypto.Keccak256([]byte(fmt.Sprintf("addr-%d", rand.Int())))[:20])
 	}
@@ -312,12 +312,12 @@ func TestVerkleTreeBenchmark(t *testing.T) {
 		return data
 	}
 
-	// 初始化根哈希为空和上一棵树
+	// Initialize root hash to empty and previous tree
 	//parentRoot := types.EmptyVerkleHash
 
 	parentRoot := common.HexToHash("0x6aff8b7cdec5669c243315a784d7dcd9bc9a7b2f9cb8782446db9ddb510acf37")
 
-	// 性能统计
+	// Performance statistics
 	stats := struct {
 		ReadTime        time.Duration
 		WriteTime       time.Duration
@@ -328,204 +328,205 @@ func TestVerkleTreeBenchmark(t *testing.T) {
 		MemoryUsage     uint64
 	}{}
 
-	// 运行测试循环
+	// Run test cycles
 	for cycle := 0; cycle < config.Cycles; cycle++ {
-		t.Logf("运行循环 %d/%d", cycle+1, config.Cycles)
+		t.Logf("Running cycle %d/%d", cycle+1, config.Cycles)
 
-		// 创建新的verkle树实例
+		// Create a new verkle tree instance
 		tr, err := trie.NewVerkleTrie(parentRoot, db, pointCache)
 		if err != nil {
-			t.Fatalf("创建verkle树失败: %v", err)
+			t.Fatalf("Failed to create verkle tree: %v", err)
 		}
 
-		// 重置AccessEvents和StateSet
+		// Reset AccessEvents and StateSet
 		accessEvents = state.NewAccessEvents(pointCache)
 		stateSet = triedb.NewStateSet()
 
-		// 1. 读取操作
+		// 1. Read operations
 		readStart := time.Now()
 		for i := 0; i < config.ReadOps && len(allAccounts) > 0; i++ {
-			// 随机选择一个已有账户
+			// Randomly select an existing account
 			addrIdx := rand.Intn(len(allAccounts))
 			addr := allAccounts[addrIdx]
 
-			// 读取账户数据
+			// Read account data
 			_, err := tr.GetAccount(addr)
 			if err != nil {
-				t.Logf("读取账户失败: %v", err)
+				t.Logf("Failed to read account: %v", err)
 				continue
 			}
-			// 记录读取访问
+			// Record read access
 			accessEvents.AddAccount(addr, false)
 
-			// 如果有存储键，读取存储数据
+			// If there are storage keys, read storage data
 			if storageKeys, ok := allStorageKeys[addr]; ok && len(storageKeys) > 0 {
 				keyIdx := rand.Intn(len(storageKeys))
 				key := storageKeys[keyIdx]
 
 				_, err := tr.GetStorage(addr, key.Bytes())
 				if err != nil {
-					t.Logf("读取存储数据失败: %v", err)
+					t.Logf("Failed to read storage data: %v", err)
 				}
-				// 记录存储读取访问
+				// Record storage read access
 				accessEvents.SlotGas(addr, key, false)
 			}
 		}
 		readTime := time.Since(readStart)
 		stats.ReadTime += readTime
 
-		// 2. 写入操作
+		// 2. Write operations
 		writeStart := time.Now()
 		for i := 0; i < config.WriteOps; i++ {
 			var addr common.Address
 			var isUpdate bool
 
-			// 根据更新比例决定是更新现有数据还是插入新数据
+			// Decide whether to update existing data or insert new data based on update ratio
 			if rand.Float64() < config.UpdateRatio && len(allAccounts) > 0 {
-				// 更新现有账户
+				// Update existing account
 				addrIdx := rand.Intn(len(allAccounts))
 				addr = allAccounts[addrIdx]
 				isUpdate = true
 			} else {
-				// 创建新账户
+				// Create new account
 				addr = randAddr()
 				allAccounts = append(allAccounts, addr)
 				allStorageKeys[addr] = make([]common.Hash, 0)
 				isUpdate = false
 			}
 
-			// 记录账户写入访问
+			// Record account write access
 			accessEvents.AddAccount(addr, true)
 
-			// 生成账户数据
+			// Generate account data
 			acct := &types.StateAccount{
 				Nonce:   uint64(rand.Intn(1000)),
 				Balance: uint256.NewInt(rand.Uint64()),
 			}
 
-			// 更新账户
+			// Update account
 			if err := tr.UpdateAccount(addr, acct, 10); err != nil {
-				t.Fatalf("更新账户失败: %v", err)
+				t.Fatalf("Failed to update account: %v", err)
 			}
 
 			for j := 0; j < 2; j++ {
 				var key common.Hash
 
-				// 如果是更新操作，有50%概率更新已有存储键
+				// If it's an update operation, there's a 50% chance to update an existing storage key
 				if isUpdate && len(allStorageKeys[addr]) > 0 && rand.Float64() < 0.5 {
 					keyIdx := rand.Intn(len(allStorageKeys[addr]))
 					key = allStorageKeys[addr][keyIdx]
 				} else {
-					// 新增存储键
+					// New storage key
 					key = randHash()
 					allStorageKeys[addr] = append(allStorageKeys[addr], key)
 				}
 
-				// 记录存储写入访问
+				// Record storage write access
 				accessEvents.SlotGas(addr, key, true)
 
-				// 更新存储数据
+				// Update storage data
 				val := randBytes(32)
 				if err := tr.UpdateStorage(addr, key.Bytes(), val); err != nil {
-					t.Fatalf("更新存储数据失败: %v", err)
+					t.Fatalf("Failed to update storage data: %v", err)
 				}
 			}
 		}
 		writeTime := time.Since(writeStart)
 		stats.WriteTime += writeTime
 
-		//证明需要提前证明，因为写入是覆盖式的，等写入再去获取旧的树，已经获取不到了
+		// Proof needs to be generated in advance, as writing is overwriting,
+		// so get the old tree before writing, which is no longer available.
 		if config.Proof {
 			newRoot := tr.Hash()
-			// 在修改之前创建树的副本
+			// Create a copy of the tree before modification
 			preTr, err := trie.NewVerkleTrie(parentRoot, db, pointCache)
 			if err != nil {
-				t.Fatalf("生成父状态失败: %v, %v", err, parentRoot)
+				t.Fatalf("Failed to generate parent state: %v, %v", err, parentRoot)
 			}
 
-			// 生成和验证证明
+			// Generate and verify proof
 			proofStart := time.Now()
 
-			// 使用AccessEvents收集的键来生成证明
+			// Use keys collected by AccessEvents to generate proof
 			modifiedKeys := accessEvents.Keys()
 
 			proof, stateDiff, err := preTr.Proof(tr, modifiedKeys)
 			if err != nil {
-				t.Fatalf("生成状态差异证明失败: %v", err)
+				t.Fatalf("Failed to generate state difference proof: %v", err)
 			}
 
 			proofGenTime := time.Since(proofStart)
 			stats.ProofGenTime += proofGenTime
 
-			// 记录证明大小
+			// Record proof size
 			jsonBytes, err := json.Marshal(proof)
 			if err != nil {
-				t.Fatalf("序列化证明失败: %v", err)
+				t.Fatalf("Failed to serialize proof: %v", err)
 			}
 			proofSize := len(jsonBytes)
 			stats.ProofSize += proofSize
 
-			// 5. 验证证明
+			// 5. Verify proof
 			verifyStart := time.Now()
 
-			// 验证从旧状态到新状态的证明
+			// Verify proof from old state to new state
 			err = verkle.Verify(proof, parentRoot.Bytes(), newRoot.Bytes(), stateDiff)
 			if err != nil {
-				t.Fatalf("验证状态差异证明失败: %v, %v， %v", err, newRoot, tr.Hash())
+				t.Fatalf("Failed to verify state difference proof: %v, %v, %v", err, newRoot, tr.Hash())
 			}
 
 			verifyTime := time.Since(verifyStart)
 			stats.ProofVerifyTime += verifyTime
 
-			//t.Logf("循环 %d 状态差异证明 - 生成时间: %v, 验证时间: %v, 大小: %d 字节",
+			//t.Logf("Cycle %d state difference proof - Generation time: %v, Verification time: %v, Size: %d bytes",
 			//	cycle, proofGenTime, verifyTime, proofSize)
 
 		}
 
-		// 3. 提交并持久化
+		// 3. Commit and persist
 		commitStart := time.Now()
 
-		// 现在提交更改
+		// Now commit changes
 		newRoot, nodeset := tr.Commit(false)
 
-		// 将节点集保存到数据库
+		// Save node set to database
 		mergedNodeset := trienode.NewWithNodeSet(nodeset)
 
 		if err := db.Update(newRoot, parentRoot, uint64(cycle), mergedNodeset, stateSet); err != nil {
-			t.Fatalf("更新数据库失败: %v", err)
+			t.Fatalf("Failed to update database: %v", err)
 		}
 
-		// 提交数据到磁盘
+		// Commit data to disk
 		if err := db.Commit(newRoot, false); err != nil {
-			t.Fatalf("提交数据到磁盘失败: %v", err)
+			t.Fatalf("Failed to commit data to disk: %v", err)
 		}
 		commitTime := time.Since(commitStart)
 		stats.CommitTime += commitTime
 
-		// 更新根哈希
+		// Update root hash
 		parentRoot = newRoot
 
-		// 获取内存使用情况
+		// Get memory usage
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 		stats.MemoryUsage += m.Alloc
 
-		//t.Logf("循环 %d 统计: 读取 %v, 写入 %v, 提交 %v",
+		//t.Logf("Cycle %d stats: Read %v, Write %v, Commit %v",
 		//	cycle+1, readTime, writeTime, commitTime)
 	}
 
-	// 计算平均值
+	// Calculate averages
 	cycles := float64(config.Cycles)
-	proofCycles := cycles - 1 // 第一轮没有证明
-	t.Logf("=== 性能测试结果 ===")
-	t.Logf("最终Root: %v", parentRoot.String())
-	t.Logf("平均读取时间: %v", stats.ReadTime/time.Duration(cycles))
-	t.Logf("平均写入时间: %v", stats.WriteTime/time.Duration(cycles))
-	t.Logf("平均提交时间: %v", stats.CommitTime/time.Duration(cycles))
+	proofCycles := cycles - 1 // First round has no proof
+	t.Logf("=== Performance Test Results ===")
+	t.Logf("Final Root: %v", parentRoot.String())
+	t.Logf("Average Read Time: %v", stats.ReadTime/time.Duration(cycles))
+	t.Logf("Average Write Time: %v", stats.WriteTime/time.Duration(cycles))
+	t.Logf("Average Commit Time: %v", stats.CommitTime/time.Duration(cycles))
 	if proofCycles > 0 {
-		t.Logf("平均证明生成时间: %v", stats.ProofGenTime/time.Duration(proofCycles))
-		t.Logf("平均证明验证时间: %v", stats.ProofVerifyTime/time.Duration(proofCycles))
-		t.Logf("平均证明大小: %d 字节", stats.ProofSize/int(proofCycles))
+		t.Logf("Average Proof Generation Time: %v", stats.ProofGenTime/time.Duration(proofCycles))
+		t.Logf("Average Proof Verification Time: %v", stats.ProofVerifyTime/time.Duration(proofCycles))
+		t.Logf("Average Proof Size: %d bytes", stats.ProofSize/int(proofCycles))
 	}
-	t.Logf("平均内存使用: %d 字节", stats.MemoryUsage/uint64(cycles))
+	t.Logf("Average Memory Usage: %d bytes", stats.MemoryUsage/uint64(cycles))
 }

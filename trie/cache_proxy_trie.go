@@ -25,8 +25,9 @@ import (
 	"github.com/ethereum/go-ethereum/trie/trienode"
 )
 
-// StateTrieInterface 定义状态trie的接口
-// 这里我们重新定义接口是因为我们需要在trie包中使用，但core/state.Trie在trie包中不可见
+// StateTrieInterface defines the interface for state trie
+// We redefine this interface here because we need to use it in the trie package,
+// but core/state.Trie is not visible in the trie package
 type StateTrieInterface interface {
 	// GetKey returns the sha3 preimage of a hashed key that was previously used
 	// to store a value.
@@ -76,31 +77,31 @@ type StateTrieInterface interface {
 	IsVerkle() bool
 }
 
-// CacheProxyTrie 包装任何trie实现并提供缓存功能
-// 它实现了StateTrieInterface接口，可以透明地替换底层的trie
+// CacheProxyTrie wraps any trie implementation and provides caching functionality
+// It implements the StateTrieInterface and can transparently replace the underlying trie
 type CacheProxyTrie struct {
-	underlying StateTrieInterface   // 底层的trie实现（StateTrie或VerkleTrie）
-	cache      *cachetrie.CacheTrie // 缓存层
-	useCache   bool                 // 是否启用缓存
+	underlying StateTrieInterface   // underlying trie implementation (StateTrie or VerkleTrie)
+	cache      *cachetrie.CacheTrie // cache layer
+	useCache   bool                 // whether caching is enabled
 }
 
-// NewCacheProxyTrie 创建一个新的缓存代理trie
+// NewCacheProxyTrie creates a new cache proxy trie
 func NewCacheProxyTrie(underlying StateTrieInterface, cache *cachetrie.CacheTrie) *CacheProxyTrie {
 	return &CacheProxyTrie{
 		underlying: underlying,
 		cache:      cache,
-		useCache:   false, // 默认关闭
+		useCache:   false, // disabled by default
 	}
 }
 
-// GetKey 返回哈希键的原始预映像
+// GetKey returns the original preimage of a hashed key
 func (t *CacheProxyTrie) GetKey(hash []byte) []byte {
 	return t.underlying.GetKey(hash)
 }
 
-// GetAccount 获取账户信息，优先从缓存获取
+// GetAccount retrieves account information, prioritizing cache access
 func (t *CacheProxyTrie) GetAccount(address common.Address) (*types.StateAccount, error) {
-	// 如果有缓存，先从缓存中尝试获取
+	// If cache is available, try to get from cache first
 	if t.cache != nil {
 		cacheNode, err := t.cache.Get(address.Bytes())
 		if err == nil && cacheNode != nil {
@@ -117,13 +118,13 @@ func (t *CacheProxyTrie) GetAccount(address common.Address) (*types.StateAccount
 		}
 	}
 
-	// 如果缓存中没有或无缓存，从底层trie获取
+	// If no cache or cache miss, get from underlying trie
 	account, err := t.underlying.GetAccount(address)
 	if err != nil {
 		return nil, err
 	}
 
-	// 如果启用useCache且获取成功，将结果写入缓存（标记为非新内容）
+	// If useCache is enabled and successful, write to cache (marked as non-new content)
 	if t.useCache && t.cache != nil && account != nil {
 		data, err := rlp.EncodeToBytes(account)
 		if err == nil {
@@ -134,19 +135,19 @@ func (t *CacheProxyTrie) GetAccount(address common.Address) (*types.StateAccount
 	return account, nil
 }
 
-// GetStorage 获取存储槽值，优先从缓存获取
+// GetStorage retrieves storage slot value, prioritizing cache access
 func (t *CacheProxyTrie) GetStorage(addr common.Address, key []byte) ([]byte, error) {
-	// 如果有缓存，先从缓存中尝试获取
+	// If cache is available, try to get from cache first
 	if t.cache != nil {
 		cacheNode, err := t.cache.GetWithAddress(addr, key)
 		if err == nil && cacheNode != nil {
 			if valueNode, ok := cacheNode.(cachetrie.ValueNode); ok {
 				if len(valueNode.Data) > 0 {
 					content := valueNode.Data
-					// 提取RLP编码中的实际内容
+					// Extract actual content from RLP-encoded data
 					_, actualContent, _, err := rlp.Split(content)
 					if err != nil {
-						return content, nil // 如果解码失败，直接返回原始内容
+						return content, nil // If decoding fails, return original content directly
 					}
 					return actualContent, nil
 				} else {
@@ -156,15 +157,15 @@ func (t *CacheProxyTrie) GetStorage(addr common.Address, key []byte) ([]byte, er
 		}
 	}
 
-	// 如果缓存中没有或无缓存，从底层trie获取
+	// If no cache or cache miss, get from underlying trie
 	value, err := t.underlying.GetStorage(addr, key)
 	if err != nil {
 		return nil, err
 	}
 
-	// 如果启用useCache且获取成功，将结果写入缓存（标记为非新内容）
+	// If useCache is enabled and successful, write to cache (marked as non-new content)
 	if t.useCache && t.cache != nil && len(value) > 0 {
-		// 使用RLP编码存储值
+		// Use RLP encoding to store the value
 		encoded, _ := rlp.EncodeToBytes(value)
 		t.cache.UpdateWithAddress(addr, key, encoded, false)
 	}
@@ -172,9 +173,9 @@ func (t *CacheProxyTrie) GetStorage(addr common.Address, key []byte) ([]byte, er
 	return value, nil
 }
 
-// UpdateAccount 更新账户信息
+// UpdateAccount updates account information
 func (t *CacheProxyTrie) UpdateAccount(address common.Address, account *types.StateAccount, codeLen int) error {
-	// 如果有缓存，直接更新缓存而不更新底层trie
+	// If cache is available, update cache directly without updating underlying trie
 	if t.cache != nil {
 		data, err := rlp.EncodeToBytes(account)
 		if err != nil {
@@ -183,101 +184,104 @@ func (t *CacheProxyTrie) UpdateAccount(address common.Address, account *types.St
 		return t.cache.Update(address.Bytes(), data, true)
 	}
 
-	// 如果无缓存，更新底层trie
+	// If no cache, update underlying trie
 	return t.underlying.UpdateAccount(address, account, codeLen)
 }
 
-// UpdateAccountRLP 使用RLP编码的账户数据更新账户
+// UpdateAccountRLP updates account with RLP-encoded data
 func (t *CacheProxyTrie) UpdateAccountRLP(address common.Address, account []byte, codeLen int) error {
-	// 如果有缓存，直接更新缓存而不更新底层trie
+	// If cache is available, update cache directly without updating underlying trie
 	if t.cache != nil {
 		return t.cache.Update(address.Bytes(), account, true)
 	}
 
-	// 如果无缓存，更新底层trie
+	// If no cache, update underlying trie
 	return t.underlying.UpdateAccountRLP(address, account, codeLen)
 }
 
-// UpdateStorage 更新存储槽
+// UpdateStorage updates storage slot
 func (t *CacheProxyTrie) UpdateStorage(addr common.Address, key, value []byte) error {
-	// 如果有缓存，直接更新缓存而不更新底层trie
+	// If cache is available, update cache directly without updating underlying trie
 	if t.cache != nil {
-		// 使用RLP编码存储值
+		// Use RLP encoding to store the value
 		encoded, _ := rlp.EncodeToBytes(value)
 		return t.cache.UpdateWithAddress(addr, key, encoded, true)
 	}
 
-	// 如果无缓存，更新底层trie
+	// If no cache, update underlying trie
 	return t.underlying.UpdateStorage(addr, key, value)
 }
 
-// DeleteAccount 删除账户
+// DeleteAccount deletes account
 func (t *CacheProxyTrie) DeleteAccount(address common.Address) error {
-	// 如果有缓存，直接从缓存删除而不操作底层trie
+	// If cache is available, delete from cache directly without operating underlying trie
 	if t.cache != nil {
 		return t.cache.Delete(address.Bytes())
 	}
 
-	// 如果无缓存，从底层trie删除
+	// If no cache, delete from underlying trie
 	return t.underlying.DeleteAccount(address)
 }
 
-// DeleteStorage 删除存储槽
+// DeleteStorage deletes storage slot
 func (t *CacheProxyTrie) DeleteStorage(addr common.Address, key []byte) error {
-	// 如果有缓存，直接从缓存删除而不操作底层trie
+	// If cache is available, delete from cache directly without operating underlying trie
 	if t.cache != nil {
 		return t.cache.DeleteWithAddress(addr, key)
 	}
 
-	// 如果无缓存，从底层trie删除
+	// If no cache, delete from underlying trie
 	return t.underlying.DeleteStorage(addr, key)
 }
 
-// UpdateContractCode 更新合约代码
+// UpdateContractCode updates contract code
 func (t *CacheProxyTrie) UpdateContractCode(address common.Address, codeHash common.Hash, code []byte) error {
 	return nil
 }
 
-// Hash 返回trie的根哈希
+// Hash returns the root hash of the trie
 func (t *CacheProxyTrie) Hash() common.Hash {
 	return t.underlying.Hash()
 }
 
-// Commit 提交所有修改
+// Commit collects all dirty nodes in the trie and replace them with the
+// corresponding node hash.
 func (t *CacheProxyTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 	return t.underlying.Commit(collectLeaf)
 }
 
-// Witness 返回见证数据
+// Witness returns a set containing all trie nodes that have been accessed.
 func (t *CacheProxyTrie) Witness() map[string]struct{} {
 	return t.underlying.Witness()
 }
 
-// NodeIterator 返回节点迭代器
+// NodeIterator returns an iterator that returns nodes of the trie.
 func (t *CacheProxyTrie) NodeIterator(startKey []byte) (NodeIterator, error) {
 	return t.underlying.NodeIterator(startKey)
 }
 
-// Prove 构造Merkle证明
+// Prove constructs a Merkle proof for key.
 func (t *CacheProxyTrie) Prove(key []byte, proofDb ethdb.KeyValueWriter) error {
 	return t.underlying.Prove(key, proofDb)
 }
 
-// IsVerkle 返回是否为Verkle trie
+// IsVerkle returns true if the trie is verkle-tree based
 func (t *CacheProxyTrie) IsVerkle() bool {
 	return t.underlying.IsVerkle()
 }
 
-// Copy 返回trie的拷贝
+// Copy returns a copy of the trie
 func (t *CacheProxyTrie) Copy() *CacheProxyTrie {
 	var cacheCopy *cachetrie.CacheTrie
 	if t.cache != nil {
-		// Note: CacheTrie目前可能没有Copy方法，这里先设为nil
-		// 在实际使用中可能需要根据具体情况处理
+		// Note: CacheTrie currently does not have a Copy method,
+		// so we set it to nil for now.
+		// In a real scenario, this might need to be handled differently
+		// depending on the specific CacheTrie implementation.
 		cacheCopy = t.cache
 	}
 
-	// 根据底层trie类型进行复制
+	// Copy based on underlying trie type
 	var underlyingCopy StateTrieInterface
 	switch ut := t.underlying.(type) {
 	case *StateTrie:
@@ -285,24 +289,24 @@ func (t *CacheProxyTrie) Copy() *CacheProxyTrie {
 	case *VerkleTrie:
 		underlyingCopy = ut.Copy()
 	default:
-		// 对于其他类型，尝试直接复制（可能需要类型断言）
+		// For other types, try to copy directly (may require type assertion)
 		underlyingCopy = t.underlying
 	}
 
 	return NewCacheProxyTrie(underlyingCopy, cacheCopy)
 }
 
-// GetCache 返回缓存实例（用于调试或统计）
+// GetCache returns the cache instance (for debugging or statistics)
 func (t *CacheProxyTrie) GetCache() *cachetrie.CacheTrie {
 	return t.cache
 }
 
-// SetCacheEnabled 设置是否启用缓存
+// SetCacheEnabled sets whether caching is enabled
 func (t *CacheProxyTrie) SetCacheEnabled(enabled bool) {
 	t.useCache = enabled
 }
 
-// GetUnderlying 返回底层trie实例
+// GetUnderlying returns the underlying trie instance
 func (t *CacheProxyTrie) GetUnderlying() StateTrieInterface {
 	return t.underlying
 }

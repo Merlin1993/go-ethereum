@@ -18,25 +18,25 @@ import (
 	"github.com/ethereum/go-ethereum/triedb"
 )
 
-// 测试配置
+// Test configuration
 const (
-	// 方法一配置
-	method1BatchSize = 5000     // 每批次处理的数据量
-	method1TotalData = 20000000 // 总数据量（可以根据需要调整到10亿）
+	// Method 1 configuration
+	method1BatchSize = 5000     // Data volume processed per batch
+	method1TotalData = 20000000 // Total data volume (can be adjusted to 1 billion as needed)
 
-	// 方法二配置
-	method2BatchSize  = 5000 // 每批次写入的数据量
-	method2Iterations = 4000 // 迭代次数
+	// Method 2 configuration
+	method2BatchSize  = 5000 // Data volume written per batch
+	method2Iterations = 4000 // Number of iterations
 
 	mptDir = "F:\\ethdata\\stree2\\mpt"
 )
 
-// 数据库键
+// Database keys
 var (
 	lastRootKey = []byte("last_root")
 )
 
-// 生成随机数据
+// Generate random data
 func generateRandomData() ([]byte, []byte) {
 	key := make([]byte, 32)
 	value := make([]byte, 32)
@@ -45,7 +45,7 @@ func generateRandomData() ([]byte, []byte) {
 	return key, value
 }
 
-// 生成随机数据
+// Generate random data
 func generateIndexData(s int) ([]byte, []byte) {
 	value := make([]byte, 32)
 	key := indexKey(s)
@@ -57,29 +57,29 @@ func indexKey(s int) [32]byte {
 	return sha256.Sum256([]byte(strconv.Itoa(s)))
 }
 
-// 保存最后一个根哈希到数据库
+// Save the last root hash to database
 func saveLastRoot(db ethdb.Database, root common.Hash) error {
 	return db.Put(lastRootKey, root.Bytes())
 }
 
-// 从数据库读取最后一个根哈希
+// Load the last root hash from database
 func loadLastRoot(db ethdb.Database) (common.Hash, error) {
 	data, err := db.Get(lastRootKey)
 	if err != nil {
-		return common.Hash{}, nil // 如果不存在，返回空哈希
+		return common.Hash{}, nil // Return empty hash if not exists
 	}
 	return common.BytesToHash(data), nil
 }
 
 func BenchmarkMPT_Update(b *testing.B) {
-	// 创建内存数据库
+	// Create in-memory database
 	memDB := rawdb.NewMemoryDatabase()
 	trieDB := triedb.NewDatabase(memDB, nil)
 
-	// 创建新的MPT树
+	// Create new MPT tree
 	tr, err := trie.New(trie.TrieID(common.Hash{}), trieDB)
 	if err != nil {
-		b.Fatalf("创建新Trie失败: %v", err)
+		b.Fatalf("Failed to create new Trie: %v", err)
 	}
 
 	b.ResetTimer()
@@ -91,45 +91,45 @@ func BenchmarkMPT_Update(b *testing.B) {
 	}
 	insertDuration := time.Since(startTime)
 
-	// 获取根哈希
+	// Get root hash
 	root, _ := tr.Commit(false)
 
-	b.Logf("插入 %d 个键值对耗时: %v (平均每个: %v), 最终根哈希: %x",
+	b.Logf("Inserted %d key-value pairs in %v (average per item: %v), final root hash: %x",
 		b.N, insertDuration, insertDuration/time.Duration(b.N), root)
 }
 
-// 方法一：批量写入并提交
+// Method 1: Batch write and commit
 func TestMethod1(t *testing.T) {
-	// 创建临时目录
+	// Create temporary directory
 	os.MkdirAll(mptDir, os.ModePerm)
 
-	// 创建数据库
+	// Create database
 	ldb, err := leveldb.New(mptDir, 128, 128, "sliding-test", false)
 	if err != nil {
-		t.Fatalf("创建数据库失败: %v", err)
+		t.Fatalf("Failed to create database: %v", err)
 	}
 	defer ldb.Close()
 
-	// 创建Trie数据库
+	// Create Trie database
 	diskDB := rawdb.NewDatabase(ldb)
 	trieDB := triedb.NewDatabase(diskDB, nil)
 
-	// 读取最后一个根哈希
+	// Load the last root hash
 	lastRoot, err := loadLastRoot(diskDB)
 	if err != nil {
-		t.Fatalf("读取最后一个根哈希失败: %v", err)
+		t.Fatalf("Failed to load last root hash: %v", err)
 	}
 
-	// 创建Trie
+	// Create Trie
 	tr, err := trie.New(trie.TrieID(lastRoot), trieDB)
 	if err != nil {
-		t.Fatalf("创建Trie失败: %v", err)
+		t.Fatalf("Failed to create Trie: %v", err)
 	}
 
 	var finalRoot common.Hash
 	totalStart := time.Now()
 
-	// 批量写入数据
+	// Batch write data
 	for i := 0; i < method1TotalData; i += method1BatchSize {
 		batchStart := time.Now()
 		batchSize := method1BatchSize
@@ -137,83 +137,83 @@ func TestMethod1(t *testing.T) {
 			batchSize = method1TotalData - i
 		}
 
-		// 写入数据
+		// Write data
 		for j := 0; j < batchSize; j++ {
 			key, value := generateIndexData(i + j)
 			tr.Update(key, value)
 		}
 
-		// 提交并获取根哈希
+		// Commit and get root hash
 		root, nodes := tr.Commit(false)
 		finalRoot = root
 
-		// 更新数据库
+		// Update database
 		if err := trieDB.Update(root, common.Hash{}, 0, trienode.NewWithNodeSet(nodes), nil); err != nil {
-			t.Fatalf("更新数据库失败: %v", err)
+			t.Fatalf("Failed to update database: %v", err)
 		}
 		if err := trieDB.Commit(root, false); err != nil {
-			t.Fatalf("提交数据库失败: %v", err)
+			t.Fatalf("Failed to commit database: %v", err)
 		}
 
-		// 保存最后一个根哈希
+		// Save the last root hash
 		if err := saveLastRoot(diskDB, root); err != nil {
-			t.Fatalf("保存最后一个根哈希失败: %v", err)
+			t.Fatalf("Failed to save last root hash: %v", err)
 		}
 
-		// 创建新的Trie继续写入
+		// Create new Trie to continue writing
 		tr, err = trie.New(trie.TrieID(root), trieDB)
 		if err != nil {
-			t.Fatalf("创建新Trie失败: %v", err)
+			t.Fatalf("Failed to create new Trie: %v", err)
 		}
 
 		batchTime := time.Since(batchStart)
-		t.Logf("批次 %d-%d 完成，耗时: %v，根哈希: %x", i, i+batchSize, batchTime, root)
+		t.Logf("Batch %d-%d completed, time taken: %v, root hash: %x", i, i+batchSize, batchTime, root)
 	}
 
 	totalTime := time.Since(totalStart)
-	t.Logf("方法一测试完成，总耗时: %v，最终根哈希: %x", totalTime, finalRoot)
+	t.Logf("Method 1 test completed, total time: %v, final root hash: %x", totalTime, finalRoot)
 }
 
-// 方法二：基于已有根哈希进行多次小批量写入测试
+// Method 2: Multiple small batch write tests based on existing root hash
 func TestMethod2(t *testing.T) {
-	// 创建数据库
+	// Create database
 	ldb, err := leveldb.New(mptDir, 128, 128, "sliding-test", false)
 	if err != nil {
-		t.Fatalf("创建数据库失败: %v", err)
+		t.Fatalf("Failed to create database: %v", err)
 	}
 	defer ldb.Close()
 
-	// 创建Trie数据库
+	// Create Trie database
 	diskDB := rawdb.NewDatabase(ldb)
 	trieDB := triedb.NewDatabase(diskDB, nil)
 
-	// 读取最后一个根哈希
+	// Load the last root hash
 	lastRoot, err := loadLastRoot(diskDB)
 	if err != nil {
-		t.Fatalf("读取最后一个根哈希失败: %v", err)
+		t.Fatalf("Failed to load last root hash: %v", err)
 	}
 
-	// 创建Trie
+	// Create Trie
 	tr, err := trie.New(trie.TrieID(lastRoot), trieDB)
 	if err != nil {
-		t.Fatalf("创建Trie失败: %v", err)
+		t.Fatalf("Failed to create Trie: %v", err)
 	}
 
-	// 记录每次操作的耗时
+	// Record time for each operation
 	var (
 		writeTimes  []time.Duration
 		commitTimes []time.Duration
 		rootTimes   []time.Duration
 	)
 
-	// 准备CSV数据
+	// Prepare CSV data
 	csvRecords := [][]string{
-		{"迭代", "写入耗时(ns)", "生成根耗时(ns)", "提交耗时(ns)", "根哈希"},
+		{"Iteration", "Write Time(ns)", "Root Generation Time(ns)", "Commit Time(ns)", "Root Hash"},
 	}
 
-	// 进行多次小批量写入测试
+	// Perform multiple small batch write tests
 	for i := 0; i < method2Iterations; i++ {
-		// 写入数据
+		// Write data
 		writeStart := time.Now()
 		for j := 0; j < method2BatchSize; j++ {
 			key, value := generateRandomData()
@@ -222,30 +222,30 @@ func TestMethod2(t *testing.T) {
 		writeTime := time.Since(writeStart)
 		writeTimes = append(writeTimes, writeTime)
 
-		// 生成根哈希
+		// Generate root hash
 		rootStart := time.Now()
 		root, nodes := tr.Commit(false)
 		rootTime := time.Since(rootStart)
 		rootTimes = append(rootTimes, rootTime)
 
-		// 提交到数据库
+		// Commit to database
 		commitStart := time.Now()
 		if err := trieDB.Update(root, common.Hash{}, 0, trienode.NewWithNodeSet(nodes), nil); err != nil {
-			t.Fatalf("更新数据库失败: %v", err)
+			t.Fatalf("Failed to update database: %v", err)
 		}
 		if err := trieDB.Commit(root, false); err != nil {
-			t.Fatalf("提交数据库失败: %v", err)
+			t.Fatalf("Failed to commit database: %v", err)
 		}
 
-		// 保存最后一个根哈希
+		// Save the last root hash
 		if err := saveLastRoot(diskDB, root); err != nil {
-			t.Fatalf("保存最后一个根哈希失败: %v", err)
+			t.Fatalf("Failed to save last root hash: %v", err)
 		}
 
 		commitTime := time.Since(commitStart)
 		commitTimes = append(commitTimes, commitTime)
 
-		// 将数据添加到CSV记录
+		// Add data to CSV records
 		csvRecords = append(csvRecords, []string{
 			strconv.Itoa(i + 1),
 			strconv.FormatInt(writeTime.Nanoseconds(), 10),
@@ -254,17 +254,17 @@ func TestMethod2(t *testing.T) {
 			root.Hex(),
 		})
 
-		// 创建新的Trie继续写入
+		// Create new Trie to continue writing
 		tr, err = trie.New(trie.TrieID(root), trieDB)
 		if err != nil {
-			t.Fatalf("创建新Trie失败: %v", err)
+			t.Fatalf("Failed to create new Trie: %v", err)
 		}
 
-		t.Logf("迭代 %d 完成，写入耗时: %v，生成根耗时: %v，提交耗时: %v，根哈希: %x",
+		t.Logf("Iteration %d completed, write time: %v, root generation time: %v, commit time: %v, root hash: %x",
 			i+1, writeTime, rootTime, commitTime, root)
 	}
 
-	// 计算平均耗时
+	// Calculate average time
 	var avgWrite, avgRoot, avgCommit time.Duration
 	for i := 0; i < method2Iterations; i++ {
 		avgWrite += writeTimes[i]
@@ -275,27 +275,27 @@ func TestMethod2(t *testing.T) {
 	avgRoot /= time.Duration(method2Iterations)
 	avgCommit /= time.Duration(method2Iterations)
 
-	t.Logf("方法二测试完成，平均耗时 - 写入: %v，生成根: %v，提交: %v",
+	t.Logf("Method 2 test completed, average time - write: %v, root generation: %v, commit: %v",
 		avgWrite, avgRoot, avgCommit)
 
-	// 将结果写入CSV文件
+	// Write results to CSV file
 	csvFileName := fmt.Sprintf("mpt_method2_batch%d_iter%d.csv", method2BatchSize, method2Iterations)
 	writeCSVFile(t, csvFileName, csvRecords)
 }
 
-// TestMPTProof 测试MPT树的证明功能
+// TestMPTProof tests the proof functionality of MPT tree
 func TestMPTProof(t *testing.T) {
-	// 创建内存数据库
+	// Create in-memory database
 	memDB := rawdb.NewMemoryDatabase()
 	trieDB := triedb.NewDatabase(memDB, nil)
 
-	// 创建新的MPT树
+	// Create new MPT tree
 	tr, err := trie.New(trie.TrieID(common.Hash{}), trieDB)
 	if err != nil {
-		t.Fatalf("创建新Trie失败: %v", err)
+		t.Fatalf("Failed to create new Trie: %v", err)
 	}
 
-	// 插入一些测试数据
+	// Insert some test data
 	testData := map[string]string{
 		"key1": "value1",
 		"key2": "value2",
@@ -304,156 +304,156 @@ func TestMPTProof(t *testing.T) {
 		"key5": "value5",
 	}
 
-	t.Log("开始向MPT树插入数据")
+	t.Log("Starting to insert data into MPT tree")
 	for k, v := range testData {
 		tr.Update([]byte(k), []byte(v))
 	}
 
 	root := tr.Hash()
-	//// 提交获取根哈希
+	//// Commit to get root hash
 	//root, _ := tr.Commit(false)
 	//if err := trieDB.Commit(root, false); err != nil {
-	//	t.Fatalf("提交树失败: %v", err)
+	//	t.Fatalf("Failed to commit tree: %v", err)
 	//}
-	//t.Logf("MPT树根哈希: %x", root)
+	//t.Logf("MPT tree root hash: %x", root)
 
-	// 测试证明存在的key
+	// Test proof for existing key
 	proofDB := trienode.NewProofSet()
 	key := "key3"
 
-	// 为特定key生成默克尔证明
-	t.Logf("为key '%s' 生成证明", key)
+	// Generate Merkle proof for specific key
+	t.Logf("Generating proof for key '%s'", key)
 	if err := tr.Prove([]byte(key), proofDB); err != nil {
-		t.Fatalf("生成证明失败: %v", err)
+		t.Fatalf("Failed to generate proof: %v", err)
 	}
 
-	// 验证证明
+	// Verify proof
 	value, err := trie.VerifyProof(root, []byte(key), proofDB)
 	if err != nil {
-		t.Fatalf("验证证明失败: %v", err)
+		t.Fatalf("Failed to verify proof: %v", err)
 	}
 
 	if string(value) != testData[key] {
-		t.Fatalf("验证的值不匹配，期望 %s，得到 %s", testData[key], string(value))
+		t.Fatalf("Verified value does not match, expected %s, got %s", testData[key], string(value))
 	}
-	t.Logf("成功验证key '%s' 的证明，值为: %s，大小为: %v.", key, string(value), proofDB.DataSize())
+	t.Logf("Successfully verified proof for key '%s', value: %s, size: %v.", key, string(value), proofDB.DataSize())
 
-	// 测试证明不存在的key
-	nonExistingKey := "不存在的key"
+	// Test proof for non-existing key
+	nonExistingKey := "non-existing-key"
 	proofDB = trienode.NewProofSet()
 
-	t.Logf("为不存在的key '%s' 生成证明", nonExistingKey)
+	t.Logf("Generating proof for non-existing key '%s'", nonExistingKey)
 	if err := tr.Prove([]byte(nonExistingKey), proofDB); err != nil {
-		t.Fatalf("生成不存在key的证明失败: %v", err)
+		t.Fatalf("Failed to generate proof for non-existing key: %v", err)
 	}
 
-	// 验证不存在的key的证明
+	// Verify proof for non-existing key
 	value, err = trie.VerifyProof(root, []byte(nonExistingKey), proofDB)
 	if err != nil {
-		t.Fatalf("验证不存在key的证明失败: %v", err)
+		t.Fatalf("Failed to verify proof for non-existing key: %v", err)
 	}
 
 	if value != nil {
-		t.Fatalf("不存在的key应返回nil值，但得到了: %s", string(value))
+		t.Fatalf("Non-existing key should return nil value, but got: %s", string(value))
 	}
-	t.Logf("成功验证key '%s' 不存在于树中", nonExistingKey)
+	t.Logf("Successfully verified that key '%s' does not exist in the tree", nonExistingKey)
 }
 
-// TestLargeMPTProof 测试大规模MPT树的证明功能
+// TestLargeMPTProof tests the proof functionality of large-scale MPT tree
 func TestLargeMPTProof(t *testing.T) {
-	// 测试数据量
+	// Test data volume
 	const (
-		totalItems = 10000000 // 1000万数据
+		totalItems = 10000000 // 10 million data
 	)
 
-	// 定义一系列渐进增长的证明规模
+	// Define a series of progressively increasing proof scales
 	proofSizes := []int{
 		2500,   // 2.5k
 		5000,   // 5k
-		10000,  // 1w
-		20000,  // 2w
-		40000,  // 4w
-		80000,  // 8w
-		160000, // 16w
+		10000,  // 10k
+		20000,  // 20k
+		40000,  // 40k
+		80000,  // 80k
+		160000, // 160k
 	}
 
-	// 创建内存数据库
+	// Create in-memory database
 	memDB := rawdb.NewMemoryDatabase()
 	trieDB := triedb.NewDatabase(memDB, nil)
 
-	// 创建新的MPT树
+	// Create new MPT tree
 	tr, err := trie.New(trie.TrieID(common.Hash{}), trieDB)
 	if err != nil {
-		t.Fatalf("创建新Trie失败: %v", err)
+		t.Fatalf("Failed to create new Trie: %v", err)
 	}
 
-	// 生成并插入1000万随机数据
-	t.Log("开始向MPT树插入1000万随机数据...")
+	// Generate and insert 10 million random data
+	t.Log("Starting to insert 10 million random data into MPT tree...")
 	start := time.Now()
 
-	// 保存所有键，以便后续生成证明
+	// Save all keys for subsequent proof generation
 	allKeys := make([][]byte, totalItems)
 
-	batchSize := 500000 // 每批50万数据
+	batchSize := 500000 // 500k data per batch
 	for i := 0; i < totalItems; i++ {
 		key, value := generateRandomData()
 		tr.Update(key, value)
 		allKeys[i] = key
 
-		// 每插入一批数据打印进度
+		// Print progress every batch
 		if (i+1)%batchSize == 0 {
 			elapsed := time.Since(start)
-			t.Logf("已插入 %d 条数据 (%.2f%%)，耗时: %v", i+1, float64(i+1)*100/float64(totalItems), elapsed)
+			t.Logf("Inserted %d items (%.2f%%), time taken: %v", i+1, float64(i+1)*100/float64(totalItems), elapsed)
 		}
 	}
 
 	insertTime := time.Since(start)
-	t.Logf("插入 %d 条数据完成，总耗时: %v", totalItems, insertTime)
+	t.Logf("Inserted %d items completed, total time: %v", totalItems, insertTime)
 
-	// 计算树的哈希
+	// Calculate tree hash
 	hashStart := time.Now()
 	root := tr.Hash()
 	hashTime := time.Since(hashStart)
-	t.Logf("计算MPT树根哈希完成，耗时: %v，根哈希: %x", hashTime, root)
+	t.Logf("MPT tree root hash calculation completed, time taken: %v, root hash: %x", hashTime, root)
 
-	// 随机选择不同数量的键进行证明
-	t.Log("开始生成不同数量的证明...")
+	// Randomly select different numbers of keys for proof
+	t.Log("Starting to generate proofs of different quantities...")
 
-	// 洗牌算法，随机打乱所有键
+	// Shuffle algorithm, randomly shuffle all keys
 	rand.Shuffle(len(allKeys), func(i, j int) {
 		allKeys[i], allKeys[j] = allKeys[j], allKeys[i]
 	})
 
-	// 用于存储每个规模的证明结果数据
+	// Data structure to store proof result data for each scale
 	type ProofResult struct {
-		proofCount  int           // 证明数量
-		elapsed     time.Duration // 总耗时
-		dataSize    uint64        // 数据大小
-		avgTime     time.Duration // 平均每个证明时间
-		bytesPerKey float64       // 每个证明的平均字节数
+		proofCount  int           // Number of proofs
+		elapsed     time.Duration // Total time
+		dataSize    uint64        // Data size
+		avgTime     time.Duration // Average time per proof
+		bytesPerKey float64       // Average bytes per proof
 		keyCount    uint64
 	}
 
 	results := make([]ProofResult, len(proofSizes))
 
-	// 测试不同数量的证明
+	// Test different numbers of proofs
 	for i, size := range proofSizes {
 		result := generateAndMeasureProofs(t, tr, root, allKeys[:size], size)
 		results[i] = result
 	}
 
-	// 打印汇总表格
-	t.Log("\n证明规模性能对比:")
+	// Print summary table
+	t.Log("\nProof Scale Performance Comparison:")
 	t.Log("------------------------------------------------------------------------------------------------------------------------------")
-	t.Log("  证明数量   |   总耗时    |   数据大小   |   节点数量   |  平均时间/证明  |  平均字节/证明  |  数量增长比例  |  大小增长比例  ")
+	t.Log("  Proof Count |   Total Time   |   Data Size   |   Node Count   |  Avg Time/Proof |  Avg Bytes/Proof |  Count Growth   |  Size Growth    ")
 	t.Log("------------------------------------------------------------------------------------------------------------------------------")
 
-	// 打印第一行
+	// Print first row
 	firstResult := results[0]
 	t.Logf("  %-10d |  %-10v |  %-10v |  %-10v |  %-14v |  %-14.2f |       -       |       -      ",
 		firstResult.proofCount, firstResult.elapsed, bytesToReadable(firstResult.dataSize), firstResult.keyCount,
 		firstResult.avgTime, firstResult.bytesPerKey)
-	// 打印其余行并计算增长比例
+	// Print remaining rows and calculate growth ratios
 	for i := 1; i < len(results); i++ {
 		current := results[i]
 		//previous := results[i-1]
@@ -468,70 +468,70 @@ func TestLargeMPTProof(t *testing.T) {
 	t.Log("------------------------------------------------------------------------------------------------------------------------------")
 }
 
-// TestHugeMPTProof 基于数据库的数据进行测试
+// TestHugeMPTProof tests based on database data
 func TestHugeMPTProof(t *testing.T) {
-	// 创建数据库
+	// Create database
 	ldb, err := leveldb.New(mptDir, 128, 128, "sliding-test", false)
 	if err != nil {
-		t.Fatalf("创建数据库失败: %v", err)
+		t.Fatalf("Failed to create database: %v", err)
 	}
 	defer ldb.Close()
 
 	root := common.HexToHash("0x8411668e6c14ecf88e2a79c5eaf478fd87829b0a6df3f9c7de6d02081dc57398")
 
-	// 创建Trie数据库
+	// Create Trie database
 	diskDB := rawdb.NewDatabase(ldb)
 	trieDB := triedb.NewDatabase(diskDB, nil)
 
-	// 创建新的MPT树
+	// Create new MPT tree
 	tr, err := trie.New(trie.TrieID(root), trieDB)
 	if err != nil {
-		t.Fatalf("创建新Trie失败: %v", err)
+		t.Fatalf("Failed to create new Trie: %v", err)
 	}
 
 	proofSizes := []int{12000, 20000, 40000, 80000, 160000, 240000, 320000}
 
-	// 保存所有键，以便后续生成证明
+	// Save all keys for subsequent proof generation
 	allKeys := make([][]byte, 10000000)
 	for i := 0; i < 10000000; i++ {
 		allKeys[i], _ = generateIndexData(i)
 	}
 
-	// 洗牌算法，随机打乱所有键
+	// Shuffle algorithm, randomly shuffle all keys
 	rand.Shuffle(len(allKeys), func(i, j int) {
 		allKeys[i], allKeys[j] = allKeys[j], allKeys[i]
 	})
 
-	// 用于存储每个规模的证明结果数据
+	// Data structure to store proof result data for each scale
 	type ProofResult struct {
-		proofCount  int           // 证明数量
-		elapsed     time.Duration // 总耗时
-		dataSize    uint64        // 数据大小
-		avgTime     time.Duration // 平均每个证明时间
-		bytesPerKey float64       // 每个证明的平均字节数
+		proofCount  int           // Number of proofs
+		elapsed     time.Duration // Total time
+		dataSize    uint64        // Data size
+		avgTime     time.Duration // Average time per proof
+		bytesPerKey float64       // Average bytes per proof
 		keyCount    uint64
 	}
 
 	results := make([]ProofResult, len(proofSizes))
 
-	// 测试不同数量的证明
+	// Test different numbers of proofs
 	for i, size := range proofSizes {
 		result := generateAndMeasureProofs(t, tr, root, allKeys[:size], size)
 		results[i] = result
 	}
 
-	// 打印汇总表格
-	t.Log("\n证明规模性能对比:")
+	// Print summary table
+	t.Log("\nProof Scale Performance Comparison:")
 	t.Log("------------------------------------------------------------------------------------------------------------------------------")
-	t.Log("  证明数量   |   总耗时    |   数据大小   |   节点数量   |  平均时间/证明  |  平均字节/证明  |  数量增长比例  |  大小增长比例  ")
+	t.Log("  Proof Count |   Total Time   |   Data Size   |   Node Count   |  Avg Time/Proof |  Avg Bytes/Proof |  Count Growth   |  Size Growth    ")
 	t.Log("------------------------------------------------------------------------------------------------------------------------------")
 
-	// 打印第一行
+	// Print first row
 	firstResult := results[0]
 	t.Logf("  %-10d |  %-10v |  %-10v |  %-10v |  %-14v |  %-14.2f |       -       |       -      ",
 		firstResult.proofCount, firstResult.elapsed, bytesToReadable(firstResult.dataSize), firstResult.keyCount,
 		firstResult.avgTime, firstResult.bytesPerKey)
-	// 打印其余行并计算增长比例
+	// Print remaining rows and calculate growth ratios
 	for i := 1; i < len(results); i++ {
 		current := results[i]
 		//previous := results[i-1]
@@ -546,7 +546,7 @@ func TestHugeMPTProof(t *testing.T) {
 	t.Log("------------------------------------------------------------------------------------------------------------------------------")
 }
 
-// generateAndMeasureProofs 生成特定数量的证明并测量性能
+// generateAndMeasureProofs generates proofs of specific quantity and measures performance
 func generateAndMeasureProofs(t *testing.T, tr *trie.Trie, root common.Hash, keys [][]byte, size int) struct {
 	proofCount  int
 	elapsed     time.Duration
@@ -560,22 +560,22 @@ func generateAndMeasureProofs(t *testing.T, tr *trie.Trie, root common.Hash, key
 	start := time.Now()
 	for i, key := range keys {
 		if err := tr.Prove(key, proofDB); err != nil {
-			t.Fatalf("生成证明失败: %v", err)
+			t.Fatalf("Failed to generate proof: %v", err)
 		}
 
-		// 每生成1万个证明打印一次进度
+		// Print progress every 10k proofs
 		if (i+1)%10000 == 0 {
-			t.Logf("已生成 %d/%d 个证明...", i+1, len(keys))
+			t.Logf("Generated %d/%d proofs...", i+1, len(keys))
 		}
 	}
 	elapsed := time.Since(start)
 
-	// 验证一个随机证明
+	// Verify a random proof
 	randomIndex := rand.Intn(len(keys))
 	randomKey := keys[randomIndex]
 	value, err := trie.VerifyProof(root, randomKey, proofDB)
 	if err != nil {
-		t.Fatalf("验证证明失败: %v", err)
+		t.Fatalf("Failed to verify proof: %v", err)
 	}
 
 	keyCount := uint64(proofDB.KeyCount())
@@ -584,9 +584,9 @@ func generateAndMeasureProofs(t *testing.T, tr *trie.Trie, root common.Hash, key
 	bytesPerKey := float64(dataSize) / float64(len(keys))
 
 	sizeText := formatSize(size)
-	t.Logf("生成 %s 个证明完成，总耗时: %v，平均每个: %v，证明数据总大小: %v (%.2f 字节/证明)",
+	t.Logf("Generated %s proofs completed, total time: %v, average per proof: %v, total proof data size: %v (%.2f bytes/proof)",
 		sizeText, elapsed, avgTime, bytesToReadable(dataSize), bytesPerKey)
-	t.Logf("随机验证第 %d 个证明成功，键长度: %d，值长度: %d",
+	t.Logf("Random verification of proof %d successful, key length: %d, value length: %d",
 		randomIndex, len(randomKey), len(value))
 
 	return struct {
@@ -606,7 +606,7 @@ func generateAndMeasureProofs(t *testing.T, tr *trie.Trie, root common.Hash, key
 	}
 }
 
-// formatSize 格式化数字为易读的文本
+// formatSize formats numbers into readable text
 func formatSize(size int) string {
 	if size < 1000 {
 		return fmt.Sprintf("%d", size)
@@ -617,7 +617,7 @@ func formatSize(size int) string {
 	}
 }
 
-// bytesToReadable 将字节数转换为可读格式
+// bytesToReadable converts byte count to readable format
 func bytesToReadable(bytes uint64) string {
 	const (
 		KB = 1024
