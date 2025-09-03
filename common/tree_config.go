@@ -2,6 +2,6 @@ package common
 
 const (
 	UserVerkle   = false
-	UseCacheTrie = true
+	UseCacheTrie = false
 	DebugFlag    = false
 )

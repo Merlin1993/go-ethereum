@@ -34,13 +34,13 @@ import (
 // TestCompareProcessTransactions tests processing transactions from CSV
 func TestCompareProcessTransactions(t *testing.T) {
 	// Define database paths
-	dbDir := "F:\\ethdata\\geth_compare_db_swmt"
-	statsDir := "F:\\ethdata\\compare_stats_2"
+	dbDir := "F:\\ethdata\\geth_compare_db_mpt2"
+	statsDir := "F:\\ethdata\\compare_stats_5_mpt"
 	dataDir := "E:\\ethdata"
 
 	// Specify file range, hardcoded way to specify start and end file indices
 	startFileIdx := 1 // Start file index (starting from 1)
-	endFileIdx := 1   // End file index
+	endFileIdx := 11  // End file index
 	//46147
 	var startNum uint64 = 46147
 
@@ -535,8 +535,8 @@ func TestCompareProcessTransactions(t *testing.T) {
 					data := deleteKVList.Data
 					length := len(data)
 					// Because submitting too much data at once consumes a lot of memory (verkle tree implementation issue), process in multiple batches
-					chunkSize := 5000
-					if length > 500000 {
+					chunkSize := 2000
+					if length > 100000 {
 						chunkSize = 10000
 					}
 					var newRoot = root
@@ -615,19 +615,20 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 				rootGenDuration = time.Since(rootGenStart)
 				// State commit to database phase - only commit when reaching configured interval
-				if blockNum-lastCommitBlock >= 5000 { // Commit every 1000 blocks
+				if common.UserVerkle || blockNum-lastCommitBlock >= 10 {
+					// Commit every 1000 blocks
+					commitStart := time.Now()
+					err = trieDB.Commit(root, false)
+					commitDuration = time.Since(commitStart)
+					lastCommitBlock = blockNum
 				}
-				commitStart := time.Now()
-				err = trieDB.Commit(root, false)
-				commitDuration = time.Since(commitStart)
-				lastCommitBlock = blockNum
 
 				if err != nil {
 					t.Fatalf("Failed to commit state, block %d: %v", blockNum, err)
 				}
 
 				// Flush database to avoid excessive memory usage
-				trieDB.Cap(10 * 1024 * 1024 * 1024) // 1GB memory limit
+				//trieDB.Cap(10 * 1024 * 1024 * 1024) // 1GB memory limit
 				//}
 			}
 
