@@ -278,7 +278,8 @@ func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 		blockNum: 0,
 	}
 	trie.codes = make(map[common.Hash][]byte)
-	trie.hrw = NewHeightRangeWindow(startNum, multiple, maxSize)
+	//trie.hrw = NewHeightRangeWindow(startNum, multiple, maxSize)
+	trie.hrw = NewFixedSizeHeightRangeWindow(startNum, 10, maxSize)
 	return trie
 }
 

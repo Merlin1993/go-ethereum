@@ -34,8 +34,8 @@ import (
 // TestCompareProcessTransactions tests processing transactions from CSV
 func TestCompareProcessTransactions(t *testing.T) {
 	// Define database paths
-	dbDir := "F:\\ethdata\\geth_compare_db_mpt2"
-	statsDir := "F:\\ethdata\\compare_stats_5_mpt"
+	dbDir := "F:\\ethdata\\geth_compare_db_mpt3"
+	statsDir := "F:\\ethdata\\compare_stats_6_mpt"
 	dataDir := "E:\\ethdata"
 
 	// Specify file range, hardcoded way to specify start and end file indices
@@ -331,11 +331,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 		ct := sdb.TrieDB().CacheTrie()
 		for blockNum := minBlock; blockNum <= maxBlock; blockNum++ {
-			if len(msgsByBlock[blockNum]) == 0 {
-				continue
-			}
-
-			// Counter enters new block
+			// Counter enters new block (even for blocks without transactions)
 			counter.NextBlock(blockNum)
 
 			// Get block timestamp, use default calculation method if not available
@@ -413,76 +409,79 @@ func TestCompareProcessTransactions(t *testing.T) {
 			// Use countingStateDB as vm.StateDB
 			vmenv := vm.NewEVM(blockContext, countingStateDB, params.MainnetChainConfig, vm.Config{})
 
-			for _, msg := range msgsByBlock[blockNum] {
+			// Process transactions if any exist
+			if len(msgsByBlock[blockNum]) > 0 {
+				for _, msg := range msgsByBlock[blockNum] {
 
-				// Process transaction
-				result, err := core.ApplyMessage(vmenv, msg, gp)
-				var receipt *types.Receipt
+					// Process transaction
+					result, err := core.ApplyMessage(vmenv, msg, gp)
+					var receipt *types.Receipt
 
-				// Determine if it's a contract transaction
-				isContractTx := false
-				isContractCreate := false
-				if msg.To == nil {
-					// Contract creation
-					isContractTx = true
-					isContractCreate = true
-					createContractCount++
+					// Determine if it's a contract transaction
+					isContractTx := false
+					isContractCreate := false
+					if msg.To == nil {
+						// Contract creation
+						isContractTx = true
+						isContractCreate = true
+						createContractCount++
 
-					// If transaction succeeds, record created contract address
-					if result != nil && result.ContractAddress != (common.Address{}) {
-						counter.ContractAddresses[result.ContractAddress] = true
+						// If transaction succeeds, record created contract address
+						if result != nil && result.ContractAddress != (common.Address{}) {
+							counter.ContractAddresses[result.ContractAddress] = true
+						}
+					} else if counter.ContractAddresses[*msg.To] && len(msg.Data) > 0 {
+						// Use recorded contract address to determine if it's a contract call
+						isContractTx = true
+						callContractCount++
 					}
-				} else if counter.ContractAddresses[*msg.To] && len(msg.Data) > 0 {
-					// Use recorded contract address to determine if it's a contract call
-					isContractTx = true
-					callContractCount++
-				}
 
-				if isContractTx {
-					contractTxCount++
-				}
-
-				if err != nil {
-					// Record error
-					errorCount++
-
-					// Create receipt
-					receipt = &types.Receipt{
-						Type:              types.LegacyTxType,
-						Status:            types.ReceiptStatusFailed,
-						CumulativeGasUsed: usedGas,
-						Logs:              countingStateDB.GetLogs(common.Hash{}, blockNum, common.Hash{}),
-						TxHash:            common.Hash{},
-						GasUsed:           2100,
-						BlockNumber:       big.NewInt(int64(blockNum)),
-						BlockHash:         common.Hash{},
-					}
-				} else {
-					// Transaction successful
-					successCount++
 					if isContractTx {
-						contractSuccessCount++
-						if isContractCreate {
-							createSuccessCount++
-						} else {
-							callSuccessCount++
+						contractTxCount++
+					}
+
+					if err != nil {
+						// Record error
+						errorCount++
+
+						// Create receipt
+						receipt = &types.Receipt{
+							Type:              types.LegacyTxType,
+							Status:            types.ReceiptStatusFailed,
+							CumulativeGasUsed: usedGas,
+							Logs:              countingStateDB.GetLogs(common.Hash{}, blockNum, common.Hash{}),
+							TxHash:            common.Hash{},
+							GasUsed:           2100,
+							BlockNumber:       big.NewInt(int64(blockNum)),
+							BlockHash:         common.Hash{},
+						}
+					} else {
+						// Transaction successful
+						successCount++
+						if isContractTx {
+							contractSuccessCount++
+							if isContractCreate {
+								createSuccessCount++
+							} else {
+								callSuccessCount++
+							}
+						}
+						usedGas += result.UsedGas
+
+						// Create receipt
+						receipt = &types.Receipt{
+							Type:              types.LegacyTxType,
+							Status:            types.ReceiptStatusSuccessful,
+							CumulativeGasUsed: usedGas,
+							Logs:              countingStateDB.GetLogs(common.Hash{}, blockNum, common.Hash{}),
+							TxHash:            common.Hash{},
+							GasUsed:           result.UsedGas,
+							BlockNumber:       big.NewInt(int64(blockNum)),
+							BlockHash:         common.Hash{},
 						}
 					}
-					usedGas += result.UsedGas
-
-					// Create receipt
-					receipt = &types.Receipt{
-						Type:              types.LegacyTxType,
-						Status:            types.ReceiptStatusSuccessful,
-						CumulativeGasUsed: usedGas,
-						Logs:              countingStateDB.GetLogs(common.Hash{}, blockNum, common.Hash{}),
-						TxHash:            common.Hash{},
-						GasUsed:           result.UsedGas,
-						BlockNumber:       big.NewInt(int64(blockNum)),
-						BlockHash:         common.Hash{},
-					}
+					receipts = append(receipts, receipt)
 				}
-				receipts = append(receipts, receipt)
 			}
 			processDuration := time.Since(processStart)
 
@@ -530,7 +529,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 						trieDB.CacheTrie().FinishCleanup(sBlockNum, root)
 						return
 					}
-					t.Logf("State commit started, block number:%d, \t committed:%d, start time: %s", sBlockNum, len(deleteKVList.Data), time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"))
+					//t.Logf("State commit started, block number:%d, \t committed:%d, start time: %s", sBlockNum, len(deleteKVList.Data), time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"))
 
 					data := deleteKVList.Data
 					length := len(data)
@@ -599,7 +598,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 					}
 
 					runtime.GC()
-					t.Logf("State commit completed, block number:%d, \t committed:%d, \t time:%d ", sBlockNum, len(deleteKVList.Data), commitDuration.Milliseconds())
+					//t.Logf("State commit completed, block number:%d, \t committed:%d, \t time:%d ", sBlockNum, len(deleteKVList.Data), commitDuration.Milliseconds())
 					// Flush database to avoid excessive memory usage
 					//preTrieDB.Cap(1024 * 1024 * 1024) // 1GB memory limit
 
@@ -704,53 +703,56 @@ func TestCompareProcessTransactions(t *testing.T) {
 				errorRate = float64(errorCount) / float64(len(msgsByBlock[blockNum]))
 			}
 
-			// Create block statistics
-			blockStats := CompareBlockStats{
-				BlockNum:              blockNum,
-				TransactionCount:      len(msgsByBlock[blockNum]),
-				SuccessCount:          successCount,
-				SuccessRate:           successRate,
-				ContractTxCount:       contractTxCount,
-				ContractTxPercent:     contractTxPercent,
-				ContractSuccessCount:  contractSuccessCount,
-				ContractSuccessRate:   contractSuccessRate,
-				CreateContractCount:   createContractCount,
-				CreateContractPercent: createContractPercent,
-				CreateSuccessCount:    createSuccessCount,
-				CreateSuccessRate:     createSuccessRate,
-				CallContractCount:     callContractCount,
-				CallContractPercent:   callContractPercent,
-				CallSuccessCount:      callSuccessCount,
-				CallSuccessRate:       callSuccessRate,
-				ErrorCount:            errorCount,
-				ErrorRate:             errorRate,
-				ProcessTime:           processDuration,
-				RootGenTime:           rootGenDuration,
-				CommitTime:            commitDuration,
-				TotalTime:             totalTime,
-				ProcessTimePercent:    processPercent,
-				RootGenTimePercent:    rootGenPercent,
-				UniqueReads:           counter.UniqueReads,
-				UniqueWrites:          counter.UniqueWrites,
-			}
+			// Only record statistics for blocks with transactions (maintain original behavior)
+			if len(msgsByBlock[blockNum]) > 0 {
+				// Create block statistics
+				blockStats := CompareBlockStats{
+					BlockNum:              blockNum,
+					TransactionCount:      len(msgsByBlock[blockNum]),
+					SuccessCount:          successCount,
+					SuccessRate:           successRate,
+					ContractTxCount:       contractTxCount,
+					ContractTxPercent:     contractTxPercent,
+					ContractSuccessCount:  contractSuccessCount,
+					ContractSuccessRate:   contractSuccessRate,
+					CreateContractCount:   createContractCount,
+					CreateContractPercent: createContractPercent,
+					CreateSuccessCount:    createSuccessCount,
+					CreateSuccessRate:     createSuccessRate,
+					CallContractCount:     callContractCount,
+					CallContractPercent:   callContractPercent,
+					CallSuccessCount:      callSuccessCount,
+					CallSuccessRate:       callSuccessRate,
+					ErrorCount:            errorCount,
+					ErrorRate:             errorRate,
+					ProcessTime:           processDuration,
+					RootGenTime:           rootGenDuration,
+					CommitTime:            commitDuration,
+					TotalTime:             totalTime,
+					ProcessTimePercent:    processPercent,
+					RootGenTimePercent:    rootGenPercent,
+					UniqueReads:           counter.UniqueReads,
+					UniqueWrites:          counter.UniqueWrites,
+				}
 
-			// Add to statistics aggregator
-			statsAgg.AddBlockStats(blockStats)
+				// Add to statistics aggregator
+				statsAgg.AddBlockStats(blockStats)
 
-			// Record state tree statistics
-			if common.UseCacheTrie && ct != nil {
-				// Record CacheTrie statistics
-				RecordCacheTrieStats(cacheTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
-					len(msgsByBlock[blockNum]), processDuration, rootGenDuration, ct)
+				// Record state tree statistics
+				if common.UseCacheTrie && ct != nil {
+					// Record CacheTrie statistics
+					RecordCacheTrieStats(cacheTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
+						len(msgsByBlock[blockNum]), processDuration, rootGenDuration, ct)
 
-			} else if trieDB.IsVerkle() {
-				// Record VerkleTrie statistics
-				RecordVerkleTrieStats(verkleTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
-					len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
-			} else {
-				// Record StandardTrie statistics
-				RecordTrieStats(standardTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
-					len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
+				} else if trieDB.IsVerkle() {
+					// Record VerkleTrie statistics
+					RecordVerkleTrieStats(verkleTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
+						len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
+				} else {
+					// Record StandardTrie statistics
+					RecordTrieStats(standardTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
+						len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
+				}
 			}
 		}
 		t.Logf("Completed processing file: %s", file)

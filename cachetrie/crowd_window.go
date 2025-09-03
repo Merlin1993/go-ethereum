@@ -2,6 +2,16 @@ package cachetrie
 
 // 可能需要，用于防止溢出等
 
+// WindowMode 定义窗口的运行模式
+type WindowMode int
+
+const (
+	// ModeCongestionControl 拥塞控制模式
+	ModeCongestionControl WindowMode = iota
+	// ModeFixedSize 固定大小模式
+	ModeFixedSize
+)
+
 type HeightRangeWindow struct {
 	initialSsthresh     uint64
 	currentSsthresh     uint64
@@ -15,6 +25,11 @@ type HeightRangeWindow struct {
 	logicalSize       [32]int
 
 	allSize uint64
+
+	// 新增：窗口运行模式
+	mode WindowMode
+	// 新增：固定大小模式下的固定容量
+	fixedCapacity uint64
 }
 
 // NewHeightRangeWindow 创建一个新的 HeightRangeWindow 实例。
@@ -32,12 +47,76 @@ func NewHeightRangeWindow(startNum, defaultSsthresh uint64, defaultMaxSize int) 
 		windowEndNumber:     startNum - 1,
 		firstSegmentIndex:   0,
 		maxBitAllowedSize:   defaultMaxSize / 20,
+		mode:                ModeCongestionControl, // 默认使用拥塞控制模式
 	}
 	hrw.recalculateLogicalCapacities(true)
 	return hrw
 }
 
+// NewFixedSizeHeightRangeWindow 创建一个固定大小模式的 HeightRangeWindow 实例
+// startNum: 起始区块号
+// fixedCapacity: 每个逻辑位的固定容量
+// defaultMaxSize: 最大总大小（用于兼容性）
+func NewFixedSizeHeightRangeWindow(startNum, fixedCapacity uint64, defaultMaxSize int) *HeightRangeWindow {
+	if fixedCapacity == 0 {
+		fixedCapacity = 1 // 保证容量至少为1
+	}
+	hrw := &HeightRangeWindow{
+		initialSsthresh:     1, // 固定大小模式下不需要慢启动阈值
+		currentSsthresh:     1,
+		maxTotalAllowedSize: defaultMaxSize,
+		windowStartNumber:   startNum,
+		windowEndNumber:     startNum - 1,
+		firstSegmentIndex:   0,
+		maxBitAllowedSize:   defaultMaxSize / 20,
+		mode:                ModeFixedSize,
+		fixedCapacity:       fixedCapacity,
+	}
+	hrw.recalculateLogicalCapacities(true)
+	return hrw
+}
+
+// SetMode 设置窗口的运行模式
+func (hrw *HeightRangeWindow) SetMode(mode WindowMode) {
+	hrw.mode = mode
+	if mode == ModeFixedSize && hrw.fixedCapacity == 0 {
+		hrw.fixedCapacity = 1 // 设置默认固定容量
+	}
+	hrw.recalculateLogicalCapacities(true)
+}
+
+// SetFixedCapacity 设置固定大小模式下的固定容量
+func (hrw *HeightRangeWindow) SetFixedCapacity(capacity uint64) {
+	if capacity == 0 {
+		capacity = 1
+	}
+	hrw.fixedCapacity = capacity
+	if hrw.mode == ModeFixedSize {
+		hrw.recalculateLogicalCapacities(true)
+	}
+}
+
+// GetMode 获取当前的窗口运行模式
+func (hrw *HeightRangeWindow) GetMode() WindowMode {
+	return hrw.mode
+}
+
+// GetFixedCapacity 获取固定大小模式下的固定容量
+func (hrw *HeightRangeWindow) GetFixedCapacity() uint64 {
+	return hrw.fixedCapacity
+}
+
 func (hrw *HeightRangeWindow) recalculateLogicalCapacities(slowStart bool) {
+	if hrw.mode == ModeFixedSize {
+		// 固定大小模式：所有逻辑位使用相同的固定容量
+		for i := 0; i < 32; i++ {
+			hrw.logicalCapacities[i] = hrw.fixedCapacity
+		}
+		hrw.allSize = uint64(32) * hrw.fixedCapacity
+		return
+	}
+
+	// 原有的拥塞控制逻辑
 	usedCapacity := hrw.windowEndNumber - hrw.windowStartNumber + 1
 	totalCapacity := uint64(0)
 	lastCapacity := hrw.logicalCapacities[hrw.firstSegmentIndex]
@@ -103,7 +182,14 @@ func (hrw *HeightRangeWindow) GetBitPosition(number uint64) int {
 // CheckAndTriggerCongestionControl 检查 currentUsedSize 是否超过 maxSize。
 // 如果超过，则 ssthresh 减半，重新计算窗口各段容量，并返回 true（表示需要修剪）。
 // 否则返回 false。
+// 注意：在固定大小模式下，此方法不会触发拥塞控制
 func (hrw *HeightRangeWindow) CheckAndTriggerCongestionControl(currentUsedSize int) bool {
+	// 固定大小模式下不进行拥塞控制
+	if hrw.mode == ModeFixedSize {
+		return false
+	}
+
+	// 原有的拥塞控制逻辑
 	if currentUsedSize > hrw.maxTotalAllowedSize {
 		newSsthresh := hrw.logicalCapacities[hrw.GetBitPosition(hrw.windowEndNumber)] / 2
 		if newSsthresh < 1 {
@@ -123,6 +209,15 @@ func (hrw *HeightRangeWindow) PruneWindow(numberOfLogicalBitsToPrune int) {
 		return // 无效参数或无需修剪
 	}
 
+	if hrw.mode == ModeFixedSize {
+		// 固定大小模式：直接计算修剪的容量
+		prunedTotalCapacity := uint64(numberOfLogicalBitsToPrune) * hrw.fixedCapacity
+		hrw.windowStartNumber += prunedTotalCapacity
+		hrw.firstSegmentIndex = (hrw.firstSegmentIndex + numberOfLogicalBitsToPrune) % 32
+		return
+	}
+
+	// 原有的拥塞控制逻辑
 	prunedTotalCapacity := uint64(0)
 	lastCapacity := hrw.logicalCapacities[(hrw.firstSegmentIndex+31)%32]
 	for i := 0; i < numberOfLogicalBitsToPrune; i++ {
@@ -164,6 +259,12 @@ func (hrw *HeightRangeWindow) resetLogicalSize(bit int) {
 }
 
 func (hrw *HeightRangeWindow) triggerSize(bit int) {
+	// 固定大小模式下不进行动态调整
+	if hrw.mode == ModeFixedSize {
+		return
+	}
+
+	// 原有的拥塞控制逻辑
 	if hrw.logicalSize[bit] > hrw.maxBitAllowedSize {
 		hrw.recalculateLogicalCapacities(false)
 	}
