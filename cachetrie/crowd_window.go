@@ -186,6 +186,9 @@ func (hrw *HeightRangeWindow) GetBitPosition(number uint64) int {
 func (hrw *HeightRangeWindow) CheckAndTriggerCongestionControl(currentUsedSize int) bool {
 	// 固定大小模式下不进行拥塞控制
 	if hrw.mode == ModeFixedSize {
+		if currentUsedSize > hrw.maxTotalAllowedSize {
+			return true
+		}
 		return false
 	}
 
@@ -212,7 +215,11 @@ func (hrw *HeightRangeWindow) PruneWindow(numberOfLogicalBitsToPrune int) {
 	if hrw.mode == ModeFixedSize {
 		// 固定大小模式：直接计算修剪的容量
 		prunedTotalCapacity := uint64(numberOfLogicalBitsToPrune) * hrw.fixedCapacity
-		hrw.windowStartNumber += prunedTotalCapacity
+		if hrw.windowEndNumber-hrw.windowStartNumber < hrw.fixedCapacity {
+			hrw.windowStartNumber = hrw.windowEndNumber + 1
+		} else {
+			hrw.windowStartNumber += prunedTotalCapacity
+		}
 		hrw.firstSegmentIndex = (hrw.firstSegmentIndex + numberOfLogicalBitsToPrune) % 32
 		return
 	}

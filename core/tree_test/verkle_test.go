@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,7 +40,8 @@ func TestVerkleMethod1(t *testing.T) {
 	// 创建Trie数据库
 	cacheConfig := core.DefaultCacheConfigWithScheme(rawdb.PathScheme)
 	cacheConfig.SnapshotLimit = 0
-	diskDB := rawdb.NewDatabase(ldb)
+	mdb := ethdb.WrapWithStats(ldb)
+	diskDB := rawdb.NewDatabase(mdb)
 	trieDB := triedb.NewDatabase(diskDB, cacheConfig.TriedbConfig(true))
 
 	// 读取最后一个根哈希
@@ -105,9 +107,10 @@ func TestVerkleMethod1(t *testing.T) {
 		if err != nil {
 			t.Fatalf("创建新Verkle Trie失败: %v", err)
 		}
-
+		as := mdb.Stats()
+		mdb.ResetStats()
 		batchTime := time.Since(batchStart)
-		t.Logf("批次 %d-%d 完成，耗时: %v，根哈希: %x", i, i+batchSize, batchTime, root)
+		t.Logf("批次 %d-%d 完成，耗时: %v，根哈希: %x,%s", i, i+batchSize, batchTime, root, as.String())
 	}
 
 	totalTime := time.Since(totalStart)

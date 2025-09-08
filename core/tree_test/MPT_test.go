@@ -111,7 +111,9 @@ func TestMethod1(t *testing.T) {
 	defer ldb.Close()
 
 	// Create Trie database
-	diskDB := rawdb.NewDatabase(ldb)
+
+	mdb := ethdb.WrapWithStats(ldb)
+	diskDB := rawdb.NewDatabase(mdb)
 	trieDB := triedb.NewDatabase(diskDB, nil)
 
 	// Load the last root hash
@@ -154,7 +156,8 @@ func TestMethod1(t *testing.T) {
 		if err := trieDB.Commit(root, false); err != nil {
 			t.Fatalf("Failed to commit database: %v", err)
 		}
-
+		as := mdb.Stats()
+		mdb.ResetStats()
 		// Save the last root hash
 		if err := saveLastRoot(diskDB, root); err != nil {
 			t.Fatalf("Failed to save last root hash: %v", err)
@@ -167,7 +170,7 @@ func TestMethod1(t *testing.T) {
 		}
 
 		batchTime := time.Since(batchStart)
-		t.Logf("Batch %d-%d completed, time taken: %v, root hash: %x", i, i+batchSize, batchTime, root)
+		t.Logf("Batch %d-%d completed, time taken: %v, root hash: %x ,%s", i, i+batchSize, batchTime, root, as.String())
 	}
 
 	totalTime := time.Since(totalStart)
