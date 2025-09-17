@@ -279,17 +279,51 @@ func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 	}
 	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewHeightRangeWindow(startNum, multiple, maxSize)
-	//trie.hrw = NewFixedSizeHeightRangeWindow(startNum, multiple, maxSize)
 	return trie
 }
 
-func NewFixedCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
+// NewFixedSizeCacheTrie 创建一个固定大小模式的缓存树实例
+// 参数：
+//   - startNum: 起始区块号，表示窗口的起始位置
+//   - fixedCapacity: 每个逻辑位的固定容量
+//   - maxSize: 最大缓存键值对数量，0表示无限制
+func NewFixedSizeCacheTrie(startNum, fixedCapacity uint64, maxSize int) *CacheTrie {
 	trie := &CacheTrie{
 		blockNum: 0,
 	}
 	trie.codes = make(map[common.Hash][]byte)
-	trie.hrw = NewFixedSizeHeightRangeWindow(startNum, multiple, maxSize)
+	trie.hrw = NewFixedSizeHeightRangeWindow(startNum, fixedCapacity, maxSize)
 	return trie
+}
+
+// SetWindowMode 设置窗口的运行模式
+func (t *CacheTrie) SetWindowMode(mode WindowMode) {
+	if t.hrw != nil {
+		t.hrw.SetMode(mode)
+	}
+}
+
+// SetFixedCapacity 设置固定大小模式下的固定容量
+func (t *CacheTrie) SetFixedCapacity(capacity uint64) {
+	if t.hrw != nil {
+		t.hrw.SetFixedCapacity(capacity)
+	}
+}
+
+// GetWindowMode 获取当前的窗口运行模式
+func (t *CacheTrie) GetWindowMode() WindowMode {
+	if t.hrw != nil {
+		return t.hrw.GetMode()
+	}
+	return ModeCongestionControl
+}
+
+// GetFixedCapacity 获取固定大小模式下的固定容量
+func (t *CacheTrie) GetFixedCapacity() uint64 {
+	if t.hrw != nil {
+		return t.hrw.GetFixedCapacity()
+	}
+	return 0
 }
 
 // SetBlockNum 更新CacheTrie的当前区块高度
