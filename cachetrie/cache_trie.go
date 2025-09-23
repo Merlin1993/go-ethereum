@@ -34,7 +34,7 @@ import (
 // EmptyRoot是一个特殊的根哈希，表示空树
 var EmptyRoot = common.HexToHash("56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 
-const WindowLeft = 4
+const WindowLeft = 2
 
 // -----------------------------------------------------------------------------
 // 数据结构定义
@@ -81,6 +81,9 @@ type CacheTrie struct {
 	updateMissCount uint64     // Update/UpdateWithAddress 操作未命中次数（插入新键）
 	statsMu         sync.Mutex // 统计操作的互斥锁
 
+	// 并行处理相关
+	parallelism     int // 并行度，1表示不并行，>1表示使用多线程
+	parallelSizeThr int // 并行处理的节点大小阈值，只有当节点size大于此值时才考虑并行
 }
 
 // -----------------------------------------------------------------------------
@@ -275,7 +278,9 @@ func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (c
 //   - maxSize: 最大缓存键值对数量，0表示无限制
 func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 	trie := &CacheTrie{
-		blockNum: 0,
+		blockNum:        0,
+		parallelism:     1,    // 默认不并行
+		parallelSizeThr: 5000, // 默认节点大小阈值
 	}
 	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewHeightRangeWindow(startNum, multiple, maxSize)
@@ -289,7 +294,9 @@ func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 //   - maxSize: 最大缓存键值对数量，0表示无限制
 func NewFixedSizeCacheTrie(startNum, fixedCapacity uint64, maxSize int) *CacheTrie {
 	trie := &CacheTrie{
-		blockNum: 0,
+		blockNum:        0,
+		parallelism:     1,   // 默认不并行
+		parallelSizeThr: 100, // 默认节点大小阈值
 	}
 	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewFixedSizeHeightRangeWindow(startNum, fixedCapacity, maxSize)
@@ -542,11 +549,11 @@ var CleanupTime time.Duration
 // pruneCache清理不常用的缓存节点
 // 返回在清理过程中删除的键值对列表
 func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
+
 	// 计算当前window的可用位数
 	// 当前位置表示已经使用了多少位
 	windowBits := t.hrw.getWindowPosition()
 
-	// 判断是否需要清理
 	needStartPrune := false
 	doPrune := false
 
@@ -563,7 +570,7 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 
 	} else {
 		// 条件1：当window的位数只剩下WindowLeft bit，触发清理
-		if windowBits <= WindowLeft-2 {
+		if windowBits <= 1 {
 			needStartPrune = true
 		}
 
@@ -577,26 +584,39 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 	if !needStartPrune && !doPrune {
 		return nil, common.Hash{}
 	}
+
+	// 总体计时开始
+	//totalStartTime := time.Now()
+	//windowCalculateDuration := time.Since(totalStartTime)
+	//fmt.Printf("[PruneCache] 窗口位置计算耗时: %v, 当前窗口位数: %d\n", windowCalculateDuration, windowBits)
 	//当需要进行裁剪时，务必先获取锁, 能获取到，说明当前已无缓存，可以进行。如果不能获取到，说明还存在数据，此时不可以直接处理。
+	//startCleanupStart := time.Now()
 	t.startCleanup()
+	//startCleanupDuration := time.Since(startCleanupStart)
+	//fmt.Printf("[PruneCache] startCleanup耗时: %v\n", startCleanupDuration)
 
 	//如果需要进行删除操作，先删除，再裁剪
 	if doPrune {
+		//pruneNodeStart := time.Now()
 		resultHash = t.GetCleanupResult()
-		//fmt.Println(fmt.Sprintf("start prune node : %v , window : %v ,sshresh : %v， result： %v ", t.root.size(), windowBits, t.hrw.currentSsthresh, resultHash))
 		t.pruneNode()
+		//pruneNodeDuration := time.Since(pruneNodeStart)
+		//fmt.Printf("[PruneCache] pruneNode操作耗时: %v, resultHash: %s\n", pruneNodeDuration, resultHash.Hex())
 	}
-	//fmt.Println(fmt.Sprintf("start prune, size : %v , window end : %v ,sshresh : %v ", t.root.size(), t.hrw.getWindowPosition(), t.hrw.currentSsthresh))
 
 	// 记录清理开始时间
-	startTime := time.Now()
+	//loopStartTime := time.Now()
 
 	// 执行循环操作，直到根节点size数量小于80%的maxSize且window位数等于8bit
 	// 使用2/3作为阈值
+	//targetSizeCalculateStart := time.Now()
 	targetSize := t.hrw.maxTotalAllowedSize * 90 / 100
 	if targetSize <= 0 {
 		targetSize = 1 // 确保至少有一个目标大小
 	}
+	//targetSizeCalculateDuration := time.Since(targetSizeCalculateStart)
+	//fmt.Printf("[PruneCache] 目标大小计算耗时: %v, targetSize: %d\n", targetSizeCalculateDuration, targetSize)
+
 	deleteKVList := &DeleteKVList{
 		Data:     make([]*DeleteKV, 0),
 		BlockNum: t.blockNum, // 设置当前区块号
@@ -604,10 +624,20 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 	bitCount := 0
 	// 找到最低一位的缓存窗口（即最早的缓存）
 	lowestBit := t.hrw.firstSegmentIndex
+
 	// 循环直到满足条件
+	iterationCount := 0
+	totalFindNodeTime := time.Duration(0)
 	for {
+		iterationCount++
+
 		// 检查是否已经满足条件：size小于目标值，且window位数大于等于12bit
-		if t.root == nil || ((t.root.size()-len(deleteKVList.Data) <= targetSize) && windowBits >= WindowLeft) {
+		//conditionCheckStart := time.Now()
+		shouldBreak := t.root == nil || ((t.root.size()-len(deleteKVList.Data) <= targetSize) && windowBits >= WindowLeft)
+		//conditionCheckDur := time.Since(conditionCheckStart)
+
+		if shouldBreak {
+			//fmt.Printf("[PruneCache] 循环条件检查耗时: %v, 满足退出条件，迭代次数: %d\n", conditionCheckDur, iterationCount)
 			break
 		}
 
@@ -615,7 +645,15 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 		//	t.root.size()
 		//}
 		// 从根节点递归查找所有节点，对于所有最低一位的叶子节点进行查找
+		findNodeStart := time.Now()
 		t.findNodeAtBit(t.root, (lowestBit+bitCount)%32, deleteKVList)
+		findNodeDuration := time.Since(findNodeStart)
+		totalFindNodeTime += findNodeDuration
+
+		if iterationCount <= 10 || iterationCount%100 == 0 { // 只打印前10次或每100次
+			//fmt.Printf("[PruneCache] 第%d次迭代 findNodeAtBit耗时: %v, bit: %d, 当前deleteKVList大小: %d, totalList: %d\n",
+			//	iterationCount, findNodeDuration, (lowestBit+bitCount)%32, len(deleteKVList.Data), t.root.size())
+		}
 
 		bitCount++
 
@@ -624,12 +662,22 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 	}
 	t.pruneBitCount = bitCount
 
+	//loopDuration := time.Since(loopStartTime)
+	//fmt.Printf("[PruneCache] 主循环总耗时: %v, 迭代次数: %d, 平均每次迭代: %v\n",
+	//	loopDuration, iterationCount, loopDuration/time.Duration(iterationCount))
+	//fmt.Printf("[PruneCache] findNodeAtBit总耗时: %v, 平均每次: %v\n",
+	//	totalFindNodeTime, totalFindNodeTime/time.Duration(iterationCount))
+
 	// 计算清理时间并更新统计
-	CleanupTime = time.Since(startTime)
+	//CleanupTime = time.Since(loopStartTime)
 	t.totalCleanupTime += CleanupTime
 	if CleanupTime > t.maxCleanupTime {
 		t.maxCleanupTime = CleanupTime
 	}
+
+	//totalDuration := time.Since(totalStartTime)
+	//fmt.Printf("[PruneCache] 清理完成，总耗时: %v, 删除的KV数量: %d, bitCount: %d\n",
+	//	totalDuration, len(deleteKVList.Data), bitCount)
 
 	return deleteKVList, resultHash
 }
@@ -647,21 +695,26 @@ func (t *CacheTrie) pruneNode() {
 	if bitCount > 0 {
 		//fmt.Println("prune node")
 	}
-	for bitCount > 0 {
-		if t.root == nil {
-			break
-		}
 
-		// 找到最低一位的缓存窗口（即最早的缓存）
+	if bitCount > 0 && t.root != nil {
+		// 构建要删除的位掩码
 		lowestBit := t.hrw.firstSegmentIndex
-		// 从根节点递归查找所有节点，对于所有最低一位的叶子节点进行实际的删除
-		if t.root != nil {
-			t.hrw.resetLogicalSize(lowestBit)
-			t.root = t.pruneNodeAtBit(t.root, lowestBit)
+		bitMask := 0
+		for i := 0; i < bitCount; i++ {
+			bitMask |= (1 << ((lowestBit + i) % 32))
 		}
 
-		t.hrw.PruneWindow(1)
-		bitCount--
+		// 批量删除多个位
+		t.root = t.PruneNodeAtBits(t.root, bitMask)
+
+		// 清零对应的位大小计数
+		for i := 0; i < bitCount; i++ {
+			bit := (lowestBit + i) % 32
+			t.hrw.resetLogicalSize(bit)
+		}
+
+		// 批量裁剪窗口
+		t.hrw.PruneWindow(bitCount)
 	}
 	t.pruneBitCount = 0
 }
@@ -671,6 +724,15 @@ func (t *CacheTrie) findNodeAtBit(n cacheNode, bit int, deleteKVList *DeleteKVLi
 	if n == nil {
 		return
 	}
+
+	// 优化：如果当前节点的window与查找的bit没有交集，直接返回
+	if (n.window() & (1 << bit)) == 0 {
+		return
+	}
+
+	// 检查是否需要并行处理
+	nodeSize := n.size()
+	shouldParallel := t.parallelism > 1 && nodeSize > t.parallelSizeThr
 
 	//首先需要向下查找。
 	switch node := n.(type) {
@@ -701,10 +763,53 @@ func (t *CacheTrie) findNodeAtBit(n cacheNode, bit int, deleteKVList *DeleteKVLi
 		// 检查这个节点是否有指定的位设置
 		if (node.window() & (1 << bit)) != 0 {
 			// 对所有子节点递归处理
-			for i := 0; i < 16; i++ {
-				if node.Children[i] != nil {
-					// 递归处理子节点
-					t.findNodeAtBit(node.Children[i], bit, deleteKVList)
+			if shouldParallel {
+				// 并行处理
+				var wg sync.WaitGroup
+				// 创建一个互斥锁保护deleteKVList
+				var mu sync.Mutex
+				// 创建一个通道控制并发数量
+				semaphore := make(chan struct{}, t.parallelism)
+
+				for i := 0; i < 16; i++ {
+					if node.Children[i] != nil {
+						// 检查子节点大小，只有足够大的子节点才并行处理
+						childSize := node.Children[i].size()
+						if childSize > t.parallelSizeThr/16 { // 子节点阈值可以适当降低
+							wg.Add(1)
+							semaphore <- struct{}{} // 获取信号量
+							childNode := node.Children[i]
+							go func() {
+								defer wg.Done()
+								defer func() { <-semaphore }() // 释放信号量
+
+								// 创建临时结果列表
+								tempList := &DeleteKVList{Data: make([]*DeleteKV, 0)}
+								// 递归处理子节点
+								t.findNodeAtBit(childNode, bit, tempList)
+
+								// 合并结果
+								if len(tempList.Data) > 0 {
+									mu.Lock()
+									deleteKVList.Data = append(deleteKVList.Data, tempList.Data...)
+									mu.Unlock()
+								}
+							}()
+						} else {
+							// 小节点直接串行处理
+							t.findNodeAtBit(node.Children[i], bit, deleteKVList)
+						}
+					}
+				}
+				// 等待所有goroutine完成
+				wg.Wait()
+			} else {
+				// 串行处理
+				for i := 0; i < 16; i++ {
+					if node.Children[i] != nil {
+						// 递归处理子节点
+						t.findNodeAtBit(node.Children[i], bit, deleteKVList)
+					}
 				}
 			}
 		}
@@ -777,6 +882,181 @@ func (t *CacheTrie) pruneNodeAtBit(n cacheNode, bit int) cacheNode {
 		return node
 	}
 	return n
+}
+
+// PruneNodeAtBits 同时删除多个bit的节点
+// bitMask: 要删除的位组合的位掩码
+func (t *CacheTrie) PruneNodeAtBits(n cacheNode, bitMask int) cacheNode {
+	if n == nil {
+		return nil
+	}
+
+	// ----- 父层快速剪枝：不相交/全覆盖 -----
+	w := n.window()
+	if (w & bitMask) == 0 {
+		// 与 bitMask 无交集，整棵子树保持不变
+		return n
+	}
+	if (w &^ bitMask) == 0 {
+		// 被 bitMask 完全覆盖，整棵子树直接删除
+		return nil
+	}
+
+	switch node := n.(type) {
+	case *ShortNode:
+		// 与 bitMask 相交才会走到这里（上面已过滤无交集）
+		if _, isLeaf := node.Val.(ValueNode); isLeaf {
+			// 你的原始逻辑：叶子命中就删
+			return nil
+		}
+
+		// 仅当子节点与 bitMask 有交集时才递归
+		child := node.Val
+		cw := child.window()
+		if (cw & bitMask) == 0 {
+			return node // 子节点无交集，不用动
+		}
+		if (cw &^ bitMask) == 0 {
+			// 子节点被完全覆盖，直接删
+			return nil
+		}
+
+		newVal := t.PruneNodeAtBits(child, bitMask)
+		if newVal == nil {
+			return nil
+		}
+		node.Val = newVal
+		node.updateFlag(bitMask) // 保持你的更新方式
+		return node
+
+	case *FullNode:
+		// 检查是否需要并行处理
+		parallelProcess := false
+		if t.parallelism > 1 && n.size() > t.parallelSizeThr {
+			// 检查是否有足够大的子节点需要并行处理
+			largeChildrenCount := 0
+			for i := 0; i < 16; i++ {
+				c := node.Children[i]
+				if c != nil && c.size() > t.parallelSizeThr/16 {
+					largeChildrenCount++
+				}
+			}
+			// 只有当有多个大子节点时才并行处理
+			parallelProcess = largeChildrenCount >= 2
+		}
+
+		if parallelProcess {
+			// 并行处理子节点
+			var wg sync.WaitGroup
+			results := make([]cacheNode, 16)
+			sem := make(chan struct{}, t.parallelism) // 信号量控制并发数
+
+			for i := 0; i < 16; i++ {
+				c := node.Children[i]
+				if c == nil {
+					continue
+				}
+				cw := c.window()
+				if (cw & bitMask) == 0 {
+					// 子树无交集，保留
+					results[i] = c
+					continue
+				}
+				if (cw &^ bitMask) == 0 {
+					// 子树被完全覆盖，直接删除
+					results[i] = nil
+					continue
+				}
+
+				// 部分命中才递归，并且并行处理
+				wg.Add(1)
+				index := i        // 捕获循环变量
+				child := c        // 捕获循环变量
+				sem <- struct{}{} // 获取信号量
+				go func() {
+					defer func() {
+						<-sem // 释放信号量
+						wg.Done()
+					}()
+					results[index] = t.PruneNodeAtBits(child, bitMask)
+				}()
+			}
+
+			// 等待所有子节点处理完成
+			wg.Wait()
+
+			// 合并结果
+			allNil := true
+			for i := 0; i < 16; i++ {
+				node.Children[i] = results[i]
+				if node.Children[i] != nil {
+					allNil = false
+				}
+			}
+
+			if allNil {
+				return nil
+			}
+			node.updateFlag(bitMask)
+			return node
+		} else {
+			// 串行处理子节点
+			allNil := true
+			for i := 0; i < 16; i++ {
+				c := node.Children[i]
+				if c == nil {
+					continue
+				}
+				cw := c.window()
+				if (cw & bitMask) == 0 {
+					// 子树无交集，保留
+					allNil = false
+					continue
+				}
+				if (cw &^ bitMask) == 0 {
+					// 子树被完全覆盖，直接删除
+					node.Children[i] = nil
+					continue
+				}
+
+				// 部分命中才递归
+				node.Children[i] = t.PruneNodeAtBits(c, bitMask)
+				if node.Children[i] != nil {
+					allNil = false
+				}
+			}
+
+			if allNil {
+				return nil
+			}
+			node.updateFlag(bitMask)
+			return node
+		}
+	}
+
+	return n
+}
+
+// 示例：使用PruneNodeAtBits同时删除多个bit
+func (t *CacheTrie) ExamplePruneMultipleBits() {
+	// 假设需要删除位0、2、5
+	bitMask := (1 << 0) | (1 << 2) | (1 << 5)
+
+	// 同时删除这些位对应的节点
+	if t.root != nil {
+		t.root = t.PruneNodeAtBits(t.root, bitMask)
+	}
+
+	// 清理对应的统计信息
+	for i := 0; i < 32; i++ {
+		if (bitMask & (1 << i)) != 0 {
+			t.hrw.resetLogicalSize(i)
+		}
+	}
+
+	// 同时裁剪多个窗口位
+	// 注意：这里需要根据实际的位数量进行调整
+	// t.hrw.PruneWindow(bitCount)
 }
 
 // insert 是Update的内部实现，递归插入键值
@@ -1150,9 +1430,9 @@ func (h *HeightRangeWindow) GetAllSize() int {
 	return int(h.allSize)
 }
 
-// 为 HeightRangeWindow 添加 GetThreshold 方法
+// 这里采用已使用的所有窗口的平均大小
 func (h *HeightRangeWindow) GetThreshold() int {
-	return int(h.currentSsthresh)
+	return int(h.windowEndNumber-h.windowStartNumber) / (32 - h.getWindowPosition())
 }
 
 // 获取自定义统计
@@ -1170,4 +1450,18 @@ func (t *CacheTrie) GetPruneNodeAtBitDuration() time.Duration {
 
 func (t *CacheTrie) GetPruneNodeAtBitMaxDuration() time.Duration {
 	return t.pruneNodeAtBitMaxDuration
+}
+
+// SetParallelism 设置并行处理的配置
+// parallelism: 并行度，1表示不并行，大于1表示使用多线程
+// sizeThr: 并行处理的节点大小阈值，只有当节点size大于此值时才考虑并行
+func (t *CacheTrie) SetParallelism(parallelism int, sizeThr int) {
+	t.parallelism = parallelism
+	if parallelism < 1 {
+		t.parallelism = 1 // 确保至少为1
+	}
+	t.parallelSizeThr = sizeThr
+	if sizeThr < 1 {
+		t.parallelSizeThr = 1 // 确保至少为1
+	}
 }

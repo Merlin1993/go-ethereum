@@ -18,30 +18,39 @@ const (
 	ModeGradual10                  // Mode 3: Every 200 writes increases by 10% (not compound)
 )
 
+// 实现10-20倍的增长，也就是（n+1）*300*10,然后状态还是5000，maxsize还是100w。fixed考虑20是刚刚好，5000的话固定是6最好，20也能接受，所以差的区间是小于5和大于20.
+// 为什么是5000
+// 为什么是20倍 --- 需要运行，找到最大点
+// 为什么是300个一增长 --- 1小时的区块数？
 func TestCachePerformance(t *testing.T) {
 	stateCount := 5000
-	iterationCount := 4000 // Statistics loop count
-	maxSize := 1000000     // Initial storage size limit
-	windowMultiple := 256
+	iterationCount := 10000 // Statistics loop count
+	maxSize := 1000000      // Initial storage size limit
+	windowMultiple := 1024
 	// Test normal mode
 	t.Run(fmt.Sprintf("NormalMode_StateCount_%d", stateCount), func(t *testing.T) {
-		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeNormal)
+		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeNormal, 20)
 	})
+
 	//
 	// Test mode 1: Spike 10x mode
-	t.Run(fmt.Sprintf("Spike10xMode_StateCount_%d", stateCount), func(t *testing.T) {
-		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeSpike10x)
-	})
+	//t.Run(fmt.Sprintf("Spike10xMode_StateCount_%d", stateCount), func(t *testing.T) {
+	//	testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeSpike10x, 0)
+	//})
 
-	// Test mode 2: Spike 2x mode
-	t.Run(fmt.Sprintf("Spike2xMode_StateCount_%d", stateCount), func(t *testing.T) {
-		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeSpike2x)
-	})
+	//// Test mode 2: Spike 2x mode
+	//t.Run(fmt.Sprintf("Spike2xMode_StateCount_%d", stateCount), func(t *testing.T) {
+	//	testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeSpike2x, 0)
+	//})
 
-	// Test mode 3: Gradual 10% mode
-	t.Run(fmt.Sprintf("Gradual10pMode_StateCount_%d", stateCount), func(t *testing.T) {
-		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeGradual10)
-	})
+	//Test mode 3: Gradual 10% mode
+	//t.Run(fmt.Sprintf("Gradual10pMode_StateCount_%d", stateCount), func(t *testing.T) {
+	//	testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeGradual10, 0)
+	//})
+
+	//t.Run(fmt.Sprintf("Gradual10pMode_StateCount_%d", stateCount), func(t *testing.T) {
+	//	testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeGradual10, 5)
+	//})
 }
 
 // Calculate the write intensity multiplier for current iteration
@@ -65,20 +74,29 @@ func calculateWriteIntensity(iteration, baseStateCount int, mode WriteMode) int 
 		return 100
 	case ModeGradual10:
 		// Every 200 writes increases by 10% (not compound)
-		cycles := iteration / 400
-		return 100 + cycles*20
+		//原实验
+		//cycles := iteration / 400
+		//return 100 + cycles*10
+		cycles := iteration / 300
+		return 100 + (cycles-9)*10
 	default:
 		return 100
 	}
 }
 
 // testCacheTrieWithStateCount performs CacheTrie test with specified state count
-func testCacheTrieWithData(t *testing.T, stateCount, iterationCount, windowMultiple, maxSize int, mod WriteMode) {
+func testCacheTrieWithData(t *testing.T, stateCount, iterationCount, windowMultiple, maxSize int, mod WriteMode, fixed uint32) {
 	t.Logf("Starting test: Single write state count=%d, Statistics loop count=%d, Initial storage size=%d", stateCount, iterationCount, maxSize)
 
 	// Create CacheTrie instance
-	cacheTrie := NewCacheTrie(startBlockNum, uint64(windowMultiple), maxSize)
+	//cacheTrie := NewCacheTrie(startBlockNum, uint64(windowMultiple), maxSize)
+	var cacheTrie *CacheTrie
+	if fixed > 0 {
+		cacheTrie = NewFixedSizeCacheTrie(startBlockNum, uint64(fixed), maxSize)
+	} else {
+		cacheTrie = NewCacheTrie(startBlockNum, uint64(windowMultiple), maxSize)
 
+	}
 	// Warmup phase - execute until first cleanup
 	t.Log("Starting warmup phase...")
 	preWarmupStartTime := time.Now()
@@ -191,8 +209,8 @@ func testCacheTrieWithData(t *testing.T, stateCount, iterationCount, windowMulti
 		// Get hash, this triggers cleanup mechanism
 		hashStart := time.Now()
 		hash, _, kvList := cacheTrie.Hash()
-		// This operation doesn't affect hash value, so it can be done later
-		hashTime := time.Since(hashStart) - CleanupTime
+		// Record the total hash time (including cleanup)
+		hashTime := time.Since(hashStart)
 		CleanupTime = 0
 
 		if kvList != nil {
@@ -217,11 +235,11 @@ func testCacheTrieWithData(t *testing.T, stateCount, iterationCount, windowMulti
 		}
 
 		// Calculate write speed (states/second)
-		writeSpeed := float64(stateCount) / writeTime.Seconds()
+		writeSpeed := float64(newStateCount) / writeTime.Seconds()
 
 		// Get current size and threshold
 		currentSize := cacheTrie.GetSize()
-		currentThreshold := cacheTrie.GetHRW().GetAllSize()
+		currentThreshold := cacheTrie.GetHRW().GetThreshold()
 
 		cleanSize := 0
 		if kvList != nil && len(kvList.Data) > 0 {
@@ -257,8 +275,10 @@ func testCacheTrieWithData(t *testing.T, stateCount, iterationCount, windowMulti
 			cleanupStatus = fmt.Sprintf("Occurred, duration: %v", cleanupTime)
 		}
 
-		t.Logf("Iteration %d/%d: Write time=%v, Speed=%.2f states/sec, Hash time=%v, Size=%d, Threshold=%d, Cleanup: %s",
-			i+1, iterationCount, writeTime, writeSpeed, hashTime.String(), currentSize, currentThreshold, cleanupStatus)
+		if cleanupStatus != "None" {
+			t.Logf("Iteration %d/%d: Write time=%v, Speed=%.2f states/sec, Hash time=%v, Size=%d, Threshold=%d, Cleanup: %s",
+				i+1, iterationCount, writeTime, writeSpeed, hashTime.String(), currentSize, currentThreshold, cleanupStatus)
+		}
 	}
 
 	// Calculate average statistics
@@ -311,8 +331,12 @@ func testCacheTrieWithData(t *testing.T, stateCount, iterationCount, windowMulti
 	t.Logf("Memory usage: %d bytes (%.2f MB)", memSize, float64(memSize)/(1024*1024))
 
 	// Write results to CSV file
-	csvFileName := fmt.Sprintf("cacheTrie_states%d_iter%d_window%d_maxsize%d_mod%d.csv",
+	var csvFileName = fmt.Sprintf("cacheTrie_states%d_iter%d_window%d_maxsize%d_mod%d_c2.csv",
 		stateCount, iterationCount, windowMultiple, maxSize, mod)
+	if fixed > 0 {
+		csvFileName = fmt.Sprintf("cacheTrie_states%d_iter%d_window%d_maxsize%d_mod%d_f2_%d.csv",
+			stateCount, iterationCount, windowMultiple, maxSize, mod, fixed)
+	}
 	writeCSVFile(t, csvFileName, csvRecords)
 
 	// Add summary statistics to summary CSV

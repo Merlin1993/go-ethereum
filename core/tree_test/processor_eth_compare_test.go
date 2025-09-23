@@ -31,16 +31,111 @@ import (
 	"encoding/csv"
 )
 
+// 写入尖峰检测相关全局变量
+var (
+	// 记录最近100个区块的写入量
+	recentBlockWrites = make([]int, 0, 100)
+	// 是否处于尖峰状态
+	inSpikeState bool
+	// 尖峰开始的区块号
+	spikeStartBlock uint64
+	// 尖峰开始的时间
+	spikeStartTime time.Time
+	// 尖峰期间的区块数
+	spikeBlockCount int
+	// 尖峰期间的总写入量
+	spikeTotalWrites int
+	// 尖峰期间的最大写入量
+	spikeMaxWrites int
+	// 尖峰前的平均写入量
+	preSpikeMeanWrites float64
+)
+
+// 检测写入尖峰
+func detectWriteSpike(blockNum uint64, uniqueWrites int, t *testing.T) {
+	// 如果当前处于尖峰状态
+	if inSpikeState {
+		// 更新尖峰统计信息
+		spikeBlockCount++
+		spikeTotalWrites += uniqueWrites
+		if uniqueWrites > spikeMaxWrites {
+			spikeMaxWrites = uniqueWrites
+		}
+
+		// 检查尖峰是否结束（当写入量降至平均值的10倍以下）
+		if float64(uniqueWrites) < preSpikeMeanWrites*10.0 {
+			// 尖峰结束，输出统计信息
+			avgSpikeWrites := float64(spikeTotalWrites) / float64(spikeBlockCount)
+			avgSpikeRatio := avgSpikeWrites / preSpikeMeanWrites
+			maxSpikeRatio := float64(spikeMaxWrites) / preSpikeMeanWrites
+
+			// 输出尖峰统计信息
+			t.Logf("写入尖峰事件结束，开始区块: %d, 结束区块: %d, 持续区块数: %d, 平均写入量: %.2f, 平均倍数: %.2f, 最大倍数: %.2f, 开始时间: %s, 结束时间: %s",
+				spikeStartBlock,
+				blockNum,
+				spikeBlockCount,
+				avgSpikeWrites,
+				avgSpikeRatio,
+				maxSpikeRatio,
+				spikeStartTime.Format("2006-01-02 15:04:05"),
+				time.Now().Format("2006-01-02 15:04:05"))
+
+			// 重置尖峰状态
+			inSpikeState = false
+			// 清空历史记录，重新开始平滑统计
+			recentBlockWrites = make([]int, 0, 100)
+		}
+		// 在尖峰期间不记录写入量到平滑数组
+	} else {
+		// 非尖峰状态，记录写入量到平滑数组
+		recentBlockWrites = append(recentBlockWrites, uniqueWrites)
+		if len(recentBlockWrites) > 100 {
+			// 保持数组长度为100
+			recentBlockWrites = recentBlockWrites[1:]
+		}
+
+		// 至少有10个区块的数据才开始检测尖峰
+		if len(recentBlockWrites) >= 10 {
+			// 计算平均写入量
+			var totalWrites int
+			for _, writes := range recentBlockWrites {
+				totalWrites += writes
+			}
+			avgWrites := float64(totalWrites) / float64(len(recentBlockWrites))
+
+			// 检测是否为尖峰（当前写入量超过平均值20倍）
+			if avgWrites > 100 && float64(uniqueWrites)/avgWrites >= 20.0 {
+				// 进入尖峰状态
+				inSpikeState = true
+				spikeStartBlock = blockNum
+				spikeStartTime = time.Now()
+				spikeBlockCount = 1
+				spikeTotalWrites = uniqueWrites
+				spikeMaxWrites = uniqueWrites
+				preSpikeMeanWrites = avgWrites
+
+				// 记录尖峰开始
+				t.Logf("写入尖峰事件开始，区块号: %d, 当前写入量: %d, 平均写入量: %.2f, 倍数: %.2f, 时间: %s",
+					blockNum,
+					uniqueWrites,
+					avgWrites,
+					float64(uniqueWrites)/avgWrites,
+					spikeStartTime.Format("2006-01-02 15:04:05"))
+			}
+		}
+	}
+}
+
 // TestCompareProcessTransactions tests processing transactions from CSV
 func TestCompareProcessTransactions(t *testing.T) {
 	// Define database paths
-	dbDir := "F:\\ethdata\\geth_compare_db_mpt3"
-	statsDir := "F:\\ethdata\\compare_stats_6_mpt"
+	dbDir := "F:\\ethdata\\geth_compare_db_mpt5"
+	statsDir := "F:\\ethdata\\compare_stats9_mpt"
 	dataDir := "E:\\ethdata"
 
 	// Specify file range, hardcoded way to specify start and end file indices
 	startFileIdx := 1 // Start file index (starting from 1)
-	endFileIdx := 11  // End file index
+	endFileIdx := 8   // End file index
 	//46147
 	var startNum uint64 = 46147
 
@@ -315,7 +410,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 		csvFile.Close() // Close CSV file
 
 		// Calculate block range
-		var minBlock, maxBlock uint64 = 1000000, 0
+		var minBlock, maxBlock uint64 = 10000000, 0
 		for blockNum := range msgsByBlock {
 			if blockNum < minBlock {
 				minBlock = blockNum
@@ -734,7 +829,9 @@ func TestCompareProcessTransactions(t *testing.T) {
 					UniqueReads:           counter.UniqueReads,
 					UniqueWrites:          counter.UniqueWrites,
 				}
-
+				// 检测写入尖峰：计算最近100个区块的平均写入量，当当前区块写入量超过平均值20倍时，
+				// 记录为尖峰事件，统计尖峰持续区块数、平均倍数及发生时间，并输出日志。
+				detectWriteSpike(blockNum, blockStats.UniqueWrites, t)
 				// Add to statistics aggregator
 				statsAgg.AddBlockStats(blockStats)
 
