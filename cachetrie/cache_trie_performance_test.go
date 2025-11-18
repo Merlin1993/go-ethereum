@@ -2,6 +2,7 @@ package cachetrie
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"strconv"
 	"testing"
@@ -24,16 +25,35 @@ const (
 // 为什么是300个一增长 --- 1小时的区块数？
 func TestCachePerformance(t *testing.T) {
 	stateCount := 5000
-	iterationCount := 10000 // Statistics loop count
-	maxSize := 1000000      // Initial storage size limit
+	iterationCount := 7800 // Statistics loop count
+	maxSize := 1000000     // Initial storage size limit
 	windowMultiple := 1024
 	// Test normal mode
 	t.Run(fmt.Sprintf("NormalMode_StateCount_%d", stateCount), func(t *testing.T) {
-		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeNormal, 20)
+		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeNormal, 0)
+	})
+	t.Run(fmt.Sprintf("NormalMode_StateCount_%d", stateCount), func(t *testing.T) {
+		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeNormal, 6)
+	})
+
+	//// Test mode 2: Spike 2x mode
+	t.Run(fmt.Sprintf("Spike2xMode_StateCount_%d", stateCount), func(t *testing.T) {
+		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeSpike10x, 0)
+	})
+	t.Run(fmt.Sprintf("Spike2xMode_StateCount_%d", stateCount), func(t *testing.T) {
+		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeSpike10x, 6)
+	})
+
+	//Test mode 3: Gradual 10% mode
+	t.Run(fmt.Sprintf("Gradual10pMode_StateCount_%d", stateCount), func(t *testing.T) {
+		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeGradual10, 0)
+	})
+	t.Run(fmt.Sprintf("Gradual10pMode_StateCount_%d", stateCount), func(t *testing.T) {
+		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeGradual10, 6)
 	})
 
 	//
-	// Test mode 1: Spike 10x mode
+	//Test mode 1: Spike 10x mode
 	//t.Run(fmt.Sprintf("Spike10xMode_StateCount_%d", stateCount), func(t *testing.T) {
 	//	testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeSpike10x, 0)
 	//})
@@ -60,9 +80,9 @@ func calculateWriteIntensity(iteration, baseStateCount int, mode WriteMode) int 
 		return 100
 	case ModeSpike10x:
 		// Every 200 writes, intensity increases 10x, lasts 10 times
-		positionInCycle := iteration % 350
-		if positionInCycle < 50 {
-			return 1000
+		positionInCycle := iteration % 300
+		if positionInCycle > 250 {
+			return 2000
 		}
 		return 100
 	case ModeSpike2x:
@@ -77,8 +97,10 @@ func calculateWriteIntensity(iteration, baseStateCount int, mode WriteMode) int 
 		//原实验
 		//cycles := iteration / 400
 		//return 100 + cycles*10
+		//cycles := iteration / 300
+		//return 100 + (cycles-4)*20
 		cycles := iteration / 300
-		return 100 + (cycles-9)*10
+		return int(20 * math.Pow(1.2, float64(cycles)))
 	default:
 		return 100
 	}
@@ -97,9 +119,6 @@ func testCacheTrieWithData(t *testing.T, stateCount, iterationCount, windowMulti
 		cacheTrie = NewCacheTrie(startBlockNum, uint64(windowMultiple), maxSize)
 
 	}
-	// Warmup phase - execute until first cleanup
-	t.Log("Starting warmup phase...")
-	preWarmupStartTime := time.Now()
 
 	// Set initial block height
 	currentBlock := uint64(startBlockNum)
@@ -111,52 +130,58 @@ func testCacheTrieWithData(t *testing.T, stateCount, iterationCount, windowMulti
 	t.Logf("Initial state: Threshold(ssthresh)=%d", initialThreshold)
 
 	// Perform warmup until first cleanup occurs
-	warmupBatchSize := 10000 // Write count per batch
-	warmupBatches := 0
 
-	for i := 0; i < warmupStateCount; i += warmupBatchSize {
-		batchSize := warmupBatchSize
-		if i+warmupBatchSize > warmupStateCount {
-			batchSize = warmupStateCount - i
+	warmup := false
+	if warmup {
+		// Warmup phase - execute until first cleanup
+		t.Log("Starting warmup phase...")
+		preWarmupStartTime := time.Now()
+		warmupBatchSize := 10000 // Write count per batch
+		warmupBatches := 0
+
+		for i := 0; i < warmupStateCount; i += warmupBatchSize {
+			batchSize := warmupBatchSize
+			if i+warmupBatchSize > warmupStateCount {
+				batchSize = warmupStateCount - i
+			}
+
+			// Write data
+			for j := 0; j < batchSize; j++ {
+				key, value := generateRandomData()
+				cacheTrie.Update(key, value, true)
+			}
+
+			// Get hash, this triggers cleanup mechanism
+			hash, _, kvList := cacheTrie.Hash()
+
+			if kvList != nil && len(kvList.Data) > 0 {
+				go func() {
+					cacheTrie.FinishCleanup(currentBlock, hash)
+				}()
+			}
+
+			currentBlock++
+			cacheTrie.SetBlockNum(currentBlock)
+
+			warmupBatches++
+
+			// Check if cleanup occurred
+			currentCleanupCount := cacheTrie.GetCleanupCount()
+			if currentCleanupCount > 0 {
+				t.Logf("Warmup phase detected cleanup occurred, batch count=%d, written state count=%d", warmupBatches, (warmupBatches-1)*warmupBatchSize+batchSize)
+				break
+			}
+
+			// If too much data written without triggering cleanup, end warmup early
+			if i+batchSize >= warmupStateCount {
+				t.Logf("Warmup phase ended, no cleanup detected, written state count=%d", i+batchSize)
+			}
 		}
+		CleanupTime = 0
 
-		// Write data
-		for j := 0; j < batchSize; j++ {
-			key, value := generateRandomData()
-			cacheTrie.Update(key, value, true)
-		}
-
-		// Get hash, this triggers cleanup mechanism
-		hash, _, kvList := cacheTrie.Hash()
-
-		if kvList != nil && len(kvList.Data) > 0 {
-			go func() {
-				cacheTrie.FinishCleanup(currentBlock, hash)
-			}()
-		}
-
-		currentBlock++
-		cacheTrie.SetBlockNum(currentBlock)
-
-		warmupBatches++
-
-		// Check if cleanup occurred
-		currentCleanupCount := cacheTrie.GetCleanupCount()
-		if currentCleanupCount > 0 {
-			t.Logf("Warmup phase detected cleanup occurred, batch count=%d, written state count=%d", warmupBatches, (warmupBatches-1)*warmupBatchSize+batchSize)
-			break
-		}
-
-		// If too much data written without triggering cleanup, end warmup early
-		if i+batchSize >= warmupStateCount {
-			t.Logf("Warmup phase ended, no cleanup detected, written state count=%d", i+batchSize)
-		}
+		preWarmupDuration := time.Since(preWarmupStartTime)
+		t.Logf("Warmup phase completed, duration: %v", preWarmupDuration)
 	}
-	CleanupTime = 0
-
-	preWarmupDuration := time.Since(preWarmupStartTime)
-	t.Logf("Warmup phase completed, duration: %v", preWarmupDuration)
-
 	// Formal test phase
 	t.Log("Starting formal test phase...")
 

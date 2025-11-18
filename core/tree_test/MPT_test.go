@@ -21,14 +21,14 @@ import (
 // Test configuration
 const (
 	// Method 1 configuration
-	method1BatchSize = 5000     // Data volume processed per batch
-	method1TotalData = 20000000 // Total data volume (can be adjusted to 1 billion as needed)
+	method1BatchSize = 1_000      // Data volume processed per batch
+	method1TotalData = 10_000_000 // Total data volume (can be adjusted to 1 billion as needed)
 
 	// Method 2 configuration
-	method2BatchSize  = 5000 // Data volume written per batch
-	method2Iterations = 4000 // Number of iterations
+	method2BatchSize  = 5000  // Data volume written per batch
+	method2Iterations = 20000 // Number of iterations
 
-	mptDir = "F:\\ethdata\\stree2\\mpt"
+	mptDir = "F:\\ethdata\\stree4\\mpt"
 )
 
 // Database keys

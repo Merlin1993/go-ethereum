@@ -22,7 +22,7 @@ import (
 
 // 测试配置
 const (
-	verkleDir = "F:\\ethdata\\stree2\\verkle"
+	verkleDir = "F:\\ethdata\\stree4\\verkle"
 )
 
 // 方法一：批量写入并提交

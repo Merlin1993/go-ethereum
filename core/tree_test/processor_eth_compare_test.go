@@ -1,6 +1,10 @@
 package tree
 
 import (
+	"fmt"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/memorydb"
+	"github.com/ethereum/go-verkle"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -23,7 +27,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/holiman/uint256"
@@ -49,7 +52,162 @@ var (
 	spikeMaxWrites int
 	// 尖峰前的平均写入量
 	preSpikeMeanWrites float64
+
+	// 累计时间统计变量
+	cumulativeProcessDuration time.Duration
+	cumulativeRootGenDuration time.Duration
+
+	// 四个操作的累计时间统计变量
+	cumulativePolyTime      time.Duration
+	cumulativeBatchTime     time.Duration
+	cumulativeSerializeTime time.Duration
+	cumulativeCommitTime    time.Duration
+
+	// mdb 数据库统计的累计变量
+	cumulativeMdbReadCount  uint64
+	cumulativeMdbReadTime   time.Duration
+	cumulativeMdbWriteCount uint64
+	cumulativeMdbWriteTime  time.Duration
+
+	// StateDB commit 子流程的累计变量
+	cumulativePreCommitDuration  time.Duration
+	cumulativePostCommitDuration time.Duration
+
+	// StateDB 7个统计区域的累计变量
+	cumulativeAccountCommitsDuration  time.Duration // 统计1: Finalise
+	cumulativeStorageUpdatesDuration  time.Duration // 统计2&3: 并发处理存储更新
+	cumulativeAccountUpdatesDuration  time.Duration // 统计4: 更新和删除状态对象
+	cumulativeAccountHashesDuration   time.Duration // 统计5: 计算trie哈希
+	cumulativeSnapshotCommitsDuration time.Duration // 统计6: 更新快照树
+	cumulativeTrieDBCommitsDuration   time.Duration // 统计7: 更新TrieDB
+
+	// 并行硬编码字段
+	isParallelEnabled = true // 硬编码设置是否启用并行处理
+
+	// CSV记录相关变量
+	csvFile   *os.File
+	csvWriter *csv.Writer
 )
+
+// CSV记录结构体
+type PerformanceRecord struct {
+	TrieType                string  // MPT 或 Verkle
+	IsParallel              bool    // 是否并行
+	BlockRange              string  // 区块范围 (如 "10000", "20000")
+	ProcessDuration         float64 // 执行时间 (ms)
+	RootGenDuration         float64 // 提交时间 (ms)
+	PolyTime                float64 // poly时间 (ms)
+	BatchTime               float64 // batch时间 (ms)
+	SerializeTime           float64 // 序列化时间 (ms)
+	CommitTime              float64 // commit时间 (ms)
+	MdbReadTime             float64 // mdb读取时间 (ms)
+	MdbWriteTime            float64 // mdb写入时间 (ms)
+	PreCommitDuration       float64 // PreCommit时间 (ms)
+	PostCommitDuration      float64 // PostCommit时间 (ms)
+	AccountCommitsDuration  float64 // AccountCommits时间 (ms)
+	StorageUpdatesDuration  float64 // StorageUpdates时间 (ms)
+	AccountUpdatesDuration  float64 // AccountUpdates时间 (ms)
+	AccountHashesDuration   float64 // AccountHashes时间 (ms)
+	SnapshotCommitsDuration float64 // SnapshotCommits时间 (ms)
+	TrieDBCommitsDuration   float64 // TrieDBCommits时间 (ms)
+}
+
+// 初始化CSV文件
+func initCSVFile(statsDir string) error {
+	// 根据配置生成动态文件名
+	parallelStr := "serial"
+	if isParallelEnabled {
+		parallelStr = "parallel_polymemo3"
+	}
+
+	verkleStr := "mpt"
+	if common.UserVerkle {
+		verkleStr = "verkle"
+	}
+
+	fileName := fmt.Sprintf("performance_stats_%s_%s.csv", verkleStr, parallelStr)
+	csvPath := filepath.Join(statsDir, fileName)
+
+	// 检查文件是否存在
+	fileExists := false
+	if _, err := os.Stat(csvPath); err == nil {
+		fileExists = true
+	}
+
+	// 打开或创建CSV文件
+	var err error
+	csvFile, err = os.OpenFile(csvPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+
+	csvWriter = csv.NewWriter(csvFile)
+
+	// 如果文件不存在，写入表头
+	if !fileExists {
+		header := []string{
+			"TrieType", "IsParallel", "BlockRange",
+			"ProcessDuration", "RootGenDuration",
+			"PolyTime", "BatchTime", "SerializeTime", "CommitTime",
+			"MdbReadTime", "MdbWriteTime",
+			"PreCommitDuration", "PostCommitDuration",
+			"AccountCommitsDuration", "StorageUpdatesDuration",
+			"AccountUpdatesDuration", "AccountHashesDuration",
+			"SnapshotCommitsDuration", "TrieDBCommitsDuration",
+		}
+		if err := csvWriter.Write(header); err != nil {
+			return err
+		}
+		csvWriter.Flush()
+	}
+
+	return nil
+}
+
+// 写入CSV记录
+func writeCSVRecord(record PerformanceRecord) error {
+	if csvWriter == nil {
+		return nil // CSV未初始化，跳过
+	}
+
+	row := []string{
+		record.TrieType,
+		strconv.FormatBool(record.IsParallel),
+		record.BlockRange,
+		strconv.FormatFloat(record.ProcessDuration, 'f', 3, 64),
+		strconv.FormatFloat(record.RootGenDuration, 'f', 3, 64),
+		strconv.FormatFloat(record.PolyTime, 'f', 3, 64),
+		strconv.FormatFloat(record.BatchTime, 'f', 3, 64),
+		strconv.FormatFloat(record.SerializeTime, 'f', 3, 64),
+		strconv.FormatFloat(record.CommitTime, 'f', 3, 64),
+		strconv.FormatFloat(record.MdbReadTime, 'f', 3, 64),
+		strconv.FormatFloat(record.MdbWriteTime, 'f', 3, 64),
+		strconv.FormatFloat(record.PreCommitDuration, 'f', 3, 64),
+		strconv.FormatFloat(record.PostCommitDuration, 'f', 3, 64),
+		strconv.FormatFloat(record.AccountCommitsDuration, 'f', 3, 64),
+		strconv.FormatFloat(record.StorageUpdatesDuration, 'f', 3, 64),
+		strconv.FormatFloat(record.AccountUpdatesDuration, 'f', 3, 64),
+		strconv.FormatFloat(record.AccountHashesDuration, 'f', 3, 64),
+		strconv.FormatFloat(record.SnapshotCommitsDuration, 'f', 3, 64),
+		strconv.FormatFloat(record.TrieDBCommitsDuration, 'f', 3, 64),
+	}
+
+	if err := csvWriter.Write(row); err != nil {
+		return err
+	}
+	csvWriter.Flush()
+	return nil
+}
+
+// 关闭CSV文件
+func closeCSVFile() {
+	if csvWriter != nil {
+		csvWriter.Flush()
+	}
+	if csvFile != nil {
+		csvFile.Close()
+	}
+}
 
 // 检测写入尖峰
 func detectWriteSpike(blockNum uint64, uniqueWrites int, t *testing.T) {
@@ -129,9 +287,17 @@ func detectWriteSpike(blockNum uint64, uniqueWrites int, t *testing.T) {
 // TestCompareProcessTransactions tests processing transactions from CSV
 func TestCompareProcessTransactions(t *testing.T) {
 	// Define database paths
-	dbDir := "F:\\ethdata\\geth_compare_db_mpt5"
-	statsDir := "F:\\ethdata\\compare_stats9_mpt"
+	dbDir := "F:\\ethdata\\geth_compare_db_verkle"
+	statsDir := "F:\\ethdata\\compare_stats10_verkle"
 	dataDir := "E:\\ethdata"
+
+	// 初始化CSV文件
+	if err := initCSVFile(statsDir); err != nil {
+		t.Logf("Failed to initialize CSV file: %v", err)
+	} else {
+		t.Logf("CSV file initialized successfully")
+	}
+	defer closeCSVFile()
 
 	// Specify file range, hardcoded way to specify start and end file indices
 	startFileIdx := 1 // Start file index (starting from 1)
@@ -149,13 +315,17 @@ func TestCompareProcessTransactions(t *testing.T) {
 	verkleTrieRecorder := CreateTrieStatsRecorder(trieStatsDir, dbDir, VerkleTrie)
 
 	// Create or open persistent database
-	ldb, err := leveldb.New(dbDir, 1024, 1024, "eth-compare-process-test", false)
-	if err != nil {
-		t.Fatalf("Failed to create database: %v", err)
-	}
+	//ldb, err := leveldb.New(dbDir, 1024, 1024, "eth-compare-process-test", false)
+	//if err != nil {
+	//	t.Fatalf("Failed to create database: %v", err)
+	//}
+	//方案一：使用内存数据库
+	ldb := memorydb.New()
+
 	defer ldb.Close()
 
-	db := rawdb.NewDatabase(ldb)
+	mdb := ethdb.WrapWithStats(ldb)
+	db := rawdb.NewDatabase(mdb)
 	hashdb := hashdb.Defaults
 	pathdb := pathdb.Defaults
 	if common.UserVerkle {
@@ -180,7 +350,16 @@ func TestCompareProcessTransactions(t *testing.T) {
 		firstRootHash = common.Hash{}
 	}
 	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, firstRootHash)
+
 	sdb := state.NewDatabase(trieDB, snaps)
+
+	//方案二 ， 搞一个数据stateDB，先访问数据把数据缓存上。
+	useMemory := false
+	var memorySDB *state.CachingDB
+	if useMemory {
+		memorySDB = state.NewDatabase(trieDB, snaps)
+	}
+
 	var preTrieDB *triedb.Database
 	var preSdb *state.CachingDB
 	if common.UseCacheTrie {
@@ -458,6 +637,17 @@ func TestCompareProcessTransactions(t *testing.T) {
 				counter: counter,
 			}
 
+			//新建一个memoryDB
+			var memoryStatedb *state.StateDB
+			if useMemory {
+				memorySDB.SetBlockNum(blockNum)
+				memoryStatedb, err = state.New(lastStateRoot, sdb)
+				if err != nil {
+					t.Fatalf("Failed to create state: %v", err)
+				}
+			}
+			//todo 如果useMemory开启，那就继续在这个逻辑后面，把countingStateDB做过的事情，都用memoryStatedb先做一遍。
+
 			bigBalance := new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18))
 			// Convert to uint256.Int
 			balance, overflow := uint256.FromBig(bigBalance)
@@ -467,6 +657,9 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 			// Pre-allocate balance for all senders (to avoid insufficient balance since there's no incentive source)
 			for _, msg := range msgsByBlock[blockNum] {
+				if useMemory {
+					memoryStatedb.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
+				}
 				countingStateDB.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
 			}
 
@@ -504,12 +697,22 @@ func TestCompareProcessTransactions(t *testing.T) {
 			// Use countingStateDB as vm.StateDB
 			vmenv := vm.NewEVM(blockContext, countingStateDB, params.MainnetChainConfig, vm.Config{})
 
+			var memoryVmenv *vm.EVM
+			if useMemory {
+				memoryVmenv = vm.NewEVM(blockContext, memoryStatedb, params.MainnetChainConfig, vm.Config{})
+			}
+
 			// Process transactions if any exist
 			if len(msgsByBlock[blockNum]) > 0 {
 				for _, msg := range msgsByBlock[blockNum] {
 
 					// Process transaction
 					result, err := core.ApplyMessage(vmenv, msg, gp)
+
+					if useMemory {
+						core.ApplyMessage(memoryVmenv, msg, gp)
+					}
+
 					var receipt *types.Receipt
 
 					// Determine if it's a contract transaction
@@ -705,9 +908,66 @@ func TestCompareProcessTransactions(t *testing.T) {
 					go st(root, blockNum, deleteKVList)
 				}
 			} else {
-				root, _ = countingStateDB.Commit(blockNum, false, false)
+				// 在 Commit 前重置统计数据
+				if trieDB.IsVerkle() {
+					verkle.ResetCommitToPolyTotalTime()
+					verkle.ResetBatchMapTotalTime()
+					verkle.ResetCommitTotalTime()
+				}
+				// 重置 mdb 统计数据
+				mdb.ResetStats()
 
-				rootGenDuration = time.Since(rootGenStart)
+				if useMemory {
+					memoryStatedb.PreCommit(false)
+				}
+
+				// 跟踪 StateDB PreCommit 时间
+				preCommitStart := time.Now()
+				_, _, err := countingStateDB.PreCommit(false)
+				if err != nil {
+					t.Fatalf("PreCommit failed: %v", err)
+				}
+				preCommitDuration := time.Since(preCommitStart)
+				cumulativePreCommitDuration += preCommitDuration
+
+				// 跟踪 StateDB PostCommit 时间
+				postCommitStart := time.Now()
+				root, err = countingStateDB.PostCommit(blockNum, false, false)
+				if err != nil {
+					t.Fatalf("PostCommit failed: %v", err)
+				}
+				postCommitDuration := time.Since(postCommitStart)
+				cumulativePostCommitDuration += postCommitDuration
+
+				//sheng 这里的时间调整了
+				rootGenDuration = time.Since(preCommitStart)
+
+				cumulativeProcessDuration += processDuration
+				cumulativeRootGenDuration += rootGenDuration
+
+				// 在 Commit 后累计统计数据
+				if trieDB.IsVerkle() {
+					// 累计 verkle 统计数据
+					cumulativePolyTime += verkle.GetCommitToPolyTotalTime()
+					cumulativeBatchTime += verkle.GetBatchMapTotalTime()
+					cumulativeCommitTime += verkle.GetCommitTotalTime()
+				}
+
+				// 累计 mdb 统计数据
+				stats := mdb.Stats()
+				cumulativeMdbReadCount += stats.ReadCount
+				cumulativeMdbReadTime += time.Duration(stats.ReadNanos)
+				cumulativeMdbWriteCount += stats.WriteCount
+				cumulativeMdbWriteTime += time.Duration(stats.WriteNanos)
+
+				// 累计 StateDB 7个统计区域的数据
+				cumulativeAccountCommitsDuration += countingStateDB.AccountCommits
+				cumulativeStorageUpdatesDuration += countingStateDB.StorageUpdates
+				cumulativeAccountUpdatesDuration += countingStateDB.AccountUpdates
+				cumulativeAccountHashesDuration += countingStateDB.AccountHashes
+				cumulativeSnapshotCommitsDuration += countingStateDB.SnapshotCommits
+				cumulativeTrieDBCommitsDuration += countingStateDB.TrieDBCommits
+
 				// State commit to database phase - only commit when reaching configured interval
 				if common.UserVerkle || blockNum-lastCommitBlock >= 10 {
 					// Commit every 1000 blocks
@@ -845,10 +1105,198 @@ func TestCompareProcessTransactions(t *testing.T) {
 					// Record VerkleTrie statistics
 					RecordVerkleTrieStats(verkleTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
 						len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
+
+					// 每1万个区块打印一次统计信息并重置
+					if blockNum%10000 == 0 {
+						t.Logf("区块 %d - Verkle执行累计： %v，Verkle提交累计: %v", blockNum, cumulativeProcessDuration, cumulativeRootGenDuration)
+
+						// 计算各个操作与 cumulativeRootGenDuration 的比例
+						var polyRatio, batchRatio, serializeRatio, commitRatio float64
+						var mdbReadTimeRatio, mdbWriteTimeRatio float64
+						var preCommitRatio, postCommitRatio float64
+						var accountCommitsRatio, storageUpdatesRatio, accountUpdatesRatio, accountHashesRatio float64
+						var snapshotCommitsRatio, trieDBCommitsRatio float64
+
+						if cumulativeRootGenDuration > 0 {
+							polyRatio = float64(cumulativePolyTime) / float64(cumulativeRootGenDuration) * 100
+							batchRatio = float64(cumulativeBatchTime) / float64(cumulativeRootGenDuration) * 100
+							serializeRatio = float64(cumulativeSerializeTime) / float64(cumulativeRootGenDuration) * 100
+							commitRatio = float64(cumulativeCommitTime) / float64(cumulativeRootGenDuration) * 100
+							mdbReadTimeRatio = float64(cumulativeMdbReadTime) / float64(cumulativeRootGenDuration) * 100
+							mdbWriteTimeRatio = float64(cumulativeMdbWriteTime) / float64(cumulativeRootGenDuration) * 100
+							preCommitRatio = float64(cumulativePreCommitDuration) / float64(cumulativeRootGenDuration) * 100
+							postCommitRatio = float64(cumulativePostCommitDuration) / float64(cumulativeRootGenDuration) * 100
+							accountCommitsRatio = float64(cumulativeAccountCommitsDuration) / float64(cumulativeRootGenDuration) * 100
+							storageUpdatesRatio = float64(cumulativeStorageUpdatesDuration) / float64(cumulativeRootGenDuration) * 100
+							accountUpdatesRatio = float64(cumulativeAccountUpdatesDuration) / float64(cumulativeRootGenDuration) * 100
+							accountHashesRatio = float64(cumulativeAccountHashesDuration) / float64(cumulativeRootGenDuration) * 100
+							snapshotCommitsRatio = float64(cumulativeSnapshotCommitsDuration) / float64(cumulativeRootGenDuration) * 100
+							trieDBCommitsRatio = float64(cumulativeTrieDBCommitsDuration) / float64(cumulativeRootGenDuration) * 100
+						}
+
+						t.Logf("      └─ poly: %.3fms (%.2f%%) - 主要耗时", float64(cumulativePolyTime.Microseconds()/1e3), polyRatio)
+						t.Logf("      └─ batch: %.3fms (%.2f%%) - 主要耗时", float64(cumulativeBatchTime.Microseconds()/1e3), batchRatio)
+						t.Logf("      └─ Serial: %.3fms (%.2f%%) - 主要耗时", float64(cumulativeSerializeTime.Microseconds()/1e3), serializeRatio)
+						t.Logf("      └─ Commit: %.3fms (%.2f%%) - 主要耗时", float64(cumulativeCommitTime.Microseconds()/1e3), commitRatio)
+
+						// 显示 StateDB Commit 子流程累计统计信息
+						t.Logf("StateDB Commit 子流程累计统计:")
+						t.Logf("      └─ PreCommit: %.3fms (%.2f%%) - 计算中间根", float64(cumulativePreCommitDuration.Microseconds()/1e3), preCommitRatio)
+						t.Logf("      └─ PostCommit: %.3fms (%.2f%%) - 提交到存储", float64(cumulativePostCommitDuration.Microseconds()/1e3), postCommitRatio)
+
+						// 显示 StateDB 7个统计区域累计统计信息
+						t.Logf("StateDB 7个统计区域累计统计:")
+						t.Logf("      └─ 统计1 - AccountCommits (Finalise): %.3fms (%.2f%%)", float64(cumulativeAccountCommitsDuration.Microseconds()/1e3), accountCommitsRatio)
+						t.Logf("      └─ 统计2&3 - StorageUpdates (并发处理存储): %.3fms (%.2f%%)", float64(cumulativeStorageUpdatesDuration.Microseconds()/1e3), storageUpdatesRatio)
+						t.Logf("      └─ 统计4 - AccountUpdates (更新删除状态对象): %.3fms (%.2f%%)", float64(cumulativeAccountUpdatesDuration.Microseconds()/1e3), accountUpdatesRatio)
+						t.Logf("      └─ 统计5 - AccountHashes (计算trie哈希): %.3fms (%.2f%%)", float64(cumulativeAccountHashesDuration.Microseconds()/1e3), accountHashesRatio)
+						t.Logf("      └─ 统计6 - SnapshotCommits (更新快照树): %.3fms (%.2f%%)", float64(cumulativeSnapshotCommitsDuration.Microseconds()/1e3), snapshotCommitsRatio)
+						t.Logf("      └─ 统计7 - TrieDBCommits (更新TrieDB): %.3fms (%.2f%%)", float64(cumulativeTrieDBCommitsDuration.Microseconds()/1e3), trieDBCommitsRatio)
+
+						// 显示 mdb 累计统计信息
+						t.Logf("MDB 累计统计:")
+						t.Logf("      └─ 读取次数: %d, 读取时间: %.3fms (%.2f%%)", cumulativeMdbReadCount, float64(cumulativeMdbReadTime.Microseconds()/1e3), mdbReadTimeRatio)
+						t.Logf("      └─ 写入次数: %d, 写入时间: %.3fms (%.2f%%)", cumulativeMdbWriteCount, float64(cumulativeMdbWriteTime.Microseconds()/1e3), mdbWriteTimeRatio)
+
+						// 写入CSV记录 - Verkle
+						verkleRecord := PerformanceRecord{
+							TrieType:                "Verkle",
+							IsParallel:              isParallelEnabled,
+							BlockRange:              strconv.FormatUint(blockNum, 10),
+							ProcessDuration:         float64(cumulativeProcessDuration.Microseconds()) / 1e3,
+							RootGenDuration:         float64(cumulativeRootGenDuration.Microseconds()) / 1e3,
+							PolyTime:                float64(cumulativePolyTime.Microseconds()) / 1e3,
+							BatchTime:               float64(cumulativeBatchTime.Microseconds()) / 1e3,
+							SerializeTime:           float64(cumulativeSerializeTime.Microseconds()) / 1e3,
+							CommitTime:              float64(cumulativeCommitTime.Microseconds()) / 1e3,
+							MdbReadTime:             float64(cumulativeMdbReadTime.Microseconds()) / 1e3,
+							MdbWriteTime:            float64(cumulativeMdbWriteTime.Microseconds()) / 1e3,
+							PreCommitDuration:       float64(cumulativePreCommitDuration.Microseconds()) / 1e3,
+							PostCommitDuration:      float64(cumulativePostCommitDuration.Microseconds()) / 1e3,
+							AccountCommitsDuration:  float64(cumulativeAccountCommitsDuration.Microseconds()) / 1e3,
+							StorageUpdatesDuration:  float64(cumulativeStorageUpdatesDuration.Microseconds()) / 1e3,
+							AccountUpdatesDuration:  float64(cumulativeAccountUpdatesDuration.Microseconds()) / 1e3,
+							AccountHashesDuration:   float64(cumulativeAccountHashesDuration.Microseconds()) / 1e3,
+							SnapshotCommitsDuration: float64(cumulativeSnapshotCommitsDuration.Microseconds()) / 1e3,
+							TrieDBCommitsDuration:   float64(cumulativeTrieDBCommitsDuration.Microseconds()) / 1e3,
+						}
+						if err := writeCSVRecord(verkleRecord); err != nil {
+							t.Logf("Failed to write Verkle CSV record: %v", err)
+						}
+
+						// 重置所有累计时间和 mdb 统计
+						cumulativeProcessDuration = 0
+						cumulativeRootGenDuration = 0
+						cumulativePolyTime = 0
+						cumulativeBatchTime = 0
+						cumulativeSerializeTime = 0
+						cumulativeCommitTime = 0
+						cumulativeMdbReadCount = 0
+						cumulativeMdbReadTime = 0
+						cumulativeMdbWriteCount = 0
+						cumulativeMdbWriteTime = 0
+						cumulativePreCommitDuration = 0
+						cumulativePostCommitDuration = 0
+						// 重置 StateDB 7个统计区域
+						cumulativeAccountCommitsDuration = 0
+						cumulativeStorageUpdatesDuration = 0
+						cumulativeAccountUpdatesDuration = 0
+						cumulativeAccountHashesDuration = 0
+						cumulativeSnapshotCommitsDuration = 0
+						cumulativeTrieDBCommitsDuration = 0
+					}
 				} else {
 					// Record StandardTrie statistics
 					RecordTrieStats(standardTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
 						len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
+
+					// 每1万个区块打印一次统计信息并重置
+					if blockNum%10000 == 0 {
+
+						t.Logf("区块 %d - mpt执行累计： %v，mpt提交累计: %v", blockNum, cumulativeProcessDuration, cumulativeRootGenDuration)
+
+						// 计算各个操作与 cumulativeRootGenDuration 的比例
+						var mdbReadTimeRatio, mdbWriteTimeRatio float64
+						var preCommitRatio, postCommitRatio float64
+						var accountCommitsRatio, storageUpdatesRatio, accountUpdatesRatio, accountHashesRatio float64
+						var snapshotCommitsRatio, trieDBCommitsRatio float64
+
+						if cumulativeRootGenDuration > 0 {
+							mdbReadTimeRatio = float64(cumulativeMdbReadTime) / float64(cumulativeRootGenDuration) * 100
+							mdbWriteTimeRatio = float64(cumulativeMdbWriteTime) / float64(cumulativeRootGenDuration) * 100
+							preCommitRatio = float64(cumulativePreCommitDuration) / float64(cumulativeRootGenDuration) * 100
+							postCommitRatio = float64(cumulativePostCommitDuration) / float64(cumulativeRootGenDuration) * 100
+							accountCommitsRatio = float64(cumulativeAccountCommitsDuration) / float64(cumulativeRootGenDuration) * 100
+							storageUpdatesRatio = float64(cumulativeStorageUpdatesDuration) / float64(cumulativeRootGenDuration) * 100
+							accountUpdatesRatio = float64(cumulativeAccountUpdatesDuration) / float64(cumulativeRootGenDuration) * 100
+							accountHashesRatio = float64(cumulativeAccountHashesDuration) / float64(cumulativeRootGenDuration) * 100
+							snapshotCommitsRatio = float64(cumulativeSnapshotCommitsDuration) / float64(cumulativeRootGenDuration) * 100
+							trieDBCommitsRatio = float64(cumulativeTrieDBCommitsDuration) / float64(cumulativeRootGenDuration) * 100
+						}
+
+						// 显示 StateDB Commit 子流程累计统计信息
+						t.Logf("StateDB Commit 子流程累计统计:")
+						t.Logf("      └─ PreCommit: %.3fms (%.2f%%) - 计算中间根", float64(cumulativePreCommitDuration.Microseconds()/1e3), preCommitRatio)
+						t.Logf("      └─ PostCommit: %.3fms (%.2f%%) - 提交到存储", float64(cumulativePostCommitDuration.Microseconds()/1e3), postCommitRatio)
+
+						// 显示 StateDB 7个统计区域累计统计信息
+						t.Logf("StateDB 7个统计区域累计统计:")
+						t.Logf("      └─ 统计1 - AccountCommits (Finalise): %.3fms (%.2f%%)", float64(cumulativeAccountCommitsDuration.Microseconds()/1e3), accountCommitsRatio)
+						t.Logf("      └─ 统计2&3 - StorageUpdates (并发处理存储): %.3fms (%.2f%%)", float64(cumulativeStorageUpdatesDuration.Microseconds()/1e3), storageUpdatesRatio)
+						t.Logf("      └─ 统计4 - AccountUpdates (更新删除状态对象): %.3fms (%.2f%%)", float64(cumulativeAccountUpdatesDuration.Microseconds()/1e3), accountUpdatesRatio)
+						t.Logf("      └─ 统计5 - AccountHashes (计算trie哈希): %.3fms (%.2f%%)", float64(cumulativeAccountHashesDuration.Microseconds()/1e3), accountHashesRatio)
+						t.Logf("      └─ 统计6 - SnapshotCommits (更新快照树): %.3fms (%.2f%%)", float64(cumulativeSnapshotCommitsDuration.Microseconds()/1e3), snapshotCommitsRatio)
+						t.Logf("      └─ 统计7 - TrieDBCommits (更新TrieDB): %.3fms (%.2f%%)", float64(cumulativeTrieDBCommitsDuration.Microseconds()/1e3), trieDBCommitsRatio)
+
+						// 显示 mdb 累计统计信息
+						t.Logf("MDB 累计统计:")
+						t.Logf("      └─ 读取次数: %d, 读取时间: %.3fms (%.2f%%)", cumulativeMdbReadCount, float64(cumulativeMdbReadTime.Microseconds()/1e3), mdbReadTimeRatio)
+						t.Logf("      └─ 写入次数: %d, 写入时间: %.3fms (%.2f%%)", cumulativeMdbWriteCount, float64(cumulativeMdbWriteTime.Microseconds()/1e3), mdbWriteTimeRatio)
+
+						// 写入CSV记录 - MPT
+						mptRecord := PerformanceRecord{
+							TrieType:                "MPT",
+							IsParallel:              isParallelEnabled,
+							BlockRange:              strconv.FormatUint(blockNum, 10),
+							ProcessDuration:         float64(cumulativeProcessDuration.Microseconds()) / 1e3,
+							RootGenDuration:         float64(cumulativeRootGenDuration.Microseconds()) / 1e3,
+							PolyTime:                0, // MPT没有poly操作
+							BatchTime:               0, // MPT没有batch操作
+							SerializeTime:           0, // MPT没有序列化操作
+							CommitTime:              0, // MPT没有单独的commit操作
+							MdbReadTime:             float64(cumulativeMdbReadTime.Microseconds()) / 1e3,
+							MdbWriteTime:            float64(cumulativeMdbWriteTime.Microseconds()) / 1e3,
+							PreCommitDuration:       float64(cumulativePreCommitDuration.Microseconds()) / 1e3,
+							PostCommitDuration:      float64(cumulativePostCommitDuration.Microseconds()) / 1e3,
+							AccountCommitsDuration:  float64(cumulativeAccountCommitsDuration.Microseconds()) / 1e3,
+							StorageUpdatesDuration:  float64(cumulativeStorageUpdatesDuration.Microseconds()) / 1e3,
+							AccountUpdatesDuration:  float64(cumulativeAccountUpdatesDuration.Microseconds()) / 1e3,
+							AccountHashesDuration:   float64(cumulativeAccountHashesDuration.Microseconds()) / 1e3,
+							SnapshotCommitsDuration: float64(cumulativeSnapshotCommitsDuration.Microseconds()) / 1e3,
+							TrieDBCommitsDuration:   float64(cumulativeTrieDBCommitsDuration.Microseconds()) / 1e3,
+						}
+						if err := writeCSVRecord(mptRecord); err != nil {
+							t.Logf("Failed to write MPT CSV record: %v", err)
+						}
+
+						// 重置所有累计时间和 mdb 统计
+						cumulativeProcessDuration = 0
+						cumulativeRootGenDuration = 0
+
+						cumulativeMdbReadCount = 0
+						cumulativeMdbReadTime = 0
+						cumulativeMdbWriteCount = 0
+						cumulativeMdbWriteTime = 0
+						cumulativePreCommitDuration = 0
+						cumulativePostCommitDuration = 0
+						// 重置 StateDB 7个统计区域
+						cumulativeAccountCommitsDuration = 0
+						cumulativeStorageUpdatesDuration = 0
+						cumulativeAccountUpdatesDuration = 0
+						cumulativeAccountHashesDuration = 0
+						cumulativeSnapshotCommitsDuration = 0
+						cumulativeTrieDBCommitsDuration = 0
+					}
 				}
 			}
 		}
