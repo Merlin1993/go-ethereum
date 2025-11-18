@@ -209,81 +209,6 @@ func closeCSVFile() {
 	}
 }
 
-// 检测写入尖峰
-func detectWriteSpike(blockNum uint64, uniqueWrites int, t *testing.T) {
-	// 如果当前处于尖峰状态
-	if inSpikeState {
-		// 更新尖峰统计信息
-		spikeBlockCount++
-		spikeTotalWrites += uniqueWrites
-		if uniqueWrites > spikeMaxWrites {
-			spikeMaxWrites = uniqueWrites
-		}
-
-		// 检查尖峰是否结束（当写入量降至平均值的10倍以下）
-		if float64(uniqueWrites) < preSpikeMeanWrites*10.0 {
-			// 尖峰结束，输出统计信息
-			avgSpikeWrites := float64(spikeTotalWrites) / float64(spikeBlockCount)
-			avgSpikeRatio := avgSpikeWrites / preSpikeMeanWrites
-			maxSpikeRatio := float64(spikeMaxWrites) / preSpikeMeanWrites
-
-			// 输出尖峰统计信息
-			t.Logf("写入尖峰事件结束，开始区块: %d, 结束区块: %d, 持续区块数: %d, 平均写入量: %.2f, 平均倍数: %.2f, 最大倍数: %.2f, 开始时间: %s, 结束时间: %s",
-				spikeStartBlock,
-				blockNum,
-				spikeBlockCount,
-				avgSpikeWrites,
-				avgSpikeRatio,
-				maxSpikeRatio,
-				spikeStartTime.Format("2006-01-02 15:04:05"),
-				time.Now().Format("2006-01-02 15:04:05"))
-
-			// 重置尖峰状态
-			inSpikeState = false
-			// 清空历史记录，重新开始平滑统计
-			recentBlockWrites = make([]int, 0, 100)
-		}
-		// 在尖峰期间不记录写入量到平滑数组
-	} else {
-		// 非尖峰状态，记录写入量到平滑数组
-		recentBlockWrites = append(recentBlockWrites, uniqueWrites)
-		if len(recentBlockWrites) > 100 {
-			// 保持数组长度为100
-			recentBlockWrites = recentBlockWrites[1:]
-		}
-
-		// 至少有10个区块的数据才开始检测尖峰
-		if len(recentBlockWrites) >= 10 {
-			// 计算平均写入量
-			var totalWrites int
-			for _, writes := range recentBlockWrites {
-				totalWrites += writes
-			}
-			avgWrites := float64(totalWrites) / float64(len(recentBlockWrites))
-
-			// 检测是否为尖峰（当前写入量超过平均值20倍）
-			if avgWrites > 100 && float64(uniqueWrites)/avgWrites >= 20.0 {
-				// 进入尖峰状态
-				inSpikeState = true
-				spikeStartBlock = blockNum
-				spikeStartTime = time.Now()
-				spikeBlockCount = 1
-				spikeTotalWrites = uniqueWrites
-				spikeMaxWrites = uniqueWrites
-				preSpikeMeanWrites = avgWrites
-
-				// 记录尖峰开始
-				t.Logf("写入尖峰事件开始，区块号: %d, 当前写入量: %d, 平均写入量: %.2f, 倍数: %.2f, 时间: %s",
-					blockNum,
-					uniqueWrites,
-					avgWrites,
-					float64(uniqueWrites)/avgWrites,
-					spikeStartTime.Format("2006-01-02 15:04:05"))
-			}
-		}
-	}
-}
-
 // TestCompareProcessTransactions tests processing transactions from CSV
 func TestCompareProcessTransactions(t *testing.T) {
 	// Define database paths
@@ -1089,9 +1014,6 @@ func TestCompareProcessTransactions(t *testing.T) {
 					UniqueReads:           counter.UniqueReads,
 					UniqueWrites:          counter.UniqueWrites,
 				}
-				// 检测写入尖峰：计算最近100个区块的平均写入量，当当前区块写入量超过平均值20倍时，
-				// 记录为尖峰事件，统计尖峰持续区块数、平均倍数及发生时间，并输出日志。
-				detectWriteSpike(blockNum, blockStats.UniqueWrites, t)
 				// Add to statistics aggregator
 				statsAgg.AddBlockStats(blockStats)
 
@@ -1109,54 +1031,6 @@ func TestCompareProcessTransactions(t *testing.T) {
 					// 每1万个区块打印一次统计信息并重置
 					if blockNum%10000 == 0 {
 						t.Logf("区块 %d - Verkle执行累计： %v，Verkle提交累计: %v", blockNum, cumulativeProcessDuration, cumulativeRootGenDuration)
-
-						// 计算各个操作与 cumulativeRootGenDuration 的比例
-						var polyRatio, batchRatio, serializeRatio, commitRatio float64
-						var mdbReadTimeRatio, mdbWriteTimeRatio float64
-						var preCommitRatio, postCommitRatio float64
-						var accountCommitsRatio, storageUpdatesRatio, accountUpdatesRatio, accountHashesRatio float64
-						var snapshotCommitsRatio, trieDBCommitsRatio float64
-
-						if cumulativeRootGenDuration > 0 {
-							polyRatio = float64(cumulativePolyTime) / float64(cumulativeRootGenDuration) * 100
-							batchRatio = float64(cumulativeBatchTime) / float64(cumulativeRootGenDuration) * 100
-							serializeRatio = float64(cumulativeSerializeTime) / float64(cumulativeRootGenDuration) * 100
-							commitRatio = float64(cumulativeCommitTime) / float64(cumulativeRootGenDuration) * 100
-							mdbReadTimeRatio = float64(cumulativeMdbReadTime) / float64(cumulativeRootGenDuration) * 100
-							mdbWriteTimeRatio = float64(cumulativeMdbWriteTime) / float64(cumulativeRootGenDuration) * 100
-							preCommitRatio = float64(cumulativePreCommitDuration) / float64(cumulativeRootGenDuration) * 100
-							postCommitRatio = float64(cumulativePostCommitDuration) / float64(cumulativeRootGenDuration) * 100
-							accountCommitsRatio = float64(cumulativeAccountCommitsDuration) / float64(cumulativeRootGenDuration) * 100
-							storageUpdatesRatio = float64(cumulativeStorageUpdatesDuration) / float64(cumulativeRootGenDuration) * 100
-							accountUpdatesRatio = float64(cumulativeAccountUpdatesDuration) / float64(cumulativeRootGenDuration) * 100
-							accountHashesRatio = float64(cumulativeAccountHashesDuration) / float64(cumulativeRootGenDuration) * 100
-							snapshotCommitsRatio = float64(cumulativeSnapshotCommitsDuration) / float64(cumulativeRootGenDuration) * 100
-							trieDBCommitsRatio = float64(cumulativeTrieDBCommitsDuration) / float64(cumulativeRootGenDuration) * 100
-						}
-
-						t.Logf("      └─ poly: %.3fms (%.2f%%) - 主要耗时", float64(cumulativePolyTime.Microseconds()/1e3), polyRatio)
-						t.Logf("      └─ batch: %.3fms (%.2f%%) - 主要耗时", float64(cumulativeBatchTime.Microseconds()/1e3), batchRatio)
-						t.Logf("      └─ Serial: %.3fms (%.2f%%) - 主要耗时", float64(cumulativeSerializeTime.Microseconds()/1e3), serializeRatio)
-						t.Logf("      └─ Commit: %.3fms (%.2f%%) - 主要耗时", float64(cumulativeCommitTime.Microseconds()/1e3), commitRatio)
-
-						// 显示 StateDB Commit 子流程累计统计信息
-						t.Logf("StateDB Commit 子流程累计统计:")
-						t.Logf("      └─ PreCommit: %.3fms (%.2f%%) - 计算中间根", float64(cumulativePreCommitDuration.Microseconds()/1e3), preCommitRatio)
-						t.Logf("      └─ PostCommit: %.3fms (%.2f%%) - 提交到存储", float64(cumulativePostCommitDuration.Microseconds()/1e3), postCommitRatio)
-
-						// 显示 StateDB 7个统计区域累计统计信息
-						t.Logf("StateDB 7个统计区域累计统计:")
-						t.Logf("      └─ 统计1 - AccountCommits (Finalise): %.3fms (%.2f%%)", float64(cumulativeAccountCommitsDuration.Microseconds()/1e3), accountCommitsRatio)
-						t.Logf("      └─ 统计2&3 - StorageUpdates (并发处理存储): %.3fms (%.2f%%)", float64(cumulativeStorageUpdatesDuration.Microseconds()/1e3), storageUpdatesRatio)
-						t.Logf("      └─ 统计4 - AccountUpdates (更新删除状态对象): %.3fms (%.2f%%)", float64(cumulativeAccountUpdatesDuration.Microseconds()/1e3), accountUpdatesRatio)
-						t.Logf("      └─ 统计5 - AccountHashes (计算trie哈希): %.3fms (%.2f%%)", float64(cumulativeAccountHashesDuration.Microseconds()/1e3), accountHashesRatio)
-						t.Logf("      └─ 统计6 - SnapshotCommits (更新快照树): %.3fms (%.2f%%)", float64(cumulativeSnapshotCommitsDuration.Microseconds()/1e3), snapshotCommitsRatio)
-						t.Logf("      └─ 统计7 - TrieDBCommits (更新TrieDB): %.3fms (%.2f%%)", float64(cumulativeTrieDBCommitsDuration.Microseconds()/1e3), trieDBCommitsRatio)
-
-						// 显示 mdb 累计统计信息
-						t.Logf("MDB 累计统计:")
-						t.Logf("      └─ 读取次数: %d, 读取时间: %.3fms (%.2f%%)", cumulativeMdbReadCount, float64(cumulativeMdbReadTime.Microseconds()/1e3), mdbReadTimeRatio)
-						t.Logf("      └─ 写入次数: %d, 写入时间: %.3fms (%.2f%%)", cumulativeMdbWriteCount, float64(cumulativeMdbWriteTime.Microseconds()/1e3), mdbWriteTimeRatio)
 
 						// 写入CSV记录 - Verkle
 						verkleRecord := PerformanceRecord{
@@ -1212,46 +1086,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 					// 每1万个区块打印一次统计信息并重置
 					if blockNum%10000 == 0 {
-
 						t.Logf("区块 %d - mpt执行累计： %v，mpt提交累计: %v", blockNum, cumulativeProcessDuration, cumulativeRootGenDuration)
-
-						// 计算各个操作与 cumulativeRootGenDuration 的比例
-						var mdbReadTimeRatio, mdbWriteTimeRatio float64
-						var preCommitRatio, postCommitRatio float64
-						var accountCommitsRatio, storageUpdatesRatio, accountUpdatesRatio, accountHashesRatio float64
-						var snapshotCommitsRatio, trieDBCommitsRatio float64
-
-						if cumulativeRootGenDuration > 0 {
-							mdbReadTimeRatio = float64(cumulativeMdbReadTime) / float64(cumulativeRootGenDuration) * 100
-							mdbWriteTimeRatio = float64(cumulativeMdbWriteTime) / float64(cumulativeRootGenDuration) * 100
-							preCommitRatio = float64(cumulativePreCommitDuration) / float64(cumulativeRootGenDuration) * 100
-							postCommitRatio = float64(cumulativePostCommitDuration) / float64(cumulativeRootGenDuration) * 100
-							accountCommitsRatio = float64(cumulativeAccountCommitsDuration) / float64(cumulativeRootGenDuration) * 100
-							storageUpdatesRatio = float64(cumulativeStorageUpdatesDuration) / float64(cumulativeRootGenDuration) * 100
-							accountUpdatesRatio = float64(cumulativeAccountUpdatesDuration) / float64(cumulativeRootGenDuration) * 100
-							accountHashesRatio = float64(cumulativeAccountHashesDuration) / float64(cumulativeRootGenDuration) * 100
-							snapshotCommitsRatio = float64(cumulativeSnapshotCommitsDuration) / float64(cumulativeRootGenDuration) * 100
-							trieDBCommitsRatio = float64(cumulativeTrieDBCommitsDuration) / float64(cumulativeRootGenDuration) * 100
-						}
-
-						// 显示 StateDB Commit 子流程累计统计信息
-						t.Logf("StateDB Commit 子流程累计统计:")
-						t.Logf("      └─ PreCommit: %.3fms (%.2f%%) - 计算中间根", float64(cumulativePreCommitDuration.Microseconds()/1e3), preCommitRatio)
-						t.Logf("      └─ PostCommit: %.3fms (%.2f%%) - 提交到存储", float64(cumulativePostCommitDuration.Microseconds()/1e3), postCommitRatio)
-
-						// 显示 StateDB 7个统计区域累计统计信息
-						t.Logf("StateDB 7个统计区域累计统计:")
-						t.Logf("      └─ 统计1 - AccountCommits (Finalise): %.3fms (%.2f%%)", float64(cumulativeAccountCommitsDuration.Microseconds()/1e3), accountCommitsRatio)
-						t.Logf("      └─ 统计2&3 - StorageUpdates (并发处理存储): %.3fms (%.2f%%)", float64(cumulativeStorageUpdatesDuration.Microseconds()/1e3), storageUpdatesRatio)
-						t.Logf("      └─ 统计4 - AccountUpdates (更新删除状态对象): %.3fms (%.2f%%)", float64(cumulativeAccountUpdatesDuration.Microseconds()/1e3), accountUpdatesRatio)
-						t.Logf("      └─ 统计5 - AccountHashes (计算trie哈希): %.3fms (%.2f%%)", float64(cumulativeAccountHashesDuration.Microseconds()/1e3), accountHashesRatio)
-						t.Logf("      └─ 统计6 - SnapshotCommits (更新快照树): %.3fms (%.2f%%)", float64(cumulativeSnapshotCommitsDuration.Microseconds()/1e3), snapshotCommitsRatio)
-						t.Logf("      └─ 统计7 - TrieDBCommits (更新TrieDB): %.3fms (%.2f%%)", float64(cumulativeTrieDBCommitsDuration.Microseconds()/1e3), trieDBCommitsRatio)
-
-						// 显示 mdb 累计统计信息
-						t.Logf("MDB 累计统计:")
-						t.Logf("      └─ 读取次数: %d, 读取时间: %.3fms (%.2f%%)", cumulativeMdbReadCount, float64(cumulativeMdbReadTime.Microseconds()/1e3), mdbReadTimeRatio)
-						t.Logf("      └─ 写入次数: %d, 写入时间: %.3fms (%.2f%%)", cumulativeMdbWriteCount, float64(cumulativeMdbWriteTime.Microseconds()/1e3), mdbWriteTimeRatio)
 
 						// 写入CSV记录 - MPT
 						mptRecord := PerformanceRecord{
