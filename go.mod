@@ -149,4 +149,4 @@ require (
 	rsc.io/tmplfunc v0.0.3 // indirect
 )
 
-replace github.com/ethereum/go-verkle => ../go-verkle
+replace github.com/ethereum/go-verkle => ./go-verkle
