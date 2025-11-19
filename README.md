@@ -94,3 +94,49 @@ The following flags are hardcoded in `common/tree_config.go`:
 
 - `cacheTrie`: Enable/disable SWMT mode.
 - `verkleTree`: Enable/disable Verkle tree mode.
+
+# 具体实验
+
+Background 2.5-1 MPT_test.go 、verkle_test.go
+Background 2.5-2 processor_eth_compare_test.go
+
+## Evaluation 5.2、5.4 - processor_eth_compare_test.go
+### 使用介绍
+首先需要把以太坊数据放置到特定位置：
+
+### 方法：
+TestCompareProcessTransactions
+
+### 通用参数：
+- startFileIdx := 1 
+- endFileIdx := 8 
+- UseMemory := false
+
+### 其他通用参数：
+- dbDir := "F:\\ethdata\\geth_compare_db_verkle" 文件存储位置
+- statsDir := "F:\\ethdata\\compare_stats10_verkle" 统计信息存储位置
+- dataDir := "E:\\ethdata" 以太坊数据存储位置
+
+### 特有参数
+- mpt - common.UseVerkle = false;  common.UseCacheTrie = false
+- verkle - common.UseVerkle = true;  common.UseCacheTrie = false
+- mpt + SWMT - common.UseVerkle = false;  common.UseCacheTrie = true
+- verkle + SWMT - common.UseVerkle = true;  common.UseCacheTrie = true
+
+### 输出文件
+- MPT         - trie_stats.csv
+- Verkle      - verkletrie_stats.csv
+- MPT+SWMT    - cachetrie_stats.csv
+- Verkle+SWMT - cachetrie_stats.csv
+
+### 数据处理脚本
+p3-t1.py, 会生成四张图片，分别为
+- MPT - p3_t1_mpt_verification_time.png
+- Verkle - p3_t1_verkle_swmt_verification_time.png
+- MPT+SWMT - p3_t1_cachetrie_verification_time.png
+- Verkle+SWMT - p3_t1_verkle_verification_time.png
+
+## Evaluation 5.3 - MPT_test.go 、verkle_test.go、 cache_trie_test.go
+MPT
+
+## Evaluation 5.5 - cache_trie_performance_test.go

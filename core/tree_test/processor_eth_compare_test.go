@@ -1,8 +1,10 @@
 package tree
 
 import (
+	"flag"
 	"fmt"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-verkle"
 	"math/big"
@@ -34,25 +36,32 @@ import (
 	"encoding/csv"
 )
 
-// 写入尖峰检测相关全局变量
-var (
-	// 记录最近100个区块的写入量
-	recentBlockWrites = make([]int, 0, 100)
-	// 是否处于尖峰状态
-	inSpikeState bool
-	// 尖峰开始的区块号
-	spikeStartBlock uint64
-	// 尖峰开始的时间
-	spikeStartTime time.Time
-	// 尖峰期间的区块数
-	spikeBlockCount int
-	// 尖峰期间的总写入量
-	spikeTotalWrites int
-	// 尖峰期间的最大写入量
-	spikeMaxWrites int
-	// 尖峰前的平均写入量
-	preSpikeMeanWrites float64
+// 默认参数值（当命令行未提供或提供空值时使用）
+const (
+	DefaultDbDir        = "F:\\ethdata\\geth_compare_db_verkle"
+	DefaultStatsDir     = "F:\\ethdata\\compare_stats10_verkle"
+	DefaultDataDir      = "E:\\ethdata"
+	DefaultStartFileIdx = 1
+	DefaultEndFileIdx   = 8
+)
 
+// 可配置标志（通过 go test -args 传入）
+var (
+	dbDirFlag        = flag.String("dbDir", "", "Database directory for comparison test")
+	statsDirFlag     = flag.String("statsDir", "", "Statistics output directory")
+	dataDirFlag      = flag.String("dataDir", "", "Input data directory")
+	startFileIdxFlag = flag.Int("startFileIdx", 0, "Start file index (1-based)")
+	endFileIdxFlag   = flag.Int("endFileIdx", 0, "End file index (inclusive)")
+	useVerkleFlag    = flag.Bool("useVerkle", false, "Enable Verkle trie")
+	useCacheTrieFlag = flag.Bool("useCacheTrie", false, "Enable CacheTrie")
+	useMemoryFlag    = flag.Bool("useMemory", false, "Use in-memory DB")
+	// New flags for cache usage, parallelism and mock mode
+	useCacheFlag    = flag.Bool("useCache", false, "Use state cache warmup")
+	parallelismFlag = flag.Int("parallelism", 0, "Parallelism level (0 uses default)")
+	mockModeFlag    = flag.Bool("mockMode", false, "Enable verkle mock mode")
+)
+
+var (
 	// 累计时间统计变量
 	cumulativeProcessDuration time.Duration
 	cumulativeRootGenDuration time.Duration
@@ -81,9 +90,6 @@ var (
 	cumulativeSnapshotCommitsDuration time.Duration // 统计6: 更新快照树
 	cumulativeTrieDBCommitsDuration   time.Duration // 统计7: 更新TrieDB
 
-	// 并行硬编码字段
-	isParallelEnabled = true // 硬编码设置是否启用并行处理
-
 	// CSV记录相关变量
 	csvFile   *os.File
 	csvWriter *csv.Writer
@@ -92,7 +98,6 @@ var (
 // CSV记录结构体
 type PerformanceRecord struct {
 	TrieType                string  // MPT 或 Verkle
-	IsParallel              bool    // 是否并行
 	BlockRange              string  // 区块范围 (如 "10000", "20000")
 	ProcessDuration         float64 // 执行时间 (ms)
 	RootGenDuration         float64 // 提交时间 (ms)
@@ -115,17 +120,12 @@ type PerformanceRecord struct {
 // 初始化CSV文件
 func initCSVFile(statsDir string) error {
 	// 根据配置生成动态文件名
-	parallelStr := "serial"
-	if isParallelEnabled {
-		parallelStr = "parallel_polymemo3"
-	}
-
 	verkleStr := "mpt"
-	if common.UserVerkle {
+	if common.UseVerkle {
 		verkleStr = "verkle"
 	}
 
-	fileName := fmt.Sprintf("performance_stats_%s_%s.csv", verkleStr, parallelStr)
+	fileName := fmt.Sprintf("performance_stats_%s.csv", verkleStr)
 	csvPath := filepath.Join(statsDir, fileName)
 
 	// 检查文件是否存在
@@ -172,7 +172,6 @@ func writeCSVRecord(record PerformanceRecord) error {
 
 	row := []string{
 		record.TrieType,
-		strconv.FormatBool(record.IsParallel),
 		record.BlockRange,
 		strconv.FormatFloat(record.ProcessDuration, 'f', 3, 64),
 		strconv.FormatFloat(record.RootGenDuration, 'f', 3, 64),
@@ -211,10 +210,49 @@ func closeCSVFile() {
 
 // TestCompareProcessTransactions tests processing transactions from CSV
 func TestCompareProcessTransactions(t *testing.T) {
-	// Define database paths
-	dbDir := "F:\\ethdata\\geth_compare_db_verkle"
-	statsDir := "F:\\ethdata\\compare_stats10_verkle"
-	dataDir := "E:\\ethdata"
+	// Define database paths (configurable via flags with defaults)
+	dbDir := DefaultDbDir
+	statsDir := DefaultStatsDir
+	dataDir := DefaultDataDir
+
+	if *dbDirFlag != "" {
+		dbDir = *dbDirFlag
+	}
+	if *statsDirFlag != "" {
+		statsDir = *statsDirFlag
+	}
+	if *dataDirFlag != "" {
+		dataDir = *dataDirFlag
+	}
+
+	// Trie and DB usage toggles
+	common.UseVerkle = *useVerkleFlag
+	common.UseCacheTrie = *useCacheTrieFlag
+	UseMemory := *useMemoryFlag
+
+	//方案二 ， 搞一个数据stateDB，先访问一次数据把数据缓存上。（可配置）
+	useCache := *useCacheFlag // default false
+	//并行度（可配置），未提供或为0则使用当前默认1
+	common.Parallelism = 1
+	if *parallelismFlag > 0 {
+		common.Parallelism = *parallelismFlag
+	}
+	//是否屏蔽poly计算消耗（可配置），缺省保持当前默认 false
+	verkle.MockMode = *mockModeFlag
+
+	// File index range
+	startFileIdx := DefaultStartFileIdx // Start file index (starting from 1)
+	endFileIdx := DefaultEndFileIdx     // End file index
+	if *startFileIdxFlag != 0 {
+		startFileIdx = *startFileIdxFlag
+	}
+	if *endFileIdxFlag != 0 {
+		endFileIdx = *endFileIdxFlag
+	}
+
+	if common.UseVerkle && common.UseCacheTrie {
+		common.VerkleLayerCount = 128
+	}
 
 	// 初始化CSV文件
 	if err := initCSVFile(statsDir); err != nil {
@@ -225,8 +263,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 	defer closeCSVFile()
 
 	// Specify file range, hardcoded way to specify start and end file indices
-	startFileIdx := 1 // Start file index (starting from 1)
-	endFileIdx := 8   // End file index
+
 	//46147
 	var startNum uint64 = 46147
 
@@ -239,13 +276,17 @@ func TestCompareProcessTransactions(t *testing.T) {
 	cacheTrieRecorder := CreateTrieStatsRecorder(trieStatsDir, dbDir, CacheTrie)
 	verkleTrieRecorder := CreateTrieStatsRecorder(trieStatsDir, dbDir, VerkleTrie)
 
-	// Create or open persistent database
-	//ldb, err := leveldb.New(dbDir, 1024, 1024, "eth-compare-process-test", false)
-	//if err != nil {
-	//	t.Fatalf("Failed to create database: %v", err)
-	//}
-	//方案一：使用内存数据库
-	ldb := memorydb.New()
+	var ldb ethdb.KeyValueStore
+	if UseMemory {
+		ldb = memorydb.New()
+	} else {
+		// Create or open persistent database
+		var err error
+		ldb, err = leveldb.New(dbDir, 1024, 1024, "eth-compare-process-test", false)
+		if err != nil {
+			t.Fatalf("Failed to create database: %v", err)
+		}
+	}
 
 	defer ldb.Close()
 
@@ -253,14 +294,14 @@ func TestCompareProcessTransactions(t *testing.T) {
 	db := rawdb.NewDatabase(mdb)
 	hashdb := hashdb.Defaults
 	pathdb := pathdb.Defaults
-	if common.UserVerkle {
+	if common.UseVerkle {
 		hashdb = nil
 	} else {
 		pathdb = nil
 	}
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
 		Preimages: false,
-		IsVerkle:  common.UserVerkle,
+		IsVerkle:  common.UseVerkle,
 		CacheTrie: common.UseCacheTrie,
 		ReadCache: false,
 		StartNum:  startNum,
@@ -271,27 +312,25 @@ func TestCompareProcessTransactions(t *testing.T) {
 	// Use correct state package API
 	var snaps *snapshot.Tree
 	firstRootHash := types.EmptyRootHash
-	if common.UserVerkle {
+	if common.UseVerkle {
 		firstRootHash = common.Hash{}
 	}
 	snaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, firstRootHash)
 
 	sdb := state.NewDatabase(trieDB, snaps)
 
-	//方案二 ， 搞一个数据stateDB，先访问数据把数据缓存上。
-	useMemory := false
 	var memorySDB *state.CachingDB
-	if useMemory {
+	if useCache {
 		memorySDB = state.NewDatabase(trieDB, snaps)
 	}
 
 	var preTrieDB *triedb.Database
 	var preSdb *state.CachingDB
 	if common.UseCacheTrie {
-		if !common.UserVerkle {
+		if !common.UseVerkle {
 			preTrieDB = triedb.NewDatabase(db, &triedb.Config{
 				Preimages: false,
-				IsVerkle:  common.UserVerkle,
+				IsVerkle:  common.UseVerkle,
 				CacheTrie: false,
 				ReadCache: false,
 				StartNum:  startNum,
@@ -564,7 +603,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 			//新建一个memoryDB
 			var memoryStatedb *state.StateDB
-			if useMemory {
+			if useCache {
 				memorySDB.SetBlockNum(blockNum)
 				memoryStatedb, err = state.New(lastStateRoot, sdb)
 				if err != nil {
@@ -582,7 +621,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 
 			// Pre-allocate balance for all senders (to avoid insufficient balance since there's no incentive source)
 			for _, msg := range msgsByBlock[blockNum] {
-				if useMemory {
+				if useCache {
 					memoryStatedb.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
 				}
 				countingStateDB.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
@@ -623,7 +662,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 			vmenv := vm.NewEVM(blockContext, countingStateDB, params.MainnetChainConfig, vm.Config{})
 
 			var memoryVmenv *vm.EVM
-			if useMemory {
+			if useCache {
 				memoryVmenv = vm.NewEVM(blockContext, memoryStatedb, params.MainnetChainConfig, vm.Config{})
 			}
 
@@ -634,7 +673,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 					// Process transaction
 					result, err := core.ApplyMessage(vmenv, msg, gp)
 
-					if useMemory {
+					if useCache {
 						core.ApplyMessage(memoryVmenv, msg, gp)
 					}
 
@@ -826,7 +865,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 					//preTrieDB.Cap(1024 * 1024 * 1024) // 1GB memory limit
 
 				}
-				if common.UserVerkle {
+				if common.UseVerkle {
 					// Currently, verkle tree doesn't have concurrent implementation, serial implementation will preempt resources affecting efficiency, so simulate execution here first.
 					st(root, blockNum, deleteKVList)
 				} else {
@@ -842,7 +881,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 				// 重置 mdb 统计数据
 				mdb.ResetStats()
 
-				if useMemory {
+				if useCache {
 					memoryStatedb.PreCommit(false)
 				}
 
@@ -894,7 +933,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 				cumulativeTrieDBCommitsDuration += countingStateDB.TrieDBCommits
 
 				// State commit to database phase - only commit when reaching configured interval
-				if common.UserVerkle || blockNum-lastCommitBlock >= 10 {
+				if common.UseVerkle || blockNum-lastCommitBlock >= 10 {
 					// Commit every 1000 blocks
 					commitStart := time.Now()
 					err = trieDB.Commit(root, false)
@@ -1035,7 +1074,6 @@ func TestCompareProcessTransactions(t *testing.T) {
 						// 写入CSV记录 - Verkle
 						verkleRecord := PerformanceRecord{
 							TrieType:                "Verkle",
-							IsParallel:              isParallelEnabled,
 							BlockRange:              strconv.FormatUint(blockNum, 10),
 							ProcessDuration:         float64(cumulativeProcessDuration.Microseconds()) / 1e3,
 							RootGenDuration:         float64(cumulativeRootGenDuration.Microseconds()) / 1e3,
@@ -1091,7 +1129,6 @@ func TestCompareProcessTransactions(t *testing.T) {
 						// 写入CSV记录 - MPT
 						mptRecord := PerformanceRecord{
 							TrieType:                "MPT",
-							IsParallel:              isParallelEnabled,
 							BlockRange:              strconv.FormatUint(blockNum, 10),
 							ProcessDuration:         float64(cumulativeProcessDuration.Microseconds()) / 1e3,
 							RootGenDuration:         float64(cumulativeRootGenDuration.Microseconds()) / 1e3,

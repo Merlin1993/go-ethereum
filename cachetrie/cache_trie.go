@@ -279,8 +279,8 @@ func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (c
 func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 	trie := &CacheTrie{
 		blockNum:        0,
-		parallelism:     1,    // 默认不并行
-		parallelSizeThr: 5000, // 默认节点大小阈值
+		parallelism:     common.Parallelism, // 默认不并行
+		parallelSizeThr: 5000,               // 默认节点大小阈值
 	}
 	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewHeightRangeWindow(startNum, multiple, maxSize)
@@ -295,8 +295,8 @@ func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 func NewFixedSizeCacheTrie(startNum, fixedCapacity uint64, maxSize int) *CacheTrie {
 	trie := &CacheTrie{
 		blockNum:        0,
-		parallelism:     1,   // 默认不并行
-		parallelSizeThr: 100, // 默认节点大小阈值
+		parallelism:     common.Parallelism, // 默认不并行
+		parallelSizeThr: 5000,               // 默认节点大小阈值
 	}
 	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewFixedSizeHeightRangeWindow(startNum, fixedCapacity, maxSize)

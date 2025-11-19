@@ -19,10 +19,6 @@ const (
 	ModeGradual10                  // Mode 3: Every 200 writes increases by 10% (not compound)
 )
 
-// 实现10-20倍的增长，也就是（n+1）*300*10,然后状态还是5000，maxsize还是100w。fixed考虑20是刚刚好，5000的话固定是6最好，20也能接受，所以差的区间是小于5和大于20.
-// 为什么是5000
-// 为什么是20倍 --- 需要运行，找到最大点
-// 为什么是300个一增长 --- 1小时的区块数？
 func TestCachePerformance(t *testing.T) {
 	stateCount := 5000
 	iterationCount := 7800 // Statistics loop count
@@ -52,25 +48,6 @@ func TestCachePerformance(t *testing.T) {
 		testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeGradual10, 6)
 	})
 
-	//
-	//Test mode 1: Spike 10x mode
-	//t.Run(fmt.Sprintf("Spike10xMode_StateCount_%d", stateCount), func(t *testing.T) {
-	//	testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeSpike10x, 0)
-	//})
-
-	//// Test mode 2: Spike 2x mode
-	//t.Run(fmt.Sprintf("Spike2xMode_StateCount_%d", stateCount), func(t *testing.T) {
-	//	testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeSpike2x, 0)
-	//})
-
-	//Test mode 3: Gradual 10% mode
-	//t.Run(fmt.Sprintf("Gradual10pMode_StateCount_%d", stateCount), func(t *testing.T) {
-	//	testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeGradual10, 0)
-	//})
-
-	//t.Run(fmt.Sprintf("Gradual10pMode_StateCount_%d", stateCount), func(t *testing.T) {
-	//	testCacheTrieWithData(t, stateCount, iterationCount, windowMultiple, maxSize, ModeGradual10, 5)
-	//})
 }
 
 // Calculate the write intensity multiplier for current iteration
@@ -93,12 +70,6 @@ func calculateWriteIntensity(iteration, baseStateCount int, mode WriteMode) int 
 		}
 		return 100
 	case ModeGradual10:
-		// Every 200 writes increases by 10% (not compound)
-		//原实验
-		//cycles := iteration / 400
-		//return 100 + cycles*10
-		//cycles := iteration / 300
-		//return 100 + (cycles-4)*20
 		cycles := iteration / 300
 		return int(20 * math.Pow(1.2, float64(cycles)))
 	default:

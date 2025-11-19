@@ -1,7 +1,9 @@
 package common
 
-const (
-	UserVerkle   = false
-	UseCacheTrie = true
-	DebugFlag    = false
+var (
+	UseVerkle        = false
+	UseCacheTrie     = true
+	VerkleLayerCount = 1
+	DebugFlag        = false
+	Parallelism      = 1
 )
