@@ -31,18 +31,18 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// 测试基本操作: 插入、查询、删除
+// Test basic operations: insert, query, delete
 func TestBasicOperations(t *testing.T) {
 	trie := NewCacheTrie(0, 1, 0)
 	trie.SetBlockNum(1)
 
-	// 测试插入
+	// Test insert
 	err := trie.Update([]byte("key1"), []byte("value1"), true)
 	if err != nil {
 		t.Fatalf("Update key1 failed: %v", err)
 	}
 
-	// 测试Get方法
+	// Test Get method
 	node, err := trie.Get([]byte("key1"))
 	if err != nil {
 		t.Fatalf("Get key1 failed: %v", err)
@@ -78,19 +78,19 @@ func TestBasicOperations(t *testing.T) {
 		t.Errorf("Wrong value for key2: got %q, want %q", string(valueNode.Data), "value2")
 	}
 
-	// 测试删除
+	// Test delete
 	err = trie.Delete([]byte("key1"))
 	if err != nil {
 		t.Fatalf("Delete key1 failed: %v", err)
 	}
 
-	// 验证删除后，key1不存在或者是空值
+	// Verify that key1 is absent or has empty value after delete
 	node, err = trie.Get([]byte("key1"))
 	if err != nil {
 		t.Fatalf("Get after delete failed: %v", err)
 	}
 
-	// 删除后该节点应该是nil或者是空的ValueNode
+	// After delete, node should be nil or an empty ValueNode
 	if node != nil {
 		valueNode, ok = node.(ValueNode)
 		if !ok || len(valueNode.Data) != 0 {
@@ -98,7 +98,7 @@ func TestBasicOperations(t *testing.T) {
 		}
 	}
 
-	// 但是key2应该仍然存在
+	// key2 should still exist
 	node, err = trie.Get([]byte("key2"))
 	if err != nil {
 		t.Fatalf("Get key2 after deleting key1 failed: %v", err)
@@ -113,7 +113,7 @@ func TestBasicOperations(t *testing.T) {
 		t.Errorf("Wrong value for key2 after deleting key1: got %q, want %q", string(valueNode.Data), "value2")
 	}
 
-	// 测试哈希计算
+	// Test hash computation
 	hash, _, _ := trie.Hash()
 	t.Logf("Trie root hash: %x", hash)
 	if hash == (common.Hash{}) {
@@ -121,12 +121,12 @@ func TestBasicOperations(t *testing.T) {
 	}
 }
 
-// 测试window的计算是否正确
+// Test window calculation correctness
 func TestWindowCalculation(t *testing.T) {
-	// 创建一个缓存树，startNum=100, multiple=5
+	// Create a cache trie, startNum=100, multiple=5
 	trie := NewCacheTrie(100, 5, 0)
 
-	// 在区块110插入key1
+	// Insert key1 at block 110
 	trie.SetBlockNum(110)
 	err := trie.Update([]byte("key1"), []byte("value1"), true)
 	if err != nil {
@@ -139,48 +139,48 @@ func TestWindowCalculation(t *testing.T) {
 			trie.root.window(), expected)
 	}
 
-	// 在区块120更新另一个key
+	// Update another key at block 120
 	trie.SetBlockNum(120)
 	err = trie.Update([]byte("key2"), []byte("value2"), true)
 	if err != nil {
 		t.Fatalf("Update at block 120 failed: %v", err)
 	}
 
-	// 检查window位，应该同时设置了第22位和第24位
-	// 计算期望的bit位置: 120 / 5 = 24，然后对32取模得到24
+	// Check window bits: should set both bit 22 and 24
+	// Expected bit position: 120 / 5 = 24, then mod 32 => 24
 	expected = (1<<3 | 1<<4)
 
-	// 验证window是否正确
+	// Verify window value
 	if trie.root.window() != expected {
 		t.Errorf("Wrong window for key2 at block 120: got %032b, expected %032b",
 			trie.root.window(), expected)
 	}
 
-	//更新同一个key,消除第22位的值
+	// Update the same key, clearing bit 22
 	err = trie.Update([]byte("key1"), []byte("value1-updated"), true)
 	if err != nil {
 		t.Fatalf("Update at block 120 failed: %v", err)
 	}
 	expected = 1 << 4
 
-	// 验证window是否正确
+	// Verify window value
 	if trie.root.window() != expected {
 		t.Errorf("Wrong window for key1 at block 120: got %032b, expected %032b",
 			trie.root.window(), expected)
 	}
 }
 
-// 测试size的计算是否正确
+// Test size calculation correctness
 func TestSizeCalculation(t *testing.T) {
-	// 创建一个缓存树
+	// Create a cache trie
 	trie := NewCacheTrie(0, 1, 0)
 
-	// 初始size应该是0
+	// Initial size should be 0
 	if size := trie.GetSize(); size != 0 {
 		t.Errorf("Initial size expected 0, got %d", size)
 	}
 
-	// 插入10个键值对
+	// Insert 10 key-value pairs
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
@@ -190,12 +190,12 @@ func TestSizeCalculation(t *testing.T) {
 		}
 	}
 
-	// 验证size是否为10
+	// Verify size equals 10
 	if size := trie.GetSize(); size != 10 {
 		t.Errorf("Size after 10 insertions: expected 10, got %d", size)
 	}
 
-	// 删除2个键值对
+	// Delete 2 key-value pairs
 	err := trie.Delete([]byte("key3"))
 	if err != nil {
 		t.Fatalf("Delete key3 failed: %v", err)
@@ -205,31 +205,31 @@ func TestSizeCalculation(t *testing.T) {
 		t.Fatalf("Delete key7 failed: %v", err)
 	}
 
-	// 因为delete操作是伪删除，所以size还为10
+	// Delete is logical-only, so size remains 10
 	if size := trie.GetSize(); size != 10 {
 		t.Errorf("Size after deleting 2 keys: expected 8, got %d", size)
 	}
 
-	// 更新一个已存在的键
+	// Update an existing key
 	err = trie.Update([]byte("key1"), []byte("updated-value"), true)
 	if err != nil {
 		t.Fatalf("Update existing key failed: %v", err)
 	}
 
-	// 验证size是否仍为10(更新不应该改变size)
+	// Verify size still equals 10 (update should not change size)
 	if size := trie.GetSize(); size != 10 {
 		t.Errorf("Size after updating existing key: expected 8, got %d", size)
 	}
 }
 
-// 测试基于size的pruneCache功能
+// Test pruneCache based on size
 func TestPruneCacheBySize(t *testing.T) {
-	// 创建一个缓存树，maxSize设置为10
+	// Create a cache trie, with maxSize=10
 	maxSize := 10
 	trie := NewCacheTrie(100, 1, maxSize)
 	trie.SetBlockNum(101)
 
-	// 插入11个键值对
+	// Insert 11 key-value pairs
 	for i := 0; i < 11; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
@@ -239,10 +239,10 @@ func TestPruneCacheBySize(t *testing.T) {
 		}
 	}
 
-	//需要跨越多个区块，才可以触发裁剪
+	// Need to span multiple blocks to trigger pruning
 	trie.SetBlockNum(105)
 
-	// 插入4个键值对，超过maxSize限制
+	// Insert 4 more pairs to exceed maxSize
 	for i := 11; i < 15; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
@@ -252,15 +252,15 @@ func TestPruneCacheBySize(t *testing.T) {
 		}
 	}
 
-	// 验证size(此时应该是15)
+	// Verify size (should be 15 before Hash)
 	if size := trie.GetSize(); size != 15 {
 		t.Errorf("Expected size 15 before Hash, got %d", size)
 	}
 
-	// 调用Hash方法触发清理
+	// Trigger cleanup by calling Hash
 	trie.Hash()
 
-	// 验证size是否减少(应该小于等于targetSize，即maxSize*2/3)
+	// Verify size decreased (should be <= targetSize, i.e., maxSize*2/3)
 	targetSize := maxSize * 2 / 3
 	if size := trie.GetSize(); size > targetSize {
 		t.Errorf("Expected size <= %d after pruning, got %d", targetSize, size)
@@ -268,13 +268,13 @@ func TestPruneCacheBySize(t *testing.T) {
 		t.Logf("Size after pruning: %d (target: %d)", size, targetSize)
 	}
 
-	// 验证是否仍然可以插入新键
+	// Verify inserting new key still works
 	err := trie.Update([]byte("newKey"), []byte("newValue"), true)
 	if err != nil {
 		t.Fatalf("Failed to insert after pruning: %v", err)
 	}
 
-	// 验证新键是否可以正确获取
+	// Verify new key can be retrieved
 	node, err := trie.Get([]byte("newKey"))
 	if err != nil {
 		t.Fatalf("Failed to get new key: %v", err)
@@ -290,45 +290,45 @@ func TestPruneCacheBySize(t *testing.T) {
 	}
 }
 
-// 测试基于window的pruneCache功能
+// Test pruneCache based on window
 func TestPruneCacheByWindow(t *testing.T) {
-	// 创建一个缓存树，startNum从100开始，multiple=1
-	trie := NewCacheTrie(100, 1, 100) // 设置较大的maxSize确保不会因size触发
+	// Create a cache trie, startNum=100, multiple=1
+	trie := NewCacheTrie(100, 1, 100) // Large maxSize to avoid size-based pruning
 
-	// 在不同区块高度插入键值对
+	// Insert at different block heights
 	keys := []string{"keyA", "keyB", "keyC"}
 
-	// 在区块101插入keyA
+	// Insert keyA at block 101
 	trie.SetBlockNum(101)
 	err := trie.Update([]byte(keys[0]), []byte("valueA"), true)
 	if err != nil {
 		t.Fatalf("Update keyA failed: %v", err)
 	}
 
-	// 在区块109插入keyB
+	// Insert keyB at block 109
 	trie.SetBlockNum(109)
 	err = trie.Update([]byte(keys[1]), []byte("valueB"), true)
 	if err != nil {
 		t.Fatalf("Update keyB failed: %v", err)
 	}
 
-	// 在区块120插入keyC
+	// Insert keyC at block 120
 	trie.SetBlockNum(120)
 	err = trie.Update([]byte(keys[2]), []byte("valueC"), true)
 	if err != nil {
 		t.Fatalf("Update keyC failed: %v", err)
 	}
 
-	// 在区块596处理哈希 (1+32)*32/2 - 32，不应触发清理(因为还有足够的窗口位)
+	// Process hash at block 496; should not prune (enough window bits left)
 	trie.SetBlockNum(496)
 	trie.Hash()
 
-	// 验证startNum未变
+	// Verify startNum unchanged
 	if trie.hrw.windowStartNumber != 100 {
 		t.Errorf("startNum changed unexpectedly: expected %d, got %d", 100, trie.hrw.windowStartNumber)
 	}
 
-	// 验证所有键值对都可以获取
+	// Verify all key-value pairs are accessible
 	for _, key := range keys {
 		node, err := trie.Get([]byte(key))
 		if err != nil {
@@ -339,10 +339,10 @@ func TestPruneCacheByWindow(t *testing.T) {
 		}
 	}
 
-	// 在区块597触发window位数只剩8位的情况(跳转到597会用满32位)
+	// At block 597, window has only 8 bits left (jump to 597 fills 32 bits)
 	trie.SetBlockNum(497)
 
-	// 手动添加几个区块，填满余下的窗口位
+	// Manually add blocks to fill remaining window bits
 	for i := 0; i < 5; i++ {
 		blockNum := uint64(597 + i)
 		trie.SetBlockNum(blockNum)
@@ -352,21 +352,21 @@ func TestPruneCacheByWindow(t *testing.T) {
 		}
 	}
 
-	// 现在窗口应该快满了，计算哈希触发清理
+	// Window should be almost full; compute hash to trigger pruning
 	trie.Hash()
 
-	// 验证startNum已经更新(应该向前移动)
+	// Verify startNum moved forward after pruning
 	if trie.hrw.windowStartNumber <= 100 {
 		t.Errorf("startNum didn't increase after pruning, still at %d", trie.hrw.windowStartNumber)
 	} else {
 		t.Logf("startNum updated to %d after pruning", trie.hrw.windowStartNumber)
 	}
 
-	// 验证最旧的键可能已被清理(keyA可能被清理掉了)
+	// Oldest key might have been pruned (keyA possibly pruned)
 	node, err := trie.Get([]byte(keys[0]))
 	t.Logf("Trying to get keyA after pruning: %v, err: %v", node, err)
 
-	// 但是较新的键应该仍然可用
+	// Newer keys should still be available
 	for _, key := range keys[1:] {
 		node, err := trie.Get([]byte(key))
 		if err != nil {
@@ -378,18 +378,18 @@ func TestPruneCacheByWindow(t *testing.T) {
 	}
 }
 
-// 测试ValueNode的New字段功能
+// Test ValueNode's New field behavior
 func TestValueNodeNewField(t *testing.T) {
 	trie := NewCacheTrie(0, 1, 100)
 	trie.SetBlockNum(1)
 
-	// 首先测试通过Update插入的键值对，New字段默认为true
+	// Insertion via Update: New should default to true
 	err := trie.Update([]byte("key1"), []byte("value1"), true)
 	if err != nil {
 		t.Fatalf("Update key1 failed: %v", err)
 	}
 
-	// 获取节点并检查New字段值
+	// Get node and check New field
 	node, err := trie.Get([]byte("key1"))
 	if err != nil {
 		t.Fatalf("Get key1 failed: %v", err)
@@ -404,7 +404,7 @@ func TestValueNodeNewField(t *testing.T) {
 		t.Errorf("Expected New field to be true for new insertion, got false")
 	}
 
-	// 测试设置New为false的情况
+	// Test insertion with New=false
 	err = trie.Update([]byte("key2"), []byte("value2"), false)
 	if err != nil {
 		t.Fatalf("Update key2 failed: %v", err)
@@ -424,7 +424,7 @@ func TestValueNodeNewField(t *testing.T) {
 		t.Errorf("Expected New field to be false for isNew=false, got true")
 	}
 
-	// 测试删除操作会将New设置为true
+	// Deleting should set New=true
 	err = trie.Delete([]byte("key2"))
 	if err != nil {
 		t.Fatalf("Delete key2 failed: %v", err)
@@ -450,14 +450,14 @@ func TestValueNodeNewField(t *testing.T) {
 		}
 	}
 
-	// 测试更新值会将New设置为true
-	// 首先插入一个New=false的值
+	// Updating value sets New=true
+	// First insert a value with New=false
 	err = trie.Update([]byte("updateKey"), []byte("initialValue"), false)
 	if err != nil {
 		t.Fatalf("Update updateKey failed: %v", err)
 	}
 
-	// 获取并确认New=false
+	// Get and confirm New=false
 	node, err = trie.Get([]byte("updateKey"))
 	if err != nil {
 		t.Fatalf("Get updateKey failed: %v", err)
@@ -472,13 +472,13 @@ func TestValueNodeNewField(t *testing.T) {
 		t.Errorf("Expected New field to be false initially, got true")
 	}
 
-	// 更新相同键的值
+	// Update the same key's value
 	err = trie.Update([]byte("updateKey"), []byte("updatedValue"), true)
 	if err != nil {
 		t.Fatalf("Update updateKey (second time) failed: %v", err)
 	}
 
-	// 再次获取并确认New=true（因为值已更新）
+	// Get again and confirm New=true (value updated)
 	node, err = trie.Get([]byte("updateKey"))
 	if err != nil {
 		t.Fatalf("Get updateKey after update failed: %v", err)
@@ -497,14 +497,14 @@ func TestValueNodeNewField(t *testing.T) {
 		t.Errorf("Expected updated value, got %s", string(valueNode.Data))
 	}
 
-	// 测试pruneCache会根据New字段返回节点
-	trie.SetBlockNum(31) // 移动到会触发清理的区块
+	// Test pruneCache returns nodes based on New field
+	trie.SetBlockNum(31) // Move to block that triggers pruning
 
-	// 添加一些键值对
+	// Add some key-value pairs
 	for i := 0; i < 5; i++ {
 		key := []byte(fmt.Sprintf("pruneKey%d", i))
 		value := []byte(fmt.Sprintf("pruneValue%d", i))
-		isNew := i%2 == 0 // 交替设置New字段
+		isNew := i%2 == 0 // Alternate New field
 
 		err := trie.Update(key, value, isNew)
 		if err != nil {
@@ -512,29 +512,29 @@ func TestValueNodeNewField(t *testing.T) {
 		}
 	}
 
-	// 触发Hash计算和pruneCache
+	// Trigger Hash and pruneCache
 	_, _, deletedKVs := trie.Hash()
 
-	// 检查删除的键值对
+	// Inspect pruned key-value pairs
 	if deletedKVs == nil {
 		t.Log("No keys were pruned yet, which might be expected")
 	} else {
-		// 记录删除的节点信息
+		// Log pruned node info
 		for i, kv := range deletedKVs.Data {
 			t.Logf("Pruned KV[%d]: key=%x, value=%x", i, kv.Key, kv.Value)
 		}
 	}
 }
 
-// 测试pruneCache返回的DeleteKV中的New字段
+// Test New field in DeleteKV returned by pruneCache
 func TestPruneCacheDeleteKVNewField(t *testing.T) {
-	// 创建一个缓存树，使用较小的窗口以便快速触发pruneCache
+	// Create cache trie with small window to trigger pruneCache quickly
 	trie := NewCacheTrie(100, 1, 10)
 
-	// 在区块101插入几个键值对，分别设置不同的New值
+	// Insert at block 101 with different New values
 	trie.SetBlockNum(101)
 
-	// 插入New=true的键值对
+	// Insert keys with New=true
 	err := trie.Update([]byte("trueKey1"), []byte("trueValue1"), true)
 	if err != nil {
 		t.Fatalf("Update trueKey1 failed: %v", err)
@@ -545,7 +545,7 @@ func TestPruneCacheDeleteKVNewField(t *testing.T) {
 		t.Fatalf("Update trueKey2 failed: %v", err)
 	}
 
-	// 插入New=false的键值对
+	// Insert keys with New=false
 	err = trie.Update([]byte("falseKey1"), []byte("falseValue1"), false)
 	if err != nil {
 		t.Fatalf("Update falseKey1 failed: %v", err)
@@ -556,23 +556,23 @@ func TestPruneCacheDeleteKVNewField(t *testing.T) {
 		t.Fatalf("Update falseKey2 failed: %v", err)
 	}
 
-	// 跳转到足够远的区块，以确保触发pruneCache
+	// Jump far enough to ensure pruneCache triggers
 	trie.SetBlockNum(131)
 
-	// 触发Hash计算和pruneCache
+	// Trigger Hash and pruneCache
 	_, _, deletedKVs := trie.Hash()
 
-	// 验证pruneCache结果
+	// Validate pruneCache result
 	if deletedKVs == nil {
 		t.Fatalf("Expected deletedKVs from pruneCache, got nil")
 	}
 
-	// 统计从true和false节点中删除的键值对数量
+	// Count KVs deleted from true/false nodes
 	trueKeyCount := 0
 	falseKeyCount := 0
 
 	for _, kv := range deletedKVs.Data {
-		// 根据键名前缀判断是true还是false节点
+		// Use key prefix to infer true/false nodes
 		if bytes.HasPrefix(kv.Key, []byte("true")) {
 			trueKeyCount++
 			t.Logf("Found key from 'true' node: key=%x, value=%x", kv.Key, kv.Value)
@@ -582,39 +582,39 @@ func TestPruneCacheDeleteKVNewField(t *testing.T) {
 		}
 	}
 
-	// 验证应该只有来自New=true节点的键值对被返回
-	// 注意：由于hashKey的原因，我们无法直接通过前缀判断，这里只是通过数量大致判断
+	// Expect only KVs from New=true nodes
+	// Note: due to hashKey, prefix detection is approximate
 	if falseKeyCount > 0 {
 		t.Logf("Found %d keys from 'false' nodes, which might be unexpected", falseKeyCount)
 	}
 
-	// 验证至少有一些键值对被删除
+	// Verify at least some KVs were pruned
 	if deletedKVs == nil || len(deletedKVs.Data) == 0 {
 		t.Errorf("Expected some deleted KVs, got none")
 	}
 
-	// 再次测试：更新一个原来New=false的值，触发变更
+	// Second test: update a previously New=false value to trigger change
 	trie.SetBlockNum(145)
 
-	// 重新插入更多数据
+	// Insert more data again
 	err = trie.Update([]byte("falseKey3"), []byte("falseValue3"), false)
 	if err != nil {
 		t.Fatalf("Update falseKey3 failed: %v", err)
 	}
 
-	// 更新值
+	// Update value
 	err = trie.Update([]byte("falseKey3"), []byte("updatedValue3"), false)
 	if err != nil {
 		t.Fatalf("Update falseKey3 (second time) failed: %v", err)
 	}
 
-	// 跳转到更远的区块
+	// Jump to a farther block
 	trie.SetBlockNum(180)
 
-	// 再次触发Hash和pruneCache
+	// Trigger Hash and pruneCache again
 	_, _, deletedKVs = trie.Hash()
 
-	// 由于hashKey的原因，我们无法直接通过值内容判断，这里只记录日志
+	// Due to hashKey, cannot directly judge by value; log only
 	if deletedKVs != nil && len(deletedKVs.Data) > 0 {
 		t.Logf("Found %d deleted KVs in second pruning", len(deletedKVs.Data))
 		for i, kv := range deletedKVs.Data {
@@ -623,27 +623,27 @@ func TestPruneCacheDeleteKVNewField(t *testing.T) {
 	}
 }
 
-// 测试New=true的节点在pruneCache后仍然可用
+// Test that New=true nodes remain accessible after pruneCache
 func TestNewNodesRetentionAfterPrune(t *testing.T) {
-	// 创建一个缓存树，window足够小以触发pruneCache
+	// Create cache trie with small window to trigger pruneCache
 	trie := NewCacheTrie(100, 1, 10)
 
-	// 在区块101插入键值对
+	// Insert key-value pairs at block 101
 	trie.SetBlockNum(101)
 
-	// 插入New=true的键值对
+	// Insert New=true KV
 	err := trie.Update([]byte("trueNode"), []byte("trueValue"), true)
 	if err != nil {
 		t.Fatalf("Update trueNode failed: %v", err)
 	}
 
-	// 插入New=false的键值对
+	// Insert New=false KV
 	err = trie.Update([]byte("falseNode"), []byte("falseValue"), false)
 	if err != nil {
 		t.Fatalf("Update falseNode failed: %v", err)
 	}
 
-	// 确认两个节点都可以正常访问
+	// Confirm both nodes are accessible
 	node1, err := trie.Get([]byte("trueNode"))
 	if err != nil || node1 == nil {
 		t.Fatalf("Get trueNode failed before pruning: %v", err)
@@ -654,7 +654,7 @@ func TestNewNodesRetentionAfterPrune(t *testing.T) {
 		t.Fatalf("Get falseNode failed before pruning: %v", err)
 	}
 
-	// 检查节点的New字段
+	// Check node New field
 	valueNode1, ok := node1.(ValueNode)
 	if ok && valueNode1.New {
 		t.Logf("trueNode has New=true as expected")
@@ -669,36 +669,36 @@ func TestNewNodesRetentionAfterPrune(t *testing.T) {
 		t.Errorf("falseNode should have New=false, got true")
 	}
 
-	// 跳转到足够远的区块触发pruneCache
+	// Jump far enough to trigger pruneCache
 	trie.SetBlockNum(135)
 
-	// 添加一些额外的键，确保触发pruneCache
+	// Add extra keys to ensure pruneCache triggers
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("extraKey%d", i))
 		value := []byte(fmt.Sprintf("extraValue%d", i))
-		err := trie.Update(key, value, i%2 == 0) // 交替设置New
+		err := trie.Update(key, value, i%2 == 0) // Alternate New
 		if err != nil {
 			t.Fatalf("Update extraKey%d failed: %v", i, err)
 		}
 	}
 
-	// 触发Hash计算和pruneCache
+	// Trigger Hash and pruneCache
 	_, _, deletedKVs := trie.Hash()
 
-	// 验证pruneCache结果
+	// Validate pruneCache result
 	if deletedKVs == nil {
 		t.Log("No nodes were pruned yet, which might not be expected")
 	} else {
 		t.Logf("Pruned %d nodes", len(deletedKVs.Data))
 
-		// 记录删除的键值对内容
+		// Log deleted key-value contents
 		for i, kv := range deletedKVs.Data {
 			t.Logf("DeletedKV[%d]: key=%x, value=%x", i, kv.Key, kv.Value)
 		}
 	}
 
-	// 尝试再次访问两个节点
-	// New=true的节点应该被返回在DeleteKV中
+	// Try accessing nodes again
+	// New=true node should appear in DeleteKV
 	node1, err = trie.Get([]byte("trueNode"))
 	if err != nil {
 		t.Fatalf("Get trueNode failed after pruning: %v", err)
@@ -707,7 +707,7 @@ func TestNewNodesRetentionAfterPrune(t *testing.T) {
 	if node1 == nil {
 		t.Logf("trueNode (New=true) was pruned from trie and should be in deletedKVs")
 
-		// 检查在deletedKVs中是否能找到相似的值
+		// Check if similar value exists in deletedKVs
 		found := false
 		for _, kv := range deletedKVs.Data {
 			if bytes.Equal(kv.Value, []byte("trueValue")) {
@@ -733,17 +733,17 @@ func TestNewNodesRetentionAfterPrune(t *testing.T) {
 		}
 	}
 
-	// New=false的节点预期会被删除
+	// New=false node is expected to be deleted
 	node2, err = trie.Get([]byte("falseNode"))
 	if err != nil {
 		t.Fatalf("Get falseNode failed with error after pruning: %v", err)
 	}
 
-	// 检查删除的节点不应该出现在deletedKVs中
+	// Deleted node should not appear in deletedKVs
 	if node2 == nil {
 		t.Logf("falseNode (New=false) was pruned from trie as expected")
 
-		// 确认在deletedKVs中找不到
+		// Confirm it is not present in deletedKVs
 		for _, kv := range deletedKVs.Data {
 			if bytes.Equal(kv.Value, []byte("falseValue")) {
 				t.Logf("Found value matching falseNode in deletedKVs, which might be unexpected")
@@ -751,7 +751,7 @@ func TestNewNodesRetentionAfterPrune(t *testing.T) {
 			}
 		}
 	} else {
-		// 如果没有触发pruneCache，这是可能的
+		// Possible if pruneCache did not trigger
 		valueNode, ok := node2.(ValueNode)
 		if !ok {
 			t.Errorf("Expected ValueNode for falseNode, got %T", node2)
@@ -763,22 +763,22 @@ func TestNewNodesRetentionAfterPrune(t *testing.T) {
 	}
 }
 
-// 测试性能：测试1000个区块，window是10个区块一计，每个区块有2w的数据写入
+// Performance test: 1000 blocks, window counts every 10 blocks, 20k writes per block
 func TestPerformance(t *testing.T) {
 	if testing.Short() {
-		t.Skip("跳过耗时的性能测试")
+		t.Skip("Skipping long-running performance test")
 	}
 
-	// 测试参数
+	// Test parameters
 	blockCount := 200
 	entriesPerBlock := 5000
-	multiple := 1024 // window是10个区块一计
-	newRatio := 0.3  // 3成是new,7成是false
+	multiple := 1024 // window counts every 10 blocks
+	newRatio := 0.3  // 30% new, 70% false
 
-	// 创建足够大的maxSize，保证只有window满时才修剪
+	// Large maxSize to prune only when window is full
 	maxSize := entriesPerBlock * blockCount
 
-	// 生成测试数据
+	// Generate test data
 	keys := make([][]byte, entriesPerBlock)
 	values := make([][]byte, entriesPerBlock)
 	isNews := make([]bool, entriesPerBlock)
@@ -789,7 +789,7 @@ func TestPerformance(t *testing.T) {
 		isNews[i] = float64(i)/float64(entriesPerBlock) < newRatio
 	}
 
-	// 1. 测试有修剪情况下的性能
+	// 1) Performance with pruning
 	t.Run("WithPruning", func(t *testing.T) {
 		trie := NewCacheTrie(1, uint64(multiple), maxSize)
 
@@ -800,55 +800,55 @@ func TestPerformance(t *testing.T) {
 		for blockNum := 1; blockNum <= blockCount; blockNum++ {
 			trie.SetBlockNum(uint64(blockNum))
 
-			// 记录区块写入时间
+			// Record block write time
 			blockStart := time.Now()
 			for i := 0; i < entriesPerBlock; i++ {
-				// 生成该区块特定的key
+				// Generate block-specific keys
 				blockKey := []byte(fmt.Sprintf("%s-block%d", keys[i], blockNum))
 				err := trie.Update(blockKey, values[i], isNews[i])
 				if err != nil {
-					t.Fatalf("无法更新key: %v", err)
+					t.Fatalf("failed to update key: %v", err)
 				}
 			}
 			blockDuration := time.Since(blockStart)
 			totalBlockTime += blockDuration.Nanoseconds()
 
-			// 生成Hash并记录时间
+			// Compute hash and record time
 			hashStart := time.Now()
 			_, _, deletedKVs := trie.Hash()
 			hashDuration := time.Since(hashStart)
 			totalHashTime += hashDuration.Nanoseconds()
 
-			// 检查是否发生了修剪
+			// Check whether pruning occurred
 			if deletedKVs != nil && len(deletedKVs.Data) > 0 {
 				pruneCount++
-				t.Logf("区块 %d: 修剪了 %d 个键值对", blockNum, len(deletedKVs.Data))
+				t.Logf("block %d: pruned %d key-value pairs", blockNum, len(deletedKVs.Data))
 			}
 
-			// 每100个区块输出一次进度
+			// Output progress every 100 blocks
 			if blockNum%100 == 0 {
-				t.Logf("处理进度: %d/%d 区块", blockNum, blockCount)
+				t.Logf("progress: %d/%d blocks", blockNum, blockCount)
 			}
 		}
 
-		// 计算平均时间
+		// Compute averages
 		avgBlockTime := time.Duration(totalBlockTime / int64(blockCount))
 		avgHashTime := time.Duration(totalHashTime / int64(blockCount))
 
-		t.Logf("有修剪模式性能统计:")
-		t.Logf("总区块数: %d", blockCount)
-		t.Logf("每区块条目数: %d", entriesPerBlock)
-		t.Logf("修剪次数: %d", pruneCount)
-		t.Logf("平均区块写入时间: %v", avgBlockTime)
-		t.Logf("平均Hash计算时间: %v", avgHashTime)
-		t.Logf("总区块写入时间: %v", time.Duration(totalBlockTime))
-		t.Logf("总Hash计算时间: %v", time.Duration(totalHashTime))
-		t.Logf("总处理时间: %v", time.Duration(totalBlockTime+totalHashTime))
+		t.Logf("with-pruning performance stats:")
+		t.Logf("total blocks: %d", blockCount)
+		t.Logf("entries per block: %d", entriesPerBlock)
+		t.Logf("prune count: %d", pruneCount)
+		t.Logf("avg block write time: %v", avgBlockTime)
+		t.Logf("avg hash time: %v", avgHashTime)
+		t.Logf("total block write time: %v", time.Duration(totalBlockTime))
+		t.Logf("total hash time: %v", time.Duration(totalHashTime))
+		t.Logf("total processing time: %v", time.Duration(totalBlockTime+totalHashTime))
 	})
 
-	// 2. 测试无修剪情况下的性能
+	// 2) Performance without pruning
 	t.Run("WithoutPruning", func(t *testing.T) {
-		// 创建一个超级大的window，保证永远不会修剪
+		// Super-large window to ensure no pruning
 		trie := NewCacheTrie(1, uint64(blockCount*2), maxSize)
 
 		totalBlockTime := int64(0)
@@ -857,56 +857,56 @@ func TestPerformance(t *testing.T) {
 		for blockNum := 1; blockNum <= blockCount; blockNum++ {
 			trie.SetBlockNum(uint64(blockNum))
 
-			// 记录区块写入时间
+			// Record block write time
 			blockStart := time.Now()
 			for i := 0; i < entriesPerBlock; i++ {
-				// 生成该区块特定的key
+				// Generate block-specific keys
 				blockKey := []byte(fmt.Sprintf("%s-block%d", keys[i], blockNum))
 				err := trie.Update(blockKey, values[i], isNews[i])
 				if err != nil {
-					t.Fatalf("无法更新key: %v", err)
+					t.Fatalf("failed to update key: %v", err)
 				}
 			}
 			blockDuration := time.Since(blockStart)
 			totalBlockTime += blockDuration.Nanoseconds()
 
-			// 生成Hash并记录时间
+			// Compute hash and record time
 			hashStart := time.Now()
 			_, _, deletedKVs := trie.Hash()
 			hashDuration := time.Since(hashStart)
 			totalHashTime += hashDuration.Nanoseconds()
 
-			// 检查确认没有发生修剪
+			// Ensure pruning did not occur
 			if deletedKVs != nil && len(deletedKVs.Data) > 0 {
-				t.Errorf("区块 %d: 意外修剪了 %d 个键值对", blockNum, len(deletedKVs.Data))
+				t.Errorf("block %d: unexpected pruning of %d key-value pairs", blockNum, len(deletedKVs.Data))
 			}
 
-			// 每100个区块输出一次进度
+			// Output progress every 100 blocks
 			if blockNum%100 == 0 {
-				t.Logf("处理进度: %d/%d 区块", blockNum, blockCount)
+				t.Logf("progress: %d/%d blocks", blockNum, blockCount)
 			}
 		}
 
-		// 计算平均时间
+		// Compute averages
 		avgBlockTime := time.Duration(totalBlockTime / int64(blockCount))
 		avgHashTime := time.Duration(totalHashTime / int64(blockCount))
 
-		t.Logf("无修剪模式性能统计:")
-		t.Logf("总区块数: %d", blockCount)
-		t.Logf("每区块条目数: %d", entriesPerBlock)
-		t.Logf("平均区块写入时间: %v", avgBlockTime)
-		t.Logf("平均Hash计算时间: %v", avgHashTime)
-		t.Logf("总区块写入时间: %v", time.Duration(totalBlockTime))
-		t.Logf("总Hash计算时间: %v", time.Duration(totalHashTime))
-		t.Logf("总处理时间: %v", time.Duration(totalBlockTime+totalHashTime))
+		t.Logf("no-pruning performance stats:")
+		t.Logf("total blocks: %d", blockCount)
+		t.Logf("entries per block: %d", entriesPerBlock)
+		t.Logf("avg block write time: %v", avgBlockTime)
+		t.Logf("avg hash time: %v", avgHashTime)
+		t.Logf("total block write time: %v", time.Duration(totalBlockTime))
+		t.Logf("total hash time: %v", time.Duration(totalHashTime))
+		t.Logf("total processing time: %v", time.Duration(totalBlockTime+totalHashTime))
 	})
 }
 
 func TestHitRateStatistics(t *testing.T) {
-	// 创建一个缓存树
+	// Create a cache trie
 	trie := NewCacheTrie(0, 1, 0)
 
-	// 插入10个键值对
+	// Insert 10 key-value pairs
 	for i := 0; i < 10; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
@@ -916,7 +916,7 @@ func TestHitRateStatistics(t *testing.T) {
 		}
 	}
 
-	// 读取存在的键（命中）
+	// Read existing keys (hit)
 	for i := 0; i < 5; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		node, err := trie.Get(key)
@@ -928,7 +928,7 @@ func TestHitRateStatistics(t *testing.T) {
 		}
 	}
 
-	// 读取不存在的键（未命中）
+	// Read non-existing keys (miss)
 	for i := 10; i < 15; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		node, err := trie.Get(key)
@@ -940,7 +940,7 @@ func TestHitRateStatistics(t *testing.T) {
 		}
 	}
 
-	// 更新已存在的键（update命中）
+	// Update existing keys (update hit)
 	for i := 0; i < 4; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("updated-value%d", i))
@@ -950,7 +950,7 @@ func TestHitRateStatistics(t *testing.T) {
 		}
 	}
 
-	// 新增不存在的键（update未命中）
+	// Add new non-existing keys (update miss)
 	for i := 20; i < 24; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		value := []byte(fmt.Sprintf("value%d", i))
@@ -960,7 +960,7 @@ func TestHitRateStatistics(t *testing.T) {
 		}
 	}
 
-	// 删除存在的键（delete命中）
+	// Delete existing keys (delete hit)
 	for i := 4; i < 6; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		err := trie.Delete(key)
@@ -969,7 +969,7 @@ func TestHitRateStatistics(t *testing.T) {
 		}
 	}
 
-	// 删除不存在的键（delete未命中）
+	// Delete non-existing keys (delete miss)
 	for i := 30; i < 32; i++ {
 		key := []byte(fmt.Sprintf("key%d", i))
 		err := trie.Delete(key)
@@ -978,11 +978,11 @@ func TestHitRateStatistics(t *testing.T) {
 		}
 	}
 
-	// 验证Get命中率统计
+	// Validate Get hit rate stats
 	totalGetRequests, hitCount, missCount, getHitRate,
 		updateCount, updateHitCount, updateMissCount, updateHitRate := trie.GetHitRate()
 
-	// 验证Get统计
+	// Validate Get stats
 	if totalGetRequests != 10 {
 		t.Errorf("Expected 10 total Get requests, got %d", totalGetRequests)
 	}
@@ -996,35 +996,35 @@ func TestHitRateStatistics(t *testing.T) {
 		t.Errorf("Expected 0.5 Get hit rate, got %f", getHitRate)
 	}
 
-	// 验证Update统计
-	// 初始10个插入 + 4个更新 + 4个新增 + 2个删除命中 + 2个删除未命中 = 22个update操作
+	// Validate Update stats
+	// 10 initial inserts + 4 updates + 4 adds + 2 delete hits + 2 delete misses = 22 updates
 	expectedUpdateCount := 10 + 4 + 4 + 2 + 2
 	if updateCount != uint64(expectedUpdateCount) {
 		t.Errorf("Expected %d total Update operations, got %d", expectedUpdateCount, updateCount)
 	}
 
-	// 4个更新操作 + 2个删除操作命中 = 6个命中
+	// 4 update hits + 2 delete hits = 6 hits
 	expectedUpdateHits := 4 + 2
 	if updateHitCount != uint64(expectedUpdateHits) {
 		t.Errorf("Expected %d Update hits, got %d", expectedUpdateHits, updateHitCount)
 	}
 
-	// 10个初始插入 + 4个新增 + 2个删除未命中 = 16个未命中
+	// 10 initial inserts + 4 adds + 2 delete misses = 16 misses
 	expectedUpdateMisses := 10 + 4 + 2
 	if updateMissCount != uint64(expectedUpdateMisses) {
 		t.Errorf("Expected %d Update misses, got %d", expectedUpdateMisses, updateMissCount)
 	}
 
-	// 命中率应该是 6/22 ≈ 0.273
+	// Hit rate should be 6/22 ≈ 0.273
 	expectedUpdateHitRate := float64(expectedUpdateHits) / float64(expectedUpdateCount)
 	if math.Abs(updateHitRate-expectedUpdateHitRate) > 0.001 {
 		t.Errorf("Expected %.3f Update hit rate, got %.3f", expectedUpdateHitRate, updateHitRate)
 	}
 
-	// 重置统计
+	// Reset stats
 	trie.ResetStats()
 
-	// 验证重置后的统计
+	// Validate stats after reset
 	totalGetRequests, hitCount, missCount, getHitRate,
 		updateCount, updateHitCount, updateMissCount, updateHitRate = trie.GetHitRate()
 
@@ -1036,17 +1036,17 @@ func TestHitRateStatistics(t *testing.T) {
 	}
 }
 
-// 测试配置
+// Test configuration
 const (
-	// 预热阶段的状态数
+	// Number of states for warmup phase
 	warmupStateCount = 1000000
 
-	// 测试参数
+	// Test parameters
 	startBlockNum  = 1000
 	windowMultiple = 10
 )
 
-// 生成随机数据
+// Generate random data
 func generateRandomData() ([]byte, []byte) {
 	key := make([]byte, 32)
 	value := make([]byte, 32)
@@ -1055,19 +1055,19 @@ func generateRandomData() ([]byte, []byte) {
 	return key, value
 }
 
-// 生成随机地址
+// Generate random address
 func generateRandomAddress() common.Address {
 	addr := common.Address{}
 	rand.Read(addr[:])
 	return addr
 }
 
-// TestCacheTriePerformance 测试CacheTrie的性能
+// TestCacheTriePerformance tests CacheTrie performance
 func TestCacheTriePerformance(t *testing.T) {
-	// 测试不同的写入状态数
+	// Test different write state counts
 	stateCounts := []int{5000, 50000, 500000} // 1K, 10K, 100K
-	iterationCount := 20                      // 统计循环次数
-	maxSize := 500000                         // 初始存储大小限制
+	iterationCount := 20                      // number of iterations to measure
+	maxSize := 500000                         // initial storage size limit
 	windowMultiple := 1024
 	for _, stateCount := range stateCounts {
 		t.Run(fmt.Sprintf("StateCount_%d", stateCount), func(t *testing.T) {
@@ -1078,36 +1078,36 @@ func TestCacheTriePerformance(t *testing.T) {
 
 func TestSampleCacheTriePerformance(t *testing.T) {
 	stateCount := 5000
-	iterationCount := 4000 // 统计循环次数
-	maxSize := 1000000     // 初始存储大小限制
+	iterationCount := 4000 // number of iterations to measure
+	maxSize := 1000000     // initial storage size limit
 	windowMultiple := 256
 	t.Run(fmt.Sprintf("StateCount_%d", stateCount), func(t *testing.T) {
 		testCacheTrieWithStateCount(t, stateCount, iterationCount, windowMultiple, maxSize, 0)
 	})
 }
 
-// testCacheTrieWithStateCount 使用指定状态数进行CacheTrie测试
+// testCacheTrieWithStateCount tests CacheTrie with specified state count
 func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windowMultiple, maxSize int, mod int) {
-	t.Logf("开始测试: 单次写入状态数=%d, 统计循环次数=%d, 初始存储大小=%d", stateCount, iterationCount, maxSize)
+	t.Logf("start test: states per iteration=%d, iterations=%d, initial storage size=%d", stateCount, iterationCount, maxSize)
 
 	// 创建CacheTrie实例
 	cacheTrie := NewCacheTrie(startBlockNum, uint64(windowMultiple), maxSize)
 
-	// 预热阶段 - 执行到第一次清理
-	t.Log("开始预热阶段...")
+	// Warmup phase - run until first cleanup
+	t.Log("start warmup phase...")
 	preWarmupStartTime := time.Now()
 
-	// 设置初始区块高度
+	// Set initial block number
 	currentBlock := uint64(startBlockNum)
 	cacheTrie.SetBlockNum(currentBlock)
 
-	// 记录初始状态
+	// Record initial state
 	initialHRW := cacheTrie.GetHRW()
 	initialThreshold := initialHRW.GetThreshold()
-	t.Logf("初始状态: 阈值(ssthresh)=%d", initialThreshold)
+	t.Logf("initial state: threshold(ssthresh)=%d", initialThreshold)
 
-	// 进行预热，直到发生第一次清理
-	warmupBatchSize := 10000 // 每批次写入数量
+	// Warm up until first cleanup occurs
+	warmupBatchSize := 10000 // writes per batch
 	warmupBatches := 0
 
 	for i := 0; i < warmupStateCount; i += warmupBatchSize {
@@ -1116,13 +1116,13 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 			batchSize = warmupStateCount - i
 		}
 
-		// 写入数据
+		// Write data
 		for j := 0; j < batchSize; j++ {
 			key, value := generateRandomData()
 			cacheTrie.Update(key, value, true)
 		}
 
-		// 获取哈希，这会触发清理机制
+		// Get hash, which triggers cleanup
 		hash, _, kvList := cacheTrie.Hash()
 
 		if kvList != nil && len(kvList.Data) > 0 {
@@ -1136,54 +1136,54 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 
 		warmupBatches++
 
-		// 检查是否发生了清理
+		// Check if cleanup occurred
 		currentCleanupCount := cacheTrie.GetCleanupCount()
 		if currentCleanupCount > 0 {
-			t.Logf("预热阶段检测到清理发生，批次数=%d, 写入状态数=%d", warmupBatches, (warmupBatches-1)*warmupBatchSize+batchSize)
+			t.Logf("warmup detected cleanup, batches=%d, states written=%d", warmupBatches, (warmupBatches-1)*warmupBatchSize+batchSize)
 			break
 		}
 
-		// 如果写入了太多数据还没有触发清理，可以提前结束预热
+		// If too much data was written without cleanup, end warmup
 		if i+batchSize >= warmupStateCount {
-			t.Logf("预热阶段结束，未检测到清理发生，已写入状态数=%d", i+batchSize)
+			t.Logf("warmup ended, no cleanup detected, states written=%d", i+batchSize)
 		}
 	}
 	CleanupTime = 0
 
 	preWarmupDuration := time.Since(preWarmupStartTime)
-	t.Logf("预热阶段完成，耗时: %v", preWarmupDuration)
+	t.Logf("warmup completed, elapsed: %v", preWarmupDuration)
 
-	// 正式测试阶段
-	t.Log("开始正式测试阶段...")
+	// Main testing phase
+	t.Log("start main testing phase...")
 
 	// 记录每次操作的统计数据
 	type IterationStats struct {
-		WriteTime       time.Duration // 写入耗时
-		HashTime        time.Duration // 计算哈希耗时
-		WriteSpeed      float64       // 写入速度（状态/秒）
-		Size            int           // 当前size
-		Threshold       int           // 当前阈值
-		CleanupOccurred bool          // 是否发生清理
-		CleanupTime     time.Duration // 清理耗时（如果发生）
+		WriteTime       time.Duration // write duration
+		HashTime        time.Duration // hash duration
+		WriteSpeed      float64       // write speed (states/s)
+		Size            int           // current size
+		Threshold       int           // current threshold
+		CleanupOccurred bool          // whether cleanup occurred
+		CleanupTime     time.Duration // cleanup duration (if occurred)
 	}
 
 	stats := make([]IterationStats, iterationCount)
 
-	// 准备CSV数据
+	// Prepare CSV records
 	csvRecords := [][]string{
-		{"迭代", "写入耗时(ns)", "哈希耗时(ns)", "写入速度(状态/秒)", "Size", "Threshold", "是否清理", "清理耗时(ns)"},
+		{"Iteration", "write time(ns)", "hash time(ns)", "write speed (states/s)", "Size", "Threshold", "cleaned", "cleanup time(ns)"},
 	}
 
-	// 重置清理时间统计
+	// Reset cleanup time stats
 	cacheTrie.ResetCleanupTimes()
 
 	for i := 0; i < iterationCount; i++ {
-		// 记录写入开始时间
+		// Record write start time
 		writeStart := time.Now()
 
-		// 写入指定数量的状态
+		// Write the specified number of states
 		for j := 0; j < stateCount; j++ {
-			// 50%概率使用普通键值，50%概率使用带地址的键值
+			// 50% chance normal KV, 50% KV with address
 			if rand.Intn(2) == 0 {
 				key, value := generateRandomData()
 				cacheTrie.Update(key, value, true)
@@ -1196,11 +1196,11 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 
 		writeTime := time.Since(writeStart)
 
-		// 记录当前清理计数
+		// Record current cleanup count
 		beforeHashCleanupCount := cacheTrie.GetCleanupCount()
 		beforeCleanupTotalTime, _ := cacheTrie.GetCleanupTimes()
 
-		// 获取哈希，这会触发清理机制
+		// Get hash, which triggers cleanup
 		hashStart := time.Now()
 		hash, _, kvList := cacheTrie.Hash()
 		hashTime := time.Since(hashStart) - CleanupTime
@@ -1212,29 +1212,29 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 			}()
 		}
 
-		// 移动到下一个区块
+		// Move to next block
 		currentBlock++
 		cacheTrie.SetBlockNum(currentBlock)
 
-		// 检查是否发生了清理
+		// Check whether cleanup occurred
 		afterHashCleanupCount := cacheTrie.GetCleanupCount()
 		cleanupOccurred := afterHashCleanupCount > beforeHashCleanupCount
 
-		// 计算清理耗时（如果发生）
+		// Compute cleanup duration (if occurred)
 		var cleanupTime time.Duration
 		if cleanupOccurred {
 			afterCleanupTotalTime, _ := cacheTrie.GetCleanupTimes()
 			cleanupTime = afterCleanupTotalTime - beforeCleanupTotalTime
 		}
 
-		// 计算写入速度（状态/秒）
+		// Compute write speed (states/s)
 		writeSpeed := float64(stateCount) / writeTime.Seconds()
 
-		// 获取当前size和threshold
+		// Get current size and threshold
 		currentSize := cacheTrie.GetSize()
 		currentThreshold := cacheTrie.GetHRW().GetThreshold()
 
-		// 保存统计信息
+		// Save stats
 		stats[i] = IterationStats{
 			WriteTime:       writeTime,
 			HashTime:        hashTime,
@@ -1245,7 +1245,7 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 			CleanupTime:     cleanupTime,
 		}
 
-		// 添加到CSV记录
+		// Append to CSV records
 		csvRecords = append(csvRecords, []string{
 			strconv.Itoa(i + 1),
 			strconv.FormatInt(writeTime.Nanoseconds(), 10),
@@ -1257,17 +1257,17 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 			strconv.FormatInt(cleanupTime.Nanoseconds(), 10),
 		})
 
-		// 输出当前迭代的统计信息
-		cleanupStatus := "无"
+		// Output stats for current iteration
+		cleanupStatus := "none"
 		if cleanupOccurred {
-			cleanupStatus = fmt.Sprintf("发生，耗时: %v", cleanupTime)
+			cleanupStatus = fmt.Sprintf("occurred, duration: %v", cleanupTime)
 		}
 
-		t.Logf("迭代 %d/%d: 写入耗时=%v, 速度=%.2f 状态/秒, 哈希耗时=%v, Size=%d, Threshold=%d, 清理: %s",
+		t.Logf("iteration %d/%d: write=%v, speed=%.2f states/s, hash=%v, Size=%d, Threshold=%d, cleanup: %s",
 			i+1, iterationCount, writeTime, writeSpeed, hashTime.String(), currentSize, currentThreshold, cleanupStatus)
 	}
 
-	// 计算平均统计数据
+	// Compute average stats
 	var totalWriteTime, totalHashTime, totalCleanupTime time.Duration
 	var totalWriteSpeed float64
 	cleanupCount := 0
@@ -1292,102 +1292,102 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 		avgCleanupTime = totalCleanupTime / time.Duration(cleanupCount)
 	}
 
-	// 输出汇总统计信息
-	t.Logf("\n===== 测试汇总 (状态数: %d) =====", stateCount)
-	t.Logf("平均写入耗时: %v", avgWriteTime)
-	t.Logf("平均写入速度: %.2f 状态/秒", avgWriteSpeed)
-	t.Logf("平均哈希耗时: %v", avgHashTime)
-	t.Logf("触发清理次数: %d/%d", cleanupCount, iterationCount)
+	// Output summary stats
+	t.Logf("\n===== Test summary (states: %d) =====", stateCount)
+	t.Logf("avg write time: %v", avgWriteTime)
+	t.Logf("avg write speed: %.2f states/s", avgWriteSpeed)
+	t.Logf("avg hash time: %v", avgHashTime)
+	t.Logf("cleanup occurrences: %d/%d", cleanupCount, iterationCount)
 
 	if cleanupCount > 0 {
 		t.Logf("平均清理耗时: %v", avgCleanupTime)
 	}
 
-	// 获取最终的hit/miss统计
+	// Get final hit/miss stats
 	totalGetRequests, hitCount, missCount, getHitRate,
 		totalUpdateRequests, updateHitCount, updateMissCount, updateHitRate := cacheTrie.GetHitRate()
 
-	t.Logf("Get操作: 总请求=%d, 命中=%d, 未命中=%d, 命中率=%.2f%%",
+	t.Logf("Get: total=%d, hits=%d, misses=%d, hit rate=%.2f%%",
 		totalGetRequests, hitCount, missCount, getHitRate*100)
-	t.Logf("Update操作: 总请求=%d, 命中=%d, 未命中=%d, 命中率=%.2f%%",
+	t.Logf("Update: total=%d, hits=%d, misses=%d, hit rate=%.2f%%",
 		totalUpdateRequests, updateHitCount, updateMissCount, updateHitRate*100)
 
-	// 获取内存占用信息
+	// Get memory usage info
 	memSize := cacheTrie.GetMemorySize()
-	t.Logf("内存占用: %d 字节 (%.2f MB)", memSize, float64(memSize)/(1024*1024))
+	t.Logf("memory usage: %d bytes (%.2f MB)", memSize, float64(memSize)/(1024*1024))
 
-	// 将结果写入CSV文件
+	// Write results to CSV
 	csvFileName := fmt.Sprintf("cacheTrie_states%d_iter%d_window%d_maxsize%d.csv",
 		stateCount, iterationCount, windowMultiple, maxSize)
 	writeCSVFile(t, csvFileName, csvRecords)
 
-	// 汇总统计添加到摘要CSV
+	// Append summary stats to summary CSV
 	writeCSVSummary(t, stateCount, iterationCount, windowMultiple, maxSize,
 		avgWriteTime, avgHashTime, avgWriteSpeed, cleanupCount,
 		avgCleanupTime, getHitRate, updateHitRate, uint64(memSize))
 }
 
-// 将测试结果写入CSV文件
+// Write test results to CSV file
 func writeCSVFile(t *testing.T, fileName string, records [][]string) {
-	// 确保结果目录存在
+	// Ensure results directory exists
 	resultsDir := "results"
 	if _, err := os.Stat(resultsDir); os.IsNotExist(err) {
 		if err := os.Mkdir(resultsDir, 0755); err != nil {
-			t.Logf("创建结果目录失败: %v", err)
+			t.Logf("failed to create results directory: %v", err)
 			return
 		}
 	}
 
-	// 创建CSV文件
+	// Create CSV file
 	filePath := filepath.Join(resultsDir, fileName)
 	file, err := os.Create(filePath)
 	if err != nil {
-		t.Logf("创建CSV文件失败: %v", err)
+		t.Logf("failed to create CSV file: %v", err)
 		return
 	}
 	defer file.Close()
 
-	// 创建CSV写入器
+	// Create CSV writer
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// 写入数据
+	// Write data
 	if err := writer.WriteAll(records); err != nil {
-		t.Logf("写入CSV数据失败: %v", err)
+		t.Logf("failed to write CSV data: %v", err)
 		return
 	}
 
-	t.Logf("测试结果已写入CSV文件: %s", filePath)
+	t.Logf("test results written to CSV: %s", filePath)
 }
 
-// 将汇总统计写入摘要CSV文件
+// Write summary stats to summary CSV file
 func writeCSVSummary(t *testing.T, stateCount, iterationCount, windowMultiple, maxSize int,
 	avgWriteTime, avgHashTime time.Duration, avgWriteSpeed float64,
 	cleanupCount int, avgCleanupTime time.Duration,
 	getHitRate, updateHitRate float64, memSize uint64) {
 
-	// 确保结果目录存在
+	// Ensure results directory exists
 	resultsDir := "results"
 	if _, err := os.Stat(resultsDir); os.IsNotExist(err) {
 		if err := os.Mkdir(resultsDir, 0755); err != nil {
-			t.Logf("创建结果目录失败: %v", err)
+			t.Logf("failed to create results directory: %v", err)
 			return
 		}
 	}
 
-	// 摘要文件名
+	// Summary file name
 	summaryFile := filepath.Join(resultsDir, "cacheTrie_summary.csv")
 
-	// 检查文件是否存在，决定是否需要写入标题行
+	// Check if file exists to decide writing header
 	fileExists := false
 	if _, err := os.Stat(summaryFile); err == nil {
 		fileExists = true
 	}
 
-	// 打开文件用于追加
+	// Open file for appending
 	file, err := os.OpenFile(summaryFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		t.Logf("打开摘要文件失败: %v", err)
+		t.Logf("failed to open summary file: %v", err)
 		return
 	}
 	defer file.Close()
@@ -1395,21 +1395,21 @@ func writeCSVSummary(t *testing.T, stateCount, iterationCount, windowMultiple, m
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// 如果文件不存在，先写入标题行
+	// Write header if file did not exist
 	if !fileExists {
 		headers := []string{
-			"状态数", "迭代次数", "窗口乘数", "最大大小",
-			"平均写入耗时(ns)", "平均哈希耗时(ns)", "平均写入速度(状态/秒)",
-			"清理次数", "平均清理耗时(ns)",
-			"Get命中率(%)", "Update命中率(%)", "内存占用(MB)",
+			"States", "Iterations", "Window multiple", "Max size",
+			"Avg write time(ns)", "Avg hash time(ns)", "Avg write speed(states/s)",
+			"Cleanup count", "Avg cleanup time(ns)",
+			"Get hit rate(%)", "Update hit rate(%)", "Memory(MB)",
 		}
 		if err := writer.Write(headers); err != nil {
-			t.Logf("写入摘要标题失败: %v", err)
+			t.Logf("failed to write summary header: %v", err)
 			return
 		}
 	}
 
-	// 写入当前测试的摘要数据
+	// Write summary record for current test
 	record := []string{
 		strconv.Itoa(stateCount),
 		strconv.Itoa(iterationCount),
@@ -1426,9 +1426,9 @@ func writeCSVSummary(t *testing.T, stateCount, iterationCount, windowMultiple, m
 	}
 
 	if err := writer.Write(record); err != nil {
-		t.Logf("写入摘要数据失败: %v", err)
+		t.Logf("failed to write summary record: %v", err)
 		return
 	}
 
-	t.Logf("测试摘要已添加到: %s", summaryFile)
+	t.Logf("test summary appended to: %s", summaryFile)
 }

@@ -94,49 +94,76 @@ The following flags are hardcoded in `common/tree_config.go`:
 
 - `cacheTrie`: Enable/disable SWMT mode.
 - `verkleTree`: Enable/disable Verkle tree mode.
+ 
+## 📊 Evaluation Guide
 
-# 具体实验
+- All experiments are packaged into an archived dataset containing datasets, scripts, and images.
 
-Background 2.5-1 MPT_test.go 、verkle_test.go
-Background 2.5-2 processor_eth_compare_test.go
+### Background 2.5-1 — `MPT_test.go`, `verkle_test.go`
 
-## Evaluation 5.2、5.4 - processor_eth_compare_test.go
-### 使用介绍
-首先需要把以太坊数据放置到特定位置：
+- Executables are provided for these tests:
+  - MPT: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestMethod2`
+  - Verkle: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestVerkleMethod2`
+- After execution, result files are generated under `result` in the executable directory. Move them to the `data` directory and run `p3-t2_1.py` to produce plots.
 
-### 方法：
-TestCompareProcessTransactions
+### Background 2.5-2 — `processor_eth_compare_test.go`
 
-### 通用参数：
-- startFileIdx := 1 
-- endFileIdx := 8 
-- UseMemory := false
+- This experiment requires five runs:
+  - MPT: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestCompareProcessTransactions -dbDir "F:\db" -statsDir "F:\stat" -dataDir "E:\ethdata" -startFileIdx 1 -endFileIdx 2`
+  - Verkle: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestCompareProcessTransactions -dbDir "F:\db" -statsDir "F:\stat" -dataDir "E:\ethdata" -startFileIdx 1 -endFileIdx 2 -useVerkle`
+  - MPT-Pre: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestCompareProcessTransactions -dbDir "F:\db" -statsDir "F:\stat" -dataDir "E:\ethdata" -startFileIdx 1 -endFileIdx 2 -useCache`
+  - Verkle-Memory: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestCompareProcessTransactions -dbDir "F:\db" -statsDir "F:\stat" -dataDir "E:\ethdata" -startFileIdx 1 -endFileIdx 2 -useVerkle -useMemory`
+  - Verkle-Memory-poly: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestCompareProcessTransactions -dbDir "F:\db" -statsDir "F:\stat" -dataDir "E:\ethdata" -startFileIdx 1 -endFileIdx 2 -useVerkle -useMemory -mockMode`
+- Place outputs into the `data` directory and run `p3-t0.py` to generate plots.
 
-### 其他通用参数：
-- dbDir := "F:\\ethdata\\geth_compare_db_verkle" 文件存储位置
-- statsDir := "F:\\ethdata\\compare_stats10_verkle" 统计信息存储位置
-- dataDir := "E:\\ethdata" 以太坊数据存储位置
+### Evaluation 5.2 & 5.4 — `processor_eth_compare_test.go`
 
-### 特有参数
-- mpt - common.UseVerkle = false;  common.UseCacheTrie = false
-- verkle - common.UseVerkle = true;  common.UseCacheTrie = false
-- mpt + SWMT - common.UseVerkle = false;  common.UseCacheTrie = true
-- verkle + SWMT - common.UseVerkle = true;  common.UseCacheTrie = true
+- Usage:
+  - Set `dataDir` to the Ethereum dataset location and select a range (e.g., 1–2).
+  - The Windows executable is located in `bin` and named `processor_eth_compare.test.exe`.
+  - Commands:
+    - MPT: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestCompareProcessTransactions -dbDir "F:\db" -statsDir "F:\stat" -dataDir "E:\ethdata" -startFileIdx 1 -endFileIdx 2`
+    - Verkle: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestCompareProcessTransactions -dbDir "F:\db" -statsDir "F:\stat" -dataDir "E:\ethdata" -startFileIdx 1 -endFileIdx 2 -useVerkle`
+    - MPT+SWMT: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestCompareProcessTransactions -dbDir "F:\db" -statsDir "F:\stat" -dataDir "E:\ethdata" -startFileIdx 1 -endFileIdx 2 -useCacheTrie`
+    - Verkle+SWMT: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestCompareProcessTransactions -dbDir "F:\db" -statsDir "F:\stat" -dataDir "E:\ethdata" -startFileIdx 1 -endFileIdx 2 -useCacheTrie -useVerkle`
+- Method:
+  - `TestCompareProcessTransactions`
+- Common parameters:
+  - `startFileIdx := 1` start position for `transactions_x.csv` and `blocks_x.csv`
+  - `endFileIdx := 8` end position for `transactions_y.csv` and `blocks_y.csv`
+  - `UseMemory := false` whether to use the in-memory database (significantly reduces I/O time)
+- Other parameters:
+  - `dbDir := "F:\ethdata\geth_compare_db_verkle"` storage directory
+  - `statsDir := "F:\ethdata\compare_stats10_verkle"` statistics output directory
+  - `dataDir := "E:\ethdata"` Ethereum dataset directory
+- Mode-specific settings:
+  - mpt: `common.UseVerkle = false`; `common.UseCacheTrie = false`
+  - verkle: `common.UseVerkle = true`; `common.UseCacheTrie = false`
+  - mpt + SWMT: `common.UseVerkle = false`; `common.UseCacheTrie = true`
+  - verkle + SWMT: `common.UseVerkle = true`; `common.UseCacheTrie = true`
+- Output files:
+  - MPT — `trie_stats.csv`
+  - Verkle — `verkletrie_stats.csv`
+  - MPT+SWMT — `cachetrie_stats.csv`
+  - Verkle+SWMT — `cachetrie_stats.csv`
+- Data processing scripts:
+  - Experiment 1 (5.2): `p3-t1.py`. Create a `data` directory in the program’s working folder and place outputs from all four modes. Generates four images:
+    - MPT — `p3_t1_mpt_verification_time.png`
+    - Verkle — `p3_t1_verkle_swmt_verification_time.png`
+    - MPT+SWMT — `p3_t1_cachetrie_verification_time.png`
+    - Verkle+SWMT — `p3_t1_verkle_verification_time.png`
+  - Experiment 2 (5.4): `p3-t3.py`. Create a `data` directory and place outputs from the MPT+SWMT mode. Generates seven images.
 
-### 输出文件
-- MPT         - trie_stats.csv
-- Verkle      - verkletrie_stats.csv
-- MPT+SWMT    - cachetrie_stats.csv
-- Verkle+SWMT - cachetrie_stats.csv
+### Evaluation 5.3 — `MPT_test.go`, `verkle_test.go`, `cache_trie_test.go`
 
-### 数据处理脚本
-p3-t1.py, 会生成四张图片，分别为
-- MPT - p3_t1_mpt_verification_time.png
-- Verkle - p3_t1_verkle_swmt_verification_time.png
-- MPT+SWMT - p3_t1_cachetrie_verification_time.png
-- Verkle+SWMT - p3_t1_verkle_verification_time.png
+- Executables are provided for these tests:
+  - MPT: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestMethod2`
+  - Verkle: `./bin/processor_eth_compare.test.exe --% -test.v -test.run TestVerkleMethod2`
+  - SWMT: `./bin/SWMT_test.exe --% -test.v -test.run TestSampleCacheTriePerformance`
+- After execution, result files are generated under `result`. Move them to the `data` directory and run `p3-t2.py` to produce plots.
 
-## Evaluation 5.3 - MPT_test.go 、verkle_test.go、 cache_trie_test.go
-MPT
+### Evaluation 5.5 — `cache_trie_performance_test.go`
 
-## Evaluation 5.5 - cache_trie_performance_test.go
+- Run `./bin/SWMT_test.exe --% -test.v -test.run TestCachePerformance` to generate the data.
+- After execution, move results to the `data` directory and run `p3-t4.py` to produce plots.
+

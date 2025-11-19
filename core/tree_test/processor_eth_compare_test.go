@@ -36,7 +36,7 @@ import (
 	"encoding/csv"
 )
 
-// 默认参数值（当命令行未提供或提供空值时使用）
+// Default parameter values (used when CLI flags are missing or empty)
 const (
 	DefaultDbDir        = "F:\\ethdata\\geth_compare_db_verkle"
 	DefaultStatsDir     = "F:\\ethdata\\compare_stats10_verkle"
@@ -45,7 +45,7 @@ const (
 	DefaultEndFileIdx   = 8
 )
 
-// 可配置标志（通过 go test -args 传入）
+// Configurable flags (pass via `go test -args`)
 var (
 	dbDirFlag        = flag.String("dbDir", "", "Database directory for comparison test")
 	statsDirFlag     = flag.String("statsDir", "", "Statistics output directory")
@@ -62,27 +62,27 @@ var (
 )
 
 var (
-	// 累计时间统计变量
+	// Cumulative timing metrics
 	cumulativeProcessDuration time.Duration
 	cumulativeRootGenDuration time.Duration
 
-	// 四个操作的累计时间统计变量
+	// Cumulative metrics for four operations
 	cumulativePolyTime      time.Duration
 	cumulativeBatchTime     time.Duration
 	cumulativeSerializeTime time.Duration
 	cumulativeCommitTime    time.Duration
 
-	// mdb 数据库统计的累计变量
+	// Cumulative metrics for mdb database stats
 	cumulativeMdbReadCount  uint64
 	cumulativeMdbReadTime   time.Duration
 	cumulativeMdbWriteCount uint64
 	cumulativeMdbWriteTime  time.Duration
 
-	// StateDB commit 子流程的累计变量
+	// Cumulative metrics for StateDB commit sub-stages
 	cumulativePreCommitDuration  time.Duration
 	cumulativePostCommitDuration time.Duration
 
-	// StateDB 7个统计区域的累计变量
+	// Cumulative metrics for 7 StateDB areas
 	cumulativeAccountCommitsDuration  time.Duration // 统计1: Finalise
 	cumulativeStorageUpdatesDuration  time.Duration // 统计2&3: 并发处理存储更新
 	cumulativeAccountUpdatesDuration  time.Duration // 统计4: 更新和删除状态对象
@@ -90,36 +90,36 @@ var (
 	cumulativeSnapshotCommitsDuration time.Duration // 统计6: 更新快照树
 	cumulativeTrieDBCommitsDuration   time.Duration // 统计7: 更新TrieDB
 
-	// CSV记录相关变量
+	// CSV record related variables
 	csvFile   *os.File
 	csvWriter *csv.Writer
 )
 
-// CSV记录结构体
+// CSV record struct
 type PerformanceRecord struct {
-	TrieType                string  // MPT 或 Verkle
-	BlockRange              string  // 区块范围 (如 "10000", "20000")
-	ProcessDuration         float64 // 执行时间 (ms)
-	RootGenDuration         float64 // 提交时间 (ms)
-	PolyTime                float64 // poly时间 (ms)
-	BatchTime               float64 // batch时间 (ms)
-	SerializeTime           float64 // 序列化时间 (ms)
-	CommitTime              float64 // commit时间 (ms)
-	MdbReadTime             float64 // mdb读取时间 (ms)
-	MdbWriteTime            float64 // mdb写入时间 (ms)
-	PreCommitDuration       float64 // PreCommit时间 (ms)
-	PostCommitDuration      float64 // PostCommit时间 (ms)
-	AccountCommitsDuration  float64 // AccountCommits时间 (ms)
-	StorageUpdatesDuration  float64 // StorageUpdates时间 (ms)
-	AccountUpdatesDuration  float64 // AccountUpdates时间 (ms)
-	AccountHashesDuration   float64 // AccountHashes时间 (ms)
-	SnapshotCommitsDuration float64 // SnapshotCommits时间 (ms)
-	TrieDBCommitsDuration   float64 // TrieDBCommits时间 (ms)
+	TrieType                string  // MPT or Verkle
+	BlockRange              string  // Block range (e.g., "10000", "20000")
+	ProcessDuration         float64 // Execution time (ms)
+	RootGenDuration         float64 // Root generation time (ms)
+	PolyTime                float64 // Poly time (ms)
+	BatchTime               float64 // Batch map time (ms)
+	SerializeTime           float64 // Serialization time (ms)
+	CommitTime              float64 // Commit time (ms)
+	MdbReadTime             float64 // mdb read time (ms)
+	MdbWriteTime            float64 // mdb write time (ms)
+	PreCommitDuration       float64 // PreCommit time (ms)
+	PostCommitDuration      float64 // PostCommit time (ms)
+	AccountCommitsDuration  float64 // AccountCommits time (ms)
+	StorageUpdatesDuration  float64 // StorageUpdates time (ms)
+	AccountUpdatesDuration  float64 // AccountUpdates time (ms)
+	AccountHashesDuration   float64 // AccountHashes time (ms)
+	SnapshotCommitsDuration float64 // SnapshotCommits time (ms)
+	TrieDBCommitsDuration   float64 // TrieDBCommits time (ms)
 }
 
-// 初始化CSV文件
+// Initialize CSV file
 func initCSVFile(statsDir string) error {
-	// 根据配置生成动态文件名
+	// Generate dynamic file name based on config
 	verkleStr := "mpt"
 	if common.UseVerkle {
 		verkleStr = "verkle"
@@ -128,13 +128,13 @@ func initCSVFile(statsDir string) error {
 	fileName := fmt.Sprintf("performance_stats_%s.csv", verkleStr)
 	csvPath := filepath.Join(statsDir, fileName)
 
-	// 检查文件是否存在
+	// Check if file exists
 	fileExists := false
 	if _, err := os.Stat(csvPath); err == nil {
 		fileExists = true
 	}
 
-	// 打开或创建CSV文件
+	// Open or create CSV file
 	var err error
 	csvFile, err = os.OpenFile(csvPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -143,7 +143,7 @@ func initCSVFile(statsDir string) error {
 
 	csvWriter = csv.NewWriter(csvFile)
 
-	// 如果文件不存在，写入表头
+	// Write header if file did not exist
 	if !fileExists {
 		header := []string{
 			"TrieType", "IsParallel", "BlockRange",
@@ -164,10 +164,10 @@ func initCSVFile(statsDir string) error {
 	return nil
 }
 
-// 写入CSV记录
+// Write CSV record
 func writeCSVRecord(record PerformanceRecord) error {
 	if csvWriter == nil {
-		return nil // CSV未初始化，跳过
+		return nil // CSV not initialized, skip
 	}
 
 	row := []string{
@@ -198,7 +198,7 @@ func writeCSVRecord(record PerformanceRecord) error {
 	return nil
 }
 
-// 关闭CSV文件
+// Close CSV file
 func closeCSVFile() {
 	if csvWriter != nil {
 		csvWriter.Flush()
@@ -230,14 +230,14 @@ func TestCompareProcessTransactions(t *testing.T) {
 	common.UseCacheTrie = *useCacheTrieFlag
 	UseMemory := *useMemoryFlag
 
-	//方案二 ， 搞一个数据stateDB，先访问一次数据把数据缓存上。（可配置）
+	// Option 2: warm stateDB by accessing data once (configurable)
 	useCache := *useCacheFlag // default false
-	//并行度（可配置），未提供或为0则使用当前默认1
+	// Parallelism (configurable), default to 1 if not provided or zero
 	common.Parallelism = 1
 	if *parallelismFlag > 0 {
 		common.Parallelism = *parallelismFlag
 	}
-	//是否屏蔽poly计算消耗（可配置），缺省保持当前默认 false
+	// Whether to disable poly computation overhead (configurable), default false
 	verkle.MockMode = *mockModeFlag
 
 	// File index range
@@ -254,7 +254,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 		common.VerkleLayerCount = 128
 	}
 
-	// 初始化CSV文件
+	// Initialize CSV file
 	if err := initCSVFile(statsDir); err != nil {
 		t.Logf("Failed to initialize CSV file: %v", err)
 	} else {
@@ -601,7 +601,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 				counter: counter,
 			}
 
-			//新建一个memoryDB
+			// Create a new memoryDB
 			var memoryStatedb *state.StateDB
 			if useCache {
 				memorySDB.SetBlockNum(blockNum)
@@ -610,7 +610,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 					t.Fatalf("Failed to create state: %v", err)
 				}
 			}
-			//todo 如果useMemory开启，那就继续在这个逻辑后面，把countingStateDB做过的事情，都用memoryStatedb先做一遍。
+			// TODO: If useMemory is enabled, mirror countingStateDB operations on memoryStatedb
 
 			bigBalance := new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18))
 			// Convert to uint256.Int
@@ -872,20 +872,20 @@ func TestCompareProcessTransactions(t *testing.T) {
 					go st(root, blockNum, deleteKVList)
 				}
 			} else {
-				// 在 Commit 前重置统计数据
+				// Reset metrics before Commit
 				if trieDB.IsVerkle() {
 					verkle.ResetCommitToPolyTotalTime()
 					verkle.ResetBatchMapTotalTime()
 					verkle.ResetCommitTotalTime()
 				}
-				// 重置 mdb 统计数据
+				// Reset mdb statistics
 				mdb.ResetStats()
 
 				if useCache {
 					memoryStatedb.PreCommit(false)
 				}
 
-				// 跟踪 StateDB PreCommit 时间
+				// Track StateDB PreCommit time
 				preCommitStart := time.Now()
 				_, _, err := countingStateDB.PreCommit(false)
 				if err != nil {
@@ -894,7 +894,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 				preCommitDuration := time.Since(preCommitStart)
 				cumulativePreCommitDuration += preCommitDuration
 
-				// 跟踪 StateDB PostCommit 时间
+				// Track StateDB PostCommit time
 				postCommitStart := time.Now()
 				root, err = countingStateDB.PostCommit(blockNum, false, false)
 				if err != nil {
@@ -903,28 +903,28 @@ func TestCompareProcessTransactions(t *testing.T) {
 				postCommitDuration := time.Since(postCommitStart)
 				cumulativePostCommitDuration += postCommitDuration
 
-				//sheng 这里的时间调整了
+				// Adjust timing here
 				rootGenDuration = time.Since(preCommitStart)
 
 				cumulativeProcessDuration += processDuration
 				cumulativeRootGenDuration += rootGenDuration
 
-				// 在 Commit 后累计统计数据
+				// Accumulate metrics after Commit
 				if trieDB.IsVerkle() {
-					// 累计 verkle 统计数据
+					// Accumulate Verkle metrics
 					cumulativePolyTime += verkle.GetCommitToPolyTotalTime()
 					cumulativeBatchTime += verkle.GetBatchMapTotalTime()
 					cumulativeCommitTime += verkle.GetCommitTotalTime()
 				}
 
-				// 累计 mdb 统计数据
+				// Accumulate mdb metrics
 				stats := mdb.Stats()
 				cumulativeMdbReadCount += stats.ReadCount
 				cumulativeMdbReadTime += time.Duration(stats.ReadNanos)
 				cumulativeMdbWriteCount += stats.WriteCount
 				cumulativeMdbWriteTime += time.Duration(stats.WriteNanos)
 
-				// 累计 StateDB 7个统计区域的数据
+				// Accumulate metrics for 7 StateDB areas
 				cumulativeAccountCommitsDuration += countingStateDB.AccountCommits
 				cumulativeStorageUpdatesDuration += countingStateDB.StorageUpdates
 				cumulativeAccountUpdatesDuration += countingStateDB.AccountUpdates
@@ -1067,9 +1067,9 @@ func TestCompareProcessTransactions(t *testing.T) {
 					RecordVerkleTrieStats(verkleTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
 						len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
 
-					// 每1万个区块打印一次统计信息并重置
+					// Every 10,000 blocks: print metrics and reset
 					if blockNum%10000 == 0 {
-						t.Logf("区块 %d - Verkle执行累计： %v，Verkle提交累计: %v", blockNum, cumulativeProcessDuration, cumulativeRootGenDuration)
+						t.Logf("block %d - Verkle cumulative exec: %v, cumulative commit: %v", blockNum, cumulativeProcessDuration, cumulativeRootGenDuration)
 
 						// 写入CSV记录 - Verkle
 						verkleRecord := PerformanceRecord{
@@ -1096,7 +1096,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 							t.Logf("Failed to write Verkle CSV record: %v", err)
 						}
 
-						// 重置所有累计时间和 mdb 统计
+						// Reset all cumulative times and mdb stats
 						cumulativeProcessDuration = 0
 						cumulativeRootGenDuration = 0
 						cumulativePolyTime = 0
@@ -1109,7 +1109,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 						cumulativeMdbWriteTime = 0
 						cumulativePreCommitDuration = 0
 						cumulativePostCommitDuration = 0
-						// 重置 StateDB 7个统计区域
+						// Reset 7 StateDB areas
 						cumulativeAccountCommitsDuration = 0
 						cumulativeStorageUpdatesDuration = 0
 						cumulativeAccountUpdatesDuration = 0
@@ -1122,9 +1122,9 @@ func TestCompareProcessTransactions(t *testing.T) {
 					RecordTrieStats(standardTrieRecorder, blockNum, counter.UniqueWrites, counter.UniqueReads,
 						len(msgsByBlock[blockNum]), processDuration, rootGenDuration)
 
-					// 每1万个区块打印一次统计信息并重置
+					// Every 10,000 blocks: print metrics and reset
 					if blockNum%10000 == 0 {
-						t.Logf("区块 %d - mpt执行累计： %v，mpt提交累计: %v", blockNum, cumulativeProcessDuration, cumulativeRootGenDuration)
+						t.Logf("block %d - MPT cumulative exec: %v, cumulative commit: %v", blockNum, cumulativeProcessDuration, cumulativeRootGenDuration)
 
 						// 写入CSV记录 - MPT
 						mptRecord := PerformanceRecord{
@@ -1132,10 +1132,10 @@ func TestCompareProcessTransactions(t *testing.T) {
 							BlockRange:              strconv.FormatUint(blockNum, 10),
 							ProcessDuration:         float64(cumulativeProcessDuration.Microseconds()) / 1e3,
 							RootGenDuration:         float64(cumulativeRootGenDuration.Microseconds()) / 1e3,
-							PolyTime:                0, // MPT没有poly操作
-							BatchTime:               0, // MPT没有batch操作
-							SerializeTime:           0, // MPT没有序列化操作
-							CommitTime:              0, // MPT没有单独的commit操作
+							PolyTime:                0, // MPT has no poly operation
+							BatchTime:               0, // MPT has no batch operation
+							SerializeTime:           0, // MPT has no serialization operation
+							CommitTime:              0, // MPT has no separate commit operation
 							MdbReadTime:             float64(cumulativeMdbReadTime.Microseconds()) / 1e3,
 							MdbWriteTime:            float64(cumulativeMdbWriteTime.Microseconds()) / 1e3,
 							PreCommitDuration:       float64(cumulativePreCommitDuration.Microseconds()) / 1e3,
@@ -1151,7 +1151,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 							t.Logf("Failed to write MPT CSV record: %v", err)
 						}
 
-						// 重置所有累计时间和 mdb 统计
+						// Reset all cumulative times and mdb stats
 						cumulativeProcessDuration = 0
 						cumulativeRootGenDuration = 0
 
@@ -1161,7 +1161,7 @@ func TestCompareProcessTransactions(t *testing.T) {
 						cumulativeMdbWriteTime = 0
 						cumulativePreCommitDuration = 0
 						cumulativePostCommitDuration = 0
-						// 重置 StateDB 7个统计区域
+						// Reset 7 StateDB areas
 						cumulativeAccountCommitsDuration = 0
 						cumulativeStorageUpdatesDuration = 0
 						cumulativeAccountUpdatesDuration = 0
