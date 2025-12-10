@@ -280,7 +280,7 @@ func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 	trie := &CacheTrie{
 		blockNum:        0,
 		parallelism:     common.Parallelism, // 默认不并行
-		parallelSizeThr: 5000,               // 默认节点大小阈值
+		parallelSizeThr: 1000,               // 默认节点大小阈值
 	}
 	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewHeightRangeWindow(startNum, multiple, maxSize)
@@ -605,7 +605,7 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 	}
 
 	// 记录清理开始时间
-	//loopStartTime := time.Now()
+	loopStartTime := time.Now()
 
 	// 执行循环操作，直到根节点size数量小于80%的maxSize且window位数等于8bit
 	// 使用2/3作为阈值
@@ -669,7 +669,7 @@ func (t *CacheTrie) pruneCache() (kvl *DeleteKVList, resultHash common.Hash) {
 	//	totalFindNodeTime, totalFindNodeTime/time.Duration(iterationCount))
 
 	// 计算清理时间并更新统计
-	//CleanupTime = time.Since(loopStartTime)
+	CleanupTime = time.Since(loopStartTime)
 	t.totalCleanupTime += CleanupTime
 	if CleanupTime > t.maxCleanupTime {
 		t.maxCleanupTime = CleanupTime
@@ -796,8 +796,13 @@ func (t *CacheTrie) findNodeAtBit(n cacheNode, bit int, deleteKVList *DeleteKVLi
 								}
 							}()
 						} else {
-							// 小节点直接串行处理
-							t.findNodeAtBit(node.Children[i], bit, deleteKVList)
+							tempList := &DeleteKVList{Data: make([]*DeleteKV, 0)}
+							t.findNodeAtBit(node.Children[i], bit, tempList)
+							if len(tempList.Data) > 0 {
+								mu.Lock()
+								deleteKVList.Data = append(deleteKVList.Data, tempList.Data...)
+								mu.Unlock()
+							}
 						}
 					}
 				}

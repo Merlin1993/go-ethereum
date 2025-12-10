@@ -5,5 +5,5 @@ var (
 	UseCacheTrie     = true
 	VerkleLayerCount = 1
 	DebugFlag        = false
-	Parallelism      = 1
+	Parallelism      = 5
 )

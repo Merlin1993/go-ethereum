@@ -38,8 +38,8 @@ import (
 
 // Default parameter values (used when CLI flags are missing or empty)
 const (
-	DefaultDbDir        = "F:\\ethdata\\geth_compare_db_verkle"
-	DefaultStatsDir     = "F:\\ethdata\\compare_stats10_verkle"
+	DefaultDbDir        = "F:\\ethdata\\geth_compare_db_cache_pa"
+	DefaultStatsDir     = "F:\\ethdata\\compare_stats_cache_pa"
 	DefaultDataDir      = "E:\\ethdata"
 	DefaultStartFileIdx = 1
 	DefaultEndFileIdx   = 8
@@ -53,11 +53,11 @@ var (
 	startFileIdxFlag = flag.Int("startFileIdx", 0, "Start file index (1-based)")
 	endFileIdxFlag   = flag.Int("endFileIdx", 0, "End file index (inclusive)")
 	useVerkleFlag    = flag.Bool("useVerkle", false, "Enable Verkle trie")
-	useCacheTrieFlag = flag.Bool("useCacheTrie", false, "Enable CacheTrie")
+	useCacheTrieFlag = flag.Bool("useCacheTrie", true, "Enable CacheTrie")
 	useMemoryFlag    = flag.Bool("useMemory", false, "Use in-memory DB")
 	// New flags for cache usage, parallelism and mock mode
 	useCacheFlag    = flag.Bool("useCache", false, "Use state cache warmup")
-	parallelismFlag = flag.Int("parallelism", 0, "Parallelism level (0 uses default)")
+	parallelismFlag = flag.Int("parallelism", 1, "Parallelism level (1 uses default)")
 	mockModeFlag    = flag.Bool("mockMode", false, "Enable verkle mock mode")
 )
 
@@ -233,8 +233,8 @@ func TestCompareProcessTransactions(t *testing.T) {
 	// Option 2: warm stateDB by accessing data once (configurable)
 	useCache := *useCacheFlag // default false
 	// Parallelism (configurable), default to 1 if not provided or zero
-	common.Parallelism = 1
-	if *parallelismFlag > 0 {
+	common.Parallelism = 20
+	if *parallelismFlag > common.Parallelism {
 		common.Parallelism = *parallelismFlag
 	}
 	// Whether to disable poly computation overhead (configurable), default false
