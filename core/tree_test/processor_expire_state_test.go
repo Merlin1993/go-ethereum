@@ -1,0 +1,575 @@
+package tree
+
+import (
+	"encoding/csv"
+	"flag"
+	"fmt"
+	"math/big"
+	"os"
+	"runtime"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/ethereum/go-ethereum/cachetrie"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/state/snapshot"
+	"github.com/ethereum/go-ethereum/core/tracing"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/leveldb"
+	"github.com/ethereum/go-ethereum/ethdb/memorydb"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/hashdb"
+	"github.com/ethereum/go-ethereum/triedb/pathdb"
+	"github.com/holiman/uint256"
+)
+
+// ProcessorHost encapsulates the environment for state processing experiments.
+type ProcessorHost struct {
+	db        ethdb.Database
+	trieDB    *triedb.Database
+	sdb       *state.CachingDB
+	snaps     *snapshot.Tree
+	config    *ProcessorConfig
+	preTrieDB *triedb.Database
+	preSdb    *state.CachingDB
+}
+
+type ProcessorConfig struct {
+	DbDir        string
+	DataDir      string
+	StartFileIdx int
+	EndFileIdx   int
+	UseVerkle    bool
+	UseCacheTrie bool
+	UseMemory    bool
+	StartNum     uint64
+}
+
+func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
+	var ldb ethdb.KeyValueStore
+	var err error
+
+	if cfg.UseMemory {
+		ldb = memorydb.New()
+	} else {
+		ldb, err = leveldb.New(cfg.DbDir, 1024, 1024, "eth-expire-state-test", false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create database: %v", err)
+		}
+	}
+
+	db := rawdb.NewDatabase(ldb)
+	hdb := hashdb.Defaults
+	pdb := pathdb.Defaults
+	if cfg.UseVerkle {
+		hdb = nil
+	} else {
+		pdb = nil
+	}
+
+	trieDB := triedb.NewDatabase(db, &triedb.Config{
+		Preimages: false,
+		IsVerkle:  cfg.UseVerkle,
+		CacheTrie: cfg.UseCacheTrie,
+		ReadCache: false,
+		StartNum:  cfg.StartNum,
+		PathDB:    pdb,
+		HashDB:    hdb,
+	})
+
+	firstRootHash := types.EmptyRootHash
+	if cfg.UseVerkle {
+		firstRootHash = common.Hash{}
+	}
+	snaps, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, firstRootHash)
+	sdb := state.NewDatabase(trieDB, snaps)
+
+	host := &ProcessorHost{
+		db:     db,
+		trieDB: trieDB,
+		sdb:    sdb,
+		snaps:  snaps,
+		config: cfg,
+	}
+
+	if cfg.UseCacheTrie {
+		if !cfg.UseVerkle {
+			host.preTrieDB = triedb.NewFixedDatabase(db, &triedb.Config{
+				Preimages: false,
+				IsVerkle:  false,
+				CacheTrie: false,
+				ReadCache: false,
+				StartNum:  cfg.StartNum,
+				PathDB:    nil,
+				HashDB:    hdb,
+			})
+		} else {
+			host.preTrieDB = triedb.NewDatabase2(db, &triedb.Config{
+				Preimages: false,
+				IsVerkle:  true,
+				CacheTrie: false,
+				ReadCache: false,
+				StartNum:  cfg.StartNum,
+				PathDB:    pdb,
+				HashDB:    nil,
+			}, trieDB.GetBackend())
+		}
+		host.preSdb = state.NewDatabase(host.preTrieDB, snaps)
+	}
+
+	return host, nil
+}
+
+func (h *ProcessorHost) Close() {
+	if h.db != nil {
+		h.db.Close()
+	}
+}
+
+// CommitToPreTrie handles the asynchronous commitment of CacheTrie data to the underlying trie.
+func (h *ProcessorHost) CommitToPreTrie(root common.Hash, blockNum uint64, deleteKVList *cachetrie.DeleteKVList) {
+	if deleteKVList == nil || len(deleteKVList.Data) == 0 {
+		h.trieDB.CacheTrie().FinishCleanup(blockNum, root)
+		return
+	}
+
+	data := deleteKVList.Data
+	length := len(data)
+	chunkSize := 2000
+	if length > 100000 {
+		chunkSize = 10000
+	}
+
+	newRoot := root
+	for i := 0; i < length; i += chunkSize {
+		end := i + chunkSize
+		if end > length {
+			end = length
+		}
+		chunk := data[i:end]
+		cleanStateDB, _ := state.New(newRoot, h.preSdb)
+
+		// Process accounts
+		for _, kv := range chunk {
+			if kv.Address == (common.Address{}) && len(kv.Key) > 0 {
+				addr := common.BytesToAddress(kv.Key)
+				cleanStateDB.SetAccount(addr, kv.Value, 0)
+			}
+		}
+
+		// Process storage slots
+		for _, kv := range chunk {
+			if kv.Address != (common.Address{}) && len(kv.Key) > 0 {
+				addr := kv.Address
+				key := common.BytesToHash(kv.Key)
+				if common.BytesToHash(kv.Value) == (common.Hash{}) {
+					cleanStateDB.SetState(addr, key, common.Hash{})
+				} else {
+					_, vc, _, _ := rlp.Split(kv.Value)
+					cleanStateDB.SetState(addr, key, common.BytesToHash(vc))
+				}
+			}
+		}
+
+		commitRoot, _ := cleanStateDB.Commit(blockNum, false, false)
+		newRoot = commitRoot
+		h.preTrieDB.Commit(newRoot, false)
+	}
+
+	h.trieDB.CacheTrie().FinishCleanup(blockNum, newRoot)
+	runtime.GC()
+}
+
+// LoadTransactionsFromCSV reads and parses transactions from a CSV file.
+func LoadTransactionsFromCSV(file string) (map[uint64][]*core.Message, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	reader := csv.NewReader(f)
+	_, err = reader.Read() // skip header
+	if err != nil {
+		return nil, err
+	}
+
+	msgsByBlock := make(map[uint64][]*core.Message)
+	for {
+		record, err := reader.Read()
+		if err != nil {
+			break
+		}
+		if len(record) < 10 || record[0] == "hash" {
+			continue
+		}
+
+		blockNum, _ := strconv.ParseUint(record[3], 10, 64)
+		from := common.HexToAddress(record[5])
+		var to *common.Address
+		if record[6] != "" && record[6] != "null" {
+			toAddr := common.HexToAddress(record[6])
+			to = &toAddr
+		}
+
+		value := new(big.Int)
+		value.SetString(record[7], 10)
+
+		gasLimit, _ := strconv.ParseUint(record[8], 10, 64)
+		if gasLimit == 0 {
+			gasLimit = 21000
+		}
+
+		gasPrice := new(big.Int)
+		gasPrice.SetString(record[9], 10)
+		if gasPrice.Sign() == 0 {
+			gasPrice = big.NewInt(1000000000)
+		}
+
+		nonce, _ := strconv.ParseUint(record[1], 10, 64)
+		data := common.FromHex(record[10])
+
+		msg := &core.Message{
+			To:               to,
+			From:             from,
+			Nonce:            nonce,
+			Value:            value,
+			GasLimit:         gasLimit,
+			GasPrice:         gasPrice,
+			GasFeeCap:        gasPrice,
+			GasTipCap:        gasPrice,
+			Data:             data,
+			SkipNonceChecks:  true,
+			SkipFromEOACheck: false,
+		}
+		msgsByBlock[blockNum] = append(msgsByBlock[blockNum], msg)
+	}
+	return msgsByBlock, nil
+}
+
+func TestExpireStateProcessor(t *testing.T) {
+	dbDir := flag.String("dbDir2", "F:\\ethdata\\expire_state_db", "Database directory")
+	dataDir := flag.String("dataDir2", "E:\\ethdata", "Input data directory")
+	startIdx := flag.Int("startFileIdx2", 1, "Start file index")
+	endIdx := flag.Int("endFileIdx2", 10, "End file index")
+	useVerkle := flag.Bool("useVerkle2", false, "Enable Verkle trie")
+	useCacheTrie := flag.Bool("useCacheTrie2", true, "Enable CacheTrie")
+	useMemory := flag.Bool("useMemory2", false, "Use in-memory DB")
+
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+
+	cfg := &ProcessorConfig{
+		DbDir:        *dbDir,
+		DataDir:      *dataDir,
+		StartFileIdx: *startIdx,
+		EndFileIdx:   *endIdx,
+		UseVerkle:    *useVerkle,
+		UseCacheTrie: *useCacheTrie,
+		UseMemory:    *useMemory,
+		StartNum:     46147,
+	}
+
+	common.UseVerkle = cfg.UseVerkle
+	common.UseCacheTrie = cfg.UseCacheTrie
+	if cfg.UseVerkle && cfg.UseCacheTrie {
+		common.VerkleLayerCount = 128
+	}
+
+	host, err := NewProcessorHost(cfg)
+	if err != nil {
+		t.Fatalf("failed to create host: %v", err)
+	}
+	defer host.Close()
+	state.ResetCacheStats() // 从零开始统计
+
+	files, err := compareFindTransactionFiles(cfg.DataDir)
+	if err != nil || len(files) == 0 {
+		t.Fatalf("failed to find transaction files: %v", err)
+	}
+
+	selectedFiles := files[cfg.StartFileIdx-1 : cfg.EndFileIdx]
+	lastStateRoot := types.EmptyRootHash
+	if cfg.UseVerkle {
+		lastStateRoot = common.Hash{}
+	}
+
+	// Statistics tracking
+	const statsInterval = 10000
+	var (
+		intervalBlocks uint64
+		totalTxTime    time.Duration
+		maxTxTime      time.Duration
+		totalRootTime  time.Duration
+		maxRootTime    time.Duration
+
+		// CacheTrie stats
+		lastAcctHit, lastAcctMissEx, lastAcctMissNo int64
+		lastStorHit, lastStorMissEx, lastStorMissNo int64
+		totalProcessedBlocks                        uint64
+	)
+
+	// CSV file setup
+	csvFile, err := os.Create("cache_stats.csv")
+	if err != nil {
+		t.Fatalf("failed to create csv file: %v", err)
+	}
+	defer csvFile.Close()
+	writer := csv.NewWriter(csvFile)
+	defer writer.Flush()
+
+	// Write CSV Header
+	writer.Write([]string{
+		"StartBlock", "EndBlock",
+		"AcctHitRate", "AcctMissExRate", "AcctMissNoRate",
+		"StorHitRate", "StorMissExRate", "StorMissNoRate",
+	})
+
+	for _, file := range selectedFiles {
+		t.Logf("Processing file: %s", file)
+		msgsByBlock, err := LoadTransactionsFromCSV(file)
+		if err != nil {
+			t.Errorf("failed to load transactions from %s: %v", file, err)
+			continue
+		}
+
+		var minBlock, maxBlock uint64 = 1e18, 0
+		for b := range msgsByBlock {
+			if b < minBlock {
+				minBlock = b
+			}
+			if b > maxBlock {
+				maxBlock = b
+			}
+		}
+
+		for b := minBlock; b <= maxBlock; b++ {
+			msgs := msgsByBlock[b]
+			header := &types.Header{
+				Number:     new(big.Int).SetUint64(b),
+				GasLimit:   30000000,
+				Time:       b * 15,
+				Difficulty: big.NewInt(1),
+			}
+
+			// For CacheTrie, we might need to load block timestamps if available
+			// fileIdx := compareGetFileIndex(file)
+			// compareLoadBlockTimestampsFromFile(cfg.DataDir, fileIdx)
+
+			host.sdb.SetBlockNum(b)
+			statedb, _ := state.New(lastStateRoot, host.sdb)
+
+			// Simple balance allocation for experiment
+			balance, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18)))
+			for _, m := range msgs {
+				statedb.SetBalance(m.From, balance, tracing.BalanceChangeUnspecified)
+			}
+
+			// 1. Transaction execution time statistics
+			txStart := time.Now()
+
+			blockCtx := vm.BlockContext{
+				CanTransfer: core.CanTransfer,
+				Transfer:    core.Transfer,
+				GetHash:     func(n uint64) common.Hash { return common.Hash{} },
+				Coinbase:    common.Address{},
+				BlockNumber: header.Number,
+				Time:        header.Time,
+				Difficulty:  header.Difficulty,
+				GasLimit:    header.GasLimit,
+				BaseFee:     big.NewInt(0),
+			}
+			vmenv := vm.NewEVM(blockCtx, statedb, params.MainnetChainConfig, vm.Config{})
+			gp := new(core.GasPool).AddGas(header.GasLimit)
+
+			for _, m := range msgs {
+				core.ApplyMessage(vmenv, m, gp)
+			}
+
+			txDuration := time.Since(txStart)
+			totalTxTime += txDuration
+			if txDuration > maxTxTime {
+				maxTxTime = txDuration
+			}
+
+			// 2. Root calculation time statistics
+			rootStart := time.Now()
+
+			if cfg.UseCacheTrie {
+				_, resultHash, _ := statedb.PreCommit(false)
+				root := lastStateRoot
+				if resultHash != (common.Hash{}) {
+					root = resultHash
+				}
+
+				// Handle code commitment
+				codes := host.sdb.TrieDB().CacheTrie().PopCodes()
+				if len(codes) > 0 {
+					batch := host.db.NewBatch()
+					for codeHash, code := range codes {
+						rawdb.WriteCode(batch, codeHash, code)
+					}
+					batch.Write()
+				}
+
+				deleteKVList := statedb.GetCachedDeleteKVList()
+				if cfg.UseVerkle {
+					host.CommitToPreTrie(root, b, deleteKVList)
+				} else {
+					go host.CommitToPreTrie(root, b, deleteKVList)
+				}
+				lastStateRoot = root
+			} else {
+				statedb.PreCommit(false)
+				root, _ := statedb.PostCommit(b, false, false)
+				lastStateRoot = root
+				if b%100 == 0 {
+					host.trieDB.Commit(root, false)
+				}
+			}
+
+			rootDuration := time.Since(rootStart)
+			totalRootTime += rootDuration
+			if rootDuration > maxRootTime {
+				maxRootTime = rootDuration
+			}
+
+			intervalBlocks++
+			totalProcessedBlocks++
+			if intervalBlocks >= statsInterval {
+				fmt.Printf("Blocks: %d - %d\n", totalProcessedBlocks-statsInterval, totalProcessedBlocks-1)
+				fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
+				fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
+
+				// CacheTrie stats
+				acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo := state.GetCacheStats()
+
+				deltaAcctHit := acctHit - lastAcctHit
+				deltaAcctMissEx := acctMissEx - lastAcctMissEx
+				deltaAcctMissNo := acctMissNo - lastAcctMissNo
+				totalAcct := deltaAcctHit + deltaAcctMissEx + deltaAcctMissNo
+
+				deltaStorHit := storHit - lastStorHit
+				deltaStorMissEx := storMissEx - lastStorMissEx
+				deltaStorMissNo := storMissNo - lastStorMissNo
+				totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
+
+				if totalAcct > 0 {
+					fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%)\n",
+						deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
+						deltaAcctMissEx, float64(deltaAcctMissEx)*100/float64(totalAcct),
+						deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct))
+				}
+				if totalStor > 0 {
+					fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%)\n",
+						deltaStorHit, float64(deltaStorHit)*100/float64(totalStor),
+						deltaStorMissEx, float64(deltaStorMissEx)*100/float64(totalStor),
+						deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor))
+				}
+
+				// Write to CSV
+				record := []string{
+					strconv.FormatUint(totalProcessedBlocks-statsInterval, 10),
+					strconv.FormatUint(totalProcessedBlocks-1, 10),
+				}
+				if totalAcct > 0 {
+					record = append(record,
+						fmt.Sprintf("%.2f%%", float64(deltaAcctHit)*100/float64(totalAcct)),
+						fmt.Sprintf("%.2f%%", float64(deltaAcctMissEx)*100/float64(totalAcct)),
+						fmt.Sprintf("%.2f%%", float64(deltaAcctMissNo)*100/float64(totalAcct)),
+					)
+				} else {
+					record = append(record, "0.00%", "0.00%", "0.00%")
+				}
+				if totalStor > 0 {
+					record = append(record,
+						fmt.Sprintf("%.2f%%", float64(deltaStorHit)*100/float64(totalStor)),
+						fmt.Sprintf("%.2f%%", float64(deltaStorMissEx)*100/float64(totalStor)),
+						fmt.Sprintf("%.2f%%", float64(deltaStorMissNo)*100/float64(totalStor)),
+					)
+				} else {
+					record = append(record, "0.00%", "0.00%", "0.00%")
+				}
+				writer.Write(record)
+				writer.Flush()
+
+				// Reset stats
+				intervalBlocks = 0
+				totalTxTime = 0
+				maxTxTime = 0
+				totalRootTime = 0
+				maxRootTime = 0
+
+				lastAcctHit, lastAcctMissEx, lastAcctMissNo = acctHit, acctMissEx, acctMissNo
+				lastStorHit, lastStorMissEx, lastStorMissNo = storHit, storMissEx, storMissNo
+			}
+		}
+	}
+	// Final statistics report for the last partial interval
+	if intervalBlocks > 0 {
+		fmt.Printf("Final Partial Interval (Blocks: %d - %d)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
+		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
+		fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
+
+		// Final CacheTrie stats
+		acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo := state.GetCacheStats()
+		deltaAcctHit := acctHit - lastAcctHit
+		deltaAcctMissEx := acctMissEx - lastAcctMissEx
+		deltaAcctMissNo := acctMissNo - lastAcctMissNo
+		totalAcct := deltaAcctHit + deltaAcctMissEx + deltaAcctMissNo
+
+		deltaStorHit := storHit - lastStorHit
+		deltaStorMissEx := storMissEx - lastStorMissEx
+		deltaStorMissNo := storMissNo - lastStorMissNo
+		totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
+
+		if totalAcct > 0 {
+			fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%)\n",
+				deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
+				deltaAcctMissEx, float64(deltaAcctMissEx)*100/float64(totalAcct),
+				deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct))
+		}
+		if totalStor > 0 {
+			fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%)\n",
+				deltaStorHit, float64(deltaStorHit)*100/float64(totalStor),
+				deltaStorMissEx, float64(deltaStorMissEx)*100/float64(totalStor),
+				deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor))
+		}
+
+		// Final Write to CSV
+		record := []string{
+			strconv.FormatUint(totalProcessedBlocks-intervalBlocks, 10),
+			strconv.FormatUint(totalProcessedBlocks-1, 10),
+		}
+		if totalAcct > 0 {
+			record = append(record,
+				fmt.Sprintf("%.2f%%", float64(deltaAcctHit)*100/float64(totalAcct)),
+				fmt.Sprintf("%.2f%%", float64(deltaAcctMissEx)*100/float64(totalAcct)),
+				fmt.Sprintf("%.2f%%", float64(deltaAcctMissNo)*100/float64(totalAcct)),
+			)
+		} else {
+			record = append(record, "0.00%", "0.00%", "0.00%")
+		}
+		if totalStor > 0 {
+			record = append(record,
+				fmt.Sprintf("%.2f%%", float64(deltaStorHit)*100/float64(totalStor)),
+				fmt.Sprintf("%.2f%%", float64(deltaStorMissEx)*100/float64(totalStor)),
+				fmt.Sprintf("%.2f%%", float64(deltaStorMissNo)*100/float64(totalStor)),
+			)
+		} else {
+			record = append(record, "0.00%", "0.00%", "0.00%")
+		}
+		writer.Write(record)
+		writer.Flush()
+	}
+	t.Logf("Final state root: %s", lastStateRoot.String())
+}

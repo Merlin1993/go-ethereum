@@ -294,6 +294,7 @@ func TestPruneCacheBySize(t *testing.T) {
 func TestPruneCacheByWindow(t *testing.T) {
 	// Create a cache trie, startNum=100, multiple=1
 	trie := NewCacheTrie(100, 1, 100) // Large maxSize to avoid size-based pruning
+	trie.SetReadSet(true)
 
 	// Insert at different block heights
 	keys := []string{"keyA", "keyB", "keyC"}
@@ -1325,6 +1326,62 @@ func testCacheTrieWithStateCount(t *testing.T, stateCount, iterationCount, windo
 	writeCSVSummary(t, stateCount, iterationCount, windowMultiple, maxSize,
 		avgWriteTime, avgHashTime, avgWriteSpeed, cleanupCount,
 		avgCleanupTime, getHitRate, updateHitRate, uint64(memSize))
+}
+
+func TestReadSetConfiguration(t *testing.T) {
+	// 1. 测试默认情况下 (readSet=false)
+	// 使用 NewCacheTrie(100, 1, 0)
+	// logicalCapacities 会被初始化为 [1, 2, 3, 4, 5, ...]
+	trie := NewCacheTrie(100, 1, 0)
+
+	// 设置高度 105
+	// valueInWindow = 105 - 100 = 5
+	// offset 0: cap 1 (range 0-1)
+	// offset 1: cap 2 (range 1-3)
+	// offset 3: cap 3 (range 3-6) -> 命中! index = 2
+	trie.SetBlockNum(105)
+
+	key := []byte("testkey")
+	val := []byte("testval")
+
+	// 插入数据，此时 window bit 应该是 1<<2 = 4
+	trie.Update(key, val, true)
+
+	windowBefore := trie.root.window()
+	if windowBefore != 4 {
+		t.Fatalf("Expected window 4, got %d", windowBefore)
+	}
+
+	// 移动到新区块 110
+	// valueInWindow = 110 - 100 = 10
+	// offset 10: cap 5 (range 10-15) -> 命中! index = 4
+	trie.SetBlockNum(110)
+
+	// 读取数据，由于 readSet=false，window 不应该更新
+	_, err := trie.Get(key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	windowAfter := trie.root.window()
+	if windowAfter != windowBefore {
+		t.Errorf("readSet=false: window updated unexpectedly. Before: %d, After: %d", windowBefore, windowAfter)
+	}
+
+	// 2. 测试开启 readSet=true
+	trie.SetReadSet(true)
+
+	// 再次读取，此时 window 应该更新为 1<<4 = 16
+	_, err = trie.Get(key)
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
+	}
+
+	windowUpdated := trie.root.window()
+	expectedWindow := 16 // replacement behavior for leaves
+	if windowUpdated != expectedWindow {
+		t.Errorf("readSet=true: window not updated correctly. Expected: %d, Got: %d", expectedWindow, windowUpdated)
+	}
 }
 
 // Write test results to CSV file

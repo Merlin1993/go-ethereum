@@ -148,6 +148,39 @@ func NewDatabase2(diskdb ethdb.Database, config *Config, bd backend) *Database {
 
 // NewDatabase initializes the trie database with default settings, note
 // the legacy hash-based scheme is used by default.
+func NewFixedDatabase(diskdb ethdb.Database, config *Config) *Database {
+	// Sanitize the config and use the default one if it's not specified.
+	if config == nil {
+		config = HashDefaults
+	}
+	var preimages *preimageStore
+	if config.Preimages {
+		preimages = newPreimageStore(diskdb)
+	}
+	db := &Database{
+		disk:      diskdb,
+		config:    config,
+		preimages: preimages,
+	}
+	if config.HashDB != nil && config.PathDB != nil {
+		log.Crit("Both 'hash' and 'path' mode are configured")
+	}
+	if config.PathDB != nil {
+		db.backend = pathdb.New(diskdb, config.PathDB, config.IsVerkle)
+	} else {
+		db.backend = hashdb.New(diskdb, config.HashDB)
+	}
+
+	// Initialize the cache trie if enabled
+	if config.CacheTrie {
+		db.cacheTrie = cachetrie.NewFixedSizeCacheTrie(config.StartNum, 82125, 1000000000)
+	}
+
+	return db
+}
+
+// NewDatabase initializes the trie database with default settings, note
+// the legacy hash-based scheme is used by default.
 func NewDatabase(diskdb ethdb.Database, config *Config) *Database {
 	// Sanitize the config and use the default one if it's not specified.
 	if config == nil {

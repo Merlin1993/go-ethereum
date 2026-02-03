@@ -84,6 +84,8 @@ type CacheTrie struct {
 	// 并行处理相关
 	parallelism     int // 并行度，1表示不并行，>1表示使用多线程
 	parallelSizeThr int // 并行处理的节点大小阈值，只有当节点size大于此值时才考虑并行
+
+	readSet bool // 是否在读取时更新节点的window bit
 }
 
 // -----------------------------------------------------------------------------
@@ -222,6 +224,9 @@ func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (c
 
 		// 如果到达key末尾，返回当前节点的Val
 		if newPos == len(key) {
+			if t.readSet {
+				n.updateFlag(bitPosition)
+			}
 			return n.Val, nil
 		}
 
@@ -229,7 +234,7 @@ func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (c
 		childNode, err := t.get(n.Val, key, newPos, bitPosition)
 
 		//如果找到了，则更新其window字段
-		if childNode != nil {
+		if childNode != nil && t.readSet {
 			n.updateFlag(bitPosition)
 		}
 
@@ -248,7 +253,7 @@ func (t *CacheTrie) get(node cacheNode, key []byte, pos int, bitPosition int) (c
 		childNode, err := t.get(n.Children[childIndex], key, pos+1, bitPosition)
 
 		//如果找到了，则更新其window字段
-		if childNode != nil {
+		if childNode != nil && t.readSet {
 			n.updateFlag(bitPosition)
 		}
 
@@ -281,6 +286,7 @@ func NewCacheTrie(startNum, multiple uint64, maxSize int) *CacheTrie {
 		blockNum:        0,
 		parallelism:     common.Parallelism, // 默认不并行
 		parallelSizeThr: 1000,               // 默认节点大小阈值
+		readSet:         false,              // 默认不更新read set
 	}
 	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewHeightRangeWindow(startNum, multiple, maxSize)
@@ -297,6 +303,7 @@ func NewFixedSizeCacheTrie(startNum, fixedCapacity uint64, maxSize int) *CacheTr
 		blockNum:        0,
 		parallelism:     common.Parallelism, // 默认不并行
 		parallelSizeThr: 5000,               // 默认节点大小阈值
+		readSet:         true,               // 默认不更新read set
 	}
 	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewFixedSizeHeightRangeWindow(startNum, fixedCapacity, maxSize)
@@ -323,6 +330,16 @@ func (t *CacheTrie) GetWindowMode() WindowMode {
 		return t.hrw.GetMode()
 	}
 	return ModeCongestionControl
+}
+
+// SetReadSet 设置是否在读取时更新节点的window bit
+func (t *CacheTrie) SetReadSet(readSet bool) {
+	t.readSet = readSet
+}
+
+// GetReadSet 获取是否在读取时更新节点的window bit
+func (t *CacheTrie) GetReadSet() bool {
+	return t.readSet
 }
 
 // GetFixedCapacity 获取固定大小模式下的固定容量

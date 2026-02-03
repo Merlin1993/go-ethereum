@@ -19,6 +19,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/cachetrie"
@@ -371,6 +372,14 @@ var (
 	storageHitCounts  []int64         // 每个reader的Storage方法调用成功次数
 	accountAccessTime []time.Duration // 每个reader的Account方法累计访问时间
 	storageAccessTime []time.Duration // 每个reader的Storage方法累计访问时间
+
+	// CacheTrie 统计信息
+	cacheAccountHit           int64
+	cacheAccountMissExists    int64
+	cacheAccountMissNotExists int64
+	cacheStorageHit           int64
+	cacheStorageMissExists    int64
+	cacheStorageMissNotExists int64
 )
 
 // multiStateReader is the aggregation of a list of StateReader interface,
@@ -407,6 +416,8 @@ func newMultiStateReader(readers ...StateReader) (*multiStateReader, error) {
 func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, error) {
 	var errs []error
 	start := time.Now()
+	var cacheMiss bool
+
 	for i, reader := range r.readers {
 		acct, err := reader.Account(addr)
 		elapsed := time.Since(start)
@@ -415,14 +426,42 @@ func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, er
 		if len(r.readers) == Readers {
 			accountAccessTime[i] += elapsed
 		}
+
+		// 检查是否是 CacheTrieReader 且未命中
+		if i == 0 {
+			if _, ok := reader.(*CacheTrieReader); ok {
+				if err == CacheNilErr {
+					cacheMiss = true
+				} else if err == nil {
+					atomic.AddInt64(&cacheAccountHit, 1)
+				}
+			}
+		}
+
 		if err == nil {
 			if len(r.readers) == Readers {
 				accountHitCounts[i]++
+			}
+			// 如果缓存未命中但在后续层找到，则写回缓存
+			if cacheMiss && i > 0 {
+				if ctReader, ok := r.readers[0].(*CacheTrieReader); ok && ctReader.ct != nil {
+					if acct != nil {
+						data, _ := rlp.EncodeToBytes(acct)
+						ctReader.ct.Update(addr.Bytes(), data, false)
+						atomic.AddInt64(&cacheAccountMissExists, 1)
+					} else {
+						atomic.AddInt64(&cacheAccountMissNotExists, 1)
+					}
+				}
 			}
 			return acct, nil
 		}
 
 		errs = append(errs, err)
+	}
+	// 如果所有 reader 都失败或未找到
+	if cacheMiss {
+		atomic.AddInt64(&cacheAccountMissNotExists, 1)
 	}
 	return nil, errors.Join(errs...)
 }
@@ -436,23 +475,52 @@ func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, er
 func (r *multiStateReader) Storage(addr common.Address, slot common.Hash) (common.Hash, error) {
 	var errs []error
 	start := time.Now()
+	var cacheMiss bool
+
 	for i, reader := range r.readers {
 		slotValue, err := reader.Storage(addr, slot)
 		elapsed := time.Since(start)
 
 		// 更新统计信息
-
 		if len(r.readers) == Readers {
 			storageAccessTime[i] += elapsed
 		}
+
+		// 检查是否是 CacheTrieReader 且未命中
+		if i == 0 {
+			if _, ok := reader.(*CacheTrieReader); ok {
+				if err == CacheNilErr {
+					cacheMiss = true
+				} else if err == nil {
+					atomic.AddInt64(&cacheStorageHit, 1)
+				}
+			}
+		}
+
 		if err == nil {
 			if len(r.readers) == Readers {
 				storageHitCounts[i]++
+			}
+			// 如果缓存未命中但在后续层找到，则写回缓存
+			if cacheMiss && i > 0 {
+				if ctReader, ok := r.readers[0].(*CacheTrieReader); ok && ctReader.ct != nil {
+					if slotValue != (common.Hash{}) {
+						data, _ := rlp.EncodeToBytes(slotValue)
+						ctReader.ct.UpdateWithAddress(addr, slot.Bytes(), data, false)
+						atomic.AddInt64(&cacheStorageMissExists, 1)
+					} else {
+						atomic.AddInt64(&cacheStorageMissNotExists, 1)
+					}
+				}
 			}
 			return slotValue, nil
 		}
 
 		errs = append(errs, err)
+	}
+	// 如果所有 reader 都失败或未找到
+	if cacheMiss {
+		atomic.AddInt64(&cacheStorageMissNotExists, 1)
 	}
 	return common.Hash{}, errors.Join(errs...)
 }
@@ -505,7 +573,34 @@ func PrintStat() {
 			i, storageHitCounts[i], percentage, storageAccessTime[i], avgTime)
 	}
 	fmt.Printf("  总计: 命中次数=%d, 累计时间=%v\n", totalStorageHits, totalStorageTime)
+	fmt.Println()
+
+	fmt.Println("CacheTrie 详细统计:")
+	fmt.Printf("  Account: 命中=%d, 未命中但存在=%d (已写回), 未命中且不存在=%d\n",
+		atomic.LoadInt64(&cacheAccountHit), atomic.LoadInt64(&cacheAccountMissExists), atomic.LoadInt64(&cacheAccountMissNotExists))
+	fmt.Printf("  Storage: 命中=%d, 未命中但存在=%d (已写回), 未命中且不存在=%d\n",
+		atomic.LoadInt64(&cacheStorageHit), atomic.LoadInt64(&cacheStorageMissExists), atomic.LoadInt64(&cacheStorageMissNotExists))
 	fmt.Println("================================")
+}
+
+// GetCacheStats 返回 CacheTrie 的统计信息
+func GetCacheStats() (hit, missExists, missNotExists, storageHit, storageMissExists, storageMissNotExists int64) {
+	return atomic.LoadInt64(&cacheAccountHit),
+		atomic.LoadInt64(&cacheAccountMissExists),
+		atomic.LoadInt64(&cacheAccountMissNotExists),
+		atomic.LoadInt64(&cacheStorageHit),
+		atomic.LoadInt64(&cacheStorageMissExists),
+		atomic.LoadInt64(&cacheStorageMissNotExists)
+}
+
+// ResetCacheStats 重置所有 CacheTrie 统计计数器为零
+func ResetCacheStats() {
+	atomic.StoreInt64(&cacheAccountHit, 0)
+	atomic.StoreInt64(&cacheAccountMissExists, 0)
+	atomic.StoreInt64(&cacheAccountMissNotExists, 0)
+	atomic.StoreInt64(&cacheStorageHit, 0)
+	atomic.StoreInt64(&cacheStorageMissExists, 0)
+	atomic.StoreInt64(&cacheStorageMissNotExists, 0)
 }
 
 // reader is the wrapper of ContractCodeReader and StateReader interface.

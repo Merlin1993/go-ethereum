@@ -69,7 +69,7 @@ func TestUpdateLeaks(t *testing.T) {
 		}
 	}
 
-	root := state.IntermediateRoot(false)
+	_, root := state.IntermediateRoot(false)
 	if err := tdb.Commit(root, false); err != nil {
 		t.Errorf("can not commit trie %v to persistent database", root.Hex())
 	}
@@ -267,7 +267,9 @@ func TestCopyWithDirtyJournal(t *testing.T) {
 			t.Errorf("Unexpected storage root %x", root)
 		}
 	}
-	if cpy.IntermediateRoot(true) != orig.IntermediateRoot(true) {
+	_, rootCpy := cpy.IntermediateRoot(true)
+	_, rootOrig := orig.IntermediateRoot(true)
+	if rootCpy != rootOrig {
 		t.Error("State is not equal after copy")
 	}
 }
