@@ -259,7 +259,7 @@ func TestExpireStateProcessor(t *testing.T) {
 	dbDir := flag.String("dbDir2", "F:\\ethdata\\expire_state_db", "Database directory")
 	dataDir := flag.String("dataDir2", "E:\\ethdata", "Input data directory")
 	startIdx := flag.Int("startFileIdx2", 1, "Start file index")
-	endIdx := flag.Int("endFileIdx2", 10, "End file index")
+	endIdx := flag.Int("endFileIdx2", 21, "End file index")
 	useVerkle := flag.Bool("useVerkle2", false, "Enable Verkle trie")
 	useCacheTrie := flag.Bool("useCacheTrie2", true, "Enable CacheTrie")
 	useMemory := flag.Bool("useMemory2", false, "Use in-memory DB")

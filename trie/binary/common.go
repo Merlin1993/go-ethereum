@@ -55,18 +55,18 @@ type PooledKeccakHasher struct {
 
 // NewPooledKeccakHasher creates a new PooledKeccakHasher.
 func NewPooledKeccakHasher() *PooledKeccakHasher {
-	return &PooledKeccakHasher{
-		pool: &sync.Pool{
-			New: func() interface{} {
-				return crypto.NewKeccakState()
-			},
-		},
-	}
+	return &PooledKeccakHasher{pool: &sync.Pool{}}
 }
 
 // Hash calculates the hash of the given data using a pooled KeccakState.
 func (h *PooledKeccakHasher) Hash(data []byte) []byte {
-	sha := h.pool.Get().(crypto.KeccakState)
+	raw := h.pool.Get()
+	var sha crypto.KeccakState
+	if raw == nil {
+		sha = crypto.NewKeccakState()
+	} else {
+		sha = raw.(crypto.KeccakState)
+	}
 	defer h.pool.Put(sha)
 
 	sha.Reset()

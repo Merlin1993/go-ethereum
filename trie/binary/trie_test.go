@@ -20,6 +20,18 @@ func (db *LevelDBAdapter) NewBatch() Batcher {
 	return db.Database.NewBatch()
 }
 
+func (db *LevelDBAdapter) PutBucket(hash []byte, data []byte) error {
+	return db.Put(hash, data)
+}
+
+func (db *LevelDBAdapter) GetBucket(hash []byte) ([]byte, error) {
+	return db.Get(hash)
+}
+
+func (db *LevelDBAdapter) DeleteBucket(hash []byte) error {
+	return db.Delete(hash)
+}
+
 func TestTriePerformance(t *testing.T) {
 	// 1. 输入参数
 	BatchSize := 2000
@@ -43,15 +55,18 @@ func TestTriePerformance(t *testing.T) {
 	defer os.RemoveAll(dir) // 测试结束清理目录
 
 	// 启动独立 LevelDB 实例（缓存 256MB，句柄 256）
-	db, err := leveldb.New(dir, 256, 256, "test", false)
+	ldb, err := leveldb.New(dir, 256, 256, "test", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer ldb.Close()
 
 	// 初始化 Trie
 	hasher := NewPooledKeccakHasher()
-	trie := NewTrie(&LevelDBAdapter{db}, hasher, true)
+	config := DefaultConfig()
+	dbAdapter := &LevelDBAdapter{ldb}
+	config.ArchiveDB = dbAdapter
+	trie := NewTrie(dbAdapter, hasher, config, true)
 
 	// 3. 测试流程：初始化全局年度基准为 0
 	trie.SetGlobalEpoch(0)
@@ -135,11 +150,10 @@ func TestTriePerformance(t *testing.T) {
 		if batchCount >= PruneTriggerEvery {
 			batchCount = 0
 			pStart := time.Now()
-			deleted, err := trie.PruneNextShard()
+			err := trie.PruneNextShard()
 			if err != nil {
-				t.Fatalf("剪枝错误: %v", err)
+				t.Fatalf("归档错误: %v", err)
 			}
-			totalPrunedItems += len(deleted)
 			currentPruneTime = time.Since(pStart)
 		}
 

@@ -2,11 +2,51 @@ package binary
 
 import (
 	"errors"
+	"sync"
+
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/trie/binary/cuckoo"
+	"github.com/ethereum/go-ethereum/trie/binary/ecmh"
 )
 
 var (
 	ErrNodeNotFound = errors.New("node not found")
 )
+
+// ArchiveStore identifies the interface to store and retrieve archived bucket data.
+type ArchiveStore interface {
+	PutBucket(hash []byte, data []byte) error
+	GetBucket(hash []byte) ([]byte, error)
+	DeleteBucket(hash []byte) error
+}
+
+// Config holds the configuration parameters for the Trie.
+type Config struct {
+	ShardDepth        int          // Number of bits for shard routing (default 16)
+	ArchiveBucketSize int          // Max number of items in an archive bucket before splitting (default 100)
+	ArchiveDB         ArchiveStore // Separate store for archive data
+}
+
+// DefaultConfig returns a Config with default values.
+func DefaultConfig() *Config {
+	return &Config{
+		ShardDepth:        16,
+		ArchiveBucketSize: 100,
+	}
+}
+
+// TrieStats holds statistics about the Trie.
+type TrieStats struct {
+	BucketCount      int   // Total number of archive buckets
+	ArchivedDataSize int64 // Total number of archived KV pairs
+	MaxBucketsPath   int   // Max number of buckets on a single path
+
+	ArchiveReadCount   int64 // Number of times archive store was accessed
+	FalsePositiveCount int64 // Number of false positives from Cuckoo Filter
+	TotalProofSize     int64 // Total size of generated proofs
+	ExistProofCount    int64 // Count of existence proofs
+	NonExistProofCount int64 // Count of non-existence proofs
+}
 
 // Shard 表示一个二叉 Merkle Patricia Trie 的分片（子树）。
 type Shard struct {
@@ -20,28 +60,50 @@ type Shard struct {
 	id       int
 	isPruned bool // "本年度已剪枝 / 未剪枝"
 
-	// Reference to global config (in a real implementation this might be cleaner)
+	// Reference to global config
+	config         *Config
 	globalEpochBit func() byte
 
 	// scratch buffer for temporary bit operations
 	scratch []byte
+
+	// Internal state for ECMH and Filter operations
+	ecmh     *ecmh.Committer
+	stats    *TrieStats
+	statsMut sync.Mutex
+
+	// Pending archive data to be written to ArchiveDB during commit
+	// Key is the bucket hash
+	pendingArchives map[string][]byte
+
+	// Pending appends to existing buckets. Key is the NEW bucket metadata hash.
+	pendingAppends map[string]appendTask
+}
+
+type appendTask struct {
+	oldHash  []byte
+	newItems []ArchivedKV
 }
 
 // NewShard 创建一个新的 Shard（若提供 rootHash 则从 DB 加载根节点）。
-func NewShard(id int, db KVStore, hasher Hasher, rootHash []byte, pruning bool, globalEpochBit func() byte) (*Shard, error) {
+func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte, pruning bool, globalEpochBit func() byte) (*Shard, error) {
 	s := &Shard{
-		id:             id,
-		db:             db,
-		hasher:         hasher,
-		pruning:        pruning,
-		staleSet:       make(map[string]struct{}),
-		globalEpochBit: globalEpochBit,
-		isPruned:       false,
-		scratch:        make([]byte, 128), // Initial capacity, will grow if needed
+		id:              id,
+		db:              db,
+		hasher:          hasher,
+		pruning:         pruning,
+		staleSet:        make(map[string]struct{}),
+		config:          config,
+		globalEpochBit:  globalEpochBit,
+		isPruned:        false,
+		scratch:         make([]byte, 128),
+		ecmh:            ecmh.New(),
+		stats:           &TrieStats{},
+		pendingArchives: make(map[string][]byte),
+		pendingAppends:  make(map[string]appendTask),
 	}
 
 	if len(rootHash) > 0 {
-		// 为简化实现，若提供 rootHash，则立即从 DB 加载根节点（不做“仅哈希”占位）。
 		node, err := s.loadNode(rootHash)
 		if err != nil {
 			return nil, err
@@ -71,8 +133,8 @@ func (s *Shard) Get(key []byte) ([]byte, error) {
 	if s.root == nil {
 		return nil, ErrNodeNotFound
 	}
-	// Shards start at depth 16
-	return s.get(s.root, key, 16)
+	// Shards start at certain depth
+	return s.get(s.root, key, s.config.ShardDepth)
 }
 
 func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
@@ -90,20 +152,225 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 		return nil, ErrNodeNotFound
 
 	case *InternalNode:
-		// 先匹配内部节点的路径前缀
+		// [热路径优先]：首先尝试在当前子树的热路径中查找
+		hotDepth := depth
+		if n.PathBits > 0 {
+			matched := s.commonPrefixLen(n.Path, n.PathBits, key, hotDepth)
+			if matched == n.PathBits {
+				hotDepth += n.PathBits
+				bit := s.getBit(key, hotDepth)
+				var next Node
+				var nextHash []byte
+				if bit == 0 {
+					next = n.Left
+					nextHash = n.LeftHash
+				} else {
+					next = n.Right
+					nextHash = n.RightHash
+				}
+
+				if next == nil && len(nextHash) > 0 {
+					loaded, _ := s.loadNode(nextHash)
+					if loaded != nil {
+						if bit == 0 {
+							n.Left = loaded
+						} else {
+							n.Right = loaded
+						}
+						next = loaded
+					}
+				}
+
+				if next != nil {
+					val, err := s.get(next, key, hotDepth+1)
+					if err == nil {
+						return val, nil
+					}
+				}
+			}
+		} else {
+			// PathBits == 0, 直接尝试孩子
+			bit := s.getBit(key, hotDepth)
+			var next Node
+			var nextHash []byte
+			if bit == 0 {
+				next = n.Left
+				nextHash = n.LeftHash
+			} else {
+				next = n.Right
+				nextHash = n.RightHash
+			}
+
+			if next == nil && len(nextHash) > 0 {
+				loaded, _ := s.loadNode(nextHash)
+				if loaded != nil {
+					if bit == 0 {
+						n.Left = loaded
+					} else {
+						n.Right = loaded
+					}
+					next = loaded
+				}
+			}
+
+			if next != nil {
+				val, err := s.get(next, key, hotDepth+1)
+				if err == nil {
+					return val, nil
+				}
+			}
+		}
+
+		// [归档桶次之]：热路径未命中，按“后进先出”（栈）顺序查找侧挂的 StubList
+		for i := len(n.StubList) - 1; i >= 0; i-- {
+			bucket := n.StubList[i]
+			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, depth)
+			if matched == bucket.PathBits {
+				filter := cuckoo.New()
+				if err := filter.Decode(bucket.Filter); err != nil {
+					continue
+				}
+				// 使用分片相对路径位进行布谷鸟过滤器查询
+				shardKey := key[s.config.ShardDepth/8:]
+				if !filter.Lookup(shardKey) {
+					continue
+				}
+
+				if s.config.ArchiveDB == nil {
+					continue
+				}
+				s.statsMut.Lock()
+				s.stats.ArchiveReadCount++
+				s.statsMut.Unlock()
+
+				bucketData, err := s.config.ArchiveDB.GetBucket(bucket.Hash())
+				if err != nil {
+					continue
+				}
+
+				items, err := s.deserializeArchivedKV(bucketData)
+				if err != nil {
+					continue
+				}
+
+				innerDepth := s.config.ShardDepth
+				keyBits := len(key) * 8
+				for _, item := range items {
+					if innerDepth+item.SuffixBits == keyBits {
+						if s.suffixMatches(item.Suffix, item.SuffixBits, key, innerDepth) {
+							s.statsMut.Lock()
+							s.stats.ExistProofCount++
+							s.stats.TotalProofSize += int64(len(item.Value) + len(item.Suffix) + 8)
+							s.statsMut.Unlock()
+							return item.Value, nil
+						}
+					}
+				}
+			}
+		}
+
+		return nil, ErrNodeNotFound
+
+	default:
+		return nil, errors.New("unknown node type")
+	}
+}
+
+// suffixMatches 检查给定的位序列后缀是否与 key 从 depth 开始的部分匹配
+func (s *Shard) suffixMatches(suffix []byte, suffixBits int, key []byte, depth int) bool {
+	for i := 0; i < suffixBits; i++ {
+		bitS := s.getBitFromBytes(suffix, i)
+		bitK := s.getBit(key, depth+i)
+		if bitS != bitK {
+			return false
+		}
+	}
+	return true
+}
+
+// Put 插入/更新指定 key 的值（以哈希存储）。
+func (s *Shard) Put(key []byte, value []byte) error {
+	valHash := s.hasher.Hash(value)
+
+	// Shard start depth
+	newRoot, err := s.insert(s.root, key, s.config.ShardDepth, valHash)
+	if err != nil {
+		return err
+	}
+	s.root = newRoot
+	return nil
+}
+
+// Activate 实现显式激活：从 StubList 查找并移除匹配项，然后执行常规插入
+func (s *Shard) Activate(key []byte, value []byte) error {
+	// 1. 深度搜索并从现有 StubList 中移除该 key
+	if s.root != nil {
+		// 已知 key，只需按路径下探并在沿途 Node 的 StubList 中定点查找
+		s.removeFromStubList(s.root, key, s.config.ShardDepth)
+	}
+
+	// 2. 执行常规插入
+	var err error
+	s.root, err = s.insert(s.root, key, s.config.ShardDepth, crypto.Keccak256Hash(value).Bytes())
+	return err
+}
+
+func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
+	if node == nil {
+		return false
+	}
+
+	switch n := node.(type) {
+	case *InternalNode:
+		// [定点移除]：只需检查当前节点侧挂的 StubList 是否包含匹配的前缀
+		for i := 0; i < len(n.StubList); i++ {
+			bucket := n.StubList[i]
+			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, depth)
+			if matched == bucket.PathBits {
+				if s.config.ArchiveDB == nil {
+					continue
+				}
+				// 既然已经匹配到桶前缀，直接读取该桶并尝试删除
+				bucketData, err := s.config.ArchiveDB.GetBucket(bucket.Hash())
+				if err != nil {
+					continue
+				}
+				items, _ := s.deserializeArchivedKV(bucketData)
+
+				innerDepth := s.config.ShardDepth
+				keyBits := len(key) * 8
+				for j, item := range items {
+					if innerDepth+item.SuffixBits == keyBits && s.suffixMatches(item.Suffix, item.SuffixBits, key, innerDepth) {
+						// 命中：从原始数据中移除
+						items = append(items[:j], items[j+1:]...)
+
+						// 更新承诺部分
+						if len(items) == 0 {
+							s.config.ArchiveDB.DeleteBucket(bucket.Hash())
+							n.StubList = append(n.StubList[:i], n.StubList[i+1:]...)
+						} else {
+							s.recomputeBucket(bucket, items)
+							bucket.SetDirty(true)
+						}
+						n.SetDirty(true)
+						return true
+					}
+				}
+			}
+		}
+
+		// 按路径下探，不扫全树
 		if n.PathBits > 0 {
 			matched := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
 			if matched != n.PathBits {
-				return nil, ErrNodeNotFound
+				return false // 路径不通，肯定不在这个子树下的 StubList
 			}
 			depth += n.PathBits
 		}
 
-		// 读取当前深度位，选择左右子树
 		bit := s.getBit(key, depth)
 		var next Node
 		var nextHash []byte
-
 		if bit == 0 {
 			next = n.Left
 			nextHash = n.LeftHash
@@ -113,42 +380,22 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 		}
 
 		if next == nil && len(nextHash) > 0 {
-			// 延迟加载子节点
-			loaded, err := s.loadNode(nextHash)
-			if err != nil {
-				return nil, err
+			loaded, _ := s.loadNode(nextHash)
+			if loaded != nil {
+				if bit == 0 {
+					n.Left = loaded
+				} else {
+					n.Right = loaded
+				}
+				next = loaded
 			}
-			// 更新父节点指针并缓存
-			if bit == 0 {
-				n.Left = loaded
-			} else {
-				n.Right = loaded
-			}
-			next = loaded
 		}
 
-		if next == nil {
-			return nil, ErrNodeNotFound
+		if next != nil {
+			return s.removeFromStubList(next, key, depth+1)
 		}
-
-		return s.get(next, key, depth+1)
-
-	default:
-		return nil, errors.New("unknown node type")
 	}
-}
-
-// Put 插入/更新指定 key 的值（以哈希存储）。
-func (s *Shard) Put(key []byte, value []byte) error {
-	valHash := s.hasher.Hash(value)
-
-	// Shard start depth = 16
-	newRoot, err := s.insert(s.root, key, 16, valHash)
-	if err != nil {
-		return err
-	}
-	s.root = newRoot
-	return nil
+	return false
 }
 
 func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node, error) {
@@ -227,38 +474,28 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		return splitNode, nil
 
 	case *InternalNode:
-		// 子树被修改：标记此内部节点为 dirty，并记录旧哈希以便修剪
+		// [子树修改标记]
 		if s.pruning && !n.dirty && len(n.OriginalHash()) > 0 {
 			s.staleSet[string(n.OriginalHash())] = struct{}{}
 		}
 		n.SetDirty(true)
 
-		// 先匹配内部节点路径前缀
+		// 1. 先匹配内部节点路径前缀
 		if n.PathBits > 0 {
 			matched := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
 			if matched < n.PathBits {
-				// 需要在当前内部节点上进行分裂
-				if matched < 0 {
-					matched = 0
-				}
-
-				// 新父节点路径为共同前缀 [0, matched)
+				// [分裂逻辑]：当前节点路径与新 key 产生分叉
 				prefixPath := s.prefixBits(n.Path, matched, nil)
 				parent := NewInternalNode(nil, nil)
 				parent.Path = prefixPath
 				parent.PathBits = matched
 
-				// 原内部节点作为一侧子树，路径调整为剩余后缀（跳过分裂位）
 				oldBit := s.getBitFromBytes(n.Path, matched)
-				remainingBits := n.PathBits - (matched + 1)
-				if remainingBits > 0 {
-					newPath := s.shiftBits(n.Path, n.PathBits, matched+1, nil)
-					n.Path = newPath
-					n.PathBits = remainingBits
-				} else {
-					n.Path = nil
-					n.PathBits = 0
-				}
+				n.Path = s.shiftBits(n.Path, n.PathBits, matched+1, nil)
+				n.PathBits -= (matched + 1)
+
+				// [StubList 分配]：根据前缀位，将原桶分配给新的子分支
+				s.distributeStubs(n, parent)
 
 				if oldBit == 0 {
 					parent.Left = n
@@ -266,11 +503,11 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 					parent.Right = n
 				}
 
-				// 新 key 一侧：从分裂位之后创建叶子
+				// 新 key 分支
 				newBit := s.getBit(key, depth+matched)
-				newSuffixBits := len(key)*8 - (depth + matched + 1)
-				newSuffix := s.getSuffix(key, depth+matched+1, nil)
-				newLeaf := NewLeafNode(newSuffix, newSuffixBits, valueHash)
+				newLeafPath := s.getSuffix(key, depth+matched+1, nil)
+				newLeafBits := len(key)*8 - (depth + matched + 1)
+				newLeaf := NewLeafNode(newLeafPath, newLeafBits, valueHash)
 				s.updateEpoch(newLeaf)
 
 				if newBit == 0 {
@@ -285,16 +522,11 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 			depth += n.PathBits
 		}
 
+		// 2. 递归向下插入
 		bit := s.getBit(key, depth)
-
 		if bit == 0 {
-			// 确保左子已加载（有哈希则延迟加载）
 			if n.Left == nil && len(n.LeftHash) > 0 {
-				loaded, err := s.loadNode(n.LeftHash)
-				if err != nil {
-					return nil, err
-				}
-				n.Left = loaded
+				n.Left, _ = s.loadNode(n.LeftHash)
 			}
 			newLeft, err := s.insert(n.Left, key, depth+1, valueHash)
 			if err != nil {
@@ -302,13 +534,8 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 			}
 			n.Left = newLeft
 		} else {
-			// 确保右子已加载
 			if n.Right == nil && len(n.RightHash) > 0 {
-				loaded, err := s.loadNode(n.RightHash)
-				if err != nil {
-					return nil, err
-				}
-				n.Right = loaded
+				n.Right, _ = s.loadNode(n.RightHash)
 			}
 			newRight, err := s.insert(n.Right, key, depth+1, valueHash)
 			if err != nil {
@@ -317,8 +544,9 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 			n.Right = newRight
 		}
 
-		s.updateEpoch(n) // Update epoch after child update
-		return n, nil
+		s.updateEpoch(n)
+		// 3. [积极收缩]：如果任一孩子为空，尝试合并
+		return s.shrink(n), nil
 
 	default:
 		return nil, errors.New("unknown node type")
@@ -327,7 +555,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 
 // Delete 删除指定 key，如果 key 不存在则为无操作。
 func (s *Shard) Delete(key []byte) error {
-	newRoot, _, err := s.delete(s.root, key, 16)
+	newRoot, _, err := s.delete(s.root, key, s.config.ShardDepth)
 	if err != nil {
 		if err == ErrNodeNotFound {
 			return nil // Deleting non-existent key is no-op
@@ -449,9 +677,9 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 			}
 
 			if leaf, ok := target.(*LeafNode); ok {
-				newPath := s.prependBit(leaf.Path, leaf.PathBits, remaining.bit, nil)
-				leaf.Path = newPath
-				leaf.PathBits++
+				// 合并路径：当前节点路径 + 分离位 + 叶子路径
+				leaf.Path = s.concatPath(n.Path, n.PathBits, remaining.bit, leaf.Path, leaf.PathBits)
+				leaf.PathBits = n.PathBits + 1 + leaf.PathBits
 				leaf.SetDirty(true)
 				if s.pruning && len(leaf.OriginalHash()) > 0 {
 					s.staleSet[string(leaf.OriginalHash())] = struct{}{}
@@ -467,7 +695,6 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 		// Update epoch
 		s.updateEpoch(n)
 		return n, true, nil
-
 	default:
 		return node, false, errors.New("unknown node type")
 	}
@@ -513,12 +740,74 @@ func (s *Shard) Commit() ([]byte, error) {
 	return rootHash, nil
 }
 
+// FlushArchives 将缓存中的归档数据同步到 ArchiveDB。
+// 此操作通常在 Commit 之后执行，以避免影响主树提交的时间统计。
+func (s *Shard) FlushArchives() error {
+	if s.config.ArchiveDB == nil {
+		return nil
+	}
+
+	// 1. 处理全量写入 (new buckets)
+	for h, data := range s.pendingArchives {
+		if err := s.config.ArchiveDB.PutBucket([]byte(h), data); err != nil {
+			return err
+		}
+		delete(s.pendingArchives, h)
+	}
+
+	// 2. 处理“盲追加”写入 (blind appends)
+	for newHash, task := range s.pendingAppends {
+		// 加载旧数据
+		oldData, err := s.config.ArchiveDB.GetBucket(task.oldHash)
+		if err != nil {
+			return err
+		}
+		items, err := s.deserializeArchivedKV(oldData)
+		if err != nil {
+			return err
+		}
+
+		// 合并新数据
+		items = append(items, task.newItems...)
+		newData, err := s.serializeArchivedKV(items)
+		if err != nil {
+			return err
+		}
+
+		// 写入新版本
+		if err := s.config.ArchiveDB.PutBucket([]byte(newHash), newData); err != nil {
+			return err
+		}
+		delete(s.pendingAppends, newHash)
+	}
+
+	return nil
+}
+
 func (s *Shard) commit(node Node, batch Batcher) ([]byte, error) {
 	if !node.IsDirty() {
 		return node.Hash(), nil
 	}
 
 	switch n := node.(type) {
+	case *ArchiveBucketNode:
+		// 提交归档桶
+		data, err := n.Serialize()
+		if err != nil {
+			return nil, err
+		}
+		h := s.hasher.Hash(data)
+		n.SetHash(h)
+		n.SetDirty(false)
+		n.SetOriginalHash(h)
+
+		// 1. 写入主数据库（承诺部分）
+		if err := batch.Put(h, data); err != nil {
+			return nil, err
+		}
+
+		return h, nil
+
 	case *InternalNode:
 		// 在持久化前，根据子节点刷新 epoch（避免在每次插入/删除时重复计算）
 		s.updateEpoch(n)
@@ -586,9 +875,19 @@ func (s *Shard) commit(node Node, batch Batcher) ([]byte, error) {
 	}
 }
 
+func (s *Shard) setBitInBytes(data []byte, bitIdx int, val byte) {
+	byteIdx := bitIdx / 8
+	bitOffset := 7 - (bitIdx % 8)
+	if val == 1 {
+		data[byteIdx] |= (1 << bitOffset)
+	} else {
+		data[byteIdx] &= ^(1 << bitOffset)
+	}
+}
+
 // 工具方法
 
-func (s *Shard) getBit(key []byte, depth int) byte {
+func getBit(key []byte, depth int) byte {
 	byteIdx := depth / 8
 	bitIdx := 7 - (depth % 8)
 	if byteIdx >= len(key) {
@@ -598,6 +897,10 @@ func (s *Shard) getBit(key []byte, depth int) byte {
 		return 1
 	}
 	return 0
+}
+
+func (s *Shard) getBit(key []byte, depth int) byte {
+	return getBit(key, depth)
 }
 
 func (s *Shard) getBitFromBytes(data []byte, bitIndex int) byte {
@@ -708,6 +1011,7 @@ func (s *Shard) prefixBits(data []byte, bits int, buf []byte) []byte {
 	return res
 }
 
+// prependBit 在位序列前部增加一位。用于在树收缩或路径调整时重新计算路径。
 func (s *Shard) prependBit(data []byte, bits int, bit byte, buf []byte) []byte {
 	newBits := bits + 1
 	size := (newBits + 7) / 8
@@ -721,21 +1025,40 @@ func (s *Shard) prependBit(data []byte, bits int, bit byte, buf []byte) []byte {
 		res = make([]byte, size)
 	}
 
-	// 写入首位
 	if bit == 1 {
 		res[0] |= 0x80
 	}
-
-	// 拷贝后续位（整体右移）
 	for i := 0; i < bits; i++ {
 		if s.getBitFromBytes(data, i) == 1 {
-			// 新位下标 = i + 1
 			byteIdx := (i + 1) / 8
 			bitIdx := 7 - ((i + 1) % 8)
 			res[byteIdx] |= (1 << bitIdx)
 		}
 	}
 	return res
+}
+
+func (s *Shard) appendBit(data []byte, bits int, bit byte) ([]byte, int) {
+	newBits := bits + 1
+	size := (newBits + 7) / 8
+	res := make([]byte, size)
+	copy(res, data)
+	if bit == 1 {
+		byteIdx := bits / 8
+		bitOffset := 7 - (bits % 8)
+		res[byteIdx] |= (1 << bitOffset)
+	}
+	return res, newBits
+}
+
+func (s *Shard) copyBits(dst []byte, dstStart int, src []byte, srcBits int) {
+	for i := 0; i < srcBits; i++ {
+		if s.getBitFromBytes(src, i) == 1 {
+			byteIdx := (dstStart + i) / 8
+			bitIdx := 7 - ((dstStart + i) % 8)
+			dst[byteIdx] |= (1 << bitIdx)
+		}
+	}
 }
 
 func (s *Shard) updateEpoch(node Node) {
@@ -747,343 +1070,198 @@ func (s *Shard) updateEpoch(node Node) {
 
 	switch n := node.(type) {
 	case *LeafNode:
-		// 叶子 bit0：按分片剪枝状态与全局年度位设定
-		var bit0 byte
-		if s.isPruned {
-			bit0 = global
-		} else {
-			bit0 = 1 - global // !global
-		}
-
-		// 叶子 bit1 固定为 0；bit2~bit7 预留为 0
-		n.epoch = bit0
+		// 叶子 bit0：新写入/更新的节点始终标记为当前全局年度位，确保其为“热”数据
+		n.epoch = global
 
 	case *InternalNode:
-		bits := []byte{}
-		if n.Left != nil {
-			bits = append(bits, n.Left.Epoch()&1)
-		}
-		if n.Right != nil {
-			bits = append(bits, n.Right.Epoch()&1)
-		}
-
-		var parentBit0 byte
-		if len(bits) > 0 {
-			if global == 1 {
-				// 全局=1：父 bit0 使用 AND（所有子 bit0 为 1 才为 1）
-				allOne := true
-				for _, b := range bits {
-					if b == 0 {
-						allOne = false
-						break
-					}
-				}
-				if allOne {
-					parentBit0 = 1
-				}
+		anyOne := false
+		allOne := true
+		count := 0
+		if n.Left != nil || len(n.LeftHash) > 0 {
+			count++
+			b := byte(0)
+			if n.Left != nil {
+				b = n.Left.Epoch() & 1
 			} else {
-				// 全局=0：父 bit0 使用 OR（任一子 bit0 为 1 则为 1）
-				anyOne := false
-				for _, b := range bits {
-					if b == 1 {
-						anyOne = true
-						break
-					}
+				// 获取哈希对应的 epoch
+				loaded, _ := s.loadNode(n.LeftHash)
+				if loaded != nil {
+					b = loaded.Epoch() & 1
 				}
-				if anyOne {
-					parentBit0 = 1
+			}
+			if b == 1 {
+				anyOne = true
+			} else {
+				allOne = false
+			}
+		}
+		if n.Right != nil || len(n.RightHash) > 0 {
+			count++
+			b := byte(0)
+			if n.Right != nil {
+				b = n.Right.Epoch() & 1
+			} else {
+				loaded, _ := s.loadNode(n.RightHash)
+				if loaded != nil {
+					b = loaded.Epoch() & 1
 				}
+			}
+			if b == 1 {
+				anyOne = true
+			} else {
+				allOne = false
 			}
 		}
 
-		// 父 bit1：子 bit0 一致为 1，否则为 0
-		var bit1 byte
-		if len(bits) <= 1 {
-			bit1 = 1
-		} else {
-			if bits[0] == bits[1] {
+		var bit0, bit1 byte
+		if count > 0 {
+			if anyOne {
+				bit0 = 1
+			}
+			if allOne {
 				bit1 = 1
-			} else {
-				bit1 = 0
 			}
 		}
 
-		n.epoch = (bit1 << 1) | parentBit0
+		// bit0: 子树存在 1；bit1: 子树全为 1
+		n.epoch = (bit1 << 1) | bit0
 	}
 }
 
-// Prune：遍历分片并删除过期节点；返回被删除的数据（包含分片 ID 与值内容）。
-// 说明：叶子仅存储 ValueHash，因此插入时将 valHash->value 写入 DB，剪枝时据此取回“数据内容”。
+// Prune：触发分片归档聚合逻辑
 
-type DeletedItem struct {
-	ShardID   int
-	KeySuffix []byte
-	Value     []byte
-}
-
-func (s *Shard) Prune(global byte) ([]DeletedItem, error) {
-	// Atomic: Pause inserts (handled by caller/lock).
-
-	deletedItems := []DeletedItem{}
-
-	// Helper to traverse and prune
-	var pruneNode func(node Node, path []byte, depth int) (Node, bool, error)
-	pruneNode = func(node Node, path []byte, depth int) (Node, bool, error) {
-		if node == nil {
-			return nil, false, nil
-		}
-
-		switch n := node.(type) {
-		case *LeafNode:
-			// Check Epoch Bit 0
-			bit0 := n.Epoch() & 1
-			if bit0 == global {
-				// Expired
-				// Fetch value
-				val, _ := s.db.Get(n.ValueHash) // Ignore error
-
-				// Reconstruct partial key?
-				// path argument is the path accumulated so far?
-				// `n.Path` is the suffix.
-				// We need the full key for the record?
-				// "节点路径".
-				// We can construct the suffix inside the shard.
-				// Shard starts at depth 16.
-
-				// Reconstruct path from current traversal + n.Path
-				// Note: `path` passed to recursive func is the prefix bits.
-
-				// For now, let's just return what we can.
-
-				deletedItems = append(deletedItems, DeletedItem{
-					ShardID: s.id,
-					Value:   val,
-					// Key? We need to track the key bits during traversal.
-				})
-
-				// Mark for deletion from DB
-				if s.pruning && len(n.OriginalHash()) > 0 {
-					s.staleSet[string(n.OriginalHash())] = struct{}{}
-				}
-
-				return nil, true, nil
-			}
-			return n, false, nil
-
-		case *InternalNode:
-			// Optimization: If Parent Epoch Bit 1 (Validation) is 1, and Bit 0 == global
-			// Then ALL children are expired. We can prune the whole subtree?
-			// Yes, "Result=1 means all children bit 0 are same".
-			// If Bit0 == global, then all children are global (Expired).
-			// So we can drop this entire subtree.
-			if (n.Epoch()>>1)&1 == 1 {
-				if (n.Epoch() & 1) == global {
-					// Prune whole subtree
-					// We need to collect all leaves in this subtree to return them.
-					s.collectLeaves(n, &deletedItems)
-
-					// Mark n as stale
-					if s.pruning && len(n.OriginalHash()) > 0 {
-						s.staleSet[string(n.OriginalHash())] = struct{}{}
-					}
-					// Also need to mark all children as stale recursively?
-					// Ideally yes, but if we delete the root of subtree, the children become garbage.
-					// If we rely on ref-counting or GC, it's fine.
-					// But `staleSet` is for explicit DB deletion.
-					// If we don't add children to staleSet, they remain in DB (leak).
-					// So we must traverse and mark all persisted nodes as stale.
-					s.markSubtreeStale(n)
-
-					return nil, true, nil
-				}
-			}
-
-			// Otherwise traverse
-			changed := false
-
-			// Left
-			if n.Left == nil && len(n.LeftHash) > 0 {
-				loaded, err := s.loadNode(n.LeftHash)
-				if err != nil {
-					return nil, false, err
-				}
-				n.Left = loaded
-			}
-			newLeft, leftDeleted, err := pruneNode(n.Left, nil, depth+1) // path tracking omitted for brevity
-			if err != nil {
-				return nil, false, err
-			}
-			if leftDeleted || newLeft != n.Left {
-				n.Left = newLeft
-				n.LeftHash = nil // 清理已变更子节点的持久化哈希，避免后续懒加载读取不存在的条目
-				changed = true
-			}
-
-			// Right
-			if n.Right == nil && len(n.RightHash) > 0 {
-				loaded, err := s.loadNode(n.RightHash)
-				if err != nil {
-					return nil, false, err
-				}
-				n.Right = loaded
-			}
-			newRight, rightDeleted, err := pruneNode(n.Right, nil, depth+1)
-			if err != nil {
-				return nil, false, err
-			}
-			if rightDeleted || newRight != n.Right {
-				n.Right = newRight
-				n.RightHash = nil // 清理已变更子节点的持久化哈希
-				changed = true
-			}
-
-			if changed {
-				// Handle merging if needed
-				// Count children
-				count := 0
-				var remaining Node
-				var remainingBit byte
-
-				if n.Left != nil {
-					count++
-					remaining = n.Left
-					remainingBit = 0
-				}
-				if n.Right != nil {
-					count++
-					remaining = n.Right
-					remainingBit = 1
-				}
-
-				if count == 0 {
-					if s.pruning && len(n.OriginalHash()) > 0 {
-						s.staleSet[string(n.OriginalHash())] = struct{}{}
-					}
-					return nil, true, nil
-				}
-
-				if count == 1 {
-					// 若内部节点自身带有路径，则不再向下合并，避免丢失前缀信息
-					if n.PathBits > 0 {
-						n.SetDirty(true)
-						s.updateEpoch(n)
-						return n, false, nil
-					}
-
-					if leaf, ok := remaining.(*LeafNode); ok {
-						newPath := s.prependBit(leaf.Path, leaf.PathBits, remainingBit, nil)
-						leaf.Path = newPath
-						leaf.PathBits++
-						leaf.SetDirty(true)
-						if s.pruning && len(leaf.OriginalHash()) > 0 {
-							s.staleSet[string(leaf.OriginalHash())] = struct{}{}
-						}
-
-						if s.pruning && len(n.OriginalHash()) > 0 {
-							s.staleSet[string(n.OriginalHash())] = struct{}{}
-						}
-						return leaf, true, nil
-					}
-				}
-
-				n.SetDirty(true)
-				s.updateEpoch(n)
-			}
-
-			return n, false, nil
-
-		default:
-			return nil, false, nil
-		}
-	}
-
-	newRoot, _, err := pruneNode(s.root, nil, 16)
+func (s *Shard) Prune(global byte) error {
+	// 深度优先递归，收集过期项并进行自底向上的桶聚合
+	newRoot, archivedItems, err := s.pruneAndArchive(s.root, global, s.config.ShardDepth, nil, 0)
 	if err != nil {
-		return nil, err
+		return err
 	}
+
+	if len(archivedItems) > 0 {
+		newRoot = s.mountAtDeepest(newRoot, s.config.ShardDepth, archivedItems)
+	}
+
 	s.root = newRoot
 	s.isPruned = true
-
-	return deletedItems, nil
+	return nil
 }
 
-func (s *Shard) collectLeaves(node Node, items *[]DeletedItem) {
+func (s *Shard) pruneAndArchive(node Node, global byte, depth int, pathFromShardRoot []byte, pathFromShardRootBits int) (Node, []ArchivedKV, error) {
 	if node == nil {
-		return
+		return nil, nil, nil
 	}
 
-	// Load if needed
-	if internal, ok := node.(*InternalNode); ok {
-		if internal.Left == nil && len(internal.LeftHash) > 0 {
-			internal.Left, _ = s.loadNode(internal.LeftHash)
-		}
-		if internal.Right == nil && len(internal.RightHash) > 0 {
-			internal.Right, _ = s.loadNode(internal.RightHash)
-		}
-		s.collectLeaves(internal.Left, items)
-		s.collectLeaves(internal.Right, items)
-	} else if leaf, ok := node.(*LeafNode); ok {
-		val, _ := s.db.Get(leaf.ValueHash)
-		*items = append(*items, DeletedItem{
-			ShardID: s.id,
-			Value:   val,
-		})
-	}
-}
+	// [Epoch 剪枝跳过优化]：依据 bit0 (anyOne) 与 bit1 (allOne) 决策
+	epoch := node.Epoch()
+	bit0 := epoch & 1        // 存在 1
+	bit1 := (epoch >> 1) & 1 // 全是 1
 
-func (s *Shard) markSubtreeStale(node Node) {
-	if node == nil {
-		return
+	if global == 1 {
+		if bit1 == 1 { // 全是 1，说明没有需要归档的 0 项，跳过
+			return node, nil, nil
+		}
+	} else {
+		if bit0 == 0 { // 全是 0，说明没有需要归档的 1 项，跳过
+			return node, nil, nil
+		}
 	}
 
-	if n, ok := node.(*InternalNode); ok {
-		if s.pruning && len(n.OriginalHash()) > 0 {
-			s.staleSet[string(n.OriginalHash())] = struct{}{}
-		}
-		// Need to load children to find their hashes?
-		// If child is not loaded, we have the hash in LeftHash/RightHash.
-		// We can just add those hashes to staleSet!
-		// No need to load.
-		if len(n.LeftHash) > 0 {
-			s.staleSet[string(n.LeftHash)] = struct{}{}
-			// If it was loaded, recurse?
-			// If it's not loaded, we assume the whole subtree under it is on disk.
-			// We need to traverse the disk nodes to find all hashes?
-			// Yes, deleting a subtree requires deleting all its descendants from DB.
-			// This is expensive. We need to walk the tree.
-			if n.Left == nil {
-				loaded, _ := s.loadNode(n.LeftHash)
-				s.markSubtreeStale(loaded)
-			} else {
-				s.markSubtreeStale(n.Left)
+	switch n := node.(type) {
+	case *LeafNode:
+		// [过期判定]：n.Epoch()&1 != global 则说明是旧版本，需要归档
+		if n.Epoch()&1 != global {
+			if s.pruning && len(n.OriginalHash()) > 0 {
+				s.staleSet[string(n.OriginalHash())] = struct{}{}
 			}
-		} else if n.Left != nil {
-			s.markSubtreeStale(n.Left)
-		}
 
-		if len(n.RightHash) > 0 {
-			s.staleSet[string(n.RightHash)] = struct{}{}
-			if n.Right == nil {
-				loaded, _ := s.loadNode(n.RightHash)
-				s.markSubtreeStale(loaded)
-			} else {
-				s.markSubtreeStale(n.Right)
+			// 还原相对于分片起始深度的全路径位
+			fullSuffixBits := pathFromShardRootBits + n.PathBits
+			fullSuffix := make([]byte, (fullSuffixBits+7)/8)
+			s.copyBits(fullSuffix, 0, pathFromShardRoot, pathFromShardRootBits)
+			s.copyBits(fullSuffix, pathFromShardRootBits, n.Path, n.PathBits)
+
+			it := ArchivedKV{
+				Suffix:     fullSuffix,
+				SuffixBits: fullSuffixBits,
+				Value:      n.ValueHash,
 			}
-		} else if n.Right != nil {
-			s.markSubtreeStale(n.Right)
+			return nil, []ArchivedKV{it}, nil
+		}
+		return n, nil, nil
+
+	case *InternalNode:
+		// 1. 递归子节点
+		if n.Left == nil && len(n.LeftHash) > 0 {
+			n.Left, _ = s.loadNode(n.LeftHash)
+		}
+		if n.Right == nil && len(n.RightHash) > 0 {
+			n.Right, _ = s.loadNode(n.RightHash)
 		}
 
-	} else if n, ok := node.(*LeafNode); ok {
-		if s.pruning && len(n.OriginalHash()) > 0 {
-			s.staleSet[string(n.OriginalHash())] = struct{}{}
+		// 构建进入子节点前的完整路径路径
+		newPathBits := pathFromShardRootBits + n.PathBits
+		newPath := make([]byte, (newPathBits+7)/8)
+		s.copyBits(newPath, 0, pathFromShardRoot, pathFromShardRootBits)
+		s.copyBits(newPath, pathFromShardRootBits, n.Path, n.PathBits)
+
+		pathForLeft, bitsForLeft := s.appendBit(newPath, newPathBits, 0)
+		pathForRight, bitsForRight := s.appendBit(newPath, newPathBits, 1)
+
+		newLeft, leftArchived, err := s.pruneAndArchive(n.Left, global, depth+n.PathBits+1, pathForLeft, bitsForLeft)
+		if err != nil {
+			return nil, nil, err
 		}
+		newRight, rightArchived, err := s.pruneAndArchive(n.Right, global, depth+n.PathBits+1, pathForRight, bitsForRight)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		n.Left = newLeft
+		n.Right = newRight
+
+		merged := append(leftArchived, rightArchived...)
+
+		// 4. [归档决策]：
+		// A. 尝试追加到本层已有的通用桶 (PathBits 0)
+		for _, bucket := range n.StubList {
+			if bucket.PathBits == 0 {
+				if bucket.Count+uint64(len(merged)) <= uint64(s.config.ArchiveBucketSize) {
+					s.blindAppendToBucket(bucket, merged)
+					bucket.SetDirty(true)
+					return s.shrink(n), nil, nil
+				}
+				break
+			}
+		}
+
+		// B. 如果 len >= config.ArchiveBucketSize，本层无法追加，则下探
+		if len(merged) >= s.config.ArchiveBucketSize {
+			// 修改：mountAtDeepest 现在由于使用了相对于分片的 Suffix，不再需要 shiftBits
+			n.Left = s.mountAtDeepest(n.Left, depth+n.PathBits+1, leftArchived)
+			n.Right = s.mountAtDeepest(n.Right, depth+n.PathBits+1, rightArchived)
+			n.SetDirty(true)
+			return s.shrink(n), nil, nil
+		}
+
+		// 如果节点变脏（由于子节点被删除），执行收缩并标记
+		if n.Left != newLeft || n.Right != newRight {
+			n.SetDirty(true)
+			if s.pruning && len(n.OriginalHash()) > 0 {
+				s.staleSet[string(n.OriginalHash())] = struct{}{}
+			}
+			return s.shrink(n), merged, nil
+		}
+
+		return n, merged, nil
 	}
+	return node, nil, nil
 }
 
 // Trie Manager
 
 type Trie struct {
-	shards           [65536]*Shard
+	config           *Config
+	shards           []*Shard
 	db               KVStore
 	hasher           Hasher
 	pruning          bool
@@ -1093,8 +1271,14 @@ type Trie struct {
 	prunedShardCount int
 }
 
-func NewTrie(db KVStore, hasher Hasher, pruning bool) *Trie {
+func NewTrie(db KVStore, hasher Hasher, config *Config, pruning bool) *Trie {
+	if config == nil {
+		config = DefaultConfig()
+	}
+	numShards := 1 << config.ShardDepth
 	t := &Trie{
+		config:  config,
+		shards:  make([]*Shard, numShards),
 		db:      db,
 		hasher:  hasher,
 		pruning: pruning,
@@ -1103,9 +1287,9 @@ func NewTrie(db KVStore, hasher Hasher, pruning bool) *Trie {
 	// Init shards
 	// Note: In real app, we would load root hashes.
 	// Here we assume new or empty.
-	for i := 0; i < 65536; i++ {
+	for i := 0; i < numShards; i++ {
 		// Use a closure to capture 't'
-		s, _ := NewShard(i, db, hasher, nil, pruning, func() byte { return t.globalEpochBit })
+		s, _ := NewShard(i, db, hasher, config, nil, pruning, func() byte { return t.globalEpochBit })
 		t.shards[i] = s
 	}
 	return t
@@ -1144,6 +1328,12 @@ func (t *Trie) BatchDelete(key []byte) error {
 	return t.shards[shardID].Delete(key)
 }
 
+// Activate 显式激活一个归档的 key。从侧挂桶移除并重注入热路径。
+func (t *Trie) Activate(key []byte, value []byte) error {
+	shardID := t.getShardID(key)
+	return t.shards[shardID].Activate(key, value)
+}
+
 func (t *Trie) Commit() ([]byte, error) {
 	// Commit all shards
 	// Return a hash of all shard roots?
@@ -1154,7 +1344,8 @@ func (t *Trie) Commit() ([]byte, error) {
 	// We can hash the list of shard roots to get a "Global Root".
 	// For now, just commit each shard.
 
-	rootHashes := make([]byte, 0, 65536*32)
+	numShards := len(t.shards)
+	rootHashes := make([]byte, 0, numShards*32)
 	for _, s := range t.shards {
 		h, err := s.Commit()
 		if err != nil {
@@ -1174,20 +1365,21 @@ func (t *Trie) Commit() ([]byte, error) {
 	return globalRoot, nil
 }
 
-func (t *Trie) PruneNextShard() ([]DeletedItem, error) {
+func (t *Trie) PruneNextShard() error {
 	shard := t.shards[t.pruneShardIdx]
-	t.pruneShardIdx = (t.pruneShardIdx + 1) % 65536
+	numShards := len(t.shards)
+	t.pruneShardIdx = (t.pruneShardIdx + 1) % numShards
 
 	wasPruned := shard.isPruned
-	deleted, err := shard.Prune(t.globalEpochBit)
+	err := shard.Prune(t.globalEpochBit)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// 若本分片在当前年度首次完成剪枝，计数 +1
 	if !wasPruned && shard.isPruned {
 		t.prunedShardCount++
-		// 当 65536 个分片均已剪枝，自动切换年度，并重置所有分片的剪枝标记与计数
-		if t.prunedShardCount >= 65536 {
+		// 当所有分片均已剪枝，自动切换年度，并重置所有分片的剪枝标记与计数
+		if t.prunedShardCount >= numShards {
 			if t.globalEpochBit == 0 {
 				t.globalEpochBit = 1
 			} else {
@@ -1199,12 +1391,314 @@ func (t *Trie) PruneNextShard() ([]DeletedItem, error) {
 			}
 		}
 	}
-	return deleted, nil
+	return nil
 }
 
 func (t *Trie) getShardID(key []byte) int {
-	if len(key) < 2 {
-		return 0 // Should not happen if keys are 32 bytes
+	depth := t.config.ShardDepth
+	bytesNeeded := (depth + 7) / 8
+	if len(key) < bytesNeeded {
+		return 0
 	}
-	return int(key[0])<<8 | int(key[1])
+
+	res := 0
+	for i := 0; i < depth; i++ {
+		if getBit(key, i) == 1 {
+			res |= (1 << (depth - 1 - i))
+		}
+	}
+	return res
+}
+
+// Stats returns the statistics for the entire Trie.
+func (t *Trie) Stats() *TrieStats {
+	stats := &TrieStats{}
+	for _, shard := range t.shards {
+		shard.accumulateStats(stats)
+	}
+	return stats
+}
+
+// FlushArchives 同步所有分片的归档缓存到数据库。
+func (t *Trie) FlushArchives() error {
+	for _, s := range t.shards {
+		if s != nil {
+			if err := s.FlushArchives(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Shard) accumulateStats(stats *TrieStats) {
+	if s.root == nil {
+		return
+	}
+	s.nodeStats(s.root, 0, stats)
+}
+
+func (s *Shard) nodeStats(node Node, currentPathBuckets int, stats *TrieStats) {
+	if node == nil {
+		return
+	}
+
+	switch n := node.(type) {
+	case *InternalNode:
+		// Process buckets at this node
+		numBuckets := len(n.StubList)
+		stats.BucketCount += numBuckets
+		for _, bucket := range n.StubList {
+			stats.ArchivedDataSize += int64(bucket.Count)
+		}
+
+		newPathBuckets := currentPathBuckets + numBuckets
+		if newPathBuckets > stats.MaxBucketsPath {
+			stats.MaxBucketsPath = newPathBuckets
+		}
+
+		// Recurse to children
+		if n.Left != nil {
+			s.nodeStats(n.Left, newPathBuckets, stats)
+		} else if len(n.LeftHash) > 0 {
+			// In a real implementation, we might not want to load all nodes for stats
+			// but for this task we assume we can or just count what's in memory.
+			// Let's at least try to load if we want accurate stats.
+			loaded, _ := s.loadNode(n.LeftHash)
+			if loaded != nil {
+				s.nodeStats(loaded, newPathBuckets, stats)
+			}
+		}
+
+		if n.Right != nil {
+			s.nodeStats(n.Right, newPathBuckets, stats)
+		} else if len(n.RightHash) > 0 {
+			loaded, _ := s.loadNode(n.RightHash)
+			if loaded != nil {
+				s.nodeStats(loaded, newPathBuckets, stats)
+			}
+		}
+	case *LeafNode:
+		// Leaf nodes don't have buckets in this implementation
+	}
+}
+
+// -----------------------------------------------------------------------------
+// [归档核心逻辑]
+// 以下包含树扫描、节点聚合以及桶分裂（下探 2 层）的实现。
+// -----------------------------------------------------------------------------
+
+// ArchiveTrigger 对外提供的触发函数，遍历所有分片并执行归档聚合逻辑。
+// -----------------------------------------------------------------------------
+// [归档辅助工具]
+// -----------------------------------------------------------------------------
+
+func (s *Shard) prependPath(base []byte, baseBits int, prefix []byte, prefixBits int) []byte {
+	res := make([]byte, (baseBits+prefixBits+7)/8)
+	s.copyBits(res, 0, prefix, prefixBits)
+	s.copyBits(res, prefixBits, base, baseBits)
+	return res
+}
+
+// mountAtDeepest 将归档项集合挂载到当前子树中最深的、路径匹配的 InternalNode 上
+func (s *Shard) mountAtDeepest(node Node, depth int, newItems []ArchivedKV) Node {
+	if len(newItems) == 0 {
+		return node
+	}
+	if node == nil {
+		// 如果节点为空，则在此创建一个容器节点并挂载桶
+		bucket := NewArchiveBucketNode(nil, 0, nil, nil, 0)
+		s.recomputeBucket(bucket, newItems)
+		bucket.SetDirty(true)
+		parent := NewInternalNode(nil, nil)
+		parent.StubList = append(parent.StubList, bucket)
+		parent.SetDirty(true)
+		return parent
+	}
+
+	switch n := node.(type) {
+	case *InternalNode:
+		// 尝试向下寻找分支
+		allGoLeft := true
+		allGoRight := true
+
+		// 如果节点有 Path，则先验证前缀匹配
+		// 注意：it.Suffix 是相对于 shard root 的，所以偏移量是 depth - s.config.ShardDepth
+		if n.PathBits > 0 {
+			for _, it := range newItems {
+				matched := s.commonPrefixLen(n.Path, n.PathBits, it.Suffix, depth-s.config.ShardDepth)
+				if matched != n.PathBits {
+					allGoLeft, allGoRight = false, false
+					break
+				}
+				// 检查是否有足够的剩余位进行分支
+				if it.SuffixBits <= (depth - s.config.ShardDepth + n.PathBits) {
+					allGoLeft, allGoRight = false, false
+					break
+				}
+				bit := s.getBitFromBytes(it.Suffix, depth-s.config.ShardDepth+n.PathBits)
+				if bit == 0 {
+					allGoRight = false
+				} else {
+					allGoLeft = false
+				}
+			}
+		} else {
+			for _, it := range newItems {
+				if it.SuffixBits <= (depth - s.config.ShardDepth) {
+					allGoLeft, allGoRight = false, false
+					break
+				}
+				bit := s.getBitFromBytes(it.Suffix, depth-s.config.ShardDepth)
+				if bit == 0 {
+					allGoRight = false
+				} else {
+					allGoLeft = false
+				}
+			}
+		}
+
+		if allGoLeft {
+			if n.Left == nil {
+				n.Left = NewInternalNode(nil, nil)
+			}
+			n.Left = s.mountAtDeepest(n.Left, depth+n.PathBits+1, newItems)
+			n.SetDirty(true)
+			return n
+		}
+		if allGoRight {
+			if n.Right == nil {
+				n.Right = NewInternalNode(nil, nil)
+			}
+			n.Right = s.mountAtDeepest(n.Right, depth+n.PathBits+1, newItems)
+			n.SetDirty(true)
+			return n
+		}
+
+		// 3. 尝试追加到现有桶
+		for _, bucket := range n.StubList {
+			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, newItems[0].Suffix, depth)
+			if matched == bucket.PathBits {
+				// 命中：尝试“盲追加”
+				if bucket.Count+uint64(len(newItems)) <= uint64(s.config.ArchiveBucketSize) {
+					s.blindAppendToBucket(bucket, newItems)
+					bucket.SetDirty(true)
+					n.SetDirty(true)
+					return n
+				}
+				// 超过阈值，不追加，继续分裂（见下文）
+				break
+			}
+		}
+
+		// 否则新建桶
+		bucket := NewArchiveBucketNode(nil, 0, nil, nil, 0)
+		s.recomputeBucket(bucket, newItems)
+		bucket.SetDirty(true)
+		n.StubList = append(n.StubList, bucket)
+		n.SetDirty(true)
+		return n
+
+	default:
+		// 如果是 LeafNode，对其进行包装以容纳挂载桶
+		parent := NewInternalNode(nil, nil)
+		if n != nil {
+			if leaf, ok := n.(*LeafNode); ok {
+				bit := s.getBitFromBytes(leaf.Path, 0)
+				leaf.Path = s.shiftBits(leaf.Path, leaf.PathBits, 1, nil)
+				leaf.PathBits--
+				if bit == 0 {
+					parent.Left = leaf
+				} else {
+					parent.Right = leaf
+				}
+			}
+		}
+		bucket := NewArchiveBucketNode(nil, 0, nil, nil, 0)
+		s.recomputeBucket(bucket, newItems)
+		bucket.SetDirty(true)
+		parent.StubList = append(parent.StubList, bucket)
+		parent.SetDirty(true)
+		return parent
+	}
+}
+
+// distributeStubs 在节点分裂时，将原有的 StubList 分配给更深层的子节点（如果前缀匹配）
+func (s *Shard) distributeStubs(oldInternal *InternalNode, newParent *InternalNode) {
+	stubs := oldInternal.StubList
+	if len(stubs) == 0 {
+		return
+	}
+
+	oldNodeBit := s.getBitFromBytes(oldInternal.Path, 0) // 分裂位对应的旧节点方向
+	var newStubs []*ArchiveBucketNode
+	var passedStubs []*ArchiveBucketNode
+
+	for _, bucket := range stubs {
+		if bucket.PathBits > 0 {
+			bucketBit := s.getBitFromBytes(bucket.Path, 0)
+			if bucketBit == oldNodeBit {
+				// 匹配旧节点方向，下移
+				bucket.Path = s.shiftBits(bucket.Path, bucket.PathBits, 1, nil)
+				bucket.PathBits--
+				newStubs = append(newStubs, bucket)
+				continue
+			}
+		}
+		// 不匹配或 PathBits 为 0，保留在新 parent（即当前分裂层级）
+		passedStubs = append(passedStubs, bucket)
+	}
+	oldInternal.StubList = newStubs
+	newParent.StubList = passedStubs
+}
+
+// shrink 实现积极收缩：若节点只有一个孩子，则将其与孩子合并以保持紧凑
+func (s *Shard) shrink(n *InternalNode) Node {
+	if n.Left != nil && n.Right != nil {
+		return n
+	}
+	if n.Left == nil && n.Right == nil {
+		if len(n.StubList) == 0 {
+			return nil
+		}
+		return n
+	}
+
+	// 只有一个孩子，且如果该孩子是热数据节点，尝试合并路径
+	var child Node
+	bit := byte(0)
+	if n.Left != nil {
+		child = n.Left
+	} else {
+		child = n.Right
+		bit = 1
+	}
+
+	// 如果当前节点有 StubList，收缩会导致挂载关系混乱，暂不收缩
+	if len(n.StubList) > 0 {
+		return n
+	}
+
+	switch c := child.(type) {
+	case *LeafNode:
+		c.Path = s.concatPath(n.Path, n.PathBits, bit, c.Path, c.PathBits)
+		c.PathBits = n.PathBits + 1 + c.PathBits
+		c.SetDirty(true)
+		return c
+	case *InternalNode:
+		c.Path = s.concatPath(n.Path, n.PathBits, bit, c.Path, c.PathBits)
+		c.PathBits = n.PathBits + 1 + c.PathBits
+		c.SetDirty(true)
+		return c
+	}
+	return n
+}
+
+func (s *Shard) concatPath(p1 []byte, b1 int, bit byte, p2 []byte, b2 int) []byte {
+	total := b1 + 1 + b2
+	res := make([]byte, (total+7)/8)
+	s.copyBits(res, 0, p1, b1)
+	s.setBitInBytes(res, b1, bit)
+	s.copyBits(res, b1+1, p2, b2)
+	return res
 }

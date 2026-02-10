@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	NodeTypeInternal = 0x00
-	NodeTypeLeaf     = 0x01
+	NodeTypeInternal      = 0x00
+	NodeTypeLeaf          = 0x01
+	NodeTypeArchiveBucket = 0x02 // [NEW] 归档桶节点类型
 )
 
 // Node 接口：统一描述二叉 Trie 节点的核心行为
@@ -43,6 +44,10 @@ type InternalNode struct {
 	// LeftHash / RightHash：用于序列化与懒加载，在 Commit 阶段更新
 	LeftHash  []byte
 	RightHash []byte
+
+	// StubList [NEW]：侧挂在该节点上的归档桶列表
+	// 归档桶不再作为左右孩子，而是作为一个侧挂的列表存在。
+	StubList []*ArchiveBucketNode
 
 	hash         []byte
 	dirty        bool
@@ -108,26 +113,31 @@ func (n *InternalNode) Serialize() ([]byte, error) {
 	nBits := binary.PutUvarint(scratch, uint64(n.PathBits))
 	buf.Write(scratch[:nBits])
 
-	// Path: Raw bytes (Length derived from PathBits)
-	expectedPathLen := (n.PathBits + 7) / 8
-	if len(n.Path) != expectedPathLen {
-		// Tolerant or strict? Let's be strict or just write what we have?
-		// Logic should ensure consistency.
-		if len(n.Path) > 255 { // Safety check mainly
-			return nil, errors.New("path length exceeds 255 bytes")
-		}
-	}
+	// Path: Raw bytes
 	buf.Write(n.Path)
 
-	if len(n.LeftHash) > 255 || len(n.RightHash) > 255 {
-		return nil, errors.New("hash length exceeds 255 bytes")
-	}
-
+	// Children hashes
 	buf.WriteByte(byte(len(n.LeftHash)))
 	buf.Write(n.LeftHash)
-
 	buf.WriteByte(byte(len(n.RightHash)))
 	buf.Write(n.RightHash)
+
+	// [NEW] StubList 序列化
+	// 写入桶的数量
+	nBits = binary.PutUvarint(scratch, uint64(len(n.StubList)))
+	buf.Write(scratch[:nBits])
+
+	// 依次写入每个桶的数据（桶内包含了路径和 ArchivedData）
+	for _, bucket := range n.StubList {
+		bData, err := bucket.Serialize()
+		if err != nil {
+			return nil, err
+		}
+		// 写入桶数据的长度
+		nBits = binary.PutUvarint(scratch, uint64(len(bData)))
+		buf.Write(scratch[:nBits])
+		buf.Write(bData)
+	}
 
 	return buf.Bytes(), nil
 }
@@ -197,31 +207,27 @@ func (n *LeafNode) SetOriginalHash(h []byte) {
 // Serialize 将叶子节点编码为字节序列。
 // 格式（按顺序）：
 // [Header(1): Type(1)|Epoch(7)] [PathBits(Uvarint)] [Path] [ValueHashLen(1)] [ValueHash]
-// 说明：
-// - Header: bit7=1 (Leaf), bit0-6=Epoch
-// - PathBits: Uvarint 编码
-// - Path: 字节序列，长度由 (PathBits+7)/8 计算
-// - ValueHashLen/ValueHash: 值哈希长度与内容
 func (n *LeafNode) Serialize() ([]byte, error) {
-	// Estimate size: Header(1) + PathBits(Uvarint) + Path + ValueHashLen(1) + ValueHash
+	// 估算大小: Header(1) + PathBits(Uvarint) + Path + ValueHashLen(1) + ValueHash
 	estSize := 1 + binary.MaxVarintLen64 + len(n.Path) + 1 + len(n.ValueHash)
 	buf := make([]byte, 0, estSize)
 
 	// Header: [Type(1bit) | Epoch(7bits)]
-	// LeafNode Type=1, so (1<<7) | (Epoch & 0x7F)
+	// 对于 LeafNode，Type=1，所以最高位为1: (1<<7) | (Epoch & 0x7F)
 	buf = append(buf, 0x80|(n.epoch&0x7F))
 
-	// PathBits: Uvarint
+	// PathBits: Uvarint 编码
 	var scratch [binary.MaxVarintLen64]byte
 	nBits := binary.PutUvarint(scratch[:], uint64(n.PathBits))
 	buf = append(buf, scratch[:nBits]...)
 
-	// Path
+	// Path 路径后缀
 	if len(n.Path) > 255 {
 		return nil, errors.New("path length exceeds 255 bytes")
 	}
 	buf = append(buf, n.Path...)
 
+	// ValueHash 值的哈希
 	if len(n.ValueHash) > 255 {
 		return nil, errors.New("value hash length exceeds 255 bytes")
 	}
@@ -229,6 +235,99 @@ func (n *LeafNode) Serialize() ([]byte, error) {
 	buf = append(buf, n.ValueHash...)
 
 	return buf, nil
+}
+
+// ArchiveBucketNode 归档桶节点，聚合存储历史数据。
+// 它不再参与 Epoch 演进，是 Trie 的“冷”数据固化结果。
+type ArchiveBucketNode struct {
+	Path     []byte // 桶相对于挂载节点的相对路径
+	PathBits int    // 路径位数
+
+	Filter     []byte // 布谷鸟过滤器序列化数据
+	Commitment []byte // ECMH 承诺 (K + Hash(V))
+	Count      uint64 // 桶内数据项数量
+
+	hash         []byte
+	dirty        bool
+	originalHash []byte
+	// 归档桶不再需要 epoch，保持静态
+}
+
+func NewArchiveBucketNode(path []byte, bits int, filter []byte, commitment []byte, count uint64) *ArchiveBucketNode {
+	return &ArchiveBucketNode{
+		Path:       path,
+		PathBits:   bits,
+		Filter:     filter,
+		Commitment: commitment,
+		Count:      count,
+		dirty:      true,
+	}
+}
+
+func (n *ArchiveBucketNode) Type() byte {
+	return NodeTypeArchiveBucket
+}
+
+func (n *ArchiveBucketNode) Epoch() byte {
+	return 0 // 归档数据无 Epoch 演进
+}
+
+func (n *ArchiveBucketNode) SetEpoch(e byte) {
+	// 归档桶不需要设置 Epoch
+}
+
+func (n *ArchiveBucketNode) Hash() []byte {
+	return n.hash
+}
+
+func (n *ArchiveBucketNode) SetHash(h []byte) {
+	n.hash = h
+}
+
+func (n *ArchiveBucketNode) IsDirty() bool {
+	return n.dirty
+}
+
+func (n *ArchiveBucketNode) SetDirty(d bool) {
+	n.dirty = d
+}
+
+func (n *ArchiveBucketNode) OriginalHash() []byte {
+	return n.originalHash
+}
+
+func (n *ArchiveBucketNode) SetOriginalHash(h []byte) {
+	n.originalHash = h
+}
+
+func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
+	var buf bytes.Buffer
+
+	// Header: bit7=1, bit6=1: ArchiveBucket
+	header := byte(0xC0)
+	buf.WriteByte(header)
+
+	// PathBits
+	scratch := make([]byte, binary.MaxVarintLen64)
+	nBits := binary.PutUvarint(scratch, uint64(n.PathBits))
+	buf.Write(scratch[:nBits])
+
+	// Path
+	buf.Write(n.Path)
+
+	// Count
+	nBits = binary.PutUvarint(scratch, n.Count)
+	buf.Write(scratch[:nBits])
+
+	// Commitment Length + Commitment
+	buf.WriteByte(byte(len(n.Commitment)))
+	buf.Write(n.Commitment)
+
+	// [NEW] Hash：为了在节点重排/加载后能直接通过 metadata 找到 raw 数据
+	buf.WriteByte(byte(len(n.hash)))
+	buf.Write(n.hash)
+
+	return buf.Bytes(), nil
 }
 
 // DeserializeNode 将字节序列解码为节点实例。
@@ -241,15 +340,17 @@ func DeserializeNode(data []byte) (Node, error) {
 	}
 
 	header := data[0]
-	nodeType := (header >> 7) & 0x01
-	epoch := header & 0x7F
+	// 判断类型：
+	// bit7=0 -> Internal
+	// bit7=1, bit6=0 -> Leaf
+	// bit7=1, bit6=1 -> ArchiveBucket
+	isLeafOrBucket := (header & 0x80) != 0
+	isBucket := (header & 0x40) != 0
 
 	reader := bytes.NewReader(data[1:])
 
-	switch nodeType {
-	case 0: // InternalNode (was NodeTypeInternal=0)
-		// [Header] [PathBits(Uvarint)] [Path] [LeftHashLen] [LeftHash] [RightHashLen] [RightHash]
-
+	if !isLeafOrBucket { // InternalNode
+		epoch := header & 0x7F
 		pathBits, err := binary.ReadUvarint(reader)
 		if err != nil {
 			return nil, fmt.Errorf("read internal path bits: %w", err)
@@ -259,7 +360,7 @@ func DeserializeNode(data []byte) (Node, error) {
 		path := make([]byte, pathLen)
 		if pathLen > 0 {
 			if _, err := reader.Read(path); err != nil {
-				return nil, fmt.Errorf("read internal path (len %d): %w", pathLen, err)
+				return nil, fmt.Errorf("read internal path: %w", err)
 			}
 		}
 
@@ -270,7 +371,7 @@ func DeserializeNode(data []byte) (Node, error) {
 		leftHash := make([]byte, int(leftLenByte))
 		if leftLenByte > 0 {
 			if _, err := reader.Read(leftHash); err != nil {
-				return nil, fmt.Errorf("read left hash (len %d): %w", leftLenByte, err)
+				return nil, fmt.Errorf("read left hash: %w", err)
 			}
 		}
 
@@ -281,7 +382,29 @@ func DeserializeNode(data []byte) (Node, error) {
 		rightHash := make([]byte, int(rightLenByte))
 		if rightLenByte > 0 {
 			if _, err := reader.Read(rightHash); err != nil {
-				return nil, fmt.Errorf("read right hash (len %d): %w", rightLenByte, err)
+				return nil, fmt.Errorf("read right hash: %w", err)
+			}
+		}
+
+		// [NEW] 读取 StubList
+		stubCount, err := binary.ReadUvarint(reader)
+		var stubs []*ArchiveBucketNode
+		if err == nil && stubCount > 0 {
+			stubs = make([]*ArchiveBucketNode, stubCount)
+			for i := uint64(0); i < stubCount; i++ {
+				bLen, err := binary.ReadUvarint(reader)
+				if err != nil {
+					return nil, fmt.Errorf("read stub %d len: %w", i, err)
+				}
+				bData := make([]byte, bLen)
+				if _, err := reader.Read(bData); err != nil {
+					return nil, fmt.Errorf("read stub %d data: %w", i, err)
+				}
+				bucketNode, err := DeserializeNode(bData)
+				if err != nil {
+					return nil, fmt.Errorf("deserialize stub %d: %w", i, err)
+				}
+				stubs[i] = bucketNode.(*ArchiveBucketNode)
 			}
 		}
 
@@ -290,13 +413,13 @@ func DeserializeNode(data []byte) (Node, error) {
 			PathBits:  int(pathBits),
 			LeftHash:  leftHash,
 			RightHash: rightHash,
+			StubList:  stubs,
 			dirty:     false,
 			epoch:     epoch,
 		}, nil
 
-	case 1: // LeafNode (was NodeTypeLeaf=1)
-		// [Header] [PathBits(Uvarint)] [Path] [ValueHashLen] [ValueHash]
-
+	} else if !isBucket { // LeafNode
+		epoch := header & 0x7F
 		pathBits, err := binary.ReadUvarint(reader)
 		if err != nil {
 			return nil, fmt.Errorf("read path bits: %w", err)
@@ -306,7 +429,7 @@ func DeserializeNode(data []byte) (Node, error) {
 		path := make([]byte, pathLen)
 		if pathLen > 0 {
 			if _, err := reader.Read(path); err != nil {
-				return nil, fmt.Errorf("read path (len %d): %w", pathLen, err)
+				return nil, fmt.Errorf("read path: %w", err)
 			}
 		}
 
@@ -316,7 +439,7 @@ func DeserializeNode(data []byte) (Node, error) {
 		}
 		valHash := make([]byte, int(valHashLenByte))
 		if _, err := reader.Read(valHash); err != nil {
-			return nil, fmt.Errorf("read val hash (len %d): %w", valHashLenByte, err)
+			return nil, fmt.Errorf("read val hash: %w", err)
 		}
 
 		return &LeafNode{
@@ -327,7 +450,68 @@ func DeserializeNode(data []byte) (Node, error) {
 			epoch:     epoch,
 		}, nil
 
-	default:
-		return nil, fmt.Errorf("unknown node type: %d", nodeType)
+	} else { // ArchiveBucketNode
+		// Header 已消耗 1 字节
+		pathBits, err := binary.ReadUvarint(reader)
+		if err != nil {
+			return nil, fmt.Errorf("read bucket path bits: %w", err)
+		}
+
+		pathLen := (int(pathBits) + 7) / 8
+		path := make([]byte, pathLen)
+		if pathLen > 0 {
+			if _, err := reader.Read(path); err != nil {
+				return nil, fmt.Errorf("read bucket path: %w", err)
+			}
+		}
+
+		count, err := binary.ReadUvarint(reader)
+		if err != nil {
+			return nil, fmt.Errorf("read bucket count: %w", err)
+		}
+
+		commitLen, err := reader.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read bucket commitment len: %w", err)
+		}
+		commitment := make([]byte, int(commitLen))
+		if commitLen > 0 {
+			if _, err := reader.Read(commitment); err != nil {
+				return nil, fmt.Errorf("read bucket commitment: %w", err)
+			}
+		}
+
+		filterLen, err := binary.ReadUvarint(reader)
+		if err != nil {
+			return nil, fmt.Errorf("read bucket filter len: %w", err)
+		}
+		filter := make([]byte, filterLen)
+		if filterLen > 0 {
+			if _, err := reader.Read(filter); err != nil {
+				return nil, fmt.Errorf("read bucket filter: %w", err)
+			}
+		}
+
+		// [NEW] 读取持久化的 hash
+		hashLenByte, err := reader.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read bucket hash len: %w", err)
+		}
+		h := make([]byte, int(hashLenByte))
+		if hashLenByte > 0 {
+			if _, err := reader.Read(h); err != nil {
+				return nil, fmt.Errorf("read bucket hash: %w", err)
+			}
+		}
+
+		return &ArchiveBucketNode{
+			Path:       path,
+			PathBits:   int(pathBits),
+			Filter:     filter,
+			Commitment: commitment,
+			Count:      count,
+			hash:       h,
+			dirty:      false,
+		}, nil
 	}
 }
