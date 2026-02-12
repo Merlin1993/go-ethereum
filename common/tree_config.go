@@ -6,4 +6,5 @@ var (
 	VerkleLayerCount = 1
 	DebugFlag        = false
 	Parallelism      = 5
+	ReadSet          = false
 )

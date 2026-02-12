@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 )
 
@@ -34,9 +35,9 @@ func (db *LevelDBAdapter) DeleteBucket(hash []byte) error {
 
 func TestTriePerformance(t *testing.T) {
 	// 1. 输入参数
-	BatchSize := 2000
-	TotalBatches := 65536 // 总批次数
-	NewRatio := 1.        // 新增：更新 = 7:3
+	BatchSize := 5000
+	TotalBatches := 165536 // 总批次数
+	NewRatio := 0.5        // 新增：更新 = 7:3
 
 	// 剪枝触发配置：
 	// “每完成 40 次批量新数据插入操作触发对下一个分片的剪枝”
@@ -46,7 +47,7 @@ func TestTriePerformance(t *testing.T) {
 	// 2. 测试环境：创建 LevelDB 临时目录
 	// 使用当前目录 "." 作为临时文件存储基准，避免占用 C 盘系统临时目录
 	// 您也可以将其修改为绝对路径，例如 "D:\\trie_perf_data"
-	baseDir := "."
+	baseDir := "F:\\\\trie_perf_data"
 	dir, err := os.MkdirTemp(baseDir, "trie-perf-test")
 	if err != nil {
 		t.Fatal(err)
@@ -82,11 +83,12 @@ func TestTriePerformance(t *testing.T) {
 		totalInsertTime  time.Duration
 		totalPruneTime   time.Duration
 		totalCommitTime  time.Duration
+		totalFlushTime   time.Duration
 		minDiskUsage     float64 = -1.0
 		maxDiskUsage     float64 = 0.0
 	)
 
-	existingKeys := make([][]byte, 0, BatchSize*TotalBatches)
+	existingKeys := lru.NewCache[string, struct{}](100000)
 	batchCount := 0
 
 	// 循环执行
@@ -99,15 +101,16 @@ func TestTriePerformance(t *testing.T) {
 		updateCount := BatchSize - newCount
 
 		// 更新：复用已有 key
-		if len(existingKeys) > 0 {
-			if updateCount > len(existingKeys) {
-				updateCount = len(existingKeys)
+		if existingKeys.Len() > 0 {
+			allKeys := existingKeys.Keys() // 本批次复用旧 key，从当前 LRU 缓存中提取
+			if updateCount > len(allKeys) {
+				updateCount = len(allKeys)
 				newCount = BatchSize - updateCount
 			}
 			for j := 0; j < updateCount; j++ {
 				// 随机选择旧 key 进行更新
-				idx := randInt(len(existingKeys))
-				batchKeys = append(batchKeys, existingKeys[idx])
+				idx := randInt(len(allKeys))
+				batchKeys = append(batchKeys, []byte(allKeys[idx]))
 
 				val := make([]byte, 32)
 				rand.Read(val)
@@ -125,7 +128,7 @@ func TestTriePerformance(t *testing.T) {
 			rand.Read(k)
 			batchKeys = append(batchKeys, k)
 			batchVals = append(batchVals, k) // 简化：值=键
-			existingKeys = append(existingKeys, k)
+			existingKeys.Add(string(k), struct{}{})
 		}
 
 		// 执行：批量插入 → 剪枝（触发时） → 提交
@@ -149,6 +152,9 @@ func TestTriePerformance(t *testing.T) {
 		batchCount++
 		if batchCount >= PruneTriggerEvery {
 			batchCount = 0
+			// 每次触发剪枝前旋转 Epoch 位，确保能归档上一个周期的旧数据
+			trie.SetGlobalEpoch(1 - trie.globalEpochBit)
+
 			pStart := time.Now()
 			err := trie.PruneNextShard()
 			if err != nil {
@@ -165,8 +171,15 @@ func TestTriePerformance(t *testing.T) {
 		}
 		currentCommitTime := time.Since(startCommit)
 
+		// 3. 归档落盘 (本次重构分离出来的 I/O)
+		startFlush := time.Now()
+		if err := trie.FlushArchives(); err != nil {
+			t.Fatalf("归档刷盘错误: %v", err)
+		}
+		currentFlushTime := time.Since(startFlush)
+
 		// 指标
-		totalLoopTime := currentInsertTime + currentPruneTime + currentCommitTime
+		totalLoopTime := currentInsertTime + currentPruneTime + currentCommitTime + currentFlushTime
 		diskUsageBytes := getDirSize(dir)
 		diskUsageMB := float64(diskUsageBytes) / 1024 / 1024
 
@@ -180,20 +193,22 @@ func TestTriePerformance(t *testing.T) {
 		totalInsertTime += currentInsertTime
 		totalPruneTime += currentPruneTime
 		totalCommitTime += currentCommitTime
+		totalFlushTime += currentFlushTime
 
-		// 输出日志（非表格形式，直接标明字段含义）
-		fmt.Printf("批次=%d 插入耗时(ms)=%d 剪枝耗时(ms)=%d 提交耗时(ms)=%d 总批次耗时(ms)=%d 磁盘占用(MB)=%.2f\n",
+		// 输出日志
+		fmt.Printf("批次=%d 插入=%d 剪枝=%d 提交=%d 刷盘=%d 总计=%d 磁盘=%.2fMB\n",
 			i+1,
 			currentInsertTime.Milliseconds(),
 			currentPruneTime.Milliseconds(),
 			currentCommitTime.Milliseconds(),
+			currentFlushTime.Milliseconds(),
 			totalLoopTime.Milliseconds(),
 			diskUsageMB,
 		)
 	}
 
 	// 4. 汇总
-	avgLoopTime := (totalInsertTime + totalPruneTime + totalCommitTime) / time.Duration(TotalBatches)
+	avgLoopTime := (totalInsertTime + totalPruneTime + totalCommitTime + totalFlushTime) / time.Duration(TotalBatches)
 
 	fmt.Printf("\n--- 测试汇总 ---\n")
 	fmt.Printf("总插入数据量: %d\n", totalInsertItems)

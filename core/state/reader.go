@@ -442,15 +442,17 @@ func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, er
 			if len(r.readers) == Readers {
 				accountHitCounts[i]++
 			}
-			// 如果缓存未命中但在后续层找到，则写回缓存
-			if cacheMiss && i > 0 {
-				if ctReader, ok := r.readers[0].(*CacheTrieReader); ok && ctReader.ct != nil {
-					if acct != nil {
-						data, _ := rlp.EncodeToBytes(acct)
-						ctReader.ct.Update(addr.Bytes(), data, false)
-						atomic.AddInt64(&cacheAccountMissExists, 1)
-					} else {
-						atomic.AddInt64(&cacheAccountMissNotExists, 1)
+			if common.ReadSet {
+				// 如果缓存未命中但在后续层找到，则写回缓存
+				if cacheMiss && i > 0 {
+					if ctReader, ok := r.readers[0].(*CacheTrieReader); ok && ctReader.ct != nil {
+						if acct != nil {
+							data, _ := rlp.EncodeToBytes(acct)
+							ctReader.ct.Update(addr.Bytes(), data, false)
+							atomic.AddInt64(&cacheAccountMissExists, 1)
+						} else {
+							atomic.AddInt64(&cacheAccountMissNotExists, 1)
+						}
 					}
 				}
 			}
@@ -501,15 +503,17 @@ func (r *multiStateReader) Storage(addr common.Address, slot common.Hash) (commo
 			if len(r.readers) == Readers {
 				storageHitCounts[i]++
 			}
-			// 如果缓存未命中但在后续层找到，则写回缓存
-			if cacheMiss && i > 0 {
-				if ctReader, ok := r.readers[0].(*CacheTrieReader); ok && ctReader.ct != nil {
-					if slotValue != (common.Hash{}) {
-						data, _ := rlp.EncodeToBytes(slotValue)
-						ctReader.ct.UpdateWithAddress(addr, slot.Bytes(), data, false)
-						atomic.AddInt64(&cacheStorageMissExists, 1)
-					} else {
-						atomic.AddInt64(&cacheStorageMissNotExists, 1)
+			if common.ReadSet {
+				// 如果缓存未命中但在后续层找到，则写回缓存
+				if cacheMiss && i > 0 {
+					if ctReader, ok := r.readers[0].(*CacheTrieReader); ok && ctReader.ct != nil {
+						if slotValue != (common.Hash{}) {
+							data, _ := rlp.EncodeToBytes(slotValue)
+							ctReader.ct.UpdateWithAddress(addr, slot.Bytes(), data, false)
+							atomic.AddInt64(&cacheStorageMissExists, 1)
+						} else {
+							atomic.AddInt64(&cacheStorageMissNotExists, 1)
+						}
 					}
 				}
 			}

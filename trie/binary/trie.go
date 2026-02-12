@@ -1,6 +1,7 @@
 package binary
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 
@@ -78,11 +79,19 @@ type Shard struct {
 
 	// Pending appends to existing buckets. Key is the NEW bucket metadata hash.
 	pendingAppends map[string]appendTask
+
+	// Pending deletes from existing buckets. Key is the NEW bucket metadata hash.
+	pendingDeletes map[string]deleteTask
 }
 
 type appendTask struct {
 	oldHash  []byte
 	newItems []ArchivedKV
+}
+
+type deleteTask struct {
+	oldHash     []byte
+	deleteItems []ArchivedKV
 }
 
 // NewShard 创建一个新的 Shard（若提供 rootHash 则从 DB 加载根节点）。
@@ -101,6 +110,7 @@ func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte
 		stats:           &TrieStats{},
 		pendingArchives: make(map[string][]byte),
 		pendingAppends:  make(map[string]appendTask),
+		pendingDeletes:  make(map[string]deleteTask),
 	}
 
 	if len(rootHash) > 0 {
@@ -126,6 +136,54 @@ func (s *Shard) loadNode(hash []byte) (Node, error) {
 	node.SetHash(hash)
 	node.SetOriginalHash(hash) // 记录节点当前持久化版本，用于之后修剪
 	return node, nil
+}
+
+func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
+	if data, ok := s.pendingArchives[string(hash)]; ok {
+		return data, nil
+	}
+	if task, ok := s.pendingAppends[string(hash)]; ok {
+		// 加载旧数据并追加
+		oldData, err := s.getBucketData(task.oldHash)
+		if err != nil {
+			return nil, err
+		}
+		items, err := s.deserializeArchivedKV(oldData)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, task.newItems...)
+		return s.serializeArchivedKV(items)
+	}
+	if task, ok := s.pendingDeletes[string(hash)]; ok {
+		// 加载旧数据并过滤删除项
+		oldData, err := s.getBucketData(task.oldHash)
+		if err != nil {
+			return nil, err
+		}
+		items, err := s.deserializeArchivedKV(oldData)
+		if err != nil {
+			return nil, err
+		}
+		newItems := make([]ArchivedKV, 0, len(items))
+		for _, it := range items {
+			found := false
+			for _, del := range task.deleteItems {
+				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newItems = append(newItems, it)
+			}
+		}
+		return s.serializeArchivedKV(newItems)
+	}
+	if s.config.ArchiveDB == nil {
+		return nil, errors.New("archive db not set")
+	}
+	return s.config.ArchiveDB.GetBucket(hash)
 }
 
 // Get 返回指定 key 的值哈希（不存在则返回 ErrNodeNotFound）。
@@ -236,14 +294,11 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 					continue
 				}
 
-				if s.config.ArchiveDB == nil {
-					continue
-				}
 				s.statsMut.Lock()
 				s.stats.ArchiveReadCount++
 				s.statsMut.Unlock()
 
-				bucketData, err := s.config.ArchiveDB.GetBucket(bucket.Hash())
+				bucketData, err := s.getBucketData(bucket.Hash())
 				if err != nil {
 					continue
 				}
@@ -327,11 +382,8 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 			bucket := n.StubList[i]
 			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, depth)
 			if matched == bucket.PathBits {
-				if s.config.ArchiveDB == nil {
-					continue
-				}
 				// 既然已经匹配到桶前缀，直接读取该桶并尝试删除
-				bucketData, err := s.config.ArchiveDB.GetBucket(bucket.Hash())
+				bucketData, err := s.getBucketData(bucket.Hash())
 				if err != nil {
 					continue
 				}
@@ -339,18 +391,14 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 
 				innerDepth := s.config.ShardDepth
 				keyBits := len(key) * 8
-				for j, item := range items {
+				for _, item := range items {
 					if innerDepth+item.SuffixBits == keyBits && s.suffixMatches(item.Suffix, item.SuffixBits, key, innerDepth) {
-						// 命中：从原始数据中移除
-						items = append(items[:j], items[j+1:]...)
+						// 命中：执行盲删除
+						s.blindDeleteFromBucket(bucket, []ArchivedKV{item})
 
-						// 更新承诺部分
-						if len(items) == 0 {
+						if bucket.Count == 0 {
 							s.config.ArchiveDB.DeleteBucket(bucket.Hash())
 							n.StubList = append(n.StubList[:i], n.StubList[i+1:]...)
-						} else {
-							s.recomputeBucket(bucket, items)
-							bucket.SetDirty(true)
 						}
 						n.SetDirty(true)
 						return true
@@ -555,6 +603,9 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 
 // Delete 删除指定 key，如果 key 不存在则为无操作。
 func (s *Shard) Delete(key []byte) error {
+	if s.root != nil {
+		s.removeFromStubList(s.root, key, s.config.ShardDepth)
+	}
 	newRoot, _, err := s.delete(s.root, key, s.config.ShardDepth)
 	if err != nil {
 		if err == ErrNodeNotFound {
@@ -779,6 +830,50 @@ func (s *Shard) FlushArchives() error {
 			return err
 		}
 		delete(s.pendingAppends, newHash)
+	}
+
+	// 3. 处理“盲删除”写入 (blind deletes)
+	for newHash, task := range s.pendingDeletes {
+		// 加载旧数据
+		oldData, err := s.config.ArchiveDB.GetBucket(task.oldHash)
+		if err != nil {
+			return err
+		}
+		items, err := s.deserializeArchivedKV(oldData)
+		if err != nil {
+			return err
+		}
+
+		// 过滤删除项
+		newItems := make([]ArchivedKV, 0, len(items))
+		for _, it := range items {
+			found := false
+			for _, del := range task.deleteItems {
+				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newItems = append(newItems, it)
+			}
+		}
+
+		// 写入新版本或删除空桶
+		if len(newItems) == 0 {
+			if err := s.config.ArchiveDB.DeleteBucket(task.oldHash); err != nil {
+				return err
+			}
+		} else {
+			newData, err := s.serializeArchivedKV(newItems)
+			if err != nil {
+				return err
+			}
+			if err := s.config.ArchiveDB.PutBucket([]byte(newHash), newData); err != nil {
+				return err
+			}
+		}
+		delete(s.pendingDeletes, newHash)
 	}
 
 	return nil

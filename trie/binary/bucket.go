@@ -130,6 +130,92 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	}
 }
 
+// blindDeleteFromBucket 实现“盲删除”：增量更新元数据（过滤器、ECMH、Count），无需加载原始数据。
+func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []ArchivedKV) {
+	// 1. 增量更新布谷鸟过滤器
+	filter := cuckoo.New()
+	if len(bucket.Filter) > 0 {
+		filter.Decode(bucket.Filter)
+	}
+	for _, it := range deleteItems {
+		filter.Delete(it.Suffix)
+	}
+	bucket.Filter = filter.Encode()
+
+	// 2. 增量更新 ECMH 承诺 (减法)
+	hashes := make([]common.Hash, 0, len(deleteItems))
+	for _, it := range deleteItems {
+		h := crypto.Keccak256Hash(append(it.Suffix, it.Value...))
+		hashes = append(hashes, h)
+	}
+	committer := ecmh.New()
+	newCommitment, _ := committer.Delete(bucket.Commitment, hashes)
+	bucket.Commitment = newCommitment
+
+	// 3. 更新计数
+	bucket.Count -= uint64(len(deleteItems))
+
+	// 4. 记录删除任务
+	oldHash := bucket.Hash()
+
+	// 清除旧哈希以重新计算元数据哈希
+	bucket.SetHash(nil)
+	meta, _ := bucket.Serialize()
+	newHash := append([]byte{}, s.hasher.Hash(meta)...)
+	bucket.SetHash(newHash)
+
+	// [优化]：如果 oldHash 已经在 pendingArchives 队列中 (说明是本批次新创建的桶)，直接处理
+	if data, ok := s.pendingArchives[string(oldHash)]; ok {
+		items, _ := s.deserializeArchivedKV(data)
+		// 简单过滤掉要删除的项
+		newItems := make([]ArchivedKV, 0, len(items))
+		for _, it := range items {
+			found := false
+			for _, del := range deleteItems {
+				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newItems = append(newItems, it)
+			}
+		}
+		newData, _ := s.serializeArchivedKV(newItems)
+		s.pendingArchives[string(newHash)] = newData
+		delete(s.pendingArchives, string(oldHash))
+	} else if task, ok := s.pendingAppends[string(oldHash)]; ok {
+		// 已经在追加缓存中，尝试从待追加项中移除
+		newItems := make([]ArchivedKV, 0, len(task.newItems))
+		for _, it := range task.newItems {
+			found := false
+			for _, del := range deleteItems {
+				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newItems = append(newItems, it)
+			}
+		}
+		task.newItems = newItems
+		s.pendingAppends[string(newHash)] = task
+		delete(s.pendingAppends, string(oldHash))
+	} else if task, ok := s.pendingDeletes[string(oldHash)]; ok {
+		// 已经在删除缓存中，累加删除任务
+		task.deleteItems = append(task.deleteItems, deleteItems...)
+		s.pendingDeletes[string(newHash)] = task
+		delete(s.pendingDeletes, string(oldHash))
+	} else {
+		// 全新删除任务
+		s.pendingDeletes[string(newHash)] = deleteTask{
+			oldHash:     oldHash,
+			deleteItems: deleteItems,
+		}
+	}
+}
+
 // recomputeBucket 重新计算桶的承诺部分 (Filter, ECMH, Count)
 func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	filter := cuckoo.New()
