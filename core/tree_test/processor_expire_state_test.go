@@ -42,15 +42,36 @@ type ProcessorHost struct {
 	preSdb    *state.CachingDB
 }
 
+var (
+	dbDir            = flag.String("dbDir2", "F:\\ethdata\\expire_state_db", "Database directory")
+	dataDir          = flag.String("dataDir2", "E:\\ethdata", "Input data directory")
+	startIdx         = flag.Int("startFileIdx2", 1, "Start file index")
+	endIdx           = flag.Int("endFileIdx2", 21, "End file index")
+	useVerkle        = flag.Bool("useVerkle2", false, "Enable Verkle trie")
+	useBinaryTrie    = flag.Bool("useBinaryTrie2", false, "Enable Binary trie")
+	useCacheTrie     = flag.Bool("useCacheTrie2", true, "Enable CacheTrie")
+	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
+	binaryArchiveDir = flag.String("binaryArchiveDir2", "", "Binary trie archive directory")
+)
+
+func TestMain(m *testing.M) {
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+	os.Exit(m.Run())
+}
+
 type ProcessorConfig struct {
-	DbDir        string
-	DataDir      string
-	StartFileIdx int
-	EndFileIdx   int
-	UseVerkle    bool
-	UseCacheTrie bool
-	UseMemory    bool
-	StartNum     uint64
+	DbDir            string
+	DataDir          string
+	StartFileIdx     int
+	EndFileIdx       int
+	UseVerkle        bool
+	UseBinaryTrie    bool
+	UseCacheTrie     bool
+	UseMemory        bool
+	BinaryArchiveDir string
+	StartNum         uint64
 }
 
 func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
@@ -69,24 +90,26 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 	db := rawdb.NewDatabase(ldb)
 	hdb := hashdb.Defaults
 	pdb := pathdb.Defaults
-	if cfg.UseVerkle {
+	if cfg.UseVerkle || cfg.UseBinaryTrie {
 		hdb = nil
 	} else {
 		pdb = nil
 	}
 
 	trieDB := triedb.NewDatabase(db, &triedb.Config{
-		Preimages: false,
-		IsVerkle:  cfg.UseVerkle,
-		CacheTrie: cfg.UseCacheTrie,
-		ReadCache: false,
-		StartNum:  cfg.StartNum,
-		PathDB:    pdb,
-		HashDB:    hdb,
+		Preimages:        false,
+		IsVerkle:         cfg.UseVerkle,
+		IsBinary:         cfg.UseBinaryTrie,
+		CacheTrie:        cfg.UseCacheTrie,
+		ReadCache:        false,
+		StartNum:         cfg.StartNum,
+		BinaryArchiveDir: cfg.BinaryArchiveDir,
+		PathDB:           pdb,
+		HashDB:           hdb,
 	})
 
 	firstRootHash := types.EmptyRootHash
-	if cfg.UseVerkle {
+	if cfg.UseVerkle || cfg.UseBinaryTrie {
 		firstRootHash = common.Hash{}
 	}
 	snaps, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, firstRootHash)
@@ -136,7 +159,10 @@ func (h *ProcessorHost) Close() {
 
 // CommitToPreTrie handles the asynchronous commitment of CacheTrie data to the underlying trie.
 func (h *ProcessorHost) CommitToPreTrie(root common.Hash, blockNum uint64, deleteKVList *cachetrie.DeleteKVList) {
-	if deleteKVList == nil || len(deleteKVList.Data) == 0 {
+	if deleteKVList == nil {
+		return
+	}
+	if len(deleteKVList.Data) == 0 {
 		h.trieDB.CacheTrie().FinishCleanup(blockNum, root)
 		return
 	}
@@ -256,27 +282,17 @@ func LoadTransactionsFromCSV(file string) (map[uint64][]*core.Message, error) {
 }
 
 func TestExpireStateProcessor(t *testing.T) {
-	dbDir := flag.String("dbDir2", "F:\\ethdata\\expire_state_db", "Database directory")
-	dataDir := flag.String("dataDir2", "E:\\ethdata", "Input data directory")
-	startIdx := flag.Int("startFileIdx2", 1, "Start file index")
-	endIdx := flag.Int("endFileIdx2", 21, "End file index")
-	useVerkle := flag.Bool("useVerkle2", false, "Enable Verkle trie")
-	useCacheTrie := flag.Bool("useCacheTrie2", true, "Enable CacheTrie")
-	useMemory := flag.Bool("useMemory2", false, "Use in-memory DB")
-
-	if !flag.Parsed() {
-		flag.Parse()
-	}
-
 	cfg := &ProcessorConfig{
-		DbDir:        *dbDir,
-		DataDir:      *dataDir,
-		StartFileIdx: *startIdx,
-		EndFileIdx:   *endIdx,
-		UseVerkle:    *useVerkle,
-		UseCacheTrie: *useCacheTrie,
-		UseMemory:    *useMemory,
-		StartNum:     46147,
+		DbDir:            *dbDir,
+		DataDir:          *dataDir,
+		StartFileIdx:     *startIdx,
+		EndFileIdx:       *endIdx,
+		UseVerkle:        *useVerkle,
+		UseBinaryTrie:    *useBinaryTrie,
+		UseCacheTrie:     *useCacheTrie,
+		UseMemory:        *useMemory,
+		BinaryArchiveDir: *binaryArchiveDir,
+		StartNum:         46147,
 	}
 
 	common.UseVerkle = cfg.UseVerkle
@@ -299,7 +315,7 @@ func TestExpireStateProcessor(t *testing.T) {
 
 	selectedFiles := files[cfg.StartFileIdx-1 : cfg.EndFileIdx]
 	lastStateRoot := types.EmptyRootHash
-	if cfg.UseVerkle {
+	if cfg.UseVerkle || cfg.UseBinaryTrie {
 		lastStateRoot = common.Hash{}
 	}
 
@@ -313,9 +329,10 @@ func TestExpireStateProcessor(t *testing.T) {
 		maxRootTime    time.Duration
 
 		// CacheTrie stats
-		lastAcctHit, lastAcctMissEx, lastAcctMissNo int64
-		lastStorHit, lastStorMissEx, lastStorMissNo int64
-		totalProcessedBlocks                        uint64
+		lastAcctHit, lastAcctMissEx, lastAcctMissNo                              int64
+		lastStorHit, lastStorMissEx, lastStorMissNo                              int64
+		lastAcctReadSize, lastAcctWriteSize, lastStorReadSize, lastStorWriteSize int64
+		totalProcessedBlocks                                                     uint64
 	)
 
 	// CSV file setup
@@ -332,6 +349,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		"StartBlock", "EndBlock",
 		"AcctHitRate", "AcctMissExRate", "AcctMissNoRate",
 		"StorHitRate", "StorMissExRate", "StorMissNoRate",
+		"AcctReadSize", "AcctWriteSize", "StorReadSize", "StorWriteSize",
 	})
 
 	for _, file := range selectedFiles {
@@ -422,7 +440,7 @@ func TestExpireStateProcessor(t *testing.T) {
 				}
 
 				deleteKVList := statedb.GetCachedDeleteKVList()
-				if cfg.UseVerkle {
+				if cfg.UseVerkle || cfg.UseBinaryTrie {
 					host.CommitToPreTrie(root, b, deleteKVList)
 				} else {
 					go host.CommitToPreTrie(root, b, deleteKVList)
@@ -451,7 +469,7 @@ func TestExpireStateProcessor(t *testing.T) {
 				fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
 
 				// CacheTrie stats
-				acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo := state.GetCacheStats()
+				acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, acctReadSize, acctWriteSize, storReadSize, storWriteSize := state.GetCacheStats()
 
 				deltaAcctHit := acctHit - lastAcctHit
 				deltaAcctMissEx := acctMissEx - lastAcctMissEx
@@ -464,16 +482,18 @@ func TestExpireStateProcessor(t *testing.T) {
 				totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
 
 				if totalAcct > 0 {
-					fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%)\n",
+					fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), ReadSize: %d, WriteSize: %d\n",
 						deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
 						deltaAcctMissEx, float64(deltaAcctMissEx)*100/float64(totalAcct),
-						deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct))
+						deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct),
+						acctReadSize-lastAcctReadSize, acctWriteSize-lastAcctWriteSize)
 				}
 				if totalStor > 0 {
-					fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%)\n",
+					fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), ReadSize: %d, WriteSize: %d\n",
 						deltaStorHit, float64(deltaStorHit)*100/float64(totalStor),
 						deltaStorMissEx, float64(deltaStorMissEx)*100/float64(totalStor),
-						deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor))
+						deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor),
+						storReadSize-lastStorReadSize, storWriteSize-lastStorWriteSize)
 				}
 
 				// Write to CSV
@@ -499,6 +519,12 @@ func TestExpireStateProcessor(t *testing.T) {
 				} else {
 					record = append(record, "0.00%", "0.00%", "0.00%")
 				}
+				record = append(record,
+					strconv.FormatInt(acctReadSize-lastAcctReadSize, 10),
+					strconv.FormatInt(acctWriteSize-lastAcctWriteSize, 10),
+					strconv.FormatInt(storReadSize-lastStorReadSize, 10),
+					strconv.FormatInt(storWriteSize-lastStorWriteSize, 10),
+				)
 				writer.Write(record)
 				writer.Flush()
 
@@ -511,6 +537,8 @@ func TestExpireStateProcessor(t *testing.T) {
 
 				lastAcctHit, lastAcctMissEx, lastAcctMissNo = acctHit, acctMissEx, acctMissNo
 				lastStorHit, lastStorMissEx, lastStorMissNo = storHit, storMissEx, storMissNo
+				lastAcctReadSize, lastAcctWriteSize = acctReadSize, acctWriteSize
+				lastStorReadSize, lastStorWriteSize = storReadSize, storWriteSize
 			}
 		}
 	}
@@ -521,7 +549,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
 
 		// Final CacheTrie stats
-		acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo := state.GetCacheStats()
+		acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, acctReadSize, acctWriteSize, storReadSize, storWriteSize := state.GetCacheStats()
 		deltaAcctHit := acctHit - lastAcctHit
 		deltaAcctMissEx := acctMissEx - lastAcctMissEx
 		deltaAcctMissNo := acctMissNo - lastAcctMissNo
@@ -533,16 +561,18 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
 
 		if totalAcct > 0 {
-			fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%)\n",
+			fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), ReadSize: %d, WriteSize: %d\n",
 				deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
 				deltaAcctMissEx, float64(deltaAcctMissEx)*100/float64(totalAcct),
-				deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct))
+				deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct),
+				acctReadSize-lastAcctReadSize, acctWriteSize-lastAcctWriteSize)
 		}
 		if totalStor > 0 {
-			fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%)\n",
+			fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), ReadSize: %d, WriteSize: %d\n",
 				deltaStorHit, float64(deltaStorHit)*100/float64(totalStor),
 				deltaStorMissEx, float64(deltaStorMissEx)*100/float64(totalStor),
-				deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor))
+				deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor),
+				storReadSize-lastStorReadSize, storWriteSize-lastStorWriteSize)
 		}
 
 		// Final Write to CSV
@@ -568,6 +598,12 @@ func TestExpireStateProcessor(t *testing.T) {
 		} else {
 			record = append(record, "0.00%", "0.00%", "0.00%")
 		}
+		record = append(record,
+			strconv.FormatInt(acctReadSize-lastAcctReadSize, 10),
+			strconv.FormatInt(acctWriteSize-lastAcctWriteSize, 10),
+			strconv.FormatInt(storReadSize-lastStorReadSize, 10),
+			strconv.FormatInt(storWriteSize-lastStorWriteSize, 10),
+		)
 		writer.Write(record)
 		writer.Flush()
 	}

@@ -17,6 +17,8 @@
 package trie
 
 import (
+	"sync/atomic"
+
 	"github.com/ethereum/go-ethereum/cachetrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -109,6 +111,8 @@ func (t *CacheProxyTrie) GetAccount(address common.Address) (*types.StateAccount
 				if len(valueNode.Data) > 0 {
 					ret := new(types.StateAccount)
 					if err := rlp.DecodeBytes(valueNode.Data, ret); err == nil {
+						atomic.AddInt64(&common.CacheAccountHit, 1)
+						atomic.AddInt64(&common.CacheAccountReadSize, int64(len(valueNode.Data)))
 						return ret, nil
 					}
 				} else {
@@ -147,8 +151,12 @@ func (t *CacheProxyTrie) GetStorage(addr common.Address, key []byte) ([]byte, er
 					// Extract actual content from RLP-encoded data
 					_, actualContent, _, err := rlp.Split(content)
 					if err != nil {
+						atomic.AddInt64(&common.CacheStorageHit, 1)
+						atomic.AddInt64(&common.CacheStorageReadSize, int64(len(content)))
 						return content, nil // If decoding fails, return original content directly
 					}
+					atomic.AddInt64(&common.CacheStorageHit, 1)
+					atomic.AddInt64(&common.CacheStorageReadSize, int64(len(content)))
 					return actualContent, nil
 				} else {
 					return nil, nil
@@ -181,6 +189,7 @@ func (t *CacheProxyTrie) UpdateAccount(address common.Address, account *types.St
 		if err != nil {
 			return err
 		}
+		atomic.AddInt64(&common.CacheAccountWriteSize, int64(len(data)))
 		return t.cache.Update(address.Bytes(), data, true)
 	}
 
@@ -192,6 +201,7 @@ func (t *CacheProxyTrie) UpdateAccount(address common.Address, account *types.St
 func (t *CacheProxyTrie) UpdateAccountRLP(address common.Address, account []byte, codeLen int) error {
 	// If cache is available, update cache directly without updating underlying trie
 	if t.cache != nil {
+		atomic.AddInt64(&common.CacheAccountWriteSize, int64(len(account)))
 		return t.cache.Update(address.Bytes(), account, true)
 	}
 
@@ -205,6 +215,7 @@ func (t *CacheProxyTrie) UpdateStorage(addr common.Address, key, value []byte) e
 	if t.cache != nil {
 		// Use RLP encoding to store the value
 		encoded, _ := rlp.EncodeToBytes(value)
+		atomic.AddInt64(&common.CacheStorageWriteSize, int64(len(encoded)))
 		return t.cache.UpdateWithAddress(addr, key, encoded, true)
 	}
 

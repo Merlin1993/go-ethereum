@@ -23,6 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/triedb/database"
@@ -32,13 +33,15 @@ import (
 
 // Config defines all necessary options for database.
 type Config struct {
-	Preimages bool           // Flag whether the preimage of node key is recorded
-	IsVerkle  bool           // Flag whether the db is holding a verkle tree
-	CacheTrie bool           // Flag whether to use CacheTrie instead of normal Trie
-	ReadCache bool           // Flag whether to enable reading from cache
-	StartNum  uint64         // Start number for CacheTrie
-	HashDB    *hashdb.Config // Configs for hash-based scheme
-	PathDB    *pathdb.Config // Configs for experimental path-based scheme
+	Preimages        bool           // Flag whether the preimage of node key is recorded
+	IsVerkle         bool           // Flag whether the db is holding a verkle tree
+	CacheTrie        bool           // Flag whether to use CacheTrie instead of normal Trie
+	ReadCache        bool           // Flag whether to enable reading from cache
+	StartNum         uint64         // Start number for CacheTrie
+	HashDB           *hashdb.Config // Configs for hash-based scheme
+	PathDB           *pathdb.Config // Configs for experimental path-based scheme
+	IsBinary         bool           // Flag whether the db is holding a binary trie
+	BinaryArchiveDir string         // Directory for binary trie archive storage
 }
 
 // HashDefaults represents a config for using hash-based scheme with
@@ -102,6 +105,7 @@ type Database struct {
 	preimages *preimageStore       // The store for caching preimages
 	backend   backend              // The backend for managing trie nodes
 	cacheTrie *cachetrie.CacheTrie // Cache trie used for enhanced caching
+	archive   ethdb.Database       // Separate archive database for binary trie
 }
 
 func (db *Database) GetBackend() *pathdb.Database {
@@ -138,6 +142,15 @@ func NewDatabase2(diskdb ethdb.Database, config *Config, bd backend) *Database {
 		db.backend = hashdb.New(diskdb, config.HashDB)
 	}
 
+	// Initialize the archive database if enabled
+	if config.BinaryArchiveDir != "" {
+		archive, err := leveldb.New(config.BinaryArchiveDir, 256, 256, "eth-binary-archive", false)
+		if err != nil {
+			log.Crit("Failed to open binary archive database", "err", err)
+		}
+		db.archive = rawdb.NewDatabase(archive)
+	}
+
 	// Initialize the cache trie if enabled
 	if config.CacheTrie {
 		db.cacheTrie = cachetrie.NewCacheTrie(config.StartNum, 256, 1000000)
@@ -171,6 +184,15 @@ func NewFixedDatabase(diskdb ethdb.Database, config *Config) *Database {
 		db.backend = hashdb.New(diskdb, config.HashDB)
 	}
 
+	// Initialize the archive database if enabled
+	if config.BinaryArchiveDir != "" {
+		archive, err := leveldb.New(config.BinaryArchiveDir, 256, 256, "eth-binary-archive", false)
+		if err != nil {
+			log.Crit("Failed to open binary archive database", "err", err)
+		}
+		db.archive = rawdb.NewDatabase(archive)
+	}
+
 	// Initialize the cache trie if enabled
 	if config.CacheTrie {
 		db.cacheTrie = cachetrie.NewFixedSizeCacheTrie(config.StartNum, 82125, 1000000000)
@@ -202,6 +224,15 @@ func NewDatabase(diskdb ethdb.Database, config *Config) *Database {
 		db.backend = pathdb.New(diskdb, config.PathDB, config.IsVerkle)
 	} else {
 		db.backend = hashdb.New(diskdb, config.HashDB)
+	}
+
+	// Initialize the archive database if enabled
+	if config.BinaryArchiveDir != "" {
+		archive, err := leveldb.New(config.BinaryArchiveDir, 256, 256, "eth-binary-archive", false)
+		if err != nil {
+			log.Crit("Failed to open binary archive database", "err", err)
+		}
+		db.archive = rawdb.NewDatabase(archive)
 	}
 
 	// Initialize the cache trie if enabled
@@ -411,6 +442,21 @@ func (db *Database) Journal(root common.Hash) error {
 // IsVerkle returns the indicator if the database is holding a verkle tree.
 func (db *Database) IsVerkle() bool {
 	return db.config.IsVerkle
+}
+
+// IsBinary returns the indicator if the database is holding a binary trie.
+func (db *Database) IsBinary() bool {
+	return db.config.IsBinary
+}
+
+// BinaryArchiveDir returns the directory for binary trie archive storage.
+func (db *Database) BinaryArchiveDir() string {
+	return db.config.BinaryArchiveDir
+}
+
+// Archive returns the archive database if it's enabled.
+func (db *Database) Archive() ethdb.Database {
+	return db.archive
 }
 
 // Disk returns the underlying disk database.

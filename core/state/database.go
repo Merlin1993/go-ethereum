@@ -227,6 +227,8 @@ func (db *CachingDB) OpenTrie(root common.Hash) (Trie, error) {
 	// 创建底层trie
 	if db.triedb.IsVerkle() {
 		baseTrie, err = trie.NewVerkleTrie(root, db.triedb, db.pointCache)
+	} else if db.triedb.IsBinary() {
+		baseTrie, err = trie.NewBinaryTrie(root, db.triedb.Disk(), db.triedb.Archive())
 	} else {
 		baseTrie, err = trie.NewStateTrie(trie.StateTrieID(root), db.triedb)
 	}
@@ -249,7 +251,7 @@ func (db *CachingDB) OpenStorageTrie(stateRoot common.Hash, address common.Addre
 	// In the verkle case, there is only one tree. But the two-tree structure
 	// is hardcoded in the codebase. So we need to return the same trie in this
 	// case.
-	if db.triedb.IsVerkle() {
+	if db.triedb.IsVerkle() || db.triedb.IsBinary() {
 		return self, nil
 	}
 
