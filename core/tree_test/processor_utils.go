@@ -310,8 +310,15 @@ func compareNaturalSort(files []string) {
 // 存储区块高度到时间戳的映射
 var compareBlockTimestamps = make(map[uint64]uint64)
 
+// 存储区块高度到打包人的映射
+var compareBlockMiners = make(map[uint64]common.Address)
+
 // 从对应的区块文件中加载时间戳
 func compareLoadBlockTimestampsFromFile(dataDir string, fileIndex string) error {
+	// 清空旧数据，避免跨文件累积导致内存过高
+	compareBlockTimestamps = make(map[uint64]uint64)
+	compareBlockMiners = make(map[uint64]common.Address)
+
 	// 构建区块文件路径
 	var blockFile string
 	if fileIndex == "" {
@@ -340,18 +347,21 @@ func compareLoadBlockTimestampsFromFile(dataDir string, fileIndex string) error 
 		return fmt.Errorf("读取区块CSV头失败: %v", err)
 	}
 
-	// 查找number和timestamp字段的索引
-	var numberIdx, timestampIdx int = -1, -1
+	// 查找number、timestamp和miner字段的索引
+	var numberIdx, timestampIdx, minerIdx int = -1, -1, -1
 	for i, header := range headers {
-		if header == "number" {
+		switch strings.ToLower(header) {
+		case "number":
 			numberIdx = i
-		} else if header == "timestamp" {
+		case "timestamp":
 			timestampIdx = i
+		case "miner", "author", "coinbase":
+			minerIdx = i
 		}
 	}
 
-	if numberIdx == -1 || timestampIdx == -1 {
-		return fmt.Errorf("区块CSV文件 %s 缺少必要的字段", blockFile)
+	if numberIdx == -1 {
+		return fmt.Errorf("区块CSV文件 %s 缺少number字段", blockFile)
 	}
 
 	// 读取CSV数据并提取区块高度和时间戳
@@ -368,13 +378,17 @@ func compareLoadBlockTimestampsFromFile(dataDir string, fileIndex string) error 
 		}
 
 		// 解析时间戳
-		timestamp, err := strconv.ParseUint(record[timestampIdx], 10, 64)
-		if err != nil {
-			continue
+		if timestampIdx != -1 {
+			timestamp, err := strconv.ParseUint(record[timestampIdx], 10, 64)
+			if err == nil {
+				compareBlockTimestamps[num] = timestamp
+			}
 		}
 
-		// 存储区块高度和时间戳的映射
-		compareBlockTimestamps[num] = timestamp
+		// 解析打包人
+		if minerIdx != -1 && record[minerIdx] != "" && record[minerIdx] != "null" {
+			compareBlockMiners[num] = common.HexToAddress(record[minerIdx])
+		}
 	}
 
 	return nil

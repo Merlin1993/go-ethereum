@@ -193,7 +193,7 @@ func NewFixedDatabase(diskdb ethdb.Database, config *Config) *Database {
 		db.archive = rawdb.NewDatabase(archive)
 	}
 
-	// Initialize the cache trie if enabled
+	// Initialize the cache trie if enabled 82125
 	if config.CacheTrie {
 		db.cacheTrie = cachetrie.NewFixedSizeCacheTrie(config.StartNum, 82125, 1000000000)
 	}

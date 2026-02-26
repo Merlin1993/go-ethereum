@@ -45,6 +45,10 @@ type InternalNode struct {
 	LeftHash  []byte
 	RightHash []byte
 
+	// [NEW] 缓存孩子节点的 epoch 信息，避免 Commit 时递归加载非脏节点
+	LeftEpoch  byte
+	RightEpoch byte
+
 	// StubList [NEW]：侧挂在该节点上的归档桶列表
 	// 归档桶不再作为左右孩子，而是作为一个侧挂的列表存在。
 	StubList []*ArchiveBucketNode
@@ -53,6 +57,22 @@ type InternalNode struct {
 	dirty        bool
 	originalHash []byte
 	epoch        byte
+}
+
+func (n *InternalNode) Reset() {
+	n.Path = nil
+	n.PathBits = 0
+	n.Left = nil
+	n.Right = nil
+	n.LeftHash = nil
+	n.RightHash = nil
+	n.LeftEpoch = 0
+	n.RightEpoch = 0
+	n.StubList = n.StubList[:0]
+	n.hash = nil
+	n.dirty = true
+	n.originalHash = nil
+	n.epoch = 0
 }
 
 func NewInternalNode(left, right Node) *InternalNode {
@@ -116,11 +136,14 @@ func (n *InternalNode) Serialize() ([]byte, error) {
 	// Path: Raw bytes
 	buf.Write(n.Path)
 
-	// Children hashes
+	// Children hashes & epochs
 	buf.WriteByte(byte(len(n.LeftHash)))
 	buf.Write(n.LeftHash)
+	buf.WriteByte(n.LeftEpoch)
+
 	buf.WriteByte(byte(len(n.RightHash)))
 	buf.Write(n.RightHash)
+	buf.WriteByte(n.RightEpoch)
 
 	// [NEW] StubList 序列化
 	// 写入桶的数量
@@ -166,6 +189,16 @@ func NewLeafNode(path []byte, bits int, valueHash []byte) *LeafNode {
 		ValueHash: valueHash,
 		dirty:     true,
 	}
+}
+
+func (n *LeafNode) Reset() {
+	n.Path = nil
+	n.PathBits = 0
+	n.ValueHash = nil
+	n.hash = nil
+	n.dirty = true
+	n.originalHash = nil
+	n.epoch = 0
 }
 
 func (n *LeafNode) Type() byte {
@@ -374,6 +407,10 @@ func DeserializeNode(data []byte) (Node, error) {
 				return nil, fmt.Errorf("read left hash: %w", err)
 			}
 		}
+		leftEpoch, err := reader.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read left epoch: %w", err)
+		}
 
 		rightLenByte, err := reader.ReadByte()
 		if err != nil {
@@ -384,6 +421,10 @@ func DeserializeNode(data []byte) (Node, error) {
 			if _, err := reader.Read(rightHash); err != nil {
 				return nil, fmt.Errorf("read right hash: %w", err)
 			}
+		}
+		rightEpoch, err := reader.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read right epoch: %w", err)
 		}
 
 		// [NEW] 读取 StubList
@@ -409,13 +450,15 @@ func DeserializeNode(data []byte) (Node, error) {
 		}
 
 		return &InternalNode{
-			Path:      path,
-			PathBits:  int(pathBits),
-			LeftHash:  leftHash,
-			RightHash: rightHash,
-			StubList:  stubs,
-			dirty:     false,
-			epoch:     epoch,
+			Path:       path,
+			PathBits:   int(pathBits),
+			LeftHash:   leftHash,
+			RightHash:  rightHash,
+			LeftEpoch:  leftEpoch,
+			RightEpoch: rightEpoch,
+			StubList:   stubs,
+			dirty:      false,
+			epoch:      epoch,
 		}, nil
 
 	} else if !isBucket { // LeafNode

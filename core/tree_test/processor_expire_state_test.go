@@ -52,6 +52,7 @@ var (
 	useCacheTrie     = flag.Bool("useCacheTrie2", true, "Enable CacheTrie")
 	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
 	binaryArchiveDir = flag.String("binaryArchiveDir2", "", "Binary trie archive directory")
+	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
 )
 
 func TestMain(m *testing.M) {
@@ -96,7 +97,8 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 		pdb = nil
 	}
 
-	trieDB := triedb.NewDatabase(db, &triedb.Config{
+	//trieDB := triedb.NewDatabase(db, &triedb.Config{
+	trieDB := triedb.NewFixedDatabase(db, &triedb.Config{
 		Preimages:        false,
 		IsVerkle:         cfg.UseVerkle,
 		IsBinary:         cfg.UseBinaryTrie,
@@ -320,7 +322,7 @@ func TestExpireStateProcessor(t *testing.T) {
 	}
 
 	// Statistics tracking
-	const statsInterval = 10000
+	statsIv := uint64(*statsInterval)
 	var (
 		intervalBlocks uint64
 		totalTxTime    time.Duration
@@ -329,14 +331,15 @@ func TestExpireStateProcessor(t *testing.T) {
 		maxRootTime    time.Duration
 
 		// CacheTrie stats
-		lastAcctHit, lastAcctMissEx, lastAcctMissNo                              int64
-		lastStorHit, lastStorMissEx, lastStorMissNo                              int64
-		lastAcctReadSize, lastAcctWriteSize, lastStorReadSize, lastStorWriteSize int64
-		totalProcessedBlocks                                                     uint64
+		lastAcctHit, lastAcctMissEx, lastAcctMissNo                        int64
+		lastStorHit, lastStorMissEx, lastStorMissNo                        int64
+		lastTotAcctReads, lastTotStorReads, lastTotAcctUpd, lastTotStorUpd int64
+		lastTotReads, lastTotUpdates                                       int64
+		totalProcessedBlocks                                               uint64
 	)
 
 	// CSV file setup
-	csvFile, err := os.Create("cache_stats.csv")
+	csvFile, err := os.Create("cache_stats_detailed.csv")
 	if err != nil {
 		t.Fatalf("failed to create csv file: %v", err)
 	}
@@ -347,9 +350,9 @@ func TestExpireStateProcessor(t *testing.T) {
 	// Write CSV Header
 	writer.Write([]string{
 		"StartBlock", "EndBlock",
-		"AcctHitRate", "AcctMissExRate", "AcctMissNoRate",
-		"StorHitRate", "StorMissExRate", "StorMissNoRate",
-		"AcctReadSize", "AcctWriteSize", "StorReadSize", "StorWriteSize",
+		"TotReads", "TotWrites", "TotMissNo", "TotCacheHit", "TotMissEx",
+		"AcctReads", "AcctWrites", "AcctMissNo", "AcctCacheHit", "AcctMissEx",
+		"StorReads", "StorWrites", "StorMissNo", "StorCacheHit", "StorMissEx",
 	})
 
 	for _, file := range selectedFiles {
@@ -359,6 +362,10 @@ func TestExpireStateProcessor(t *testing.T) {
 			t.Errorf("failed to load transactions from %s: %v", file, err)
 			continue
 		}
+
+		// Load block metadata (timestamps and miners) once per file
+		fileIdx := compareGetFileIndex(file)
+		compareLoadBlockTimestampsFromFile(cfg.DataDir, fileIdx)
 
 		var minBlock, maxBlock uint64 = 1e18, 0
 		for b := range msgsByBlock {
@@ -379,17 +386,13 @@ func TestExpireStateProcessor(t *testing.T) {
 				Difficulty: big.NewInt(1),
 			}
 
-			// For CacheTrie, we might need to load block timestamps if available
-			// fileIdx := compareGetFileIndex(file)
-			// compareLoadBlockTimestampsFromFile(cfg.DataDir, fileIdx)
-
 			host.sdb.SetBlockNum(b)
 			statedb, _ := state.New(lastStateRoot, host.sdb)
 
-			// Simple balance allocation for experiment
-			balance, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18)))
-			for _, m := range msgs {
-				statedb.SetBalance(m.From, balance, tracing.BalanceChangeUnspecified)
+			// 0. Reward miner/packer
+			if miner, ok := compareBlockMiners[b]; ok && miner != (common.Address{}) {
+				reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18))) // 1,000,000 ETH
+				statedb.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
 			}
 
 			// 1. Transaction execution time statistics
@@ -463,13 +466,15 @@ func TestExpireStateProcessor(t *testing.T) {
 
 			intervalBlocks++
 			totalProcessedBlocks++
-			if intervalBlocks >= statsInterval {
-				fmt.Printf("Blocks: %d - %d\n", totalProcessedBlocks-statsInterval, totalProcessedBlocks-1)
+			if intervalBlocks >= statsIv {
+				fmt.Printf("Blocks: %d - %d\n", totalProcessedBlocks-statsIv, totalProcessedBlocks-1)
 				fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
 				fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
 
 				// CacheTrie stats
-				acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, acctReadSize, acctWriteSize, storReadSize, storWriteSize := state.GetCacheStats()
+				acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, _, _, _, _,
+					totAcctReads, totStorReads, totAcctUpd, totStorUpd,
+					totalReads, totalUpdates := state.GetCacheStats()
 
 				deltaAcctHit := acctHit - lastAcctHit
 				deltaAcctMissEx := acctMissEx - lastAcctMissEx
@@ -481,50 +486,51 @@ func TestExpireStateProcessor(t *testing.T) {
 				deltaStorMissNo := storMissNo - lastStorMissNo
 				totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
 
+				fmt.Printf("  [5 Metrics Summary]:\n")
+				fmt.Printf("    1. 读取次数 (Total Reads): %d\n", totalReads-lastTotReads)
+				fmt.Printf("    2. 写入次数 (Total Writes): %d\n", totalUpdates-lastTotUpdates)
+				fmt.Printf("    3. 读取不中的次数 (MissNo): %d\n", (acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo))
+				fmt.Printf("    4. 读取中了在缓存 (CacheHit): %d\n", (acctHit+storHit)-(lastAcctHit+lastStorHit))
+				fmt.Printf("    5. 读取中了不在缓存 (MissEx): %d\n", (acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx))
+
 				if totalAcct > 0 {
-					fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), ReadSize: %d, WriteSize: %d\n",
+					fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
 						deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
 						deltaAcctMissEx, float64(deltaAcctMissEx)*100/float64(totalAcct),
 						deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct),
-						acctReadSize-lastAcctReadSize, acctWriteSize-lastAcctWriteSize)
+						totAcctReads-lastTotAcctReads, totAcctUpd-lastTotAcctUpd)
 				}
 				if totalStor > 0 {
-					fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), ReadSize: %d, WriteSize: %d\n",
+					fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
 						deltaStorHit, float64(deltaStorHit)*100/float64(totalStor),
 						deltaStorMissEx, float64(deltaStorMissEx)*100/float64(totalStor),
 						deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor),
-						storReadSize-lastStorReadSize, storWriteSize-lastStorWriteSize)
+						totStorReads-lastTotStorReads, totStorUpd-lastTotStorUpd)
 				}
 
 				// Write to CSV
 				record := []string{
-					strconv.FormatUint(totalProcessedBlocks-statsInterval, 10),
+					strconv.FormatUint(totalProcessedBlocks-statsIv, 10),
 					strconv.FormatUint(totalProcessedBlocks-1, 10),
+					// Aggregated
+					strconv.FormatInt(totalReads-lastTotReads, 10),
+					strconv.FormatInt(totalUpdates-lastTotUpdates, 10),
+					strconv.FormatInt((acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo), 10),
+					strconv.FormatInt((acctHit+storHit)-(lastAcctHit+lastStorHit), 10),
+					strconv.FormatInt((acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx), 10),
+					// Account specific
+					strconv.FormatInt(totAcctReads-lastTotAcctReads, 10),
+					strconv.FormatInt(totAcctUpd-lastTotAcctUpd, 10),
+					strconv.FormatInt(acctMissNo-lastAcctMissNo, 10),
+					strconv.FormatInt(acctHit-lastAcctHit, 10),
+					strconv.FormatInt(acctMissEx-lastAcctMissEx, 10),
+					// Storage specific
+					strconv.FormatInt(totStorReads-lastTotStorReads, 10),
+					strconv.FormatInt(totStorUpd-lastTotStorUpd, 10),
+					strconv.FormatInt(storMissNo-lastStorMissNo, 10),
+					strconv.FormatInt(storHit-lastStorHit, 10),
+					strconv.FormatInt(storMissEx-lastStorMissEx, 10),
 				}
-				if totalAcct > 0 {
-					record = append(record,
-						fmt.Sprintf("%.2f%%", float64(deltaAcctHit)*100/float64(totalAcct)),
-						fmt.Sprintf("%.2f%%", float64(deltaAcctMissEx)*100/float64(totalAcct)),
-						fmt.Sprintf("%.2f%%", float64(deltaAcctMissNo)*100/float64(totalAcct)),
-					)
-				} else {
-					record = append(record, "0.00%", "0.00%", "0.00%")
-				}
-				if totalStor > 0 {
-					record = append(record,
-						fmt.Sprintf("%.2f%%", float64(deltaStorHit)*100/float64(totalStor)),
-						fmt.Sprintf("%.2f%%", float64(deltaStorMissEx)*100/float64(totalStor)),
-						fmt.Sprintf("%.2f%%", float64(deltaStorMissNo)*100/float64(totalStor)),
-					)
-				} else {
-					record = append(record, "0.00%", "0.00%", "0.00%")
-				}
-				record = append(record,
-					strconv.FormatInt(acctReadSize-lastAcctReadSize, 10),
-					strconv.FormatInt(acctWriteSize-lastAcctWriteSize, 10),
-					strconv.FormatInt(storReadSize-lastStorReadSize, 10),
-					strconv.FormatInt(storWriteSize-lastStorWriteSize, 10),
-				)
 				writer.Write(record)
 				writer.Flush()
 
@@ -537,8 +543,9 @@ func TestExpireStateProcessor(t *testing.T) {
 
 				lastAcctHit, lastAcctMissEx, lastAcctMissNo = acctHit, acctMissEx, acctMissNo
 				lastStorHit, lastStorMissEx, lastStorMissNo = storHit, storMissEx, storMissNo
-				lastAcctReadSize, lastAcctWriteSize = acctReadSize, acctWriteSize
-				lastStorReadSize, lastStorWriteSize = storReadSize, storWriteSize
+				lastTotAcctReads, lastTotStorReads = totAcctReads, totStorReads
+				lastTotAcctUpd, lastTotStorUpd = totAcctUpd, totStorUpd
+				lastTotReads, lastTotUpdates = totalReads, totalUpdates
 			}
 		}
 	}
@@ -549,7 +556,16 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
 
 		// Final CacheTrie stats
-		acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, acctReadSize, acctWriteSize, storReadSize, storWriteSize := state.GetCacheStats()
+		acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, _, _, _, _,
+			totAcctReads, totStorReads, totAcctUpd, totStorUpd,
+			totalReads, totalUpdates := state.GetCacheStats()
+
+		fmt.Printf("  [5 Metrics Summary]:\n")
+		fmt.Printf("    1. 读取次数 (Total Reads): %d\n", totalReads-lastTotReads)
+		fmt.Printf("    2. 写入次数 (Total Writes): %d\n", totalUpdates-lastTotUpdates)
+		fmt.Printf("    3. 读取不中的次数 (MissNo): %d\n", (acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo))
+		fmt.Printf("    4. 读取中了在缓存 (CacheHit): %d\n", (acctHit+storHit)-(lastAcctHit+lastStorHit))
+		fmt.Printf("    5. 读取中了不在缓存 (MissEx): %d\n", (acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx))
 		deltaAcctHit := acctHit - lastAcctHit
 		deltaAcctMissEx := acctMissEx - lastAcctMissEx
 		deltaAcctMissNo := acctMissNo - lastAcctMissNo
@@ -561,49 +577,43 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
 
 		if totalAcct > 0 {
-			fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), ReadSize: %d, WriteSize: %d\n",
+			fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
 				deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
 				deltaAcctMissEx, float64(deltaAcctMissEx)*100/float64(totalAcct),
 				deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct),
-				acctReadSize-lastAcctReadSize, acctWriteSize-lastAcctWriteSize)
+				totAcctReads-lastTotAcctReads, totAcctUpd-lastTotAcctUpd)
 		}
 		if totalStor > 0 {
-			fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), ReadSize: %d, WriteSize: %d\n",
+			fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
 				deltaStorHit, float64(deltaStorHit)*100/float64(totalStor),
 				deltaStorMissEx, float64(deltaStorMissEx)*100/float64(totalStor),
 				deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor),
-				storReadSize-lastStorReadSize, storWriteSize-lastStorWriteSize)
+				totStorReads-lastTotStorReads, totStorUpd-lastTotStorUpd)
 		}
 
 		// Final Write to CSV
 		record := []string{
 			strconv.FormatUint(totalProcessedBlocks-intervalBlocks, 10),
 			strconv.FormatUint(totalProcessedBlocks-1, 10),
+			// Aggregated
+			strconv.FormatInt(totalReads-lastTotReads, 10),
+			strconv.FormatInt(totalUpdates-lastTotUpdates, 10),
+			strconv.FormatInt((acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo), 10),
+			strconv.FormatInt((acctHit+storHit)-(lastAcctHit+lastStorHit), 10),
+			strconv.FormatInt((acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx), 10),
+			// Account specific
+			strconv.FormatInt(totAcctReads-lastTotAcctReads, 10),
+			strconv.FormatInt(totAcctUpd-lastTotAcctUpd, 10),
+			strconv.FormatInt(acctMissNo-lastAcctMissNo, 10),
+			strconv.FormatInt(acctHit-lastAcctHit, 10),
+			strconv.FormatInt(acctMissEx-lastAcctMissEx, 10),
+			// Storage specific
+			strconv.FormatInt(totStorReads-lastTotStorReads, 10),
+			strconv.FormatInt(totStorUpd-lastTotStorUpd, 10),
+			strconv.FormatInt(storMissNo-lastStorMissNo, 10),
+			strconv.FormatInt(storHit-lastStorHit, 10),
+			strconv.FormatInt(storMissEx-lastStorMissEx, 10),
 		}
-		if totalAcct > 0 {
-			record = append(record,
-				fmt.Sprintf("%.2f%%", float64(deltaAcctHit)*100/float64(totalAcct)),
-				fmt.Sprintf("%.2f%%", float64(deltaAcctMissEx)*100/float64(totalAcct)),
-				fmt.Sprintf("%.2f%%", float64(deltaAcctMissNo)*100/float64(totalAcct)),
-			)
-		} else {
-			record = append(record, "0.00%", "0.00%", "0.00%")
-		}
-		if totalStor > 0 {
-			record = append(record,
-				fmt.Sprintf("%.2f%%", float64(deltaStorHit)*100/float64(totalStor)),
-				fmt.Sprintf("%.2f%%", float64(deltaStorMissEx)*100/float64(totalStor)),
-				fmt.Sprintf("%.2f%%", float64(deltaStorMissNo)*100/float64(totalStor)),
-			)
-		} else {
-			record = append(record, "0.00%", "0.00%", "0.00%")
-		}
-		record = append(record,
-			strconv.FormatInt(acctReadSize-lastAcctReadSize, 10),
-			strconv.FormatInt(acctWriteSize-lastAcctWriteSize, 10),
-			strconv.FormatInt(storReadSize-lastStorReadSize, 10),
-			strconv.FormatInt(storWriteSize-lastStorWriteSize, 10),
-		)
 		writer.Write(record)
 		writer.Flush()
 	}

@@ -183,6 +183,8 @@ func (t *CacheProxyTrie) GetStorage(addr common.Address, key []byte) ([]byte, er
 
 // UpdateAccount updates account information
 func (t *CacheProxyTrie) UpdateAccount(address common.Address, account *types.StateAccount, codeLen int) error {
+	atomic.AddInt64(&common.TotalAccountUpdates, 1)
+	atomic.AddInt64(&common.TotalUpdates, 1)
 	// If cache is available, update cache directly without updating underlying trie
 	if t.cache != nil {
 		data, err := rlp.EncodeToBytes(account)
@@ -211,6 +213,8 @@ func (t *CacheProxyTrie) UpdateAccountRLP(address common.Address, account []byte
 
 // UpdateStorage updates storage slot
 func (t *CacheProxyTrie) UpdateStorage(addr common.Address, key, value []byte) error {
+	atomic.AddInt64(&common.TotalStorageUpdates, 1)
+	atomic.AddInt64(&common.TotalUpdates, 1)
 	// If cache is available, update cache directly without updating underlying trie
 	if t.cache != nil {
 		// Use RLP encoding to store the value

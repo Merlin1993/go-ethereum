@@ -6,7 +6,7 @@ var (
 	VerkleLayerCount = 1
 	DebugFlag        = false
 	Parallelism      = 5
-	ReadSet          = false
+	ReadSet          = true
 
 	// CacheTrie statistics
 	CacheAccountHit           int64
@@ -19,4 +19,13 @@ var (
 	CacheStorageReadSize      int64
 	CacheAccountWriteSize     int64
 	CacheStorageWriteSize     int64
+
+	// Total state access statistics (Aggregated)
+	TotalAccountReads   int64
+	TotalStorageReads   int64
+	TotalAccountUpdates int64
+	TotalStorageUpdates int64
+
+	TotalReads   int64
+	TotalUpdates int64
 )

@@ -3,6 +3,7 @@ package binary
 import (
 	"bytes"
 	"errors"
+	"runtime"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/crypto"
@@ -82,6 +83,9 @@ type Shard struct {
 
 	// Pending deletes from existing buckets. Key is the NEW bucket metadata hash.
 	pendingDeletes map[string]deleteTask
+
+	// Node pool for reusing internal and leaf nodes
+	pool *NodePool
 }
 
 type appendTask struct {
@@ -111,6 +115,7 @@ func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte
 		pendingArchives: make(map[string][]byte),
 		pendingAppends:  make(map[string]appendTask),
 		pendingDeletes:  make(map[string]deleteTask),
+		pool:            NewNodePool(),
 	}
 
 	if len(rootHash) > 0 {
@@ -452,7 +457,11 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		// 叶子后缀为 key[depth:] 的位序列
 		pathBits := len(key)*8 - depth
 		path := s.getSuffix(key, depth, nil)
-		leaf := NewLeafNode(path, pathBits, valueHash)
+		leaf := s.pool.GetLeaf()
+		leaf.Path = path
+		leaf.PathBits = pathBits
+		leaf.ValueHash = valueHash
+		leaf.SetDirty(true)
 		s.updateEpoch(leaf) // Update epoch for new leaf
 		return leaf, nil
 	}
@@ -499,15 +508,22 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		tmpSuffix := s.getSuffix(key, depth, s.scratch)
 		newLeafSuffix := s.shiftBits(tmpSuffix, len(key)*8-depth, matchBits+1, nil)
 
-		oldLeaf := NewLeafNode(oldLeafSuffix, n.PathBits-(matchBits+1), n.ValueHash)
+		oldLeaf := s.pool.GetLeaf()
+		oldLeaf.Path = oldLeafSuffix
+		oldLeaf.PathBits = n.PathBits - (matchBits + 1)
+		oldLeaf.ValueHash = n.ValueHash
 		oldLeaf.SetEpoch(n.Epoch())
 
-		newLeaf := NewLeafNode(newLeafSuffix, (len(key)*8-depth)-(matchBits+1), valueHash)
+		newLeaf := s.pool.GetLeaf()
+		newLeaf.Path = newLeafSuffix
+		newLeaf.PathBits = (len(key)*8 - depth) - (matchBits + 1)
+		newLeaf.ValueHash = valueHash
 		s.updateEpoch(newLeaf)
 
 		prefixPath := s.prefixBits(n.Path, matchBits, nil)
 		splitBit := s.getBitFromBytes(n.Path, matchBits)
-		splitNode := NewInternalNode(nil, nil)
+
+		splitNode := s.pool.GetInternal()
 		splitNode.Path = prefixPath
 		splitNode.PathBits = matchBits
 		if splitBit == 0 {
@@ -518,6 +534,9 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 			splitNode.Right = oldLeaf
 		}
 		s.updateEpoch(splitNode)
+
+		// 释放旧叶子（如果它是新创建的或不再被引用，但在 trie 中由于是持久化结构，通常在 Commit 后清理或者直接由 GC 处理，POOL 这里仅对临时节点有效，但 insert 中创建的是持久节点。不过如果我们有明确的释放点可以 Put）
+		// 在这里直接替换了 n，n 可能以后会被 GC。
 
 		return splitNode, nil
 
@@ -534,7 +553,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 			if matched < n.PathBits {
 				// [分裂逻辑]：当前节点路径与新 key 产生分叉
 				prefixPath := s.prefixBits(n.Path, matched, nil)
-				parent := NewInternalNode(nil, nil)
+				parent := s.pool.GetInternal()
 				parent.Path = prefixPath
 				parent.PathBits = matched
 
@@ -555,7 +574,10 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 				newBit := s.getBit(key, depth+matched)
 				newLeafPath := s.getSuffix(key, depth+matched+1, nil)
 				newLeafBits := len(key)*8 - (depth + matched + 1)
-				newLeaf := NewLeafNode(newLeafPath, newLeafBits, valueHash)
+				newLeaf := s.pool.GetLeaf()
+				newLeaf.Path = newLeafPath
+				newLeaf.PathBits = newLeafBits
+				newLeaf.ValueHash = valueHash
 				s.updateEpoch(newLeaf)
 
 				if newBit == 0 {
@@ -914,6 +936,7 @@ func (s *Shard) commit(node Node, batch Batcher) ([]byte, error) {
 				return nil, err
 			}
 			n.LeftHash = h
+			n.LeftEpoch = n.Left.Epoch()
 		}
 		if n.Right != nil {
 			h, err := s.commit(n.Right, batch)
@@ -921,6 +944,7 @@ func (s *Shard) commit(node Node, batch Batcher) ([]byte, error) {
 				return nil, err
 			}
 			n.RightHash = h
+			n.RightEpoch = n.Right.Epoch()
 		}
 
 		// 序列化内部节点（包含 epoch 与子节点哈希）
@@ -1012,10 +1036,24 @@ func (s *Shard) getBitFromBytes(data []byte, bitIndex int) byte {
 
 func (s *Shard) commonPrefixLen(a []byte, aBits int, b []byte, bStartBit int) int {
 	// a 为路径后缀（按位），b 为完整 key（从 bStartBit 位开始对齐比较）
+	// [OPTIMIZED] 优先使用字节比较提速
 	matched := 0
-	for i := 0; i < aBits; i++ {
-		bitA := s.getBitFromBytes(a, i)
-		bitB := s.getBit(b, bStartBit+i)
+	// 1. 尝试按字节对齐比较 (如果 bStartBit 是 8 的倍数且 aBits >= 8)
+	if bStartBit%8 == 0 && aBits >= 8 {
+		bIdx := bStartBit / 8
+		for matched+8 <= aBits && bIdx < len(b) {
+			if a[matched/8] != b[bIdx] {
+				break
+			}
+			matched += 8
+			bIdx++
+		}
+	}
+
+	// 2. 剩余位逐位比较
+	for matched < aBits {
+		bitA := s.getBitFromBytes(a, matched)
+		bitB := s.getBit(b, bStartBit+matched)
 		if bitA != bitB {
 			break
 		}
@@ -1172,17 +1210,16 @@ func (s *Shard) updateEpoch(node Node) {
 		anyOne := false
 		allOne := true
 		count := 0
+
+		// 左孩子
 		if n.Left != nil || len(n.LeftHash) > 0 {
 			count++
 			b := byte(0)
 			if n.Left != nil {
 				b = n.Left.Epoch() & 1
 			} else {
-				// 获取哈希对应的 epoch
-				loaded, _ := s.loadNode(n.LeftHash)
-				if loaded != nil {
-					b = loaded.Epoch() & 1
-				}
+				// [OPTIMIZED] 使用缓存的 LeftEpoch，不再调用 loadNode
+				b = n.LeftEpoch & 1
 			}
 			if b == 1 {
 				anyOne = true
@@ -1190,16 +1227,16 @@ func (s *Shard) updateEpoch(node Node) {
 				allOne = false
 			}
 		}
+
+		// 右孩子
 		if n.Right != nil || len(n.RightHash) > 0 {
 			count++
 			b := byte(0)
 			if n.Right != nil {
 				b = n.Right.Epoch() & 1
 			} else {
-				loaded, _ := s.loadNode(n.RightHash)
-				if loaded != nil {
-					b = loaded.Epoch() & 1
-				}
+				// [OPTIMIZED] 使用缓存的 RightEpoch，不再调用 loadNode
+				b = n.RightEpoch & 1
 			}
 			if b == 1 {
 				anyOne = true
@@ -1430,25 +1467,41 @@ func (t *Trie) Activate(key []byte, value []byte) error {
 }
 
 func (t *Trie) Commit() ([]byte, error) {
-	// Commit all shards
-	// Return a hash of all shard roots?
-	// Or just commit to DB.
-	// Requirement: "每次提交完成后...".
-	// We need to commit all modified shards.
-
-	// We can hash the list of shard roots to get a "Global Root".
-	// For now, just commit each shard.
-
+	// [OPTIMIZED] Parallel Commit across shards
 	numShards := len(t.shards)
+	hashes := make([][]byte, numShards)
+	errs := make([]error, numShards)
+
+	var wg sync.WaitGroup
+	// Limit concurrency to NumCPU to avoid overwhelming the system
+	nCPU := runtime.NumCPU()
+	if nCPU > numShards {
+		nCPU = numShards
+	}
+	sem := make(chan struct{}, nCPU)
+
+	for i := 0; i < numShards; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			h, err := t.shards[idx].Commit()
+			hashes[idx] = h
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	// Check for errors
 	rootHashes := make([]byte, 0, numShards*32)
-	for _, s := range t.shards {
-		h, err := s.Commit()
-		if err != nil {
-			return nil, err
+	for i := 0; i < numShards; i++ {
+		if errs[i] != nil {
+			return nil, errs[i]
 		}
-		// If empty, append nil hash?
+		h := hashes[i]
 		if len(h) == 0 {
-			// Append 32 bytes of zero?
 			rootHashes = append(rootHashes, make([]byte, 32)...)
 		} else {
 			rootHashes = append(rootHashes, h...)

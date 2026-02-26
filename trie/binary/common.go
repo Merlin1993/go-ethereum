@@ -75,3 +75,44 @@ func (h *PooledKeccakHasher) Hash(data []byte) []byte {
 	sha.Read(hash)
 	return hash
 }
+
+// NodePool manages reuse of Trie nodes to reduce GC pressure.
+type NodePool struct {
+	internalPool sync.Pool
+	leafPool     sync.Pool
+}
+
+func NewNodePool() *NodePool {
+	return &NodePool{
+		internalPool: sync.Pool{
+			New: func() interface{} { return &InternalNode{} },
+		},
+		leafPool: sync.Pool{
+			New: func() interface{} { return &LeafNode{} },
+		},
+	}
+}
+
+func (p *NodePool) GetInternal() *InternalNode {
+	n := p.internalPool.Get().(*InternalNode)
+	n.Reset()
+	return n
+}
+
+func (p *NodePool) PutInternal(n *InternalNode) {
+	if n != nil {
+		p.internalPool.Put(n)
+	}
+}
+
+func (p *NodePool) GetLeaf() *LeafNode {
+	n := p.leafPool.Get().(*LeafNode)
+	n.Reset()
+	return n
+}
+
+func (p *NodePool) PutLeaf(n *LeafNode) {
+	if n != nil {
+		p.leafPool.Put(n)
+	}
+}

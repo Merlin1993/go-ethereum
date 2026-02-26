@@ -410,6 +410,8 @@ func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, er
 	start := time.Now()
 	var cacheMiss bool
 
+	atomic.AddInt64(&common.TotalAccountReads, 1)
+	atomic.AddInt64(&common.TotalReads, 1)
 	for i, reader := range r.readers {
 		acct, err := reader.Account(addr)
 		elapsed := time.Since(start)
@@ -438,17 +440,21 @@ func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, er
 			if len(r.readers) == Readers {
 				accountHitCounts[i]++
 			}
-			if common.ReadSet {
-				// 如果缓存未命中但在后续层找到，则写回缓存
-				if cacheMiss && i > 0 {
+			// 如果缓存未命中但在后续层找到
+			if cacheMiss && i > 0 {
+				if acct != nil {
+					atomic.AddInt64(&common.CacheAccountMissExists, 1)
+				} else {
+					atomic.AddInt64(&common.CacheAccountMissNotExists, 1)
+				}
+
+				if common.ReadSet {
+					// 如果设置了写回，则写回缓存
 					if ctReader, ok := r.readers[0].(*CacheTrieReader); ok && ctReader.ct != nil {
 						if acct != nil {
 							data, _ := rlp.EncodeToBytes(acct)
 							ctReader.ct.Update(addr.Bytes(), data, false)
-							atomic.AddInt64(&common.CacheAccountMissExists, 1)
 							atomic.AddInt64(&common.CacheAccountWriteSize, int64(len(data)))
-						} else {
-							atomic.AddInt64(&common.CacheAccountMissNotExists, 1)
 						}
 					}
 				}
@@ -476,6 +482,8 @@ func (r *multiStateReader) Storage(addr common.Address, slot common.Hash) (commo
 	start := time.Now()
 	var cacheMiss bool
 
+	atomic.AddInt64(&common.TotalStorageReads, 1)
+	atomic.AddInt64(&common.TotalReads, 1)
 	for i, reader := range r.readers {
 		slotValue, err := reader.Storage(addr, slot)
 		elapsed := time.Since(start)
@@ -502,17 +510,21 @@ func (r *multiStateReader) Storage(addr common.Address, slot common.Hash) (commo
 			if len(r.readers) == Readers {
 				storageHitCounts[i]++
 			}
-			if common.ReadSet {
-				// 如果缓存未命中但在后续层找到，则写回缓存
-				if cacheMiss && i > 0 {
+			// 如果缓存未命中但在后续层找到
+			if cacheMiss && i > 0 {
+				if slotValue != (common.Hash{}) {
+					atomic.AddInt64(&common.CacheStorageMissExists, 1)
+				} else {
+					atomic.AddInt64(&common.CacheStorageMissNotExists, 1)
+				}
+
+				if common.ReadSet {
+					// 如果设置了写回，则写回缓存
 					if ctReader, ok := r.readers[0].(*CacheTrieReader); ok && ctReader.ct != nil {
 						if slotValue != (common.Hash{}) {
 							data, _ := rlp.EncodeToBytes(slotValue)
 							ctReader.ct.UpdateWithAddress(addr, slot.Bytes(), data, false)
-							atomic.AddInt64(&common.CacheStorageMissExists, 1)
 							atomic.AddInt64(&common.CacheStorageWriteSize, int64(len(data)))
-						} else {
-							atomic.AddInt64(&common.CacheStorageMissNotExists, 1)
 						}
 					}
 				}
@@ -580,18 +592,28 @@ func PrintStat() {
 	fmt.Println()
 
 	fmt.Println("CacheTrie 详细统计:")
-	fmt.Printf("  Account: 命中=%d, 未命中但存在=%d (已写回), 未命中且不存在=%d, 读取数据量=%d bytes, 写入数据量=%d bytes\n",
+	fmt.Printf("  Account: 命中=%d, 未命中但存在=%d (已写回), 未命中且不存在=%d, 读取数据量=%d bytes, 写入数据量=%d bytes, 总读取次数=%d, 总更新次数=%d\n",
 		atomic.LoadInt64(&common.CacheAccountHit), atomic.LoadInt64(&common.CacheAccountMissExists), atomic.LoadInt64(&common.CacheAccountMissNotExists),
-		atomic.LoadInt64(&common.CacheAccountReadSize), atomic.LoadInt64(&common.CacheAccountWriteSize))
-	fmt.Printf("  Storage: 命中=%d, 未命中但存在=%d (已写回), 未命中且不存在=%d, 读取数据量=%d bytes, 写入数据量=%d bytes\n",
+		atomic.LoadInt64(&common.CacheAccountReadSize), atomic.LoadInt64(&common.CacheAccountWriteSize),
+		atomic.LoadInt64(&common.TotalAccountReads), atomic.LoadInt64(&common.TotalAccountUpdates))
+	fmt.Printf("  Storage: 命中=%d, 未命中但存在=%d (已写回), 未命中且不存在=%d, 读取数据量=%d bytes, 写入数据量=%d bytes, 总读取次数=%d, 总更新次数=%d\n",
 		atomic.LoadInt64(&common.CacheStorageHit), atomic.LoadInt64(&common.CacheStorageMissExists), atomic.LoadInt64(&common.CacheStorageMissNotExists),
-		atomic.LoadInt64(&common.CacheStorageReadSize), atomic.LoadInt64(&common.CacheStorageWriteSize))
+		atomic.LoadInt64(&common.CacheStorageReadSize), atomic.LoadInt64(&common.CacheStorageWriteSize),
+		atomic.LoadInt64(&common.TotalStorageReads), atomic.LoadInt64(&common.TotalStorageUpdates))
+
+	fmt.Printf("  [汇总统计]: 总读取次数=%d, 总写入(更新)次数=%d, 读取命中在缓存=%d, 读取命中不在缓存=%d, 读取不中=%d\n",
+		atomic.LoadInt64(&common.TotalReads), atomic.LoadInt64(&common.TotalUpdates),
+		atomic.LoadInt64(&common.CacheAccountHit)+atomic.LoadInt64(&common.CacheStorageHit),
+		atomic.LoadInt64(&common.CacheAccountMissExists)+atomic.LoadInt64(&common.CacheStorageMissExists),
+		atomic.LoadInt64(&common.CacheAccountMissNotExists)+atomic.LoadInt64(&common.CacheStorageMissNotExists))
 	fmt.Println("================================")
 }
 
 // GetCacheStats 返回 CacheTrie 的统计信息
 func GetCacheStats() (hit, missExists, missNotExists, storageHit, storageMissExists, storageMissNotExists,
-	acctReadSize, acctWriteSize, storReadSize, storWriteSize int64) {
+	acctReadSize, acctWriteSize, storReadSize, storWriteSize,
+	totalAcctReads, totalStorReads, totalAcctUpdates, totalStorUpdates,
+	totalReads, totalUpdates int64) {
 	return atomic.LoadInt64(&common.CacheAccountHit),
 		atomic.LoadInt64(&common.CacheAccountMissExists),
 		atomic.LoadInt64(&common.CacheAccountMissNotExists),
@@ -601,7 +623,13 @@ func GetCacheStats() (hit, missExists, missNotExists, storageHit, storageMissExi
 		atomic.LoadInt64(&common.CacheAccountReadSize),
 		atomic.LoadInt64(&common.CacheAccountWriteSize),
 		atomic.LoadInt64(&common.CacheStorageReadSize),
-		atomic.LoadInt64(&common.CacheStorageWriteSize)
+		atomic.LoadInt64(&common.CacheStorageWriteSize),
+		atomic.LoadInt64(&common.TotalAccountReads),
+		atomic.LoadInt64(&common.TotalStorageReads),
+		atomic.LoadInt64(&common.TotalAccountUpdates),
+		atomic.LoadInt64(&common.TotalStorageUpdates),
+		atomic.LoadInt64(&common.TotalReads),
+		atomic.LoadInt64(&common.TotalUpdates)
 }
 
 // ResetCacheStats 重置所有 CacheTrie 统计计数器为零
@@ -616,6 +644,14 @@ func ResetCacheStats() {
 	atomic.StoreInt64(&common.CacheAccountWriteSize, 0)
 	atomic.StoreInt64(&common.CacheStorageReadSize, 0)
 	atomic.StoreInt64(&common.CacheStorageWriteSize, 0)
+
+	atomic.StoreInt64(&common.TotalAccountReads, 0)
+	atomic.StoreInt64(&common.TotalStorageReads, 0)
+	atomic.StoreInt64(&common.TotalAccountUpdates, 0)
+	atomic.StoreInt64(&common.TotalStorageUpdates, 0)
+
+	atomic.StoreInt64(&common.TotalReads, 0)
+	atomic.StoreInt64(&common.TotalUpdates, 0)
 }
 
 // reader is the wrapper of ContractCodeReader and StateReader interface.
