@@ -48,26 +48,28 @@ type Batcher interface {
 	ValueSize() int
 }
 
-// PooledKeccakHasher uses a sync.Pool to reuse KeccakState objects, reducing allocation overhead.
-type PooledKeccakHasher struct {
-	pool *sync.Pool
-}
+var (
+	keccakPool = &sync.Pool{}
+)
 
-// NewPooledKeccakHasher creates a new PooledKeccakHasher.
+// PooledKeccakHasher uses a global sync.Pool to reuse KeccakState objects, reducing allocation overhead.
+type PooledKeccakHasher struct{}
+
+// NewPooledKeccakHasher returns a PooledKeccakHasher instance.
 func NewPooledKeccakHasher() *PooledKeccakHasher {
-	return &PooledKeccakHasher{pool: &sync.Pool{}}
+	return &PooledKeccakHasher{}
 }
 
-// Hash calculates the hash of the given data using a pooled KeccakState.
+// Hash calculates the hash of the given data using the global pooled KeccakState.
 func (h *PooledKeccakHasher) Hash(data []byte) []byte {
-	raw := h.pool.Get()
+	raw := keccakPool.Get()
 	var sha crypto.KeccakState
 	if raw == nil {
 		sha = crypto.NewKeccakState()
 	} else {
 		sha = raw.(crypto.KeccakState)
 	}
-	defer h.pool.Put(sha)
+	defer keccakPool.Put(sha)
 
 	sha.Reset()
 	sha.Write(data)
@@ -94,7 +96,11 @@ func NewNodePool() *NodePool {
 }
 
 func (p *NodePool) GetInternal() *InternalNode {
-	n := p.internalPool.Get().(*InternalNode)
+	raw := p.internalPool.Get()
+	if raw == nil {
+		return &InternalNode{}
+	}
+	n := raw.(*InternalNode)
 	n.Reset()
 	return n
 }
@@ -106,7 +112,11 @@ func (p *NodePool) PutInternal(n *InternalNode) {
 }
 
 func (p *NodePool) GetLeaf() *LeafNode {
-	n := p.leafPool.Get().(*LeafNode)
+	raw := p.leafPool.Get()
+	if raw == nil {
+		return &LeafNode{}
+	}
+	n := raw.(*LeafNode)
 	n.Reset()
 	return n
 }

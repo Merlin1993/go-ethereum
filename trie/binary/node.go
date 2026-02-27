@@ -5,6 +5,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
+
+	"github.com/ethereum/go-ethereum/trie/binary/cuckoo"
 )
 
 const (
@@ -284,6 +287,12 @@ type ArchiveBucketNode struct {
 	dirty        bool
 	originalHash []byte
 	// 归档桶不再需要 epoch，保持静态
+
+	// [CACHE] 缓存解码后的过滤器和数据项，避免重复解码/反序列化。
+	// 这些字段不序列化到磁盘。
+	cachedFilter *cuckoo.Filter
+	cachedItems  []ArchivedKV
+	cacheMu      sync.RWMutex
 }
 
 func NewArchiveBucketNode(path []byte, bits int, filter []byte, commitment []byte, count uint64) *ArchiveBucketNode {

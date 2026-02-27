@@ -3,6 +3,7 @@ package binary
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 
@@ -149,6 +150,9 @@ func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
 	}
 	if task, ok := s.pendingAppends[string(hash)]; ok {
 		// 加载旧数据并追加
+		if bytes.Equal(task.oldHash, hash) {
+			return nil, errors.New("infinite recursion in getBucketData (append)")
+		}
 		oldData, err := s.getBucketData(task.oldHash)
 		if err != nil {
 			return nil, err
@@ -162,6 +166,9 @@ func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
 	}
 	if task, ok := s.pendingDeletes[string(hash)]; ok {
 		// 加载旧数据并过滤删除项
+		if bytes.Equal(task.oldHash, hash) {
+			return nil, errors.New("infinite recursion in getBucketData (delete)")
+		}
 		oldData, err := s.getBucketData(task.oldHash)
 		if err != nil {
 			return nil, err
@@ -289,10 +296,27 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 			bucket := n.StubList[i]
 			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, depth)
 			if matched == bucket.PathBits {
-				filter := cuckoo.New()
-				if err := filter.Decode(bucket.Filter); err != nil {
+				// 获取或解码过滤器
+				bucket.cacheMu.RLock()
+				filter := bucket.cachedFilter
+				bucket.cacheMu.RUnlock()
+
+				if filter == nil {
+					bucket.cacheMu.Lock()
+					if bucket.cachedFilter == nil {
+						f := cuckoo.New()
+						if err := f.Decode(bucket.Filter); err == nil {
+							bucket.cachedFilter = f
+						}
+					}
+					filter = bucket.cachedFilter
+					bucket.cacheMu.Unlock()
+				}
+
+				if filter == nil {
 					continue
 				}
+
 				// 使用分片相对路径位进行布谷鸟过滤器查询
 				shardKey := key[s.config.ShardDepth/8:]
 				if !filter.Lookup(shardKey) {
@@ -303,13 +327,27 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 				s.stats.ArchiveReadCount++
 				s.statsMut.Unlock()
 
-				bucketData, err := s.getBucketData(bucket.Hash())
-				if err != nil {
-					continue
+				// 获取或反序列化桶数据
+				bucket.cacheMu.RLock()
+				items := bucket.cachedItems
+				bucket.cacheMu.RUnlock()
+
+				if items == nil {
+					bucket.cacheMu.Lock()
+					if bucket.cachedItems == nil {
+						bucketData, err := s.getBucketData(bucket.Hash())
+						if err == nil {
+							itms, err := s.deserializeArchivedKV(bucketData)
+							if err == nil {
+								bucket.cachedItems = itms
+							}
+						}
+					}
+					items = bucket.cachedItems
+					bucket.cacheMu.Unlock()
 				}
 
-				items, err := s.deserializeArchivedKV(bucketData)
-				if err != nil {
+				if items == nil {
 					continue
 				}
 
@@ -779,20 +817,16 @@ type ChildInfo struct {
 	bit  byte
 }
 
-// Commit 递归提交改动并执行修剪，返回最新根哈希（空树返回 nil）。
-func (s *Shard) Commit() ([]byte, error) {
-	var rootHash []byte
-	var err error
-
-	batch := s.db.NewBatch()
-	defer batch.Reset()
-
-	if s.root != nil {
-		// Recursively hash and save
-		rootHash, err = s.commit(s.root, batch)
-		if err != nil {
-			return nil, err
-		}
+// CommitToBatch 递归提交改动到提供的 Batcher 中，返回最新根哈希。
+// 注意：此方法不会调用 batch.Write()。
+func (s *Shard) CommitToBatch(batch Batcher) ([]byte, error) {
+	if s.root == nil {
+		return nil, nil
+	}
+	nodeCount := 0
+	rootHash, err := s.commit(s.root, batch, &nodeCount)
+	if err != nil {
+		return nil, err
 	}
 
 	// Pruning
@@ -804,6 +838,18 @@ func (s *Shard) Commit() ([]byte, error) {
 			}
 		}
 		s.staleSet = make(map[string]struct{})
+	}
+	return rootHash, nil
+}
+
+// Commit 递归提交改动并执行修剪，返回最新根哈希（空树返回 nil）。
+func (s *Shard) Commit() ([]byte, error) {
+	batch := s.db.NewBatch()
+	defer batch.Reset()
+
+	rootHash, err := s.CommitToBatch(batch)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := batch.Write(); err != nil {
@@ -901,9 +947,15 @@ func (s *Shard) FlushArchives() error {
 	return nil
 }
 
-func (s *Shard) commit(node Node, batch Batcher) ([]byte, error) {
+func (s *Shard) commit(node Node, batch Batcher, nodeCount *int) ([]byte, error) {
 	if !node.IsDirty() {
 		return node.Hash(), nil
+	}
+	if nodeCount != nil {
+		*nodeCount++
+	}
+	if nodeCount != nil {
+		*nodeCount++
 	}
 
 	switch n := node.(type) {
@@ -931,7 +983,7 @@ func (s *Shard) commit(node Node, batch Batcher) ([]byte, error) {
 
 		// Commit children
 		if n.Left != nil {
-			h, err := s.commit(n.Left, batch)
+			h, err := s.commit(n.Left, batch, nodeCount)
 			if err != nil {
 				return nil, err
 			}
@@ -939,7 +991,7 @@ func (s *Shard) commit(node Node, batch Batcher) ([]byte, error) {
 			n.LeftEpoch = n.Left.Epoch()
 		}
 		if n.Right != nil {
-			h, err := s.commit(n.Right, batch)
+			h, err := s.commit(n.Right, batch, nodeCount)
 			if err != nil {
 				return nil, err
 			}
@@ -1394,6 +1446,14 @@ func (s *Shard) pruneAndArchive(node Node, global byte, depth int, pathFromShard
 type Trie struct {
 	config           *Config
 	shards           []*Shard
+	dirtyShards      map[int]struct{}
+	dirtyList        []int // 记录本次迭代中发生改变的分片索引，用于 O(Dirty) 收集
+	dirtyArchive     map[int]struct{}
+	dirtyArchiveList []int    // 记录待刷盘的归档分片
+	shardRoots       []byte   // 预分配的 [NumShards * 32] 缓冲区，维护所有分片最新的根哈希
+	topTree          *TopTree // [NEW] 16-ary tree for efficient root hash computation
+	cachedRoot       []byte   // 缓存的全局根哈希
+	rootDirty        bool     // 标记全局根哈希是否需要重新计算
 	db               KVStore
 	hasher           Hasher
 	pruning          bool
@@ -1401,73 +1461,231 @@ type Trie struct {
 	insertCount      int
 	pruneShardIdx    int
 	prunedShardCount int
+
+	shardMu sync.RWMutex
 }
 
-func NewTrie(db KVStore, hasher Hasher, config *Config, pruning bool) *Trie {
+// IsDirty returns true if the Trie has uncommitted changes.
+func (t *Trie) IsDirty() bool {
+	t.shardMu.RLock()
+	defer t.shardMu.RUnlock()
+	return t.rootDirty
+}
+
+func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning bool) *Trie {
 	if config == nil {
 		config = DefaultConfig()
 	}
 	numShards := 1 << config.ShardDepth
 	t := &Trie{
-		config:  config,
-		shards:  make([]*Shard, numShards),
-		db:      db,
-		hasher:  hasher,
-		pruning: pruning,
+		config:           config,
+		shards:           make([]*Shard, numShards),
+		dirtyShards:      make(map[int]struct{}),
+		dirtyList:        make([]int, 0, 128),
+		dirtyArchive:     make(map[int]struct{}),
+		dirtyArchiveList: make([]int, 0, 128),
+		shardRoots:       make([]byte, numShards*32),
+		rootDirty:        true,
+		db:               db,
+		hasher:           hasher,
+		pruning:          pruning,
 	}
-
-	// Init shards
-	// Note: In real app, we would load root hashes.
-	// Here we assume new or empty.
-	for i := 0; i < numShards; i++ {
-		// Use a closure to capture 't'
-		s, _ := NewShard(i, db, hasher, config, nil, pruning, func() byte { return t.globalEpochBit })
-		t.shards[i] = s
+	// Initialize the 16-ary TopTree for O(Dirty) root hash computation
+	batch := t.db.NewBatch()
+	t.topTree = NewTopTree(hasher, batch)
+	if len(root) > 0 {
+		t.Load(root)
 	}
 	return t
+}
+
+func (t *Trie) Load(root []byte) error {
+	if len(root) == 0 {
+		return nil
+	}
+	data, err := t.db.Get(root)
+	if err != nil {
+		return err
+	}
+
+	if len(data) == len(t.shardRoots) {
+		copy(t.shardRoots, data)
+	} else if len(data) == 513 && data[0] == 0xD0 {
+		if err := t.parseTopTree(data, 0, 0); err != nil {
+			return err
+		}
+		if t.topTree != nil && t.topTree.root != nil {
+			t.topTree.root.Hash = root
+			t.topTree.root.Dirty = false
+		}
+	} else {
+		return errors.New("invalid shard roots data size")
+	}
+
+	t.cachedRoot = append([]byte{}, root...)
+	t.rootDirty = false
+	return nil
+}
+
+// parseTopTree recursively traverses the 16-ary TopTree down to level 3
+// and populates the t.shardRoots flat array.
+func (t *Trie) parseTopTree(data []byte, level int, prefix int) error {
+	if len(data) != 513 {
+		return fmt.Errorf("invalid TopNode size at level %d: %d", level, len(data))
+	}
+	if data[0] != byte(0xD0+level) {
+		return fmt.Errorf("invalid TopNode header at level %d: %x", level, data[0])
+	}
+
+	for i := 0; i < 16; i++ {
+		start := 1 + i*32
+		h := data[start : start+32]
+
+		empty := true
+		for _, b := range h {
+			if b != 0 {
+				empty = false
+				break
+			}
+		}
+		if empty {
+			continue
+		}
+
+		if level == 3 {
+			shardID := (prefix << 4) | i
+			copy(t.shardRoots[shardID*32:(shardID+1)*32], h)
+		} else {
+			childData, err := t.db.Get(h)
+			if err != nil {
+				return err
+			}
+			childPrefix := (prefix << 4) | i
+			if err := t.parseTopTree(childData, level+1, childPrefix); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (t *Trie) SetGlobalEpoch(bit byte) {
 	if bit != t.globalEpochBit {
 		t.globalEpochBit = bit
 		// Reset prune status of all shards
+		t.shardMu.RLock()
+		defer t.shardMu.RUnlock()
 		for _, s := range t.shards {
-			s.isPruned = false
+			if s != nil {
+				s.isPruned = false
+			}
 		}
 	}
 }
 
 func (t *Trie) Put(key []byte, value []byte) error {
+	t.shardMu.Lock()
+	defer t.shardMu.Unlock()
+
 	// Store value in DB for retrieval during prune (Requirement)
 	valHash := t.hasher.Hash(value)
 	t.db.Put(valHash, value)
 
 	shardID := t.getShardID(key)
-	err := t.shards[shardID].Put(key, value)
+	s, err := t.getOrCreateShardLocked(shardID)
 	if err != nil {
 		return err
+	}
+	err = s.Put(key, value)
+	if err != nil {
+		return err
+	}
+	if _, ok := t.dirtyShards[shardID]; !ok {
+		t.dirtyShards[shardID] = struct{}{}
+		t.dirtyList = append(t.dirtyList, shardID)
+		t.rootDirty = true
 	}
 	return nil
 }
 
 func (t *Trie) Get(key []byte) ([]byte, error) {
-	shardID := t.getShardID(key)
-	return t.shards[shardID].Get(key)
+	id := t.getShardID(key)
+
+	t.shardMu.RLock()
+	s := t.shards[id]
+	t.shardMu.RUnlock()
+
+	if s == nil {
+		var err error
+		s, err = t.getOrCreateShard(id)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return s.Get(key)
 }
 
 func (t *Trie) BatchDelete(key []byte) error {
+	t.shardMu.Lock()
+	defer t.shardMu.Unlock()
+
 	shardID := t.getShardID(key)
-	return t.shards[shardID].Delete(key)
+	s, err := t.getOrCreateShardLocked(shardID)
+	if err != nil {
+		return err
+	}
+	err = s.Delete(key)
+	if err != nil {
+		return err
+	}
+	if _, ok := t.dirtyShards[shardID]; !ok {
+		t.dirtyShards[shardID] = struct{}{}
+		t.dirtyList = append(t.dirtyList, shardID)
+		t.rootDirty = true
+	}
+	return nil
 }
 
 // Activate 显式激活一个归档的 key。从侧挂桶移除并重注入热路径。
 func (t *Trie) Activate(key []byte, value []byte) error {
+	t.shardMu.Lock()
+	defer t.shardMu.Unlock()
+
 	shardID := t.getShardID(key)
-	return t.shards[shardID].Activate(key, value)
+	s, err := t.getOrCreateShardLocked(shardID)
+	if err != nil {
+		return err
+	}
+	err = s.Activate(key, value)
+	if err != nil {
+		return err
+	}
+	if _, ok := t.dirtyShards[shardID]; !ok {
+		t.dirtyShards[shardID] = struct{}{}
+		t.dirtyList = append(t.dirtyList, shardID)
+		t.rootDirty = true
+	}
+	if _, ok := t.dirtyArchive[shardID]; !ok {
+		t.dirtyArchive[shardID] = struct{}{}
+		t.dirtyArchiveList = append(t.dirtyArchiveList, shardID)
+	}
+	return nil
 }
 
-func (t *Trie) Commit() ([]byte, error) {
-	// [OPTIMIZED] Parallel Commit across shards
+// CommitToBatch 递归提交所有脏分片改动到提供的 Batcher 中，返回最新根哈希。
+// 注意：此方法不会调用 batch.Write()。
+func (t *Trie) CommitToBatch(batch Batcher) ([]byte, error) {
+	t.shardMu.Lock()
+	defer t.shardMu.Unlock()
+
+	if !t.rootDirty {
+		return t.cachedRoot, nil
+	}
+	// [OPTIMIZED] Only commit dirty shards
+	if len(t.dirtyList) == 0 {
+		return t.hasher.Hash(t.shardRoots), nil
+	}
+
 	numShards := len(t.shards)
 	hashes := make([][]byte, numShards)
 	errs := make([]error, numShards)
@@ -1475,57 +1693,105 @@ func (t *Trie) Commit() ([]byte, error) {
 	var wg sync.WaitGroup
 	// Limit concurrency to NumCPU to avoid overwhelming the system
 	nCPU := runtime.NumCPU()
-	if nCPU > numShards {
-		nCPU = numShards
-	}
 	sem := make(chan struct{}, nCPU)
 
-	for i := 0; i < numShards; i++ {
+	// Collect shards to commit
+	toCommit := t.dirtyList
+
+	for _, id := range toCommit {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			h, err := t.shards[idx].Commit()
+			h, err := t.shards[idx].CommitToBatch(batch)
 			hashes[idx] = h
 			errs[idx] = err
-		}(i)
+		}(id)
 	}
 	wg.Wait()
 
-	// Check for errors
-	rootHashes := make([]byte, 0, numShards*32)
-	for i := 0; i < numShards; i++ {
-		if errs[i] != nil {
-			return nil, errs[i]
+	// Fill in unchanged shard roots (In O(Dirty) mode, we already have them in t.shardRoots)
+	// Update shardRoots for dirty ones
+	for _, id := range toCommit {
+		if errs[id] != nil {
+			return nil, errs[id]
 		}
-		h := hashes[i]
+		h := hashes[id]
 		if len(h) == 0 {
-			rootHashes = append(rootHashes, make([]byte, 32)...)
+			copy(t.shardRoots[id*32:(id+1)*32], make([]byte, 32))
 		} else {
-			rootHashes = append(rootHashes, h...)
+			copy(t.shardRoots[id*32:(id+1)*32], h)
+		}
+
+		// Mark for archive flush
+		if _, ok := t.dirtyArchive[id]; !ok {
+			t.dirtyArchive[id] = struct{}{}
+			t.dirtyArchiveList = append(t.dirtyArchiveList, id)
 		}
 	}
 
-	// Hash the root hashes
-	globalRoot := t.hasher.Hash(rootHashes)
-	return globalRoot, nil
+	// [OPTIMIZATION] 16-ary Top Tree Aggregation replacing flat 2MB hash
+	if t.topTree == nil {
+		t.topTree = NewTopTree(t.hasher, batch) // Initialize on demand or in NewTrie
+	} else {
+		t.topTree.db = batch // Update batcher reference
+	}
+
+	var err error
+	t.cachedRoot, err = t.topTree.Compute(t.shardRoots, toCommit)
+	if err != nil {
+		return nil, fmt.Errorf("top tree compute error: %w", err)
+	}
+
+	// Clear dirty shards after commit
+	t.dirtyShards = make(map[int]struct{})
+	t.dirtyList = make([]int, 0, 128)
+	t.rootDirty = false
+
+	// [PERSISTENCE] Store the top-level 16-ary root
+	// The internal TopNodes were persisted during topTree.Compute()
+	// No need to persist the 2MB flat array anymore.
+	return t.cachedRoot, nil
+}
+
+func (t *Trie) Commit() ([]byte, error) {
+	batch := t.db.NewBatch()
+	defer batch.Reset()
+
+	root, err := t.CommitToBatch(batch)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := batch.Write(); err != nil {
+		return nil, err
+	}
+	return root, nil
 }
 
 func (t *Trie) PruneNextShard() error {
-	shard := t.shards[t.pruneShardIdx]
+	shardID := t.pruneShardIdx
+	s, err := t.getOrCreateShard(shardID)
+	if err != nil {
+		return err
+	}
 	numShards := len(t.shards)
 	t.pruneShardIdx = (t.pruneShardIdx + 1) % numShards
 
-	wasPruned := shard.isPruned
-	err := shard.Prune(t.globalEpochBit)
+	wasPruned := s.isPruned
+	err = s.Prune(t.globalEpochBit)
 	if err != nil {
 		return err
 	}
 	// 若本分片在当前年度首次完成剪枝，计数 +1
-	if !wasPruned && shard.isPruned {
+	if !wasPruned && s.isPruned {
 		t.prunedShardCount++
+		if _, ok := t.dirtyArchive[shardID]; !ok {
+			t.dirtyArchive[shardID] = struct{}{}
+			t.dirtyArchiveList = append(t.dirtyArchiveList, shardID)
+		}
 		// 当所有分片均已剪枝，自动切换年度，并重置所有分片的剪枝标记与计数
 		if t.prunedShardCount >= numShards {
 			if t.globalEpochBit == 0 {
@@ -1534,12 +1800,59 @@ func (t *Trie) PruneNextShard() error {
 				t.globalEpochBit = 0
 			}
 			t.prunedShardCount = 0
+			t.shardMu.RLock()
 			for _, s := range t.shards {
-				s.isPruned = false
+				if s != nil {
+					s.isPruned = false
+				}
 			}
+			t.shardMu.RUnlock()
 		}
 	}
 	return nil
+}
+
+func (t *Trie) getOrCreateShard(id int) (*Shard, error) {
+	t.shardMu.RLock()
+	s := t.shards[id]
+	t.shardMu.RUnlock()
+
+	if s != nil {
+		return s, nil
+	}
+
+	t.shardMu.Lock()
+	defer t.shardMu.Unlock()
+
+	return t.getOrCreateShardLocked(id)
+}
+
+func (t *Trie) getOrCreateShardLocked(id int) (*Shard, error) {
+	// Check again in case it was created while waiting for lock
+	if t.shards[id] != nil {
+		return t.shards[id], nil
+	}
+
+	// Note: We need to load shard roots if they exist.
+	rootHash := t.shardRoots[id*32 : (id+1)*32]
+	// Check if the hash is all zeros (empty shard)
+	isEmpty := true
+	for _, b := range rootHash {
+		if b != 0 {
+			isEmpty = false
+			break
+		}
+	}
+	if isEmpty {
+		rootHash = nil
+	}
+
+	s, err := NewShard(id, t.db, t.hasher, t.config, rootHash, t.pruning, func() byte { return t.globalEpochBit })
+	if err != nil {
+		return nil, err
+	}
+	t.shards[id] = s
+	return s, nil
 }
 
 func (t *Trie) getShardID(key []byte) int {
@@ -1562,20 +1875,28 @@ func (t *Trie) getShardID(key []byte) int {
 func (t *Trie) Stats() *TrieStats {
 	stats := &TrieStats{}
 	for _, shard := range t.shards {
-		shard.accumulateStats(stats)
+		if shard != nil {
+			shard.accumulateStats(stats)
+		}
 	}
 	return stats
 }
 
 // FlushArchives 同步所有分片的归档缓存到数据库。
 func (t *Trie) FlushArchives() error {
-	for _, s := range t.shards {
+	if len(t.dirtyArchiveList) == 0 {
+		return nil
+	}
+	for _, id := range t.dirtyArchiveList {
+		s := t.shards[id]
 		if s != nil {
 			if err := s.FlushArchives(); err != nil {
 				return err
 			}
 		}
 	}
+	t.dirtyArchive = make(map[int]struct{})
+	t.dirtyArchiveList = make([]int, 0, 128)
 	return nil
 }
 

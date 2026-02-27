@@ -34,7 +34,7 @@ func setupTrie() (*Trie, Hasher) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ArchiveDB = db // Use the same memory DB for archive for testing
-	return NewTrie(db, hasher, config, true), hasher
+	return NewTrie(nil, db, hasher, config, true), hasher
 }
 
 func TestBasicOperations(t *testing.T) {
@@ -177,7 +177,7 @@ func TestNodeSerialization(t *testing.T) {
 func TestPersistence(t *testing.T) {
 	db := &MemoryDBAdapter{memorydb.New()}
 	hasher := NewPooledKeccakHasher()
-	trie := NewTrie(db, hasher, nil, true)
+	trie := NewTrie(nil, db, hasher, nil, true)
 
 	key := make([]byte, 32)
 	rand.Read(key)
@@ -193,7 +193,7 @@ func TestPersistence(t *testing.T) {
 	}
 
 	// New trie instance
-	_ = NewTrie(db, hasher, nil, true)
+	_ = NewTrie(nil, db, hasher, nil, true)
 	// Shards in our implementation are lazy. They don't load from DB until Get/Put.
 	// But our NewTrie doesn't take root hashes, so shard.root will be nil.
 	// Wait, the current NewTrie implementation:
@@ -222,7 +222,7 @@ func TestPersistence(t *testing.T) {
 func TestPruningBasic(t *testing.T) {
 	db := &MemoryDBAdapter{memorydb.New()}
 	hasher := NewPooledKeccakHasher()
-	trie := NewTrie(db, hasher, nil, true)
+	trie := NewTrie(nil, db, hasher, nil, true)
 
 	trie.SetGlobalEpoch(0)
 	key := make([]byte, 32)
@@ -305,7 +305,7 @@ func TestDeleteCollapsing(t *testing.T) {
 func TestLazyLoading(t *testing.T) {
 	db := &MemoryDBAdapter{memorydb.New()}
 	hasher := NewPooledKeccakHasher()
-	trie := NewTrie(db, hasher, nil, true)
+	trie := NewTrie(nil, db, hasher, nil, true)
 
 	key := make([]byte, 32)
 	rand.Read(key)
@@ -342,7 +342,7 @@ func TestLazyLoading(t *testing.T) {
 func TestSubtreePruning(t *testing.T) {
 	db := &MemoryDBAdapter{memorydb.New()}
 	hasher := NewPooledKeccakHasher()
-	trie := NewTrie(db, hasher, nil, true)
+	trie := NewTrie(nil, db, hasher, nil, true)
 
 	trie.SetGlobalEpoch(0)
 
@@ -392,7 +392,7 @@ func TestCrossShardOperations(t *testing.T) {
 	db := &MemoryDBAdapter{memorydb.New()}
 	hasher := NewPooledKeccakHasher()
 	// 使用默认配置 (16位分片深度)
-	trie := NewTrie(db, hasher, nil, true)
+	trie := NewTrie(nil, db, hasher, nil, true)
 
 	// 构造分片 0x0000 和 0xFFFF 的 Key
 	key1 := make([]byte, 32)
@@ -437,7 +437,7 @@ func TestCustomConfig(t *testing.T) {
 		ShardDepth:        8,
 		ArchiveBucketSize: 10,
 	}
-	trie := NewTrie(db, hasher, config, true)
+	trie := NewTrie(nil, db, hasher, config, true)
 
 	// 构造分片 0xAA 的 Key
 	key := make([]byte, 32)
@@ -469,7 +469,7 @@ func TestArchiveBucketSplitAndMovement(t *testing.T) {
 		ArchiveBucketSize: 2,
 		ArchiveDB:         db,
 	}
-	trie := NewTrie(db, hasher, config, true)
+	trie := NewTrie(nil, db, hasher, config, true)
 
 	// 构造 3 个共享长前缀的 Key (位 16 之后的前缀相同)
 	// 这样它们在归档时会根据 ArchiveBucketSize=2 触发分裂
@@ -524,7 +524,7 @@ func TestDataActivation(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ArchiveDB = db
-	trie := NewTrie(db, hasher, config, true)
+	trie := NewTrie(nil, db, hasher, config, true)
 
 	key := make([]byte, 32)
 	copy(key, []byte{0x00, 0x00, 0x01})
@@ -576,7 +576,7 @@ func TestTrieStatistics(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ArchiveDB = db
-	trie := NewTrie(db, hasher, config, true)
+	trie := NewTrie(nil, db, hasher, config, true)
 
 	// 写入一些热数据
 	for i := 0; i < 5; i++ {
@@ -607,5 +607,32 @@ func TestTrieStatistics(t *testing.T) {
 	}
 	if stats.BucketCount == 0 {
 		t.Error("Expected at least one bucket")
+	}
+}
+
+func TestFullTrieReload(t *testing.T) {
+	db := &MemoryDBAdapter{memorydb.New()}
+	hasher := NewPooledKeccakHasher()
+	trie := NewTrie(nil, db, hasher, nil, true)
+
+	key := make([]byte, 32)
+	rand.Read(key)
+	val := []byte("reloadable")
+
+	trie.Put(key, val)
+	root, err := trie.Commit()
+	if err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	// Create a fresh trie instance and load from root
+	trie2 := NewTrie(root, db, hasher, nil, true)
+
+	got, err := trie2.Get(key)
+	if err != nil {
+		t.Fatalf("Get failed after reload: %v", err)
+	}
+	if !bytes.Equal(got, hasher.Hash(val)) {
+		t.Errorf("Value mismatch after reload")
 	}
 }

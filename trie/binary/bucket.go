@@ -75,15 +75,25 @@ func (s *Shard) deserializeArchivedKV(data []byte) ([]ArchivedKV, error) {
 
 // blindAppendToBucket 实现“盲追加”：只更新元数据（过滤器、ECMH、Count），无需加载原始数据。
 func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []ArchivedKV) {
+	bucket.cacheMu.Lock()
+	defer bucket.cacheMu.Unlock()
+
 	// 1. 增量更新布谷鸟过滤器
-	filter := cuckoo.New()
-	if len(bucket.Filter) > 0 {
-		filter.Decode(bucket.Filter)
+	if bucket.cachedFilter != nil {
+		for _, it := range newItems {
+			bucket.cachedFilter.Insert(it.Suffix)
+		}
+		bucket.Filter = bucket.cachedFilter.Encode()
+	} else {
+		filter := cuckoo.New()
+		if len(bucket.Filter) > 0 {
+			filter.Decode(bucket.Filter)
+		}
+		for _, it := range newItems {
+			filter.Insert(it.Suffix)
+		}
+		bucket.Filter = filter.Encode()
 	}
-	for _, it := range newItems {
-		filter.Insert(it.Suffix)
-	}
-	bucket.Filter = filter.Encode()
 
 	// 2. 增量更新 ECMH 承诺
 	hashes := make([]common.Hash, 0, len(newItems))
@@ -99,7 +109,12 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	// 3. 更新计数
 	bucket.Count += uint64(len(newItems))
 
-	// 4. 记录追加任务
+	// 4. 更新缓存的数据项（如果已加载）
+	if bucket.cachedItems != nil {
+		bucket.cachedItems = append(bucket.cachedItems, newItems...)
+	}
+
+	// 5. 记录追加任务
 	oldHash := bucket.Hash()
 
 	// 清除旧哈希以重新计算元数据哈希
@@ -132,15 +147,25 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 
 // blindDeleteFromBucket 实现“盲删除”：增量更新元数据（过滤器、ECMH、Count），无需加载原始数据。
 func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []ArchivedKV) {
+	bucket.cacheMu.Lock()
+	defer bucket.cacheMu.Unlock()
+
 	// 1. 增量更新布谷鸟过滤器
-	filter := cuckoo.New()
-	if len(bucket.Filter) > 0 {
-		filter.Decode(bucket.Filter)
+	if bucket.cachedFilter != nil {
+		for _, it := range deleteItems {
+			bucket.cachedFilter.Delete(it.Suffix)
+		}
+		bucket.Filter = bucket.cachedFilter.Encode()
+	} else {
+		filter := cuckoo.New()
+		if len(bucket.Filter) > 0 {
+			filter.Decode(bucket.Filter)
+		}
+		for _, it := range deleteItems {
+			filter.Delete(it.Suffix)
+		}
+		bucket.Filter = filter.Encode()
 	}
-	for _, it := range deleteItems {
-		filter.Delete(it.Suffix)
-	}
-	bucket.Filter = filter.Encode()
 
 	// 2. 增量更新 ECMH 承诺 (减法)
 	hashes := make([]common.Hash, 0, len(deleteItems))
@@ -154,6 +179,24 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 
 	// 3. 更新计数
 	bucket.Count -= uint64(len(deleteItems))
+
+	// 4. 更新缓存的数据项（如果已加载）
+	if bucket.cachedItems != nil {
+		newItems := make([]ArchivedKV, 0, len(bucket.cachedItems))
+		for _, it := range bucket.cachedItems {
+			found := false
+			for _, del := range deleteItems {
+				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newItems = append(newItems, it)
+			}
+		}
+		bucket.cachedItems = newItems
+	}
 
 	// 4. 记录删除任务
 	oldHash := bucket.Hash()
@@ -218,6 +261,9 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 
 // recomputeBucket 重新计算桶的承诺部分 (Filter, ECMH, Count)
 func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
+	bucket.cacheMu.Lock()
+	defer bucket.cacheMu.Unlock()
+
 	filter := cuckoo.New()
 	var hashes []common.Hash
 
@@ -232,6 +278,10 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 
 	bucket.Filter = filter.Encode()
 	bucket.Count = uint64(len(items))
+
+	// 更新缓存
+	bucket.cachedFilter = filter
+	bucket.cachedItems = items
 
 	// ECMH 承诺
 	comm, _ := s.ecmh.Add(nil, hashes)

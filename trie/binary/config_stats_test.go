@@ -16,7 +16,7 @@ func TestConfigAndStats(t *testing.T) {
 		ArchiveBucketSize: 5,
 		ArchiveDB:         db,
 	}
-	trie := NewTrie(db, hasher, config, true)
+	trie := NewTrie(nil, db, hasher, config, true)
 
 	if len(trie.shards) != 16 {
 		t.Errorf("Expected 16 shards, got %d", len(trie.shards))

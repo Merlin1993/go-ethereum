@@ -67,7 +67,7 @@ func TestTriePerformance(t *testing.T) {
 	config := DefaultConfig()
 	dbAdapter := &LevelDBAdapter{ldb}
 	config.ArchiveDB = dbAdapter
-	trie := NewTrie(dbAdapter, hasher, config, true)
+	trie := NewTrie(nil, dbAdapter, hasher, config, true)
 
 	// 3. 测试流程：初始化全局年度基准为 0
 	trie.SetGlobalEpoch(0)

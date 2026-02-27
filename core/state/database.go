@@ -228,7 +228,7 @@ func (db *CachingDB) OpenTrie(root common.Hash) (Trie, error) {
 	if db.triedb.IsVerkle() {
 		baseTrie, err = trie.NewVerkleTrie(root, db.triedb, db.pointCache)
 	} else if db.triedb.IsBinary() {
-		baseTrie, err = trie.NewBinaryTrie(root, db.triedb.Disk(), db.triedb.Archive())
+		baseTrie, err = trie.NewBinaryTrie(root, db.triedb, db.triedb.Archive())
 	} else {
 		baseTrie, err = trie.NewStateTrie(trie.StateTrieID(root), db.triedb)
 	}

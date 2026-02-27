@@ -43,15 +43,15 @@ type ProcessorHost struct {
 }
 
 var (
-	dbDir            = flag.String("dbDir2", "F:\\ethdata\\expire_state_db", "Database directory")
+	dbDir            = flag.String("dbDir2", "F:\\expire_data\\expire_state_db", "Database directory")
 	dataDir          = flag.String("dataDir2", "E:\\ethdata", "Input data directory")
 	startIdx         = flag.Int("startFileIdx2", 1, "Start file index")
 	endIdx           = flag.Int("endFileIdx2", 21, "End file index")
 	useVerkle        = flag.Bool("useVerkle2", false, "Enable Verkle trie")
-	useBinaryTrie    = flag.Bool("useBinaryTrie2", false, "Enable Binary trie")
-	useCacheTrie     = flag.Bool("useCacheTrie2", true, "Enable CacheTrie")
+	useBinaryTrie    = flag.Bool("useBinaryTrie2", true, "Enable Binary trie")
+	useCacheTrie     = flag.Bool("useCacheTrie2", false, "Enable CacheTrie")
 	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
-	binaryArchiveDir = flag.String("binaryArchiveDir2", "", "Binary trie archive directory")
+	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
 	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
 )
 
@@ -97,7 +97,6 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 		pdb = nil
 	}
 
-	//trieDB := triedb.NewDatabase(db, &triedb.Config{
 	trieDB := triedb.NewFixedDatabase(db, &triedb.Config{
 		Preimages:        false,
 		IsVerkle:         cfg.UseVerkle,
@@ -130,6 +129,7 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 			host.preTrieDB = triedb.NewFixedDatabase(db, &triedb.Config{
 				Preimages: false,
 				IsVerkle:  false,
+				IsBinary:  cfg.UseBinaryTrie,
 				CacheTrie: false,
 				ReadCache: false,
 				StartNum:  cfg.StartNum,
@@ -159,6 +159,15 @@ func (h *ProcessorHost) Close() {
 	}
 }
 
+// Statistics tracking for CommitToPreTrie
+var (
+	preTrieSetupTime    time.Duration
+	preTrieUpdateTime   time.Duration
+	preTrieCommitTime   time.Duration
+	preTrieDBCommitTime time.Duration
+	preTrieGCTime       time.Duration
+)
+
 // CommitToPreTrie handles the asynchronous commitment of CacheTrie data to the underlying trie.
 func (h *ProcessorHost) CommitToPreTrie(root common.Hash, blockNum uint64, deleteKVList *cachetrie.DeleteKVList) {
 	if deleteKVList == nil {
@@ -183,9 +192,13 @@ func (h *ProcessorHost) CommitToPreTrie(root common.Hash, blockNum uint64, delet
 			end = length
 		}
 		chunk := data[i:end]
+
+		t0 := time.Now()
 		cleanStateDB, _ := state.New(newRoot, h.preSdb)
+		preTrieSetupTime += time.Since(t0)
 
 		// Process accounts
+		t1 := time.Now()
 		for _, kv := range chunk {
 			if kv.Address == (common.Address{}) && len(kv.Key) > 0 {
 				addr := common.BytesToAddress(kv.Key)
@@ -206,14 +219,24 @@ func (h *ProcessorHost) CommitToPreTrie(root common.Hash, blockNum uint64, delet
 				}
 			}
 		}
+		preTrieUpdateTime += time.Since(t1)
 
+		t2 := time.Now()
 		commitRoot, _ := cleanStateDB.Commit(blockNum, false, false)
+		preTrieCommitTime += time.Since(t2)
+
 		newRoot = commitRoot
+
+		t3 := time.Now()
 		h.preTrieDB.Commit(newRoot, false)
+		preTrieDBCommitTime += time.Since(t3)
 	}
 
 	h.trieDB.CacheTrie().FinishCleanup(blockNum, newRoot)
+
+	t4 := time.Now()
 	runtime.GC()
+	preTrieGCTime += time.Since(t4)
 }
 
 // LoadTransactionsFromCSV reads and parses transactions from a CSV file.
@@ -231,10 +254,17 @@ func LoadTransactionsFromCSV(file string) (map[uint64][]*core.Message, error) {
 	}
 
 	msgsByBlock := make(map[uint64][]*core.Message)
+	count := 0
+	start := time.Now()
+	fmt.Printf("[Test] Loading transactions from %s...\n", file)
 	for {
 		record, err := reader.Read()
 		if err != nil {
 			break
+		}
+		count++
+		if count%1000000 == 0 {
+			fmt.Printf("[Test] Loaded %d transactions so far...\n", count)
 		}
 		if len(record) < 10 || record[0] == "hash" {
 			continue
@@ -280,10 +310,14 @@ func LoadTransactionsFromCSV(file string) (map[uint64][]*core.Message, error) {
 		}
 		msgsByBlock[blockNum] = append(msgsByBlock[blockNum], msg)
 	}
+	fmt.Printf("[Test] Loaded %d transactions total in %v\n", count, time.Since(start))
 	return msgsByBlock, nil
 }
 
 func TestExpireStateProcessor(t *testing.T) {
+	if !flag.Parsed() {
+		flag.Parse()
+	}
 	cfg := &ProcessorConfig{
 		DbDir:            *dbDir,
 		DataDir:          *dataDir,
@@ -312,8 +346,10 @@ func TestExpireStateProcessor(t *testing.T) {
 
 	files, err := compareFindTransactionFiles(cfg.DataDir)
 	if err != nil || len(files) == 0 {
+		fmt.Printf("[Test] Failed to find transaction files: %v (len=%d)\n", err, len(files))
 		t.Fatalf("failed to find transaction files: %v", err)
 	}
+	fmt.Printf("[Test] Found %d transaction files\n", len(files))
 
 	selectedFiles := files[cfg.StartFileIdx-1 : cfg.EndFileIdx]
 	lastStateRoot := types.EmptyRootHash
@@ -377,15 +413,13 @@ func TestExpireStateProcessor(t *testing.T) {
 			}
 		}
 
+		start10k := time.Now()
 		for b := minBlock; b <= maxBlock; b++ {
-			msgs := msgsByBlock[b]
-			header := &types.Header{
-				Number:     new(big.Int).SetUint64(b),
-				GasLimit:   30000000,
-				Time:       b * 15,
-				Difficulty: big.NewInt(1),
+			if b%10000 == 0 {
+				fmt.Printf("[Test] Processing block %d (Total Processed: %d) duration: %v...\n", b, totalProcessedBlocks, time.Since(start10k))
+				start10k = time.Now()
 			}
-
+			msgs := msgsByBlock[b]
 			host.sdb.SetBlockNum(b)
 			statedb, _ := state.New(lastStateRoot, host.sdb)
 
@@ -402,63 +436,42 @@ func TestExpireStateProcessor(t *testing.T) {
 				CanTransfer: core.CanTransfer,
 				Transfer:    core.Transfer,
 				GetHash:     func(n uint64) common.Hash { return common.Hash{} },
-				Coinbase:    common.Address{},
-				BlockNumber: header.Number,
-				Time:        header.Time,
-				Difficulty:  header.Difficulty,
-				GasLimit:    header.GasLimit,
+				Coinbase:    compareBlockMiners[b],
+				BlockNumber: new(big.Int).SetUint64(b),
+				Time:        b * 15,
+				Difficulty:  big.NewInt(1),
 				BaseFee:     big.NewInt(0),
 			}
-			vmenv := vm.NewEVM(blockCtx, statedb, params.MainnetChainConfig, vm.Config{})
-			gp := new(core.GasPool).AddGas(header.GasLimit)
-
-			for _, m := range msgs {
-				core.ApplyMessage(vmenv, m, gp)
+			evm := vm.NewEVM(blockCtx, statedb, params.MainnetChainConfig, vm.Config{})
+			for _, msg := range msgs {
+				applyStart := time.Now()
+				core.ApplyMessage(evm, msg, new(core.GasPool).AddGas(msg.GasLimit))
+				totalTxTime += time.Since(applyStart)
 			}
-
 			txDuration := time.Since(txStart)
-			totalTxTime += txDuration
-			if txDuration > maxTxTime {
-				maxTxTime = txDuration
-			}
 
-			// 2. Root calculation time statistics
+			// 2. State root calculation time statistics
 			rootStart := time.Now()
+			statedb.Finalise(false)
+			finaliseDuration := time.Since(rootStart)
 
-			if cfg.UseCacheTrie {
-				_, resultHash, _ := statedb.PreCommit(false)
-				root := lastStateRoot
-				if resultHash != (common.Hash{}) {
-					root = resultHash
-				}
-
-				// Handle code commitment
-				codes := host.sdb.TrieDB().CacheTrie().PopCodes()
-				if len(codes) > 0 {
-					batch := host.db.NewBatch()
-					for codeHash, code := range codes {
-						rawdb.WriteCode(batch, codeHash, code)
-					}
-					batch.Write()
-				}
-
-				deleteKVList := statedb.GetCachedDeleteKVList()
-				if cfg.UseVerkle || cfg.UseBinaryTrie {
-					host.CommitToPreTrie(root, b, deleteKVList)
-				} else {
-					go host.CommitToPreTrie(root, b, deleteKVList)
-				}
-				lastStateRoot = root
-			} else {
-				statedb.PreCommit(false)
-				root, _ := statedb.PostCommit(b, false, false)
-				lastStateRoot = root
-				if b%100 == 0 {
-					host.trieDB.Commit(root, false)
-				}
-			}
+			commitStart := time.Now()
+			h, _ := statedb.Commit(b, false, false)
+			commitDuration := time.Since(commitStart)
 
 			rootDuration := time.Since(rootStart)
+
+			if b%10000 == 0 {
+				fmt.Printf("[Test] Block %d: TxExec: %v, Finalise: %v, Commit: %v, RootCalc: %v, Total: %v\n",
+					b, txDuration, finaliseDuration, commitDuration, rootDuration, txDuration+rootDuration)
+			}
+			lastStateRoot = h
+
+			// Optional treeDB commit
+			if b%100 == 0 {
+				host.trieDB.Commit(h, false)
+			}
+
 			totalRootTime += rootDuration
 			if rootDuration > maxRootTime {
 				maxRootTime = rootDuration
@@ -470,6 +483,11 @@ func TestExpireStateProcessor(t *testing.T) {
 				fmt.Printf("Blocks: %d - %d\n", totalProcessedBlocks-statsIv, totalProcessedBlocks-1)
 				fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
 				fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
+				fmt.Printf("  CommitToPreTrie - Setup: %v, Update: %v, Commit: %v, DBCommit: %v, GC: %v\n",
+					preTrieSetupTime, preTrieUpdateTime, preTrieCommitTime, preTrieDBCommitTime, preTrieGCTime)
+
+				// Reset sub-timers
+				preTrieSetupTime, preTrieUpdateTime, preTrieCommitTime, preTrieDBCommitTime, preTrieGCTime = 0, 0, 0, 0, 0
 
 				// CacheTrie stats
 				acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, _, _, _, _,
