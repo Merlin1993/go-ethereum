@@ -53,6 +53,7 @@ var (
 	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
 	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
 	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
+	pruneInterval    = flag.Int("pruneInterval", 5, "Blocks between Trie.PruneNextShard() calls")
 )
 
 func TestMain(m *testing.M) {
@@ -73,6 +74,7 @@ type ProcessorConfig struct {
 	UseMemory        bool
 	BinaryArchiveDir string
 	StartNum         uint64
+	PruneInterval    int
 }
 
 func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
@@ -329,6 +331,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		UseMemory:        *useMemory,
 		BinaryArchiveDir: *binaryArchiveDir,
 		StartNum:         46147,
+		PruneInterval:    *pruneInterval,
 	}
 
 	common.UseVerkle = cfg.UseVerkle
@@ -360,11 +363,16 @@ func TestExpireStateProcessor(t *testing.T) {
 	// Statistics tracking
 	statsIv := uint64(*statsInterval)
 	var (
-		intervalBlocks uint64
+		intervalBlocks     uint64
+		intervalStartBlock uint64
+		firstBlockSet      bool
+		lastProcessedBlock uint64
+
 		totalTxTime    time.Duration
 		maxTxTime      time.Duration
 		totalRootTime  time.Duration
 		maxRootTime    time.Duration
+		totalPruneTime time.Duration
 
 		// CacheTrie stats
 		lastAcctHit, lastAcctMissEx, lastAcctMissNo                        int64
@@ -415,6 +423,12 @@ func TestExpireStateProcessor(t *testing.T) {
 
 		start10k := time.Now()
 		for b := minBlock; b <= maxBlock; b++ {
+			if !firstBlockSet {
+				intervalStartBlock = b
+				firstBlockSet = true
+			}
+			lastProcessedBlock = b
+
 			if b%10000 == 0 {
 				fmt.Printf("[Test] Processing block %d (Total Processed: %d) duration: %v...\n", b, totalProcessedBlocks, time.Since(start10k))
 				start10k = time.Now()
@@ -450,6 +464,18 @@ func TestExpireStateProcessor(t *testing.T) {
 			}
 			txDuration := time.Since(txStart)
 
+			if txDuration > maxTxTime {
+				maxTxTime = txDuration
+			}
+
+			// Prune Next Shard
+			pruneStart := time.Now()
+			if cfg.UseBinaryTrie && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
+				statedb.PruneNextShard()
+			}
+			pruneDuration := time.Since(pruneStart)
+			totalPruneTime += pruneDuration
+
 			// 2. State root calculation time statistics
 			rootStart := time.Now()
 			statedb.Finalise(false)
@@ -462,8 +488,8 @@ func TestExpireStateProcessor(t *testing.T) {
 			rootDuration := time.Since(rootStart)
 
 			if b%10000 == 0 {
-				fmt.Printf("[Test] Block %d: TxExec: %v, Finalise: %v, Commit: %v, RootCalc: %v, Total: %v\n",
-					b, txDuration, finaliseDuration, commitDuration, rootDuration, txDuration+rootDuration)
+				fmt.Printf("[Test] Block %d: TxExec: %v, Prune: %v, Finalise: %v, Commit: %v, RootCalc: %v, Total: %v\n",
+					b, txDuration, pruneDuration, finaliseDuration, commitDuration, rootDuration, txDuration+rootDuration)
 			}
 			lastStateRoot = h
 
@@ -479,10 +505,11 @@ func TestExpireStateProcessor(t *testing.T) {
 
 			intervalBlocks++
 			totalProcessedBlocks++
-			if intervalBlocks >= statsIv {
-				fmt.Printf("Blocks: %d - %d\n", totalProcessedBlocks-statsIv, totalProcessedBlocks-1)
+			if b > 0 && (b+1)%statsIv == 0 {
+				fmt.Printf("Blocks: %d - %d\n", intervalStartBlock, b)
 				fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
 				fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
+				fmt.Printf("  PruneNextShard - Avg: %v\n", totalPruneTime/time.Duration(intervalBlocks))
 				fmt.Printf("  CommitToPreTrie - Setup: %v, Update: %v, Commit: %v, DBCommit: %v, GC: %v\n",
 					preTrieSetupTime, preTrieUpdateTime, preTrieCommitTime, preTrieDBCommitTime, preTrieGCTime)
 
@@ -504,13 +531,14 @@ func TestExpireStateProcessor(t *testing.T) {
 				deltaStorMissNo := storMissNo - lastStorMissNo
 				totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
 
-				fmt.Printf("  [5 Metrics Summary]:\n")
-				fmt.Printf("    1. 读取次数 (Total Reads): %d\n", totalReads-lastTotReads)
-				fmt.Printf("    2. 写入次数 (Total Writes): %d\n", totalUpdates-lastTotUpdates)
-				fmt.Printf("    3. 读取不中的次数 (MissNo): %d\n", (acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo))
-				fmt.Printf("    4. 读取中了在缓存 (CacheHit): %d\n", (acctHit+storHit)-(lastAcctHit+lastStorHit))
-				fmt.Printf("    5. 读取中了不在缓存 (MissEx): %d\n", (acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx))
-
+				if cfg.UseCacheTrie {
+					fmt.Printf("  [5 Metrics Summary]:\n")
+					fmt.Printf("    1. 读取次数 (Total Reads): %d\n", totalReads-lastTotReads)
+					fmt.Printf("    2. 写入次数 (Total Writes): %d\n", totalUpdates-lastTotUpdates)
+					fmt.Printf("    3. 读取不中的次数 (MissNo): %d\n", (acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo))
+					fmt.Printf("    4. 读取中了在缓存 (CacheHit): %d\n", (acctHit+storHit)-(lastAcctHit+lastStorHit))
+					fmt.Printf("    5. 读取中了不在缓存 (MissEx): %d\n", (acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx))
+				}
 				if totalAcct > 0 {
 					fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
 						deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
@@ -528,8 +556,8 @@ func TestExpireStateProcessor(t *testing.T) {
 
 				// Write to CSV
 				record := []string{
-					strconv.FormatUint(totalProcessedBlocks-statsIv, 10),
-					strconv.FormatUint(totalProcessedBlocks-1, 10),
+					strconv.FormatUint(intervalStartBlock, 10),
+					strconv.FormatUint(b, 10),
 					// Aggregated
 					strconv.FormatInt(totalReads-lastTotReads, 10),
 					strconv.FormatInt(totalUpdates-lastTotUpdates, 10),
@@ -558,20 +586,24 @@ func TestExpireStateProcessor(t *testing.T) {
 				maxTxTime = 0
 				totalRootTime = 0
 				maxRootTime = 0
+				totalPruneTime = 0
 
 				lastAcctHit, lastAcctMissEx, lastAcctMissNo = acctHit, acctMissEx, acctMissNo
 				lastStorHit, lastStorMissEx, lastStorMissNo = storHit, storMissEx, storMissNo
 				lastTotAcctReads, lastTotStorReads = totAcctReads, totStorReads
 				lastTotAcctUpd, lastTotStorUpd = totAcctUpd, totStorUpd
 				lastTotReads, lastTotUpdates = totalReads, totalUpdates
+
+				intervalStartBlock = b + 1
 			}
 		}
 	}
 	// Final statistics report for the last partial interval
 	if intervalBlocks > 0 {
-		fmt.Printf("Final Partial Interval (Blocks: %d - %d)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
+		fmt.Printf("Final Partial Interval (Blocks: %d - %d)\n", intervalStartBlock, lastProcessedBlock)
 		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
 		fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
+		fmt.Printf("  PruneNextShard - Avg: %v\n", totalPruneTime/time.Duration(intervalBlocks))
 
 		// Final CacheTrie stats
 		acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, _, _, _, _,
@@ -611,8 +643,8 @@ func TestExpireStateProcessor(t *testing.T) {
 
 		// Final Write to CSV
 		record := []string{
-			strconv.FormatUint(totalProcessedBlocks-intervalBlocks, 10),
-			strconv.FormatUint(totalProcessedBlocks-1, 10),
+			strconv.FormatUint(intervalStartBlock, 10),
+			strconv.FormatUint(lastProcessedBlock, 10),
 			// Aggregated
 			strconv.FormatInt(totalReads-lastTotReads, 10),
 			strconv.FormatInt(totalUpdates-lastTotUpdates, 10),

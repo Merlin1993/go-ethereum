@@ -314,6 +314,11 @@ func (t *VerkleTrie) IsVerkle() bool {
 	return true
 }
 
+// PruneNextShard is not supported by VerkleTrie.
+func (t *VerkleTrie) PruneNextShard() error {
+	return nil
+}
+
 // Proof builds and returns the verkle multiproof for keys, built against
 // the pre tree. The post tree is passed in order to add the post values
 // to that proof.

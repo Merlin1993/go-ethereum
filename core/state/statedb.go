@@ -139,6 +139,9 @@ type StateDB struct {
 	// State witness if cross validation is needed
 	witness *stateless.Witness
 
+	// SnapshotCommits time.Duration
+	// TrieDBCommits   time.Duration
+
 	// Measurements gathered during execution for debugging purposes
 	AccountReads    time.Duration
 	AccountHashes   time.Duration
@@ -224,6 +227,14 @@ func (s *StateDB) StopPrefetcher() {
 		s.prefetcher.report()
 		s.prefetcher = nil
 	}
+}
+
+// PruneNextShard calls the underlying trie's PruneNextShard method.
+func (s *StateDB) PruneNextShard() error {
+	if s.trie != nil {
+		return s.trie.PruneNextShard()
+	}
+	return nil
 }
 
 // setError remembers the first non-nil error it is called with.

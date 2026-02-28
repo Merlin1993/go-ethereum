@@ -332,3 +332,8 @@ func (t *StateTrie) getSecKeyCache() map[string][]byte {
 func (t *StateTrie) IsVerkle() bool {
 	return false
 }
+
+// PruneNextShard is not supported by StateTrie.
+func (t *StateTrie) PruneNextShard() error {
+	return nil
+}

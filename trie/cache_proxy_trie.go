@@ -77,6 +77,9 @@ type StateTrieInterface interface {
 
 	// IsVerkle returns true if the trie is verkle-tree based
 	IsVerkle() bool
+
+	// PruneNextShard prunes the next shard in the binary trie.
+	PruneNextShard() error
 }
 
 // CacheProxyTrie wraps any trie implementation and provides caching functionality
@@ -283,6 +286,11 @@ func (t *CacheProxyTrie) Prove(key []byte, proofDb ethdb.KeyValueWriter) error {
 // IsVerkle returns true if the trie is verkle-tree based
 func (t *CacheProxyTrie) IsVerkle() bool {
 	return t.underlying.IsVerkle()
+}
+
+// PruneNextShard prunes the next shard in the binary trie.
+func (t *CacheProxyTrie) PruneNextShard() error {
+	return t.underlying.PruneNextShard()
 }
 
 // Copy returns a copy of the trie
