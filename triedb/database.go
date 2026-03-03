@@ -106,6 +106,7 @@ type Database struct {
 	backend   backend              // The backend for managing trie nodes
 	cacheTrie *cachetrie.CacheTrie // Cache trie used for enhanced caching
 	archive   ethdb.Database       // Separate archive database for binary trie
+	activeBT  interface{}          // Persistent binary trie instance
 }
 
 func (db *Database) GetBackend() *pathdb.Database {
@@ -477,4 +478,14 @@ func (db *Database) CacheTrie() *cachetrie.CacheTrie {
 // ReadCache returns whether to enable reading from cache.
 func (db *Database) ReadCache() bool {
 	return db.config.ReadCache
+}
+
+// SetBinaryTrie stores a persistent binary trie instance in the database.
+func (db *Database) SetBinaryTrie(trie interface{}) {
+	db.activeBT = trie
+}
+
+// GetBinaryTrie retrieves the persistent binary trie instance from the database.
+func (db *Database) GetBinaryTrie() interface{} {
+	return db.activeBT
 }

@@ -48,8 +48,8 @@ var (
 	startIdx         = flag.Int("startFileIdx2", 1, "Start file index")
 	endIdx           = flag.Int("endFileIdx2", 21, "End file index")
 	useVerkle        = flag.Bool("useVerkle2", false, "Enable Verkle trie")
-	useBinaryTrie    = flag.Bool("useBinaryTrie2", true, "Enable Binary trie")
-	useCacheTrie     = flag.Bool("useCacheTrie2", false, "Enable CacheTrie")
+	useBinaryTrie    = flag.Bool("useBinaryTrie2", false, "Enable Binary trie")
+	useCacheTrie     = flag.Bool("useCacheTrie2", true, "Enable CacheTrie")
 	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
 	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
 	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
@@ -93,7 +93,7 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 	db := rawdb.NewDatabase(ldb)
 	hdb := hashdb.Defaults
 	pdb := pathdb.Defaults
-	if cfg.UseVerkle || cfg.UseBinaryTrie {
+	if cfg.UseVerkle || cfg.UseBinaryTrie || !cfg.UseBinaryTrie && !cfg.UseVerkle {
 		hdb = nil
 	} else {
 		pdb = nil
@@ -135,8 +135,8 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 				CacheTrie: false,
 				ReadCache: false,
 				StartNum:  cfg.StartNum,
-				PathDB:    nil,
-				HashDB:    hdb,
+				PathDB:    pdb,
+				HashDB:    nil,
 			})
 		} else {
 			host.preTrieDB = triedb.NewDatabase2(db, &triedb.Config{
@@ -429,7 +429,7 @@ func TestExpireStateProcessor(t *testing.T) {
 			}
 			lastProcessedBlock = b
 
-			if b%10000 == 0 {
+			if b%100000 == 0 {
 				fmt.Printf("[Test] Processing block %d (Total Processed: %d) duration: %v...\n", b, totalProcessedBlocks, time.Since(start10k))
 				start10k = time.Now()
 			}
@@ -470,7 +470,7 @@ func TestExpireStateProcessor(t *testing.T) {
 
 			// Prune Next Shard
 			pruneStart := time.Now()
-			if cfg.UseBinaryTrie && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
+			if (cfg.UseBinaryTrie || !cfg.UseVerkle) && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
 				statedb.PruneNextShard()
 			}
 			pruneDuration := time.Since(pruneStart)
@@ -487,14 +487,14 @@ func TestExpireStateProcessor(t *testing.T) {
 
 			rootDuration := time.Since(rootStart)
 
-			if b%10000 == 0 {
+			if b%100000 == 0 {
 				fmt.Printf("[Test] Block %d: TxExec: %v, Prune: %v, Finalise: %v, Commit: %v, RootCalc: %v, Total: %v\n",
 					b, txDuration, pruneDuration, finaliseDuration, commitDuration, rootDuration, txDuration+rootDuration)
 			}
 			lastStateRoot = h
 
 			// Optional treeDB commit
-			if b%100 == 0 {
+			if b%1000 == 0 {
 				host.trieDB.Commit(h, false)
 			}
 

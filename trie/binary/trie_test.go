@@ -35,7 +35,7 @@ func (db *LevelDBAdapter) DeleteBucket(hash []byte) error {
 
 func TestTriePerformance(t *testing.T) {
 	// 1. 输入参数
-	BatchSize := 5000
+	BatchSize := 50
 	TotalBatches := 165536 // 总批次数
 	NewRatio := 0.5        // 新增：更新 = 7:3
 

@@ -1445,15 +1445,15 @@ func (s *Shard) pruneAndArchive(node Node, global byte, depth int, pathFromShard
 
 type Trie struct {
 	config           *Config
-	shards           []*Shard
+	shards           map[int]*Shard
 	dirtyShards      map[int]struct{}
 	dirtyList        []int // 记录本次迭代中发生改变的分片索引，用于 O(Dirty) 收集
 	dirtyArchive     map[int]struct{}
-	dirtyArchiveList []int    // 记录待刷盘的归档分片
-	shardRoots       []byte   // 预分配的 [NumShards * 32] 缓冲区，维护所有分片最新的根哈希
-	topTree          *TopTree // [NEW] 16-ary tree for efficient root hash computation
-	cachedRoot       []byte   // 缓存的全局根哈希
-	rootDirty        bool     // 标记全局根哈希是否需要重新计算
+	dirtyArchiveList []int          // 记录待刷盘的归档分片
+	shardRoots       map[int][]byte // 维护所有分片最新的根哈希
+	topTree          *TopTree       // [NEW] 16-ary tree for efficient root hash computation
+	cachedRoot       []byte         // 缓存的全局根哈希
+	rootDirty        bool           // 标记全局根哈希是否需要重新计算
 	db               KVStore
 	hasher           Hasher
 	pruning          bool
@@ -1476,15 +1476,14 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 	if config == nil {
 		config = DefaultConfig()
 	}
-	numShards := 1 << config.ShardDepth
 	t := &Trie{
 		config:           config,
-		shards:           make([]*Shard, numShards),
+		shards:           make(map[int]*Shard),
 		dirtyShards:      make(map[int]struct{}),
 		dirtyList:        make([]int, 0, 128),
 		dirtyArchive:     make(map[int]struct{}),
 		dirtyArchiveList: make([]int, 0, 128),
-		shardRoots:       make([]byte, numShards*32),
+		shardRoots:       make(map[int][]byte),
 		rootDirty:        true,
 		db:               db,
 		hasher:           hasher,
@@ -1508,8 +1507,20 @@ func (t *Trie) Load(root []byte) error {
 		return err
 	}
 
-	if len(data) == len(t.shardRoots) {
-		copy(t.shardRoots, data)
+	if len(data) == (1<<t.config.ShardDepth)*32 {
+		for i := 0; i < (1 << t.config.ShardDepth); i++ {
+			h := data[i*32 : (i+1)*32]
+			empty := true
+			for _, b := range h {
+				if b != 0 {
+					empty = false
+					break
+				}
+			}
+			if !empty {
+				t.shardRoots[i] = append([]byte(nil), h...)
+			}
+		}
 	} else if len(data) == 513 && data[0] == 0xD0 {
 		if err := t.parseTopTree(data, 0, 0); err != nil {
 			return err
@@ -1554,7 +1565,7 @@ func (t *Trie) parseTopTree(data []byte, level int, prefix int) error {
 
 		if level == 3 {
 			shardID := (prefix << 4) | i
-			copy(t.shardRoots[shardID*32:(shardID+1)*32], h)
+			t.shardRoots[shardID] = append([]byte(nil), h...)
 		} else {
 			childData, err := t.db.Get(h)
 			if err != nil {
@@ -1683,12 +1694,12 @@ func (t *Trie) CommitToBatch(batch Batcher) ([]byte, error) {
 	}
 	// [OPTIMIZED] Only commit dirty shards
 	if len(t.dirtyList) == 0 {
-		return t.hasher.Hash(t.shardRoots), nil
+		return t.cachedRoot, nil
 	}
 
-	numShards := len(t.shards)
-	hashes := make([][]byte, numShards)
-	errs := make([]error, numShards)
+	hashes := make(map[int][]byte, len(t.dirtyList))
+	errs := make(map[int]error, len(t.dirtyList))
+	var mu sync.Mutex
 
 	var wg sync.WaitGroup
 	// Limit concurrency to NumCPU to avoid overwhelming the system
@@ -1706,8 +1717,10 @@ func (t *Trie) CommitToBatch(batch Batcher) ([]byte, error) {
 			defer func() { <-sem }()
 
 			h, err := t.shards[idx].CommitToBatch(batch)
+			mu.Lock()
 			hashes[idx] = h
 			errs[idx] = err
+			mu.Unlock()
 		}(id)
 	}
 	wg.Wait()
@@ -1720,9 +1733,9 @@ func (t *Trie) CommitToBatch(batch Batcher) ([]byte, error) {
 		}
 		h := hashes[id]
 		if len(h) == 0 {
-			copy(t.shardRoots[id*32:(id+1)*32], make([]byte, 32))
+			delete(t.shardRoots, id)
 		} else {
-			copy(t.shardRoots[id*32:(id+1)*32], h)
+			t.shardRoots[id] = h
 		}
 
 		// Mark for archive flush
@@ -1834,7 +1847,7 @@ func (t *Trie) getOrCreateShardLocked(id int) (*Shard, error) {
 	}
 
 	// Note: We need to load shard roots if they exist.
-	rootHash := t.shardRoots[id*32 : (id+1)*32]
+	rootHash := t.shardRoots[id]
 	// Check if the hash is all zeros (empty shard)
 	isEmpty := true
 	for _, b := range rootHash {

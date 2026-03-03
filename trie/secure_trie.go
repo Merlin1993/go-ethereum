@@ -333,7 +333,14 @@ func (t *StateTrie) IsVerkle() bool {
 	return false
 }
 
-// PruneNextShard is not supported by StateTrie.
+// PruneNextShard prunes the trie database if it supports it.
 func (t *StateTrie) PruneNextShard() error {
+	// If the database supports capping (e.g. HashDB), trigger it.
+	// For PathDB, pruning happens automatically during commit.
+	if capper, ok := t.db.(interface {
+		Cap(common.StorageSize) error
+	}); ok {
+		return capper.Cap(0)
+	}
 	return nil
 }
