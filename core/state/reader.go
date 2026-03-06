@@ -286,10 +286,12 @@ func newTrieReader(root common.Hash, db *triedb.Database, cache *utils.PointCach
 		tr  Trie
 		err error
 	)
-	if !db.IsVerkle() {
-		tr, err = trie.NewStateTrie(trie.StateTrieID(root), db)
-	} else {
+	if db.IsVerkle() {
 		tr, err = trie.NewVerkleTrie(root, db, cache)
+	} else if db.IsBinary() {
+		tr, err = trie.NewBinaryTrie(root, db, db.Archive())
+	} else {
+		tr, err = trie.NewStateTrie(trie.StateTrieID(root), db)
 	}
 	if err != nil {
 		return nil, err
@@ -332,7 +334,7 @@ func (r *trieReader) Storage(addr common.Address, key common.Hash) (common.Hash,
 		found bool
 		value common.Hash
 	)
-	if r.db.IsVerkle() {
+	if r.db.IsVerkle() || r.db.IsBinary() {
 		tr = r.mainTrie
 	} else {
 		tr, found = r.subTries[addr]
@@ -652,6 +654,13 @@ func ResetCacheStats() {
 
 	atomic.StoreInt64(&common.TotalReads, 0)
 	atomic.StoreInt64(&common.TotalUpdates, 0)
+
+	atomic.StoreInt64(&common.BinaryHitCount, 0)
+	atomic.StoreInt64(&common.BinaryMissNonExistentCount, 0)
+	atomic.StoreInt64(&common.BinaryMissExistentCount, 0)
+	atomic.StoreInt64(&common.BinaryCycleFPCount, 0)
+	atomic.StoreInt64(&common.BinaryMaxFPInSingleBlock, 0)
+	atomic.StoreInt64(&common.BinaryTrieFPInBlock, 0)
 }
 
 // reader is the wrapper of ContractCodeReader and StateReader interface.

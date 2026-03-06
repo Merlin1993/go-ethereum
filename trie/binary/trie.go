@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/trie/binary/cuckoo"
 	"github.com/ethereum/go-ethereum/trie/binary/ecmh"
@@ -201,10 +203,15 @@ func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
 // Get 返回指定 key 的值哈希（不存在则返回 ErrNodeNotFound）。
 func (s *Shard) Get(key []byte) ([]byte, error) {
 	if s.root == nil {
+		atomic.AddInt64(&common.BinaryMissNonExistentCount, 1)
 		return nil, ErrNodeNotFound
 	}
 	// Shards start at certain depth
-	return s.get(s.root, key, s.config.ShardDepth)
+	val, err := s.get(s.root, key, s.config.ShardDepth)
+	if err != nil {
+		atomic.AddInt64(&common.BinaryMissNonExistentCount, 1)
+	}
+	return val, err
 }
 
 func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
@@ -217,6 +224,7 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 		// 检查叶子后缀是否完全匹配 key 的剩余位
 		matchLen := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
 		if matchLen == n.PathBits && depth+matchLen == len(key)*8 {
+			atomic.AddInt64(&common.BinaryHitCount, 1)
 			return n.ValueHash, nil
 		}
 		return nil, ErrNodeNotFound
@@ -353,6 +361,7 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 
 				innerDepth := s.config.ShardDepth
 				keyBits := len(key) * 8
+				var found bool
 				for _, item := range items {
 					if innerDepth+item.SuffixBits == keyBits {
 						if s.suffixMatches(item.Suffix, item.SuffixBits, key, innerDepth) {
@@ -360,9 +369,17 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 							s.stats.ExistProofCount++
 							s.stats.TotalProofSize += int64(len(item.Value) + len(item.Suffix) + 8)
 							s.statsMut.Unlock()
+
+							atomic.AddInt64(&common.BinaryMissExistentCount, 1)
+							found = true
 							return item.Value, nil
 						}
 					}
+				}
+				if !found {
+					// 过滤器查询存在，但数据实际不存在 -> 假阳性
+					atomic.AddInt64(&common.BinaryCycleFPCount, 1)
+					atomic.AddInt64(&common.BinaryTrieFPInBlock, 1)
 				}
 			}
 		}
@@ -1502,6 +1519,21 @@ func (t *Trie) Load(root []byte) error {
 	if len(root) == 0 {
 		return nil
 	}
+
+	// Handle empty root (all zeros) for Binary Trie
+	allZero := true
+	for _, b := range root {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		t.cachedRoot = append([]byte{}, root...)
+		t.rootDirty = false
+		return nil
+	}
+
 	data, err := t.db.Get(root)
 	if err != nil {
 		return err
@@ -1689,11 +1721,11 @@ func (t *Trie) CommitToBatch(batch Batcher) ([]byte, error) {
 	t.shardMu.Lock()
 	defer t.shardMu.Unlock()
 
-	if !t.rootDirty {
+	if !t.rootDirty && t.cachedRoot != nil {
 		return t.cachedRoot, nil
 	}
 	// [OPTIMIZED] Only commit dirty shards
-	if len(t.dirtyList) == 0 {
+	if len(t.dirtyList) == 0 && t.cachedRoot != nil {
 		return t.cachedRoot, nil
 	}
 
@@ -1790,7 +1822,7 @@ func (t *Trie) PruneNextShard() error {
 	if err != nil {
 		return err
 	}
-	numShards := len(t.shards)
+	numShards := 1 << t.config.ShardDepth
 	t.pruneShardIdx = (t.pruneShardIdx + 1) % numShards
 
 	wasPruned := s.isPruned

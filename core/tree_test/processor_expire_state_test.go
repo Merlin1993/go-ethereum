@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,7 +44,7 @@ var (
 	startIdx         = flag.Int("startFileIdx2", 1, "Start file index")
 	endIdx           = flag.Int("endFileIdx2", 21, "End file index")
 	useVerkle        = flag.Bool("useVerkle2", false, "Enable Verkle trie")
-	useBinaryTrie    = flag.Bool("useBinaryTrie2", false, "Enable Binary trie")
+	useBinaryTrie    = flag.Bool("useBinaryTrie2", true, "Enable Binary trie")
 	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
 	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
 	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
@@ -54,6 +55,7 @@ func TestMain(m *testing.M) {
 	if !flag.Parsed() {
 		flag.Parse()
 	}
+	common.DebugFlag = false // 关闭调试标志
 	os.Exit(m.Run())
 }
 
@@ -108,14 +110,19 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 	if cfg.UseVerkle || cfg.UseBinaryTrie {
 		firstRootHash = common.Hash{}
 	}
-	snaps, _ := snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, firstRootHash)
-	sdb := state.NewDatabase(trieDB, snaps)
+	// --- 硬编码开关：当使用 Binary Trie 时是否禁用快照 (用于精准调试 Binary Trie 指标) ---
+	disableSnapForBinary := true
+	var activeSnaps *snapshot.Tree
+	if !(cfg.UseBinaryTrie && disableSnapForBinary) {
+		activeSnaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, firstRootHash)
+	}
+	sdb := state.NewDatabase(trieDB, activeSnaps)
 
 	host := &ProcessorHost{
 		db:     db,
 		trieDB: trieDB,
 		sdb:    sdb,
-		snaps:  snaps,
+		snaps:  activeSnaps,
 		config: cfg,
 	}
 
@@ -273,6 +280,7 @@ func TestExpireStateProcessor(t *testing.T) {
 	// Write CSV Header
 	writer.Write([]string{
 		"Epoch_ID", "Cumulative_Storage_Bytes", "Avg_Root_Calc_Time_ms", "Max_Root_Calc_Time_ms", "Avg_Pruning_Time_us", "Max_Pruning_Time_us",
+		"Hit_Count", "Miss_NonExistent_Count", "Miss_Existent_Count", "Cycle_FP_Count", "Max_FP_In_Single_Block",
 	})
 
 	for _, file := range selectedFiles {
@@ -362,6 +370,15 @@ func TestExpireStateProcessor(t *testing.T) {
 			}
 			lastStateRoot = h
 
+			// 统计单区块假阳性最大次数
+			fpInBlock := atomic.SwapInt64(&common.BinaryTrieFPInBlock, 0)
+			for {
+				maxFP := atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock)
+				if fpInBlock <= maxFP || atomic.CompareAndSwapInt64(&common.BinaryMaxFPInSingleBlock, maxFP, fpInBlock) {
+					break
+				}
+			}
+
 			// Optional treeDB commit
 			if b%1000 == 0 {
 				host.trieDB.Commit(h, false)
@@ -389,6 +406,11 @@ func TestExpireStateProcessor(t *testing.T) {
 				}
 				fmt.Printf("  平均裁剪耗时: %.2f us\n", avgPruneTime)
 				fmt.Printf("  最大裁剪耗时: %v\n", maxPruneTime)
+				fmt.Printf("  命中热状态次数: %d\n", atomic.LoadInt64(&common.BinaryHitCount))
+				fmt.Printf("  未命中且数据不存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissNonExistentCount))
+				fmt.Printf("  未命中但数据存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissExistentCount))
+				fmt.Printf("  假阳性触发次数: %d\n", atomic.LoadInt64(&common.BinaryCycleFPCount))
+				fmt.Printf("  单区块假阳性最大次数: %d\n", atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock))
 
 				// 写入 CSV
 				record := []string{
@@ -398,6 +420,11 @@ func TestExpireStateProcessor(t *testing.T) {
 					strconv.FormatInt(maxRootTime.Milliseconds(), 10),
 					fmt.Sprintf("%.2f", avgPruneTime),
 					strconv.FormatInt(maxPruneTime.Microseconds(), 10),
+					strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
+					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
+					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
+					strconv.FormatInt(atomic.LoadInt64(&common.BinaryCycleFPCount), 10),
+					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock), 10),
 				}
 				writer.Write(record)
 				writer.Flush()
@@ -409,6 +436,12 @@ func TestExpireStateProcessor(t *testing.T) {
 				totalPruneTime = 0
 				maxPruneTime = 0
 				pruneCount = 0
+
+				atomic.StoreInt64(&common.BinaryHitCount, 0)
+				atomic.StoreInt64(&common.BinaryMissNonExistentCount, 0)
+				atomic.StoreInt64(&common.BinaryMissExistentCount, 0)
+				atomic.StoreInt64(&common.BinaryCycleFPCount, 0)
+				atomic.StoreInt64(&common.BinaryMaxFPInSingleBlock, 0)
 
 				intervalStartBlock = b + 1
 			}
@@ -439,6 +472,11 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(maxRootTime.Milliseconds(), 10),
 			fmt.Sprintf("%.2f", avgPruneTime),
 			strconv.FormatInt(maxPruneTime.Microseconds(), 10),
+			strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
+			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
+			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
+			strconv.FormatInt(atomic.LoadInt64(&common.BinaryCycleFPCount), 10),
+			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock), 10),
 		}
 		writer.Write(record)
 		writer.Flush()

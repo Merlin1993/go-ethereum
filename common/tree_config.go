@@ -28,4 +28,12 @@ var (
 
 	TotalReads   int64
 	TotalUpdates int64
+
+	// Binary Trie statistics
+	BinaryHitCount             int64
+	BinaryMissNonExistentCount int64
+	BinaryMissExistentCount    int64
+	BinaryCycleFPCount         int64
+	BinaryMaxFPInSingleBlock   int64
+	BinaryTrieFPInBlock        int64
 )

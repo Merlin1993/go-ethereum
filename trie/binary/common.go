@@ -85,14 +85,7 @@ type NodePool struct {
 }
 
 func NewNodePool() *NodePool {
-	return &NodePool{
-		internalPool: sync.Pool{
-			New: func() interface{} { return &InternalNode{} },
-		},
-		leafPool: sync.Pool{
-			New: func() interface{} { return &LeafNode{} },
-		},
-	}
+	return &NodePool{}
 }
 
 func (p *NodePool) GetInternal() *InternalNode {
