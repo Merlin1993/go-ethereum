@@ -687,3 +687,8 @@ func (t *Trie) Reset() {
 	t.tracer.reset()
 	t.committed = false
 }
+
+// PruneNextShard is a no-op for MPT.
+func (t *Trie) PruneNextShard() error {
+	return nil
+}

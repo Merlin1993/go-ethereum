@@ -60,6 +60,8 @@ type Database interface {
 
 	// Snapshot returns the underlying state snapshot.
 	Snapshot() *snapshot.Tree
+
+	SetBlockNum(num uint64)
 }
 
 // Trie is a Ethereum Merkle Patricia trie.

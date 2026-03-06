@@ -828,6 +828,24 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 	}
 }
 
+// Hash computes the root hash of the shard without clearing dirty flags or updating internal state.
+func (s *Shard) Hash() ([]byte, error) {
+	if s.root == nil {
+		return nil, nil
+	}
+	count := 0
+	return s.commit(s.root, &dummyBatcher{}, &count, false)
+}
+
+// dummyBatcher is a no-op batcher for hashing only.
+type dummyBatcher struct{}
+
+func (b *dummyBatcher) Put(key, value []byte) error { return nil }
+func (b *dummyBatcher) Delete(key []byte) error     { return nil }
+func (b *dummyBatcher) Write() error                { return nil }
+func (b *dummyBatcher) Reset()                      {}
+func (b *dummyBatcher) ValueSize() int              { return 0 }
+
 type ChildInfo struct {
 	node Node
 	hash []byte
@@ -836,18 +854,18 @@ type ChildInfo struct {
 
 // CommitToBatch 递归提交改动到提供的 Batcher 中，返回最新根哈希。
 // 注意：此方法不会调用 batch.Write()。
-func (s *Shard) CommitToBatch(batch Batcher) ([]byte, error) {
+func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	if s.root == nil {
 		return nil, nil
 	}
 	nodeCount := 0
-	rootHash, err := s.commit(s.root, batch, &nodeCount)
+	rootHash, err := s.commit(s.root, batch, &nodeCount, destructive)
 	if err != nil {
 		return nil, err
 	}
 
 	// Pruning
-	if s.pruning {
+	if s.pruning && destructive {
 		for h := range s.staleSet {
 			err := batch.Delete([]byte(h))
 			if err != nil {
@@ -864,7 +882,7 @@ func (s *Shard) Commit() ([]byte, error) {
 	batch := s.db.NewBatch()
 	defer batch.Reset()
 
-	rootHash, err := s.CommitToBatch(batch)
+	rootHash, err := s.CommitToBatch(batch, true)
 	if err != nil {
 		return nil, err
 	}
@@ -964,15 +982,17 @@ func (s *Shard) FlushArchives() error {
 	return nil
 }
 
-func (s *Shard) commit(node Node, batch Batcher, nodeCount *int) ([]byte, error) {
+func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive bool) ([]byte, error) {
+	if node == nil {
+		return nil, nil
+	}
+
+	if nodeCount != nil {
+		*nodeCount++
+	}
+
 	if !node.IsDirty() {
 		return node.Hash(), nil
-	}
-	if nodeCount != nil {
-		*nodeCount++
-	}
-	if nodeCount != nil {
-		*nodeCount++
 	}
 
 	switch n := node.(type) {
@@ -1000,20 +1020,24 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int) ([]byte, error)
 
 		// Commit children
 		if n.Left != nil {
-			h, err := s.commit(n.Left, batch, nodeCount)
+			h, err := s.commit(n.Left, batch, nodeCount, destructive)
 			if err != nil {
 				return nil, err
 			}
-			n.LeftHash = h
-			n.LeftEpoch = n.Left.Epoch()
+			if destructive {
+				n.LeftHash = h
+				n.LeftEpoch = n.Left.Epoch()
+			}
 		}
 		if n.Right != nil {
-			h, err := s.commit(n.Right, batch, nodeCount)
+			h, err := s.commit(n.Right, batch, nodeCount, destructive)
 			if err != nil {
 				return nil, err
 			}
-			n.RightHash = h
-			n.RightEpoch = n.Right.Epoch()
+			if destructive {
+				n.RightHash = h
+				n.RightEpoch = n.Right.Epoch()
+			}
 		}
 
 		// 序列化内部节点（包含 epoch 与子节点哈希）
@@ -1024,14 +1048,16 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int) ([]byte, error)
 
 		// Hash
 		h := s.hasher.Hash(data)
-		n.SetHash(h)
-		n.SetDirty(false)
-		n.SetOriginalHash(h) // It's now persisted (logically)
+		if destructive {
+			n.SetHash(h)
+			n.SetDirty(false)
+			n.SetOriginalHash(h) // It's now persisted (logically)
 
-		// Write to DB
-		err = batch.Put(h, data)
-		if err != nil {
-			return nil, err
+			// Write to DB
+			err = batch.Put(h, data)
+			if err != nil {
+				return nil, err
+			}
 		}
 		return h, nil
 
@@ -1047,14 +1073,16 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int) ([]byte, error)
 
 		// Hash
 		h := s.hasher.Hash(data)
-		n.SetHash(h)
-		n.SetDirty(false)
-		n.SetOriginalHash(h)
+		if destructive {
+			n.SetHash(h)
+			n.SetDirty(false)
+			n.SetOriginalHash(h)
 
-		// Write to DB
-		err = batch.Put(h, data)
-		if err != nil {
-			return nil, err
+			// Write to DB
+			err = batch.Put(h, data)
+			if err != nil {
+				return nil, err
+			}
 		}
 		return h, nil
 
@@ -1717,7 +1745,7 @@ func (t *Trie) Activate(key []byte, value []byte) error {
 
 // CommitToBatch 递归提交所有脏分片改动到提供的 Batcher 中，返回最新根哈希。
 // 注意：此方法不会调用 batch.Write()。
-func (t *Trie) CommitToBatch(batch Batcher) ([]byte, error) {
+func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	t.shardMu.Lock()
 	defer t.shardMu.Unlock()
 
@@ -1748,7 +1776,7 @@ func (t *Trie) CommitToBatch(batch Batcher) ([]byte, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			h, err := t.shards[idx].CommitToBatch(batch)
+			h, err := t.shards[idx].CommitToBatch(batch, destructive)
 			mu.Lock()
 			hashes[idx] = h
 			errs[idx] = err
@@ -1790,10 +1818,13 @@ func (t *Trie) CommitToBatch(batch Batcher) ([]byte, error) {
 		return nil, fmt.Errorf("top tree compute error: %w", err)
 	}
 
-	// Clear dirty shards after commit
-	t.dirtyShards = make(map[int]struct{})
-	t.dirtyList = make([]int, 0, 128)
-	t.rootDirty = false
+	// [OPTIMIZATION] Only clear dirty state if destructive (actual commit)
+	if destructive {
+		// Clear dirty shards after commit
+		t.dirtyShards = make(map[int]struct{})
+		t.dirtyList = make([]int, 0, 128)
+		t.rootDirty = false
+	}
 
 	// [PERSISTENCE] Store the top-level 16-ary root
 	// The internal TopNodes were persisted during topTree.Compute()
@@ -1805,7 +1836,7 @@ func (t *Trie) Commit() ([]byte, error) {
 	batch := t.db.NewBatch()
 	defer batch.Reset()
 
-	root, err := t.CommitToBatch(batch)
+	root, err := t.CommitToBatch(batch, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1814,6 +1845,61 @@ func (t *Trie) Commit() ([]byte, error) {
 		return nil, err
 	}
 	return root, nil
+}
+
+// Hash computes the root hash of the Trie without clearing dirty flags or updating internal state.
+func (t *Trie) Hash() ([]byte, error) {
+	t.shardMu.RLock()
+	if !t.rootDirty && t.cachedRoot != nil {
+		defer t.shardMu.RUnlock()
+		return t.cachedRoot, nil
+	}
+	t.shardMu.RUnlock()
+
+	t.shardMu.Lock()
+	defer t.shardMu.Unlock()
+
+	// Compute shard roots for dirty shards without updating them
+	hashes := make(map[int][]byte, len(t.dirtyList))
+	var wg sync.WaitGroup
+	nCPU := runtime.NumCPU()
+	sem := make(chan struct{}, nCPU)
+	var mu sync.Mutex
+
+	for _, id := range t.dirtyList {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			h, _ := t.shards[idx].Hash()
+			mu.Lock()
+			hashes[idx] = h
+			mu.Unlock()
+		}(id)
+	}
+	wg.Wait()
+
+	// Temp copy of shardRoots to avoid modifying original during Hash()
+	tempShardRoots := make(map[int][]byte, len(t.shardRoots))
+	for k, v := range t.shardRoots {
+		tempShardRoots[k] = v
+	}
+	for id, h := range hashes {
+		if len(h) == 0 {
+			delete(tempShardRoots, id)
+		} else {
+			tempShardRoots[id] = h
+		}
+	}
+
+	// Use TopTree to compute root (assumes Compute is non-destructive to TopTree internal state if we don't save it)
+	// Actually TopTree.Compute writes to t.topTree.db (the batch).
+	// For Hash(), we use a dummy batch.
+	dummy := &dummyBatcher{}
+	topTree := NewTopTree(t.hasher, dummy)
+	return topTree.Compute(tempShardRoots, t.dirtyList)
 }
 
 func (t *Trie) PruneNextShard() error {

@@ -1,11 +1,14 @@
 package tree
 
 import (
+	"encoding/binary"
 	"encoding/csv"
 	"flag"
 	"fmt"
+	"hash"
 	"math/big"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -19,6 +22,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
@@ -88,7 +92,7 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 	db := rawdb.NewDatabase(ldb)
 	hdb := hashdb.Defaults
 	pdb := pathdb.Defaults
-	if cfg.UseVerkle || cfg.UseBinaryTrie || !cfg.UseBinaryTrie && !cfg.UseVerkle {
+	if cfg.UseVerkle || !cfg.UseBinaryTrie && !cfg.UseVerkle {
 		hdb = nil
 	} else {
 		pdb = nil
@@ -482,4 +486,237 @@ func TestExpireStateProcessor(t *testing.T) {
 		writer.Flush()
 	}
 	t.Logf("最终状态根: %s", lastStateRoot.String())
+}
+
+// BlockSummary aggregates state changes for a block.
+type BlockSummary struct {
+	BlockNum   uint64
+	StateRoot  common.Hash
+	WriteCount int
+	WriteHash  common.Hash
+}
+
+type consistencyTracer struct {
+	prefix string
+	count  int
+	hasher hash.Hash
+}
+
+func newConsistencyTracer(prefix string) *consistencyTracer {
+	return &consistencyTracer{
+		prefix: prefix,
+		hasher: crypto.NewKeccakState(),
+	}
+}
+
+func (t *consistencyTracer) Reset() {
+	t.count = 0
+	t.hasher.Reset()
+}
+
+func (t *consistencyTracer) Hooks() *tracing.Hooks {
+	return &tracing.Hooks{
+		OnBalanceChange: func(addr common.Address, prev, new *big.Int, reason tracing.BalanceChangeReason) {
+			t.count++
+			t.hasher.Write(addr[:])
+			t.hasher.Write(common.LeftPadBytes(new.Bytes(), 32))
+			fmt.Printf("[%s] BalanceChange: addr=%s, prev=%s, new=%s, reason=%d\n", t.prefix, addr.Hex(), prev.String(), new.String(), reason)
+		},
+		OnNonceChangeV2: func(addr common.Address, prev, new uint64, reason tracing.NonceChangeReason) {
+			t.count++
+			t.hasher.Write(addr[:])
+			var b [8]byte
+			binary.BigEndian.PutUint64(b[:], new)
+			t.hasher.Write(b[:])
+			if common.DebugFlag {
+				fmt.Printf("[Tracer] NonceChange: addr=%s, new=%d, reason=%d\n", addr.Hex(), new, reason)
+			}
+		},
+		OnCodeChange: func(addr common.Address, prevCodeHash common.Hash, prevCode []byte, codeHash common.Hash, code []byte) {
+			t.count++
+			t.hasher.Write(addr[:])
+			t.hasher.Write(codeHash[:])
+			if common.DebugFlag {
+				fmt.Printf("[Tracer] CodeChange: addr=%s, new=%s\n", addr.Hex(), codeHash.Hex())
+			}
+		},
+		OnStorageChange: func(addr common.Address, slot common.Hash, prev, new common.Hash) {
+			t.count++
+			t.hasher.Write(addr[:])
+			t.hasher.Write(slot[:])
+			t.hasher.Write(new[:])
+			if common.DebugFlag {
+				fmt.Printf("[Tracer] StorageChange: addr=%s, slot=%s, new=%s\n", addr.Hex(), slot.Hex(), new.Hex())
+			}
+		},
+	}
+}
+
+func (t *consistencyTracer) Summary(blockNum uint64, stateRoot common.Hash) BlockSummary {
+	var h common.Hash
+	t.hasher.Sum(h[:0])
+	return BlockSummary{
+		BlockNum:   blockNum,
+		StateRoot:  stateRoot,
+		WriteCount: t.count,
+		WriteHash:  h,
+	}
+}
+
+func TestBinaryTrieConsistency(t *testing.T) {
+	if !flag.Parsed() {
+		flag.Parse()
+	}
+	common.DebugFlag = true
+
+	// 1. MPT Host setup
+	mptCfg := &ProcessorConfig{
+		DbDir:            filepath.Join(os.TempDir(), "mpt_consistency_db"),
+		DataDir:          *dataDir,
+		StartFileIdx:     *startIdx,
+		EndFileIdx:       *endIdx,
+		UseVerkle:        false,
+		UseBinaryTrie:    false,
+		UseMemory:        false,
+		BinaryArchiveDir: "",
+		StartNum:         46147,
+		PruneInterval:    0,
+	}
+	os.RemoveAll(mptCfg.DbDir)
+	defer os.RemoveAll(mptCfg.DbDir)
+	mptHost, err := NewProcessorHost(mptCfg)
+	if err != nil {
+		t.Fatalf("failed to create MPT host: %v", err)
+	}
+	defer mptHost.Close()
+
+	// 2. Binary Trie Host setup
+	binCfg := &ProcessorConfig{
+		DbDir:            filepath.Join(os.TempDir(), "bin_consistency_db"),
+		DataDir:          *dataDir,
+		StartFileIdx:     *startIdx,
+		EndFileIdx:       *endIdx,
+		UseVerkle:        false,
+		UseBinaryTrie:    true,
+		UseMemory:        false,
+		BinaryArchiveDir: filepath.Join(os.TempDir(), "bin_consistency_archive"),
+		StartNum:         46147,
+		PruneInterval:    0,
+	}
+	os.RemoveAll(binCfg.DbDir)
+	os.RemoveAll(binCfg.BinaryArchiveDir)
+	defer os.RemoveAll(binCfg.DbDir)
+	defer os.RemoveAll(binCfg.BinaryArchiveDir)
+	binHost, err := NewProcessorHost(binCfg)
+	if err != nil {
+		t.Fatalf("failed to create Binary host: %v", err)
+	}
+	defer binHost.Close()
+
+	files, err := compareFindTransactionFiles(binCfg.DataDir)
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no transaction files found")
+	}
+	selectedFiles := files[binCfg.StartFileIdx-1 : binCfg.EndFileIdx]
+
+	mptLastRoot := types.EmptyRootHash
+	binLastRoot := common.Hash{}
+
+	mptTracer := newConsistencyTracer("MPT")
+	binTracer := newConsistencyTracer("BIN")
+
+	for _, file := range selectedFiles {
+		msgsByBlock, err := LoadTransactionsFromCSV(file)
+		if err != nil {
+			t.Errorf("failed to load transactions from %s: %v", file, err)
+			continue
+		}
+
+		fileIdx := compareGetFileIndex(file)
+		compareLoadBlockTimestampsFromFile(binCfg.DataDir, fileIdx)
+
+		var minBlock, maxBlock uint64 = 1e18, 0
+		for b := range msgsByBlock {
+			if b < minBlock {
+				minBlock = b
+			}
+			if b > maxBlock {
+				maxBlock = b
+			}
+		}
+
+		for b := minBlock; b <= maxBlock; b++ {
+			msgs := msgsByBlock[b]
+			miner := compareBlockMiners[b]
+			reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18)))
+
+			// A. Process with MPT
+			mptTracer.Reset()
+			mptHost.sdb.SetBlockNum(b)
+			mptStateDB, _ := state.New(mptLastRoot, mptHost.sdb)
+			mptHooked := state.NewHookedState(mptStateDB, mptTracer.Hooks())
+
+			if miner != (common.Address{}) {
+				mptHooked.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+			}
+			blockCtx := vm.BlockContext{
+				CanTransfer: core.CanTransfer,
+				Transfer:    core.Transfer,
+				GetHash:     func(n uint64) common.Hash { return common.Hash{} },
+				Coinbase:    miner,
+				BlockNumber: new(big.Int).SetUint64(b),
+				Time:        b * 15,
+				Difficulty:  big.NewInt(1),
+				BaseFee:     big.NewInt(0),
+			}
+			mptEVM := vm.NewEVM(blockCtx, mptHooked, params.MainnetChainConfig, vm.Config{})
+			for _, msg := range msgs {
+				core.ApplyMessage(mptEVM, msg, new(core.GasPool).AddGas(msg.GasLimit))
+			}
+			mptHooked.Finalise(false)
+			mptRoot, _ := mptStateDB.Commit(b, false, false)
+			mptSummary := mptTracer.Summary(b, mptRoot)
+
+			// B. Process with Binary Trie
+			binTracer.Reset()
+			binHost.sdb.SetBlockNum(b)
+			binStateDB, _ := state.New(binLastRoot, binHost.sdb)
+			binHooked := state.NewHookedState(binStateDB, binTracer.Hooks())
+
+			if miner != (common.Address{}) {
+				binHooked.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+			}
+			binEVM := vm.NewEVM(blockCtx, binHooked, params.MainnetChainConfig, vm.Config{})
+			for _, msg := range msgs {
+				core.ApplyMessage(binEVM, msg, new(core.GasPool).AddGas(msg.GasLimit))
+			}
+
+			if binCfg.PruneInterval > 0 && b%uint64(binCfg.PruneInterval) == 0 {
+				binStateDB.PruneNextShard()
+			}
+
+			binHooked.Finalise(false)
+			binRoot, _ := binStateDB.Commit(b, false, false)
+			binSummary := binTracer.Summary(b, binRoot)
+
+			// C. Compare
+			if mptSummary.WriteCount != binSummary.WriteCount {
+				t.Fatalf("Block %d: WriteCount mismatch! MPT=%d, BIN=%d", b, mptSummary.WriteCount, binSummary.WriteCount)
+			}
+			if mptSummary.WriteHash != binSummary.WriteHash {
+				t.Fatalf("Block %d: WriteHash mismatch! MPT=%s, BIN=%s (WriteCount=%d)", b, mptSummary.WriteHash.Hex(), binSummary.WriteHash.Hex(), mptSummary.WriteCount)
+			}
+			// Note: Roots will be different because MPT and Binary Trie have different structures.
+			// But the state changes (captured by tracer) must be identical.
+
+			mptLastRoot = mptRoot
+			binLastRoot = binRoot
+
+			if b%1000 == 0 {
+				mptHost.trieDB.Commit(mptRoot, false)
+				binHost.trieDB.Commit(binRoot, false)
+				fmt.Printf("[Test] Consistency check passed up to block %d\n", b)
+			}
+		}
+	}
 }

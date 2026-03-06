@@ -62,7 +62,8 @@ var (
 
 // Config contains the settings for database.
 type Config struct {
-	CleanCacheSize int // Maximum memory allowance (in bytes) for caching clean nodes
+	CleanCacheSize int  // Maximum memory allowance (in bytes) for caching clean nodes
+	IsBinary       bool // Flag whether the db is holding a binary trie
 }
 
 // Defaults is the default setting for database if it's not specified.
@@ -95,6 +96,8 @@ type Database struct {
 	dirtiesSize  common.StorageSize // Storage size of the dirty node cache (exc. metadata)
 	childrenSize common.StorageSize // Storage size of the external children tracking
 
+	isBinary bool
+
 	lock sync.RWMutex
 }
 
@@ -116,11 +119,13 @@ var cachedNodeSize = int(reflect.TypeOf(cachedNode{}).Size())
 // forChildren invokes the callback for all the tracked children of this node,
 // both the implicit ones from inside the node as well as the explicit ones
 // from outside the node.
-func (n *cachedNode) forChildren(onChild func(hash common.Hash)) {
+func (n *cachedNode) forChildren(isBinary bool, onChild func(hash common.Hash)) {
 	for child := range n.external {
 		onChild(child)
 	}
-	trie.ForGatherChildren(n.node, onChild)
+	if !isBinary {
+		trie.ForGatherChildren(n.node, onChild)
+	}
 }
 
 // New initializes the hash-based node database.
@@ -133,9 +138,10 @@ func New(diskdb ethdb.Database, config *Config) *Database {
 		cleans = fastcache.New(config.CleanCacheSize)
 	}
 	return &Database{
-		diskdb:  diskdb,
-		cleans:  cleans,
-		dirties: make(map[common.Hash]*cachedNode),
+		diskdb:   diskdb,
+		cleans:   cleans,
+		dirties:  make(map[common.Hash]*cachedNode),
+		isBinary: config.IsBinary,
 	}
 }
 
@@ -154,7 +160,7 @@ func (db *Database) insert(hash common.Hash, node []byte) {
 		node:      node,
 		flushPrev: db.newest,
 	}
-	entry.forChildren(func(child common.Hash) {
+	entry.forChildren(db.isBinary, func(child common.Hash) {
 		if c := db.dirties[child]; c != nil {
 			c.parents++
 		}
@@ -307,7 +313,7 @@ func (db *Database) dereference(hash common.Hash) {
 			db.dirties[node.flushNext].flushPrev = node.flushPrev
 		}
 		// Dereference all children and delete the node
-		node.forChildren(func(child common.Hash) {
+		node.forChildren(db.isBinary, func(child common.Hash) {
 			db.dereference(child)
 		})
 		delete(db.dirties, hash)
@@ -456,7 +462,7 @@ func (db *Database) commit(hash common.Hash, batch ethdb.Batch, uncacher *cleane
 	var err error
 
 	// Dereference all children and delete the node
-	node.forChildren(func(child common.Hash) {
+	node.forChildren(db.isBinary, func(child common.Hash) {
 		if err == nil {
 			err = db.commit(child, batch, uncacher)
 		}
@@ -571,14 +577,16 @@ func (db *Database) Update(root common.Hash, parent common.Hash, block uint64, n
 	}
 	// Link up the account trie and storage trie if the node points
 	// to an account trie leaf.
-	if set, present := nodes.Sets[common.Hash{}]; present {
-		for _, n := range set.Leaves {
-			var account types.StateAccount
-			if err := rlp.DecodeBytes(n.Blob, &account); err != nil {
-				return err
-			}
-			if account.Root != types.EmptyRootHash {
-				db.reference(account.Root, n.Parent)
+	if !db.isBinary {
+		if set, present := nodes.Sets[common.Hash{}]; present {
+			for _, n := range set.Leaves {
+				var account types.StateAccount
+				if err := rlp.DecodeBytes(n.Blob, &account); err != nil {
+					return err
+				}
+				if account.Root != types.EmptyRootHash {
+					db.reference(account.Root, n.Parent)
+				}
 			}
 		}
 	}

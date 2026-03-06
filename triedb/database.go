@@ -140,6 +140,10 @@ func NewDatabase2(diskdb ethdb.Database, config *Config, bd backend) *Database {
 			db.backend = pathdb.New(diskdb, config.PathDB, config.IsVerkle)
 		}
 	} else {
+		if config.HashDB == nil {
+			config.HashDB = &hashdb.Config{}
+		}
+		config.HashDB.IsBinary = config.IsBinary
 		db.backend = hashdb.New(diskdb, config.HashDB)
 	}
 
@@ -182,6 +186,10 @@ func NewFixedDatabase(diskdb ethdb.Database, config *Config) *Database {
 	if config.PathDB != nil {
 		db.backend = pathdb.New(diskdb, config.PathDB, config.IsVerkle)
 	} else {
+		if config.HashDB == nil {
+			config.HashDB = &hashdb.Config{}
+		}
+		config.HashDB.IsBinary = config.IsBinary
 		db.backend = hashdb.New(diskdb, config.HashDB)
 	}
 
@@ -224,6 +232,10 @@ func NewDatabase(diskdb ethdb.Database, config *Config) *Database {
 	if config.PathDB != nil {
 		db.backend = pathdb.New(diskdb, config.PathDB, config.IsVerkle)
 	} else {
+		if config.HashDB == nil {
+			config.HashDB = &hashdb.Config{}
+		}
+		config.HashDB.IsBinary = config.IsBinary
 		db.backend = hashdb.New(diskdb, config.HashDB)
 	}
 
