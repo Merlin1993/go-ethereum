@@ -109,6 +109,16 @@ type Database struct {
 	activeBT  interface{}          // Persistent binary trie instance
 }
 
+func (db *Database) UpdateBlockNum(num uint64) {
+	if db.config.IsBinary && db.activeBT != nil {
+		if bt, ok := db.activeBT.(interface {
+			SetGlobalEpoch(byte)
+		}); ok {
+			bt.SetGlobalEpoch(byte(num/1000) % 2) // Example logic: alternate epoch every 1000 blocks
+		}
+	}
+}
+
 func (db *Database) GetBackend() *pathdb.Database {
 	if t, v := db.backend.(*pathdb.Database); v {
 		return t
@@ -204,7 +214,7 @@ func NewFixedDatabase(diskdb ethdb.Database, config *Config) *Database {
 
 	// Initialize the cache trie if enabled 82125
 	if config.CacheTrie {
-		db.cacheTrie = cachetrie.NewFixedSizeCacheTrie(config.StartNum, 82125, 1000000000)
+		db.cacheTrie = cachetrie.NewFixedSizeCacheTrie(config.StartNum, 41000, 1000000000)
 	}
 
 	return db

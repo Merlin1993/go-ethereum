@@ -125,6 +125,8 @@ func (n *cachedNode) forChildren(isBinary bool, onChild func(hash common.Hash)) 
 	}
 	if !isBinary {
 		trie.ForGatherChildren(n.node, onChild)
+	} else {
+		trie.ForGatherBinaryChildren(n.node, onChild)
 	}
 }
 
@@ -148,7 +150,7 @@ func New(diskdb ethdb.Database, config *Config) *Database {
 // insert inserts a trie node into the memory database. All nodes inserted by
 // this function will be reference tracked. This function assumes the lock is
 // already held.
-func (db *Database) insert(hash common.Hash, node []byte) {
+func (db *Database) insert(hash common.Hash, node []byte, link bool) {
 	// If the node's already cached, skip
 	if _, ok := db.dirties[hash]; ok {
 		return
@@ -160,11 +162,13 @@ func (db *Database) insert(hash common.Hash, node []byte) {
 		node:      node,
 		flushPrev: db.newest,
 	}
-	entry.forChildren(db.isBinary, func(child common.Hash) {
-		if c := db.dirties[child]; c != nil {
-			c.parents++
-		}
-	})
+	if link {
+		entry.forChildren(db.isBinary, func(child common.Hash) {
+			if c := db.dirties[child]; c != nil {
+				c.parents++
+			}
+		})
+	}
 	db.dirties[hash] = entry
 
 	// Update the flush-list endpoints
@@ -572,7 +576,23 @@ func (db *Database) Update(root common.Hash, parent common.Hash, block uint64, n
 			if n.IsDeleted() {
 				return // ignore deletion
 			}
-			db.insert(n.Hash, n.Blob)
+			db.insert(n.Hash, n.Blob, false) // 1st pass: just insert
+		})
+	}
+	for _, owner := range order {
+		subset := nodes.Sets[owner]
+		subset.ForEachWithOrder(func(path string, n *trienode.Node) {
+			if n.IsDeleted() {
+				return // ignore deletion
+			}
+			// 2nd pass: link children
+			if entry := db.dirties[n.Hash]; entry != nil {
+				entry.forChildren(db.isBinary, func(child common.Hash) {
+					if c := db.dirties[child]; c != nil {
+						c.parents++
+					}
+				})
+			}
 		})
 	}
 	// Link up the account trie and storage trie if the node points

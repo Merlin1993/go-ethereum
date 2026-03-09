@@ -179,6 +179,7 @@ func (db *CachingDB) SetBlockNum(num uint64) {
 	if db.triedb.CacheTrie() != nil {
 		db.triedb.CacheTrie().SetBlockNum(num)
 	}
+	db.triedb.UpdateBlockNum(num)
 }
 
 // Reader returns a state reader associated with the specified state root.
@@ -256,7 +257,13 @@ func (db *CachingDB) OpenStorageTrie(stateRoot common.Hash, address common.Addre
 	// In the verkle case, there is only one tree. But the two-tree structure
 	// is hardcoded in the codebase. So we need to return the same trie in this
 	// case.
-	if db.triedb.IsVerkle() || db.triedb.IsBinary() {
+	if db.triedb.IsVerkle() {
+		return self, nil
+	}
+	if db.triedb.IsBinary() {
+		if bt, ok := self.(*trie.BinaryTrie); ok {
+			return trie.NewBinaryStorageTrie(address, bt), nil
+		}
 		return self, nil
 	}
 

@@ -6,7 +6,7 @@ var (
 	VerkleLayerCount = 1
 	DebugFlag        = false
 	Parallelism      = 5
-	ReadSet          = false
+	ReadSet          = true
 
 	// CacheTrie statistics
 	CacheAccountHit           int64

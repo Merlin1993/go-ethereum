@@ -303,7 +303,7 @@ func NewFixedSizeCacheTrie(startNum, fixedCapacity uint64, maxSize int) *CacheTr
 		blockNum:        0,
 		parallelism:     common.Parallelism, // 默认不并行
 		parallelSizeThr: 5000,               // 默认节点大小阈值
-		readSet:         common.ReadSet,     // 默认不更新read set
+		readSet:         false,              //common.ReadSet,     // 默认不更新read set
 	}
 	trie.codes = make(map[common.Hash][]byte)
 	trie.hrw = NewFixedSizeHeightRangeWindow(startNum, fixedCapacity, maxSize)

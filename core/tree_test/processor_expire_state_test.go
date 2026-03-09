@@ -497,9 +497,10 @@ type BlockSummary struct {
 }
 
 type consistencyTracer struct {
-	prefix string
-	count  int
-	hasher hash.Hash
+	prefix   string
+	count    int
+	hasher   hash.Hash
+	blockNum uint64
 }
 
 func newConsistencyTracer(prefix string) *consistencyTracer {
@@ -520,7 +521,9 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 			t.count++
 			t.hasher.Write(addr[:])
 			t.hasher.Write(common.LeftPadBytes(new.Bytes(), 32))
-			fmt.Printf("[%s] BalanceChange: addr=%s, prev=%s, new=%s, reason=%d\n", t.prefix, addr.Hex(), prev.String(), new.String(), reason)
+			if t.blockNum >= 54340 && t.blockNum <= 54345 {
+				fmt.Printf("[%s] Block %d BalanceChange: addr=%s, reason=%d\n", t.prefix, t.blockNum, addr.Hex(), reason)
+			}
 		},
 		OnNonceChangeV2: func(addr common.Address, prev, new uint64, reason tracing.NonceChangeReason) {
 			t.count++
@@ -545,8 +548,10 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 			t.hasher.Write(addr[:])
 			t.hasher.Write(slot[:])
 			t.hasher.Write(new[:])
-			if common.DebugFlag {
-				fmt.Printf("[Tracer] StorageChange: addr=%s, slot=%s, new=%s\n", addr.Hex(), slot.Hex(), new.Hex())
+			targetAddr := common.HexToAddress("0x59622442B567187157b85d6928A6c56e1E0841CA")
+			targetSlot := common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000002")
+			if (addr == targetAddr && slot == targetSlot) || (t.blockNum >= 54340 && t.blockNum <= 54345) {
+				fmt.Printf("[%s] Block %d StorageChange: addr=%s, slot=%s, prev=%s, new=%s\n", t.prefix, t.blockNum, addr.Hex(), slot.Hex(), prev.Hex(), new.Hex())
 			}
 		},
 	}
@@ -567,7 +572,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 	if !flag.Parsed() {
 		flag.Parse()
 	}
-	common.DebugFlag = true
+	common.DebugFlag = false
 
 	// 1. MPT Host setup
 	mptCfg := &ProcessorConfig{
@@ -652,6 +657,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 
 			// A. Process with MPT
 			mptTracer.Reset()
+			mptTracer.blockNum = b
 			mptHost.sdb.SetBlockNum(b)
 			mptStateDB, _ := state.New(mptLastRoot, mptHost.sdb)
 			mptHooked := state.NewHookedState(mptStateDB, mptTracer.Hooks())
@@ -679,6 +685,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 
 			// B. Process with Binary Trie
 			binTracer.Reset()
+			binTracer.blockNum = b
 			binHost.sdb.SetBlockNum(b)
 			binStateDB, _ := state.New(binLastRoot, binHost.sdb)
 			binHooked := state.NewHookedState(binStateDB, binTracer.Hooks())
@@ -696,7 +703,10 @@ func TestBinaryTrieConsistency(t *testing.T) {
 			}
 
 			binHooked.Finalise(false)
-			binRoot, _ := binStateDB.Commit(b, false, false)
+			binRoot, err := binStateDB.Commit(b, false, false)
+			if err != nil {
+				t.Fatalf("Block %d: BIN Commit failed: %v", b, err)
+			}
 			binSummary := binTracer.Summary(b, binRoot)
 
 			// C. Compare
@@ -704,7 +714,16 @@ func TestBinaryTrieConsistency(t *testing.T) {
 				t.Fatalf("Block %d: WriteCount mismatch! MPT=%d, BIN=%d", b, mptSummary.WriteCount, binSummary.WriteCount)
 			}
 			if mptSummary.WriteHash != binSummary.WriteHash {
-				t.Fatalf("Block %d: WriteHash mismatch! MPT=%s, BIN=%s (WriteCount=%d)", b, mptSummary.WriteHash.Hex(), binSummary.WriteHash.Hex(), mptSummary.WriteCount)
+				t.Fatalf("Block %d: WriteHash mismatch! MPT=%s, BIN=%s (WriteCount=%d), binRoot=%s", b, mptSummary.WriteHash.Hex(), binSummary.WriteHash.Hex(), mptSummary.WriteCount, binRoot.Hex())
+			}
+
+			if b == 52313 {
+				targetAddr := common.HexToAddress("0x59622442B567187157b85d6928A6c56e1E0841CA")
+				targetSlot := common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000002")
+				binVal := binStateDB.GetState(targetAddr, targetSlot)
+				mptVal := mptStateDB.GetState(targetAddr, targetSlot)
+				fmt.Printf("DEBUG: Block 52313: BIN GetState(0x5962..CA, slot02) = %s\n", binVal.Hex())
+				fmt.Printf("DEBUG: Block 52313: MPT GetState(0x5962..CA, slot02) = %s\n", mptVal.Hex())
 			}
 			// Note: Roots will be different because MPT and Binary Trie have different structures.
 			// But the state changes (captured by tracer) must be identical.

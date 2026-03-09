@@ -137,6 +137,9 @@ func (s *Shard) loadNode(hash []byte) (Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	if data == nil {
+		return nil, ErrNodeNotFound
+	}
 	node, err := DeserializeNode(data)
 	if err != nil {
 		return nil, err
@@ -1517,6 +1520,11 @@ func (t *Trie) IsDirty() bool {
 	return t.rootDirty
 }
 
+// Database returns the underlying database adapter.
+func (t *Trie) Database() KVStore {
+	return t.db
+}
+
 func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning bool) *Trie {
 	if config == nil {
 		config = DefaultConfig()
@@ -1547,6 +1555,10 @@ func (t *Trie) Load(root []byte) error {
 	if len(root) == 0 {
 		return nil
 	}
+	if bytes.Equal(t.cachedRoot, root) {
+		return nil
+	}
+	fmt.Printf("DEBUG Trie.Load: cachedRoot=%x, newRoot=%x → WIPING shards (count=%d)\n", t.cachedRoot, root, len(t.shards))
 
 	// Handle empty root (all zeros) for Binary Trie
 	allZero := true
@@ -1557,6 +1569,8 @@ func (t *Trie) Load(root []byte) error {
 		}
 	}
 	if allZero {
+		t.shardRoots = make(map[int][]byte)
+		t.shards = make(map[int]*Shard)
 		t.cachedRoot = append([]byte{}, root...)
 		t.rootDirty = false
 		return nil
@@ -1566,6 +1580,11 @@ func (t *Trie) Load(root []byte) error {
 	if err != nil {
 		return err
 	}
+
+	// Reset internal state before loading new root
+	t.shards = make(map[int]*Shard)
+	t.shardRoots = make(map[int][]byte)
+	t.topTree = NewTopTree(t.hasher, t.db.NewBatch())
 
 	if len(data) == (1<<t.config.ShardDepth)*32 {
 		for i := 0; i < (1 << t.config.ShardDepth); i++ {
@@ -1582,13 +1601,13 @@ func (t *Trie) Load(root []byte) error {
 			}
 		}
 	} else if len(data) == 513 && data[0] == 0xD0 {
-		if err := t.parseTopTree(data, 0, 0); err != nil {
+		rootNode, err := t.parseTopTree(data, 0, 0)
+		if err != nil {
 			return err
 		}
-		if t.topTree != nil && t.topTree.root != nil {
-			t.topTree.root.Hash = root
-			t.topTree.root.Dirty = false
-		}
+		t.topTree.root = rootNode
+		t.topTree.root.Hash = append([]byte(nil), root...)
+		t.topTree.root.Dirty = false
 	} else {
 		return errors.New("invalid shard roots data size")
 	}
@@ -1599,13 +1618,19 @@ func (t *Trie) Load(root []byte) error {
 }
 
 // parseTopTree recursively traverses the 16-ary TopTree down to level 3
-// and populates the t.shardRoots flat array.
-func (t *Trie) parseTopTree(data []byte, level int, prefix int) error {
+// and populates the t.shardRoots flat array, while reconstructing the TopNode hierarchy.
+func (t *Trie) parseTopTree(data []byte, level int, prefix int) (*TopNode, error) {
 	if len(data) != 513 {
-		return fmt.Errorf("invalid TopNode size at level %d: %d", level, len(data))
+		return nil, fmt.Errorf("invalid TopNode size at level %d: %d", level, len(data))
 	}
 	if data[0] != byte(0xD0+level) {
-		return fmt.Errorf("invalid TopNode header at level %d: %x", level, data[0])
+		return nil, fmt.Errorf("invalid TopNode header at level %d: %x", level, data[0])
+	}
+
+	node := &TopNode{
+		Level: level,
+		Hash:  t.hasher.Hash(data),
+		Dirty: false,
 	}
 
 	for i := 0; i < 16; i++ {
@@ -1619,25 +1644,28 @@ func (t *Trie) parseTopTree(data []byte, level int, prefix int) error {
 				break
 			}
 		}
-		if empty {
-			continue
-		}
 
 		if level == 3 {
 			shardID := (prefix << 4) | i
-			t.shardRoots[shardID] = append([]byte(nil), h...)
-		} else {
-			childData, err := t.db.Get(h)
-			if err != nil {
-				return err
+			if !empty {
+				t.shardRoots[shardID] = append([]byte(nil), h...)
 			}
-			childPrefix := (prefix << 4) | i
-			if err := t.parseTopTree(childData, level+1, childPrefix); err != nil {
-				return err
+		} else {
+			if !empty {
+				childData, err := t.db.Get(h)
+				if err != nil {
+					return nil, err
+				}
+				childPrefix := (prefix << 4) | i
+				child, err := t.parseTopTree(childData, level+1, childPrefix)
+				if err != nil {
+					return nil, err
+				}
+				node.Children[i] = child
 			}
 		}
 	}
-	return nil
+	return node, nil
 }
 
 func (t *Trie) SetGlobalEpoch(bit byte) {
@@ -1657,6 +1685,11 @@ func (t *Trie) SetGlobalEpoch(bit byte) {
 func (t *Trie) Put(key []byte, value []byte) error {
 	t.shardMu.Lock()
 	defer t.shardMu.Unlock()
+
+	// Debug for target composite key (addr 0x5962..CA + slot 0x02)
+	if len(key) >= 4 && key[0] == 0x59 && key[1] == 0x62 && key[2] == 0x24 && key[3] == 0x42 {
+		fmt.Printf("DEBUG Trie.Put: keyLen=%d, key=%x, val=%x, shardID=%d\n", len(key), key, value, t.getShardID(key))
+	}
 
 	// Store value in DB for retrieval during prune (Requirement)
 	valHash := t.hasher.Hash(value)
@@ -1693,7 +1726,11 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return s.Get(key)
+	hash, err := s.Get(key)
+	if err != nil {
+		return nil, err
+	}
+	return t.db.Get(hash)
 }
 
 func (t *Trie) BatchDelete(key []byte) error {
@@ -1813,7 +1850,7 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	}
 
 	var err error
-	t.cachedRoot, err = t.topTree.Compute(t.shardRoots, toCommit)
+	t.cachedRoot, err = t.topTree.Compute(t.shardRoots, toCommit, batch)
 	if err != nil {
 		return nil, fmt.Errorf("top tree compute error: %w", err)
 	}
@@ -1899,7 +1936,7 @@ func (t *Trie) Hash() ([]byte, error) {
 	// For Hash(), we use a dummy batch.
 	dummy := &dummyBatcher{}
 	topTree := NewTopTree(t.hasher, dummy)
-	return topTree.Compute(tempShardRoots, t.dirtyList)
+	return topTree.Compute(tempShardRoots, t.dirtyList, dummy)
 }
 
 func (t *Trie) PruneNextShard() error {
@@ -2301,4 +2338,93 @@ func (s *Shard) concatPath(p1 []byte, b1 int, bit byte, p2 []byte, b2 int) []byt
 	s.setBitInBytes(res, b1, bit)
 	s.copyBits(res, b1+1, p2, b2)
 	return res
+}
+
+// ForEach traverses all leaf nodes in the trie.
+func (t *Trie) ForEach(onLeaf func(key, value []byte) bool) error {
+	t.shardMu.RLock()
+	defer t.shardMu.RUnlock()
+
+	for id, s := range t.shards {
+		if s == nil {
+			continue
+		}
+		// 重建分片前缀
+		prefix := make([]byte, (t.config.ShardDepth+7)/8)
+		for i := 0; i < t.config.ShardDepth; i++ {
+			if (uint64(id)>>(t.config.ShardDepth-1-i))&1 == 1 {
+				s.setBitInBytes(prefix, i, 1)
+			}
+		}
+
+		if err := s.ForEach(prefix, t.config.ShardDepth, onLeaf); err != nil {
+			if err.Error() == "iteration stopped" {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// ForEach traverses all leaf nodes in the shard.
+func (s *Shard) ForEach(prefix []byte, prefixBits int, onLeaf func(key, value []byte) bool) error {
+	return s.forEach(s.root, prefix, prefixBits, onLeaf)
+}
+
+func (s *Shard) forEach(node Node, path []byte, bits int, onLeaf func(key, value []byte) bool) error {
+	if node == nil {
+		return nil
+	}
+	switch n := node.(type) {
+	case *LeafNode:
+		fullBits := bits + n.PathBits
+		fullKey := make([]byte, (fullBits+7)/8)
+		for i := 0; i < bits; i++ {
+			if s.getBit(path, i) == 1 {
+				s.setBitInBytes(fullKey, i, 1)
+			}
+		}
+		for i := 0; i < n.PathBits; i++ {
+			if s.getBit(n.Path, i) == 1 {
+				s.setBitInBytes(fullKey, bits+i, 1)
+			}
+		}
+		if !onLeaf(fullKey, n.ValueHash) {
+			return errors.New("iteration stopped")
+		}
+		return nil
+
+	case *InternalNode:
+		midBits := bits + n.PathBits
+		midPath := make([]byte, (midBits+1+7)/8)
+		for i := 0; i < bits; i++ {
+			if s.getBit(path, i) == 1 {
+				s.setBitInBytes(midPath, i, 1)
+			}
+		}
+		for i := 0; i < n.PathBits; i++ {
+			if s.getBit(n.Path, i) == 1 {
+				s.setBitInBytes(midPath, bits+i, 1)
+			}
+		}
+
+		// Left
+		leftPath := make([]byte, len(midPath))
+		copy(leftPath, midPath)
+		s.setBitInBytes(leftPath, midBits, 0)
+		if err := s.forEach(n.Left, leftPath, midBits+1, onLeaf); err != nil {
+			return err
+		}
+
+		// Right
+		rightPath := make([]byte, len(midPath))
+		copy(rightPath, midPath)
+		s.setBitInBytes(rightPath, midBits, 1)
+		if err := s.forEach(n.Right, rightPath, midBits+1, onLeaf); err != nil {
+			return err
+		}
+		return nil
+	}
+	return nil
 }

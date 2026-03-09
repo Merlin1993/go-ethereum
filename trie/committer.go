@@ -17,7 +17,10 @@
 package trie
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -179,6 +182,97 @@ func (c *committer) store(path []byte, n node) node {
 // ForGatherChildren decodes the provided node and traverses the children inside.
 func ForGatherChildren(node []byte, onChild func(common.Hash)) {
 	forGatherChildren(mustDecodeNodeUnsafe(nil, node), onChild)
+}
+
+// ForGatherBinaryChildren extracts child hashes from a binary trie node or top tree node.
+func ForGatherBinaryChildren(node []byte, onChild func(common.Hash)) {
+	if len(node) == 0 {
+		return
+	}
+	header := node[0]
+
+	// 1. TopTree Node (Header: 0xD0 - 0xD3)
+	if header >= 0xD0 && header <= 0xD3 {
+		if len(node) < 1+16*32 {
+			return
+		}
+		for i := 0; i < 16; i++ {
+			var h common.Hash
+			copy(h[:], node[1+i*32:1+i*32+32])
+			if h != (common.Hash{}) {
+				onChild(h)
+			}
+		}
+		return
+	}
+
+	// 2. Binary Trie Node (Header: Bit7=0 Internal, Bit7=1 Leaf/Bucket)
+	if (header & 0x80) == 0 { // InternalNode
+		reader := bytes.NewReader(node[1:])
+		pathBits, err := binary.ReadUvarint(reader)
+		if err != nil {
+			return
+		}
+		pathLen := (int(pathBits) + 7) / 8
+		if _, err := reader.Seek(int64(pathLen), io.SeekCurrent); err != nil {
+			return
+		}
+
+		// LeftHash
+		leftLen, err := reader.ReadByte()
+		if err != nil {
+			return
+		}
+		if leftLen == 32 {
+			h := make([]byte, 32)
+			reader.Read(h)
+			onChild(common.BytesToHash(h))
+		} else if leftLen > 0 {
+			inlined := make([]byte, leftLen)
+			reader.Read(inlined)
+			ForGatherBinaryChildren(inlined, onChild)
+		}
+		reader.ReadByte() // LeftEpoch
+
+		// RightHash
+		rightLen, err := reader.ReadByte()
+		if err != nil {
+			return
+		}
+		if rightLen == 32 {
+			h := make([]byte, 32)
+			reader.Read(h)
+			onChild(common.BytesToHash(h))
+		} else if rightLen > 0 {
+			inlined := make([]byte, rightLen)
+			reader.Read(inlined)
+			ForGatherBinaryChildren(inlined, onChild)
+		}
+		reader.ReadByte() // RightEpoch
+
+		// Note: StubList embeds bucket data directly, so no separate hash references in hashdb.
+	} else if (header & 0xC0) == 0x80 { // LeafNode (Bit7=1, Bit6=0)
+		reader := bytes.NewReader(node[1:])
+		pathBits, err := binary.ReadUvarint(reader)
+		if err != nil {
+			return
+		}
+		pathLen := (int(pathBits) + 7) / 8
+		if _, err := reader.Seek(int64(pathLen), io.SeekCurrent); err != nil {
+			return
+		}
+
+		// ValueHash
+		valHashLen, err := reader.ReadByte()
+		if err != nil {
+			return
+		}
+		if valHashLen == 32 {
+			h := make([]byte, 32)
+			reader.Read(h)
+			onChild(common.BytesToHash(h))
+		}
+	}
 }
 
 // forGatherChildren traverses the node hierarchy and invokes the callback
