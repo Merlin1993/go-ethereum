@@ -3,6 +3,8 @@ package binary
 import (
 	"bytes"
 	"encoding/binary"
+	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -297,4 +299,68 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 
 	bucketData, _ := s.serializeArchivedKV(items)
 	s.pendingArchives[string(h)] = bucketData
+}
+
+// verifyBucket 验证桶的 ECMH 承诺是否正确。返回布尔值及验证耗时（纳秒）。
+func (s *Shard) verifyBucket(bucket *ArchiveBucketNode) (bool, int64) {
+	start := time.Now()
+	bucket.cacheMu.RLock()
+	items := bucket.cachedItems
+	bucket.cacheMu.RUnlock()
+
+	if items == nil {
+		bucketData, err := s.getBucketData(bucket.Hash())
+		if err != nil {
+			return false, time.Since(start).Nanoseconds()
+		}
+		items, err = s.deserializeArchivedKV(bucketData)
+		if err != nil {
+			return false, time.Since(start).Nanoseconds()
+		}
+		// 不需要在这里写回缓存，因为 load 过程通常已经处理了缓存。
+	}
+
+	hashes := make([]common.Hash, 0, len(items))
+	for _, it := range items {
+		// K + Hash(V)
+		h := crypto.Keccak256Hash(append(it.Suffix, it.Value...))
+		hashes = append(hashes, h)
+	}
+
+	committer := ecmh.New()
+	ok := committer.Verify(hashes, bucket.Commitment)
+	dur := time.Since(start).Nanoseconds()
+
+	// Track Max time
+	for {
+		oldMax := atomic.LoadInt64(&common.BinaryProofVerifTimeMax)
+		if dur <= oldMax || atomic.CompareAndSwapInt64(&common.BinaryProofVerifTimeMax, oldMax, dur) {
+			break
+		}
+	}
+
+	// Track proof sizes (bucket size)
+	if ok {
+		var bucketSize int64
+		for _, it := range items {
+			bucketSize += int64(len(it.Suffix) + len(it.Value))
+		}
+		bucketSize += 32 // Commitment
+		bucketSize += int64(len(bucket.Filter))
+
+		atomic.AddInt64(&common.BinaryTotalProofSize, bucketSize)
+		atomic.AddInt64(&common.BinaryBlockProofSize, bucketSize)
+
+		common.BinaryStatsMu.Lock()
+		common.BinaryItemProofSizes = append(common.BinaryItemProofSizes, bucketSize)
+		if bucketSize > common.BinaryItemProofSizeMax {
+			common.BinaryItemProofSizeMax = bucketSize
+		}
+		if common.BinaryItemProofSizeMin == 0 || bucketSize < common.BinaryItemProofSizeMin {
+			common.BinaryItemProofSizeMin = bucketSize
+		}
+		common.BinaryStatsMu.Unlock()
+	}
+
+	return ok, dur
 }

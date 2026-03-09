@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -284,7 +285,11 @@ func TestExpireStateProcessor(t *testing.T) {
 	// Write CSV Header
 	writer.Write([]string{
 		"Epoch_ID", "Cumulative_Storage_Bytes", "Avg_Root_Calc_Time_ms", "Max_Root_Calc_Time_ms", "Avg_Pruning_Time_us", "Max_Pruning_Time_us",
-		"Hit_Count", "Miss_NonExistent_Count", "Miss_Existent_Count", "Cycle_FP_Count", "Max_FP_In_Single_Block",
+		"Hit_Count", "Miss_NonExistent_Count", "Miss_Existent_Count",
+		"Avg_Proof_Gen_Time_ms", "Max_Proof_Gen_Time_ms", "Avg_Proof_Verify_Time_ms", "Max_Proof_Verify_Time_ms",
+		"Avg_Proof_Size_Byte", "Max_Proof_Size_Byte",
+		"Item_Proof_Min", "Item_Proof_P25", "Item_Proof_Med", "Item_Proof_P75", "Item_Proof_Max",
+		"Cycle_FP_Count", "Max_FP_In_Single_Block",
 	})
 
 	for _, file := range selectedFiles {
@@ -374,11 +379,19 @@ func TestExpireStateProcessor(t *testing.T) {
 			}
 			lastStateRoot = h
 
-			// 统计单区块假阳性最大次数
+			// 统计单区块假阳性最大次数与证明最大大小
 			fpInBlock := atomic.SwapInt64(&common.BinaryTrieFPInBlock, 0)
 			for {
 				maxFP := atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock)
 				if fpInBlock <= maxFP || atomic.CompareAndSwapInt64(&common.BinaryMaxFPInSingleBlock, maxFP, fpInBlock) {
+					break
+				}
+			}
+
+			blockProofSize := atomic.SwapInt64(&common.BinaryBlockProofSize, 0)
+			for {
+				maxBlockSize := atomic.LoadInt64(&common.BinaryBlockProofSizeMax)
+				if blockProofSize <= maxBlockSize || atomic.CompareAndSwapInt64(&common.BinaryBlockProofSizeMax, maxBlockSize, blockProofSize) {
 					break
 				}
 			}
@@ -413,6 +426,48 @@ func TestExpireStateProcessor(t *testing.T) {
 				fmt.Printf("  命中热状态次数: %d\n", atomic.LoadInt64(&common.BinaryHitCount))
 				fmt.Printf("  未命中且数据不存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissNonExistentCount))
 				fmt.Printf("  未命中但数据存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissExistentCount))
+
+				totalReads := atomic.LoadInt64(&common.BinaryHitCount) + atomic.LoadInt64(&common.BinaryMissNonExistentCount) + atomic.LoadInt64(&common.BinaryMissExistentCount)
+				avgGenTime := 0.0
+				if totalReads > 0 {
+					avgGenTime = (float64(atomic.LoadInt64(&common.BinaryProofGenTime)) / float64(totalReads)) / 1_000_000.0 // us -> ms
+				}
+				maxGenTime := float64(atomic.LoadInt64(&common.BinaryProofGenTimeMax)) / 1_000_000.0
+
+				avgVerifTime := 0.0
+				if atomic.LoadInt64(&common.BinaryMissExistentCount) > 0 {
+					avgVerifTime = (float64(atomic.LoadInt64(&common.BinaryProofVerifTime)) / float64(atomic.LoadInt64(&common.BinaryMissExistentCount))) / 1_000_000.0 // us -> ms
+				}
+				maxVerifTime := float64(atomic.LoadInt64(&common.BinaryProofVerifTimeMax)) / 1_000_000.0
+
+				fmt.Printf("  平均证明生成耗时: %.4f ms\n", avgGenTime)
+				fmt.Printf("  最大证明生成耗时: %.4f ms\n", maxGenTime)
+				fmt.Printf("  平均复活验证耗时: %.4f ms\n", avgVerifTime)
+				fmt.Printf("  最大复活验证耗时: %.4f ms\n", maxVerifTime)
+
+				// Proof size metrics
+				avgProofSizeBlock := float64(atomic.LoadInt64(&common.BinaryTotalProofSize)) / float64(intervalBlocks)
+				maxProofSizeBlock := atomic.LoadInt64(&common.BinaryBlockProofSizeMax)
+				fmt.Printf("  平均每区块证明大小: %.2f bytes\n", avgProofSizeBlock)
+				fmt.Printf("  单区块证明最大大小: %d bytes\n", maxProofSizeBlock)
+
+				// Five-number summary for item proof sizes
+				common.BinaryStatsMu.Lock()
+				sizes := make([]int64, len(common.BinaryItemProofSizes))
+				copy(sizes, common.BinaryItemProofSizes)
+				common.BinaryStatsMu.Unlock()
+
+				var minS, p25S, medS, p75S, maxS int64
+				if len(sizes) > 0 {
+					sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
+					minS = sizes[0]
+					maxS = sizes[len(sizes)-1]
+					medS = sizes[len(sizes)/2]
+					p25S = sizes[len(sizes)/4]
+					p75S = sizes[3*len(sizes)/4]
+				}
+				fmt.Printf("  Item_Proof_Size 五数概括: Min=%d, P25=%d, Median=%d, P75=%d, Max=%d\n", minS, p25S, medS, p75S, maxS)
+
 				fmt.Printf("  假阳性触发次数: %d\n", atomic.LoadInt64(&common.BinaryCycleFPCount))
 				fmt.Printf("  单区块假阳性最大次数: %d\n", atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock))
 
@@ -427,6 +482,17 @@ func TestExpireStateProcessor(t *testing.T) {
 					strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
 					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
 					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
+					fmt.Sprintf("%.4f", avgGenTime),
+					fmt.Sprintf("%.4f", maxGenTime),
+					fmt.Sprintf("%.4f", avgVerifTime),
+					fmt.Sprintf("%.4f", maxVerifTime),
+					fmt.Sprintf("%.2f", avgProofSizeBlock),
+					strconv.FormatInt(maxProofSizeBlock, 10),
+					strconv.FormatInt(minS, 10),
+					strconv.FormatInt(p25S, 10),
+					strconv.FormatInt(medS, 10),
+					strconv.FormatInt(p75S, 10),
+					strconv.FormatInt(maxS, 10),
 					strconv.FormatInt(atomic.LoadInt64(&common.BinaryCycleFPCount), 10),
 					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock), 10),
 				}
@@ -446,6 +512,17 @@ func TestExpireStateProcessor(t *testing.T) {
 				atomic.StoreInt64(&common.BinaryMissExistentCount, 0)
 				atomic.StoreInt64(&common.BinaryCycleFPCount, 0)
 				atomic.StoreInt64(&common.BinaryMaxFPInSingleBlock, 0)
+				atomic.StoreInt64(&common.BinaryProofGenTime, 0)
+				atomic.StoreInt64(&common.BinaryProofGenTimeMax, 0)
+				atomic.StoreInt64(&common.BinaryProofVerifTime, 0)
+				atomic.StoreInt64(&common.BinaryProofVerifTimeMax, 0)
+				atomic.StoreInt64(&common.BinaryTotalProofSize, 0)
+				atomic.StoreInt64(&common.BinaryBlockProofSizeMax, 0)
+				common.BinaryStatsMu.Lock()
+				common.BinaryItemProofSizes = nil
+				common.BinaryItemProofSizeMin = 0
+				common.BinaryItemProofSizeMax = 0
+				common.BinaryStatsMu.Unlock()
 
 				intervalStartBlock = b + 1
 			}
@@ -468,6 +545,50 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  平均裁剪耗时: %.2f us\n", avgPruneTime)
 		fmt.Printf("  最大裁剪耗时: %v\n", maxPruneTime)
 
+		totalReads := atomic.LoadInt64(&common.BinaryHitCount) + atomic.LoadInt64(&common.BinaryMissNonExistentCount) + atomic.LoadInt64(&common.BinaryMissExistentCount)
+		avgGenTime := 0.0
+		if totalReads > 0 {
+			avgGenTime = (float64(atomic.LoadInt64(&common.BinaryProofGenTime)) / float64(totalReads)) / 1_000_000.0 // us -> ms
+		}
+		maxGenTime := float64(atomic.LoadInt64(&common.BinaryProofGenTimeMax)) / 1_000_000.0
+
+		avgVerifTime := 0.0
+		if atomic.LoadInt64(&common.BinaryMissExistentCount) > 0 {
+			avgVerifTime = (float64(atomic.LoadInt64(&common.BinaryProofVerifTime)) / float64(atomic.LoadInt64(&common.BinaryMissExistentCount))) / 1_000_000.0 // us -> ms
+		}
+		maxVerifTime := float64(atomic.LoadInt64(&common.BinaryProofVerifTimeMax)) / 1_000_000.0
+
+		fmt.Printf("  平均证明生成耗时: %.4f ms\n", avgGenTime)
+		fmt.Printf("  最大证明生成耗时: %.4f ms\n", maxGenTime)
+		fmt.Printf("  平均复活验证耗时: %.4f ms\n", avgVerifTime)
+		fmt.Printf("  最大复活验证耗时: %.4f ms\n", maxVerifTime)
+
+		// Proof size metrics
+		avgProofSizeBlock := float64(atomic.LoadInt64(&common.BinaryTotalProofSize)) / float64(intervalBlocks)
+		maxProofSizeBlock := atomic.LoadInt64(&common.BinaryBlockProofSizeMax)
+		fmt.Printf("  平均每区块证明大小: %.2f bytes\n", avgProofSizeBlock)
+		fmt.Printf("  单区块证明最大大小: %d bytes\n", maxProofSizeBlock)
+
+		// Five-number summary for item proof sizes
+		common.BinaryStatsMu.Lock()
+		sizes := make([]int64, len(common.BinaryItemProofSizes))
+		copy(sizes, common.BinaryItemProofSizes)
+		common.BinaryStatsMu.Unlock()
+
+		var minS, p25S, medS, p75S, maxS int64
+		if len(sizes) > 0 {
+			sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
+			minS = sizes[0]
+			maxS = sizes[len(sizes)-1]
+			medS = sizes[len(sizes)/2]
+			p25S = sizes[len(sizes)/4]
+			p75S = sizes[3*len(sizes)/4]
+		}
+		fmt.Printf("  Item_Proof_Size 五数概括: Min=%d, P25=%d, Median=%d, P75=%d, Max=%d\n", minS, p25S, medS, p75S, maxS)
+
+		fmt.Printf("  假阳性触发次数: %d\n", atomic.LoadInt64(&common.BinaryCycleFPCount))
+		fmt.Printf("  单区块假阳性最大次数: %d\n", atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock))
+
 		// 写入 CSV
 		record := []string{
 			strconv.FormatUint(epochID, 10),
@@ -479,6 +600,17 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
+			fmt.Sprintf("%.4f", avgGenTime),
+			fmt.Sprintf("%.4f", maxGenTime),
+			fmt.Sprintf("%.4f", avgVerifTime),
+			fmt.Sprintf("%.4f", maxVerifTime),
+			fmt.Sprintf("%.2f", avgProofSizeBlock),
+			strconv.FormatInt(maxProofSizeBlock, 10),
+			strconv.FormatInt(minS, 10),
+			strconv.FormatInt(p25S, 10),
+			strconv.FormatInt(medS, 10),
+			strconv.FormatInt(p75S, 10),
+			strconv.FormatInt(maxS, 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryCycleFPCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock), 10),
 		}

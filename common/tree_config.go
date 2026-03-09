@@ -1,6 +1,10 @@
 package common
 
+import "sync"
+
 var (
+	BinaryStatsMu sync.Mutex
+
 	UseVerkle        = false
 	UseCacheTrie     = true
 	VerkleLayerCount = 1
@@ -36,4 +40,17 @@ var (
 	BinaryCycleFPCount         int64
 	BinaryMaxFPInSingleBlock   int64
 	BinaryTrieFPInBlock        int64
+
+	// Binary Trie proof metrics
+	BinaryProofVerifTime    int64 // Nanoseconds spent on verifying ECMH buckets
+	BinaryProofVerifTimeMax int64 // Max nanoseconds spent on verifying a single bucket
+	BinaryProofGenTime      int64 // Nanoseconds spent on searching/generating proofs (including stub hits)
+	BinaryProofGenTimeMax   int64 // Max nanoseconds spent on searching/generating proofs
+
+	BinaryItemProofSizeMin  int64   // Min size of a single item proof
+	BinaryItemProofSizeMax  int64   // Max size of a single item proof
+	BinaryItemProofSizes    []int64 // All individual proof sizes for five-number summary (Needs Mu)
+	BinaryBlockProofSize    int64   // Total proof size in current block (reset per block)
+	BinaryBlockProofSizeMax int64   // Max total proof size in a single block
+	BinaryTotalProofSize    int64   // Total proof size across the epoch
 )

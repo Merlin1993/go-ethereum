@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -303,6 +304,7 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 		}
 
 		// [归档桶次之]：热路径未命中，按“后进先出”（栈）顺序查找侧挂的 StubList
+		recoveryStart := time.Now()
 		for i := len(n.StubList) - 1; i >= 0; i-- {
 			bucket := n.StubList[i]
 			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, depth)
@@ -364,26 +366,40 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 
 				innerDepth := s.config.ShardDepth
 				keyBits := len(key) * 8
-				var found bool
 				for _, item := range items {
 					if innerDepth+item.SuffixBits == keyBits {
 						if s.suffixMatches(item.Suffix, item.SuffixBits, key, innerDepth) {
+							// 命中归档项，记录耗时
+							dur := time.Since(recoveryStart).Nanoseconds()
+							atomic.AddInt64(&common.BinaryProofGenTime, dur)
+							for {
+								oldMax := atomic.LoadInt64(&common.BinaryProofGenTimeMax)
+								if dur <= oldMax || atomic.CompareAndSwapInt64(&common.BinaryProofGenTimeMax, oldMax, dur) {
+									break
+								}
+							}
+
 							s.statsMut.Lock()
 							s.stats.ExistProofCount++
 							s.stats.TotalProofSize += int64(len(item.Value) + len(item.Suffix) + 8)
 							s.statsMut.Unlock()
 
 							atomic.AddInt64(&common.BinaryMissExistentCount, 1)
-							found = true
+
+							// [NEW] 验证存储挂出的 StubList 数据是否可信 (ECMH 验证)
+							ok, vTime := s.verifyBucket(bucket)
+							atomic.AddInt64(&common.BinaryProofVerifTime, vTime)
+							if !ok {
+								return nil, errors.New("archive bucket commitment verification failed")
+							}
+
 							return item.Value, nil
 						}
 					}
 				}
-				if !found {
-					// 过滤器查询存在，但数据实际不存在 -> 假阳性
-					atomic.AddInt64(&common.BinaryCycleFPCount, 1)
-					atomic.AddInt64(&common.BinaryTrieFPInBlock, 1)
-				}
+				// 过滤器查询存在，但数据实际不存在 -> 假阳性
+				atomic.AddInt64(&common.BinaryCycleFPCount, 1)
+				atomic.AddInt64(&common.BinaryTrieFPInBlock, 1)
 			}
 		}
 
@@ -1097,6 +1113,9 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 func (s *Shard) setBitInBytes(data []byte, bitIdx int, val byte) {
 	byteIdx := bitIdx / 8
 	bitOffset := 7 - (bitIdx % 8)
+	if byteIdx >= len(data) {
+		return
+	}
 	if val == 1 {
 		data[byteIdx] |= (1 << bitOffset)
 	} else {
@@ -1138,6 +1157,11 @@ func (s *Shard) commonPrefixLen(a []byte, aBits int, b []byte, bStartBit int) in
 	// a 为路径后缀（按位），b 为完整 key（从 bStartBit 位开始对齐比较）
 	// [OPTIMIZED] 优先使用字节比较提速
 	matched := 0
+	bTotalBits := len(b) * 8
+	if bStartBit >= bTotalBits {
+		return 0
+	}
+
 	// 1. 尝试按字节对齐比较 (如果 bStartBit 是 8 的倍数且 aBits >= 8)
 	if bStartBit%8 == 0 && aBits >= 8 {
 		bIdx := bStartBit / 8
@@ -1151,7 +1175,7 @@ func (s *Shard) commonPrefixLen(a []byte, aBits int, b []byte, bStartBit int) in
 	}
 
 	// 2. 剩余位逐位比较
-	for matched < aBits {
+	for matched < aBits && (bStartBit+matched) < bTotalBits {
 		bitA := s.getBitFromBytes(a, matched)
 		bitB := s.getBit(b, bStartBit+matched)
 		if bitA != bitB {
@@ -1278,8 +1302,10 @@ func (s *Shard) appendBit(data []byte, bits int, bit byte) ([]byte, int) {
 	copy(res, data)
 	if bit == 1 {
 		byteIdx := bits / 8
-		bitOffset := 7 - (bits % 8)
-		res[byteIdx] |= (1 << bitOffset)
+		if byteIdx < len(res) {
+			bitOffset := 7 - (bits % 8)
+			res[byteIdx] |= (1 << bitOffset)
+		}
 	}
 	return res, newBits
 }
@@ -1287,9 +1313,12 @@ func (s *Shard) appendBit(data []byte, bits int, bit byte) ([]byte, int) {
 func (s *Shard) copyBits(dst []byte, dstStart int, src []byte, srcBits int) {
 	for i := 0; i < srcBits; i++ {
 		if s.getBitFromBytes(src, i) == 1 {
-			byteIdx := (dstStart + i) / 8
-			bitIdx := 7 - ((dstStart + i) % 8)
-			dst[byteIdx] |= (1 << bitIdx)
+			bitPos := dstStart + i
+			byteIdx := bitPos / 8
+			if byteIdx < len(dst) {
+				bitIdx := 7 - (bitPos % 8)
+				dst[byteIdx] |= (1 << bitIdx)
+			}
 		}
 	}
 }
@@ -1558,7 +1587,6 @@ func (t *Trie) Load(root []byte) error {
 	if bytes.Equal(t.cachedRoot, root) {
 		return nil
 	}
-	fmt.Printf("DEBUG Trie.Load: cachedRoot=%x, newRoot=%x → WIPING shards (count=%d)\n", t.cachedRoot, root, len(t.shards))
 
 	// Handle empty root (all zeros) for Binary Trie
 	allZero := true
@@ -1685,11 +1713,6 @@ func (t *Trie) SetGlobalEpoch(bit byte) {
 func (t *Trie) Put(key []byte, value []byte) error {
 	t.shardMu.Lock()
 	defer t.shardMu.Unlock()
-
-	// Debug for target composite key (addr 0x5962..CA + slot 0x02)
-	if len(key) >= 4 && key[0] == 0x59 && key[1] == 0x62 && key[2] == 0x24 && key[3] == 0x42 {
-		fmt.Printf("DEBUG Trie.Put: keyLen=%d, key=%x, val=%x, shardID=%d\n", len(key), key, value, t.getShardID(key))
-	}
 
 	// Store value in DB for retrieval during prune (Requirement)
 	valHash := t.hasher.Hash(value)
@@ -2333,6 +2356,9 @@ func (s *Shard) shrink(n *InternalNode) Node {
 
 func (s *Shard) concatPath(p1 []byte, b1 int, bit byte, p2 []byte, b2 int) []byte {
 	total := b1 + 1 + b2
+	if total < 0 {
+		total = 0 // Safety fallback
+	}
 	res := make([]byte, (total+7)/8)
 	s.copyBits(res, 0, p1, b1)
 	s.setBitInBytes(res, b1, bit)
@@ -2397,6 +2423,7 @@ func (s *Shard) forEach(node Node, path []byte, bits int, onLeaf func(key, value
 
 	case *InternalNode:
 		midBits := bits + n.PathBits
+		// Need enough bytes to hold midBits + 1 bits (includes the split bit)
 		midPath := make([]byte, (midBits+1+7)/8)
 		for i := 0; i < bits; i++ {
 			if s.getBit(path, i) == 1 {
@@ -2409,7 +2436,7 @@ func (s *Shard) forEach(node Node, path []byte, bits int, onLeaf func(key, value
 			}
 		}
 
-		// Left
+		// Left: set bit at midBits to 0
 		leftPath := make([]byte, len(midPath))
 		copy(leftPath, midPath)
 		s.setBitInBytes(leftPath, midBits, 0)
@@ -2417,7 +2444,7 @@ func (s *Shard) forEach(node Node, path []byte, bits int, onLeaf func(key, value
 			return err
 		}
 
-		// Right
+		// Right: set bit at midBits to 1
 		rightPath := make([]byte, len(midPath))
 		copy(rightPath, midPath)
 		s.setBitInBytes(rightPath, midBits, 1)
