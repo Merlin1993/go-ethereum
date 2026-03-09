@@ -400,6 +400,10 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 				// 过滤器查询存在，但数据实际不存在 -> 假阳性
 				atomic.AddInt64(&common.BinaryCycleFPCount, 1)
 				atomic.AddInt64(&common.BinaryTrieFPInBlock, 1)
+
+				common.BinaryStatsMu.Lock()
+				common.BinaryFPDistribution = append(common.BinaryFPDistribution, int64(bucket.Count))
+				common.BinaryStatsMu.Unlock()
 			}
 		}
 

@@ -40,12 +40,17 @@ var (
 	BinaryCycleFPCount         int64
 	BinaryMaxFPInSingleBlock   int64
 	BinaryTrieFPInBlock        int64
+	BinaryFPDistribution       []int64 // Record bucket size (0-100+) when FP occurs (Needs Mu)
+	BinaryTrieWriteCount       int64   // Total writes/deletes to trigger CSV flush
 
 	// Binary Trie proof metrics
 	BinaryProofVerifTime    int64 // Nanoseconds spent on verifying ECMH buckets
 	BinaryProofVerifTimeMax int64 // Max nanoseconds spent on verifying a single bucket
 	BinaryProofGenTime      int64 // Nanoseconds spent on searching/generating proofs (including stub hits)
 	BinaryProofGenTimeMax   int64 // Max nanoseconds spent on searching/generating proofs
+
+	BinaryPruneTime    int64 // Total nanoseconds spent on Sharded-Pruning
+	BinaryPruneTimeMax int64 // Max nanoseconds spent on a single Sharded-Pruning
 
 	BinaryItemProofSizeMin  int64   // Min size of a single item proof
 	BinaryItemProofSizeMax  int64   // Max size of a single item proof

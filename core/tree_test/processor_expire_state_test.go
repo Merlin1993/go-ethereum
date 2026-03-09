@@ -284,7 +284,8 @@ func TestExpireStateProcessor(t *testing.T) {
 
 	// Write CSV Header
 	writer.Write([]string{
-		"Epoch_ID", "Cumulative_Storage_Bytes", "Avg_Root_Calc_Time_ms", "Max_Root_Calc_Time_ms", "Avg_Pruning_Time_us", "Max_Pruning_Time_us",
+		"Epoch_ID", "Cumulative_Storage_Bytes", "Avg_Root_Calc_Time_ms", "Max_Root_Calc_Time_ms",
+		"Avg_Pruning_Time_us", "Max_Pruning_Time_us",
 		"Hit_Count", "Miss_NonExistent_Count", "Miss_Existent_Count",
 		"Avg_Proof_Gen_Time_ms", "Max_Proof_Gen_Time_ms", "Avg_Proof_Verify_Time_ms", "Max_Proof_Verify_Time_ms",
 		"Avg_Proof_Size_Byte", "Max_Proof_Size_Byte",
@@ -417,12 +418,12 @@ func TestExpireStateProcessor(t *testing.T) {
 				fmt.Printf("  平均根计算耗时: %.2f ms\n", float64(totalRootTime.Milliseconds())/float64(intervalBlocks))
 				fmt.Printf("  最大根计算耗时: %v\n", maxRootTime)
 
-				avgPruneTime := 0.0
+				avgBinaryPruneTime := 0.0
 				if pruneCount > 0 {
-					avgPruneTime = float64(totalPruneTime.Microseconds()) / float64(pruneCount)
+					avgBinaryPruneTime = float64(atomic.LoadInt64(&common.BinaryPruneTime)) / float64(pruneCount) / 1000.0 // ns -> us
 				}
-				fmt.Printf("  平均裁剪耗时: %.2f us\n", avgPruneTime)
-				fmt.Printf("  最大裁剪耗时: %v\n", maxPruneTime)
+				fmt.Printf("  平均二进制裁剪耗时: %.2f us\n", avgBinaryPruneTime)
+				fmt.Printf("  最大二进制裁剪耗时: %.2f us\n", float64(atomic.LoadInt64(&common.BinaryPruneTimeMax))/1000.0)
 				fmt.Printf("  命中热状态次数: %d\n", atomic.LoadInt64(&common.BinaryHitCount))
 				fmt.Printf("  未命中且数据不存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissNonExistentCount))
 				fmt.Printf("  未命中但数据存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissExistentCount))
@@ -471,14 +472,27 @@ func TestExpireStateProcessor(t *testing.T) {
 				fmt.Printf("  假阳性触发次数: %d\n", atomic.LoadInt64(&common.BinaryCycleFPCount))
 				fmt.Printf("  单区块假阳性最大次数: %d\n", atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock))
 
+				common.BinaryStatsMu.Lock()
+				fpDistCount := len(common.BinaryFPDistribution)
+				var fpAvgBucketSize float64
+				if fpDistCount > 0 {
+					var sum int64
+					for _, size := range common.BinaryFPDistribution {
+						sum += size
+					}
+					fpAvgBucketSize = float64(sum) / float64(fpDistCount)
+				}
+				common.BinaryStatsMu.Unlock()
+				fmt.Printf("  假阳性归档桶平均大小: %.2f (样本数: %d)\n", fpAvgBucketSize, fpDistCount)
+
 				// 写入 CSV
 				record := []string{
 					strconv.FormatUint(epochID, 10),
 					strconv.FormatInt(storageSize, 10),
 					fmt.Sprintf("%.2f", float64(totalRootTime.Milliseconds())/float64(intervalBlocks)),
 					strconv.FormatInt(maxRootTime.Milliseconds(), 10),
-					fmt.Sprintf("%.2f", avgPruneTime),
-					strconv.FormatInt(maxPruneTime.Microseconds(), 10),
+					fmt.Sprintf("%.2f", avgBinaryPruneTime),
+					strconv.FormatInt(atomic.LoadInt64(&common.BinaryPruneTimeMax)/1000, 10),
 					strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
 					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
 					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
@@ -516,8 +530,11 @@ func TestExpireStateProcessor(t *testing.T) {
 				atomic.StoreInt64(&common.BinaryProofGenTimeMax, 0)
 				atomic.StoreInt64(&common.BinaryProofVerifTime, 0)
 				atomic.StoreInt64(&common.BinaryProofVerifTimeMax, 0)
+				atomic.StoreInt64(&common.BinaryProofVerifTimeMax, 0)
 				atomic.StoreInt64(&common.BinaryTotalProofSize, 0)
 				atomic.StoreInt64(&common.BinaryBlockProofSizeMax, 0)
+				atomic.StoreInt64(&common.BinaryPruneTime, 0)
+				atomic.StoreInt64(&common.BinaryPruneTimeMax, 0)
 				common.BinaryStatsMu.Lock()
 				common.BinaryItemProofSizes = nil
 				common.BinaryItemProofSizeMin = 0
@@ -525,6 +542,10 @@ func TestExpireStateProcessor(t *testing.T) {
 				common.BinaryStatsMu.Unlock()
 
 				intervalStartBlock = b + 1
+				// 每 10w 区块刷新一次假阳性分布
+				if (b+1)%100000 == 0 {
+					flushGlobalFPDistribution()
+				}
 			}
 		}
 	}
@@ -538,12 +559,12 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  平均根计算耗时: %.2f ms\n", float64(totalRootTime.Milliseconds())/float64(intervalBlocks))
 		fmt.Printf("  最大根计算耗时: %v\n", maxRootTime)
 
-		avgPruneTime := 0.0
+		avgBinaryPruneTimeSummary := 0.0
 		if pruneCount > 0 {
-			avgPruneTime = float64(totalPruneTime.Microseconds()) / float64(pruneCount)
+			avgBinaryPruneTimeSummary = float64(atomic.LoadInt64(&common.BinaryPruneTime)) / float64(pruneCount) / 1000.0 // ns -> us
 		}
-		fmt.Printf("  平均裁剪耗时: %.2f us\n", avgPruneTime)
-		fmt.Printf("  最大裁剪耗时: %v\n", maxPruneTime)
+		fmt.Printf("  平均二进制裁剪耗时: %.2f us\n", avgBinaryPruneTimeSummary)
+		fmt.Printf("  最大二进制裁剪耗时: %.2f us\n", float64(atomic.LoadInt64(&common.BinaryPruneTimeMax))/1000.0)
 
 		totalReads := atomic.LoadInt64(&common.BinaryHitCount) + atomic.LoadInt64(&common.BinaryMissNonExistentCount) + atomic.LoadInt64(&common.BinaryMissExistentCount)
 		avgGenTime := 0.0
@@ -589,14 +610,27 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  假阳性触发次数: %d\n", atomic.LoadInt64(&common.BinaryCycleFPCount))
 		fmt.Printf("  单区块假阳性最大次数: %d\n", atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock))
 
+		common.BinaryStatsMu.Lock()
+		fpDistCount := len(common.BinaryFPDistribution)
+		var fpAvgBucketSize float64
+		if fpDistCount > 0 {
+			var sum int64
+			for _, size := range common.BinaryFPDistribution {
+				sum += size
+			}
+			fpAvgBucketSize = float64(sum) / float64(fpDistCount)
+		}
+		common.BinaryStatsMu.Unlock()
+		fmt.Printf("  假阳性归档桶平均大小: %.2f (样本数: %d)\n", fpAvgBucketSize, fpDistCount)
+
 		// 写入 CSV
 		record := []string{
 			strconv.FormatUint(epochID, 10),
 			strconv.FormatInt(storageSize, 10),
 			fmt.Sprintf("%.2f", float64(totalRootTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxRootTime.Milliseconds(), 10),
-			fmt.Sprintf("%.2f", avgPruneTime),
-			strconv.FormatInt(maxPruneTime.Microseconds(), 10),
+			fmt.Sprintf("%.2f", avgBinaryPruneTimeSummary),
+			strconv.FormatInt(atomic.LoadInt64(&common.BinaryPruneTimeMax)/1000, 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
@@ -618,6 +652,37 @@ func TestExpireStateProcessor(t *testing.T) {
 		writer.Flush()
 	}
 	t.Logf("最终状态根: %s", lastStateRoot.String())
+	flushGlobalFPDistribution() // 结束后强制刷新一次
+}
+
+func flushGlobalFPDistribution() {
+	common.BinaryStatsMu.Lock()
+	if len(common.BinaryFPDistribution) == 0 {
+		common.BinaryStatsMu.Unlock()
+		return
+	}
+	dist := make([]int64, len(common.BinaryFPDistribution))
+	copy(dist, common.BinaryFPDistribution)
+	common.BinaryFPDistribution = nil
+	common.BinaryStatsMu.Unlock()
+
+	f, err := os.OpenFile("global_fp_distribution.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	writer := csv.NewWriter(f)
+	defer writer.Flush()
+
+	// 检查文件是否为空，写入表头
+	if info, err := f.Stat(); err == nil && info.Size() == 0 {
+		writer.Write([]string{"Bucket_Size"})
+	}
+
+	for _, d := range dist {
+		writer.Write([]string{strconv.FormatInt(d, 10)})
+	}
 }
 
 // BlockSummary aggregates state changes for a block.
