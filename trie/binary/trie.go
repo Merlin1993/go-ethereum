@@ -1832,6 +1832,7 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 
 	// Collect shards to commit
 	toCommit := t.dirtyList
+	safeBatch := NewSafeBatcher(batch)
 
 	for _, id := range toCommit {
 		wg.Add(1)
@@ -1840,7 +1841,7 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			h, err := t.shards[idx].CommitToBatch(batch, destructive)
+			h, err := t.shards[idx].CommitToBatch(safeBatch, destructive)
 			mu.Lock()
 			hashes[idx] = h
 			errs[idx] = err
