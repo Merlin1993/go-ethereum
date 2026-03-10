@@ -1,4 +1,4 @@
-package tree_test
+package tree
 
 import (
 	"crypto/sha256"
@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/trie"
@@ -28,7 +30,7 @@ const (
 	method2BatchSize  = 5000  // Data volume written per batch
 	method2Iterations = 20000 // Number of iterations
 
-	mptDir = "F:\\ethdata\\stree4\\mpt"
+	mptDir = "F:\\trie_stress_data\\mpt"
 )
 
 // Database keys
@@ -66,7 +68,7 @@ func saveLastRoot(db ethdb.Database, root common.Hash) error {
 func loadLastRoot(db ethdb.Database) (common.Hash, error) {
 	data, err := db.Get(lastRootKey)
 	if err != nil {
-		return common.Hash{}, nil // Return empty hash if not exists
+		return common.Hash{}, nil // Return zero hash if not exists
 	}
 	return common.BytesToHash(data), nil
 }
@@ -101,6 +103,7 @@ func BenchmarkMPT_Update(b *testing.B) {
 // Method 1: Batch write and commit
 func TestMethod1(t *testing.T) {
 	// Create temporary directory
+	os.RemoveAll(mptDir)
 	os.MkdirAll(mptDir, os.ModePerm)
 
 	// Create database
@@ -114,12 +117,18 @@ func TestMethod1(t *testing.T) {
 
 	mdb := ethdb.WrapWithStats(ldb)
 	diskDB := rawdb.NewDatabase(mdb)
-	trieDB := triedb.NewDatabase(diskDB, nil)
+	// Use PathScheme for pruning support
+	cacheConfig := core.DefaultCacheConfigWithScheme(rawdb.PathScheme)
+	cacheConfig.SnapshotLimit = 0
+	trieDB := triedb.NewDatabase(diskDB, cacheConfig.TriedbConfig(false))
 
 	// Load the last root hash
 	lastRoot, err := loadLastRoot(diskDB)
 	if err != nil {
 		t.Fatalf("Failed to load last root hash: %v", err)
+	}
+	if lastRoot == (common.Hash{}) {
+		lastRoot = types.EmptyRootHash
 	}
 
 	// Create Trie
@@ -128,12 +137,13 @@ func TestMethod1(t *testing.T) {
 		t.Fatalf("Failed to create Trie: %v", err)
 	}
 
-	var finalRoot common.Hash
+	var finalRoot common.Hash = lastRoot
 	totalStart := time.Now()
+
+	collector := NewMetricsCollector(100000, mptDir)
 
 	// Batch write data
 	for i := 0; i < method1TotalData; i += method1BatchSize {
-		batchStart := time.Now()
 		batchSize := method1BatchSize
 		if i+method1BatchSize > method1TotalData {
 			batchSize = method1TotalData - i
@@ -144,24 +154,31 @@ func TestMethod1(t *testing.T) {
 			key, value := generateIndexData(i + j)
 			tr.Update(key, value)
 		}
+		collector.AddInjected(batchSize)
 
 		// Commit and get root hash
+		rootStart := time.Now()
 		root, nodes := tr.Commit(false)
+		collector.AddRootTime(time.Since(rootStart))
 		finalRoot = root
 
 		// Update database
-		if err := trieDB.Update(root, common.Hash{}, 0, trienode.NewWithNodeSet(nodes), nil); err != nil {
+		if err := trieDB.Update(root, lastRoot, uint64(i/method1BatchSize), trienode.NewWithNodeSet(nodes), triedb.NewStateSet()); err != nil {
 			t.Fatalf("Failed to update database: %v", err)
 		}
 		if err := trieDB.Commit(root, false); err != nil {
 			t.Fatalf("Failed to commit database: %v", err)
 		}
-		as := mdb.Stats()
-		mdb.ResetStats()
+
+		// Prune historical state to keep only current data
+		trieDB.Cap(0)
+
 		// Save the last root hash
 		if err := saveLastRoot(diskDB, root); err != nil {
 			t.Fatalf("Failed to save last root hash: %v", err)
 		}
+
+		lastRoot = root
 
 		// Create new Trie to continue writing
 		tr, err = trie.New(trie.TrieID(root), trieDB)
@@ -169,8 +186,10 @@ func TestMethod1(t *testing.T) {
 			t.Fatalf("Failed to create new Trie: %v", err)
 		}
 
-		batchTime := time.Since(batchStart)
-		t.Logf("Batch %d-%d completed, time taken: %v, root hash: %x ,%s", i, i+batchSize, batchTime, root, as.String())
+		if collector.ShouldReport() {
+			t.Logf("Period Summary (Total Items: %d), root: %x, metrics: %s", collector.totalInjected, root, collector.GetMetricsString())
+			collector.ResetWindow()
+		}
 	}
 
 	totalTime := time.Since(totalStart)
@@ -606,35 +625,5 @@ func generateAndMeasureProofs(t *testing.T, tr *trie.Trie, root common.Hash, key
 		avgTime:     avgTime,
 		bytesPerKey: bytesPerKey,
 		keyCount:    keyCount,
-	}
-}
-
-// formatSize formats numbers into readable text
-func formatSize(size int) string {
-	if size < 1000 {
-		return fmt.Sprintf("%d", size)
-	} else if size < 1000000 {
-		return fmt.Sprintf("%.1fk", float64(size)/1000)
-	} else {
-		return fmt.Sprintf("%.1fw", float64(size)/10000)
-	}
-}
-
-// bytesToReadable converts byte count to readable format
-func bytesToReadable(bytes uint64) string {
-	const (
-		KB = 1024
-		MB = 1024 * KB
-		GB = 1024 * MB
-	)
-
-	if bytes < KB {
-		return fmt.Sprintf("%d B", bytes)
-	} else if bytes < MB {
-		return fmt.Sprintf("%.2f KB", float64(bytes)/KB)
-	} else if bytes < GB {
-		return fmt.Sprintf("%.2f MB", float64(bytes)/MB)
-	} else {
-		return fmt.Sprintf("%.2f GB", float64(bytes)/GB)
 	}
 }

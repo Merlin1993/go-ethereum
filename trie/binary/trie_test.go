@@ -36,6 +36,7 @@ func (db *LevelDBAdapter) DeleteBucket(hash []byte) error {
 	return db.Delete(hash)
 }
 
+// 内存使用爆炸,查看下是不是哪里有问题.
 func TestTrieStress(t *testing.T) {
 	// 1. 测试参数
 	TargetItems := 500000000 // 总目标量 (5亿)

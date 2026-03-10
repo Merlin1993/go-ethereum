@@ -1,33 +1,33 @@
-package tree_test
+package tree
 
 import (
-	"encoding/csv"
 	"fmt"
-	"github.com/ethereum/go-ethereum/core"
-	"github.com/ethereum/go-ethereum/ethdb"
 	"os"
-	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/ethdb"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
-	"github.com/ethereum/go-ethereum/trie/utils"
+	trieutils "github.com/ethereum/go-ethereum/trie/utils"
 	"github.com/ethereum/go-ethereum/triedb"
 )
 
 // Test configuration
 const (
-	verkleDir = "F:\\ethdata\\stree4\\verkle"
+	verkleDir = "F:\\trie_stress_data\\verkle"
 )
 
 // Method 1: batch writes and commit
 func TestVerkleMethod1(t *testing.T) {
 	// Create temporary directory
+	os.RemoveAll(verkleDir)
 	os.MkdirAll(verkleDir, os.ModePerm)
 
 	// Create database
@@ -52,7 +52,7 @@ func TestVerkleMethod1(t *testing.T) {
 	t.Logf("read last root hash: %v", lastRoot.String())
 
 	// Create point cache
-	pointCache := utils.NewPointCache(1024)
+	pointCache := trieutils.NewPointCache(1024)
 
 	// Create Verkle trie
 	vt, err := trie.NewVerkleTrie(lastRoot, trieDB, pointCache)
@@ -63,12 +63,13 @@ func TestVerkleMethod1(t *testing.T) {
 	var finalRoot common.Hash = lastRoot
 	totalStart := time.Now()
 
+	collector := NewMetricsCollector(100000, verkleDir)
+
 	// Use a fixed address for testing
 	testAddr := common.Address{}
 
 	// Batch write data
 	for i := 0; i < method1TotalData; i += method1BatchSize {
-		batchStart := time.Now()
 		batchSize := method1BatchSize
 		if i+method1BatchSize > method1TotalData {
 			batchSize = method1TotalData - i
@@ -81,9 +82,12 @@ func TestVerkleMethod1(t *testing.T) {
 				t.Fatalf("failed to update storage: %v", err)
 			}
 		}
+		collector.AddInjected(batchSize)
 
 		// Commit and get root hash
+		rootStart := time.Now()
 		root, nodes := vt.Commit(false)
+		collector.AddRootTime(time.Since(rootStart))
 
 		// Update database
 		mergedNodeset := trienode.NewWithNodeSet(nodes)
@@ -96,6 +100,9 @@ func TestVerkleMethod1(t *testing.T) {
 			t.Fatalf("failed to commit database: %v", err)
 		}
 
+		// Prune historical state
+		trieDB.Cap(0)
+
 		finalRoot = root
 		// Save last root hash
 		if err := saveLastRoot(diskDB, root); err != nil {
@@ -107,10 +114,10 @@ func TestVerkleMethod1(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to create new Verkle trie: %v", err)
 		}
-		as := mdb.Stats()
-		mdb.ResetStats()
-		batchTime := time.Since(batchStart)
-		t.Logf("batch %d-%d done, elapsed: %v, root: %x,%s", i, i+batchSize, batchTime, root, as.String())
+		if collector.ShouldReport() {
+			t.Logf("Period Summary (Total Items: %d), metrics: %s", collector.totalInjected, collector.GetMetricsString())
+			collector.ResetWindow()
+		}
 	}
 
 	totalTime := time.Since(totalStart)
@@ -139,7 +146,7 @@ func TestVerkleMethod2(t *testing.T) {
 	}
 
 	// Create point cache
-	pointCache := utils.NewPointCache(1024)
+	pointCache := trieutils.NewPointCache(1024)
 
 	// Create Verkle trie
 	vt, err := trie.NewVerkleTrie(lastRoot, trieDB, pointCache)
@@ -277,37 +284,4 @@ func BenchmarkVT_Update(b *testing.B) {
 
 	b.Logf("inserted %d key-value pairs in: %v (avg: %v), final root: %x",
 		b.N, insertDuration, insertDuration/time.Duration(b.N), root)
-}
-
-// Write test results to CSV file
-func writeCSVFile(t *testing.T, fileName string, records [][]string) {
-	// Ensure results directory exists
-	resultsDir := "results"
-	if _, err := os.Stat(resultsDir); os.IsNotExist(err) {
-		if err := os.Mkdir(resultsDir, 0755); err != nil {
-			t.Logf("failed to create results directory: %v", err)
-			return
-		}
-	}
-
-	// Create CSV file
-	filePath := filepath.Join(resultsDir, fileName)
-	file, err := os.Create(filePath)
-	if err != nil {
-		t.Logf("failed to create CSV file: %v", err)
-		return
-	}
-	defer file.Close()
-
-	// Create CSV writer
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	// Write data
-	if err := writer.WriteAll(records); err != nil {
-		t.Logf("failed to write CSV data: %v", err)
-		return
-	}
-
-	t.Logf("test results written to CSV: %s", filePath)
 }

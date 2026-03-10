@@ -215,6 +215,8 @@ func LoadTransactionsFromCSV(file string) (map[uint64][]*core.Message, error) {
 	return msgsByBlock, nil
 }
 
+// 增加配置 -- binary-trie的分片数 binary-trie stub桶的大小上限.
+// mpt测试模式下,让mpt会剪枝,不保留历史数据.
 func TestExpireStateProcessor(t *testing.T) {
 	if !flag.Parsed() {
 		flag.Parse()
