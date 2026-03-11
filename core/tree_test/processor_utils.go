@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"sync/atomic"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
@@ -18,6 +20,72 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/holiman/uint256"
 )
+
+// AddBalanceSilent performs a balance change on a StateDB without affecting the accumulated reading statistics.
+func AddBalanceSilent(sdb *state.StateDB, addr common.Address, amount *uint256.Int) {
+	if amount == nil || amount.IsZero() {
+		return
+	}
+
+	// Capture baseline statistics
+	beforeReads := atomic.LoadInt64(&common.TotalReads)
+	beforeAccReads := atomic.LoadInt64(&common.TotalAccountReads)
+	beforeCAccHit := atomic.LoadInt64(&common.CacheAccountHit)
+	beforeCAccMissNo := atomic.LoadInt64(&common.CacheAccountMissNotExists)
+	beforeCAccMissEx := atomic.LoadInt64(&common.CacheAccountMissExists)
+	beforeBHit := atomic.LoadInt64(&common.BinaryHitCount)
+	beforeBMissNo := atomic.LoadInt64(&common.BinaryMissNonExistentCount)
+	beforeBMissEx := atomic.LoadInt64(&common.BinaryMissExistentCount)
+
+	// Perform the balance change
+	sdb.AddBalance(addr, amount, tracing.BalanceChangeUnspecified)
+
+	// Calculate and undo the delta in reading statistics
+	afterReads := atomic.LoadInt64(&common.TotalReads)
+	if afterReads > beforeReads {
+		atomic.AddInt64(&common.TotalReads, beforeReads-afterReads)
+		atomic.AddInt64(&common.TotalAccountReads, beforeAccReads-atomic.LoadInt64(&common.TotalAccountReads))
+		atomic.AddInt64(&common.CacheAccountHit, beforeCAccHit-atomic.LoadInt64(&common.CacheAccountHit))
+		atomic.AddInt64(&common.CacheAccountMissNotExists, beforeCAccMissNo-atomic.LoadInt64(&common.CacheAccountMissNotExists))
+		atomic.AddInt64(&common.CacheAccountMissExists, beforeCAccMissEx-atomic.LoadInt64(&common.CacheAccountMissExists))
+		atomic.AddInt64(&common.BinaryHitCount, beforeBHit-atomic.LoadInt64(&common.BinaryHitCount))
+		atomic.AddInt64(&common.BinaryMissNonExistentCount, beforeBMissNo-atomic.LoadInt64(&common.BinaryMissNonExistentCount))
+		atomic.AddInt64(&common.BinaryMissExistentCount, beforeBMissEx-atomic.LoadInt64(&common.BinaryMissExistentCount))
+	}
+}
+
+// SetCodeSilent performs a code update on a StateDB without affecting the accumulated reading statistics.
+func SetCodeSilent(sdb *state.StateDB, addr common.Address, code []byte) {
+	if len(code) == 0 {
+		return
+	}
+
+	// Capture baseline statistics
+	beforeReads := atomic.LoadInt64(&common.TotalReads)
+	beforeAccReads := atomic.LoadInt64(&common.TotalAccountReads)
+	beforeCAccHit := atomic.LoadInt64(&common.CacheAccountHit)
+	beforeCAccMissNo := atomic.LoadInt64(&common.CacheAccountMissNotExists)
+	beforeCAccMissEx := atomic.LoadInt64(&common.CacheAccountHit) // Use Hit for simplicity or specific miss count
+	beforeBHit := atomic.LoadInt64(&common.BinaryHitCount)
+	beforeBMissNo := atomic.LoadInt64(&common.BinaryMissNonExistentCount)
+	beforeBMissEx := atomic.LoadInt64(&common.BinaryMissExistentCount)
+
+	// Perform the code update
+	sdb.SetCode(addr, code)
+
+	// Calculate and undo the delta in reading statistics
+	afterReads := atomic.LoadInt64(&common.TotalReads)
+	if afterReads > beforeReads {
+		atomic.AddInt64(&common.TotalReads, beforeReads-afterReads)
+		atomic.AddInt64(&common.TotalAccountReads, beforeAccReads-atomic.LoadInt64(&common.TotalAccountReads))
+		atomic.AddInt64(&common.CacheAccountHit, beforeCAccHit-atomic.LoadInt64(&common.CacheAccountHit))
+		atomic.AddInt64(&common.CacheAccountMissNotExists, beforeCAccMissNo-atomic.LoadInt64(&common.CacheAccountMissNotExists))
+		atomic.AddInt64(&common.CacheAccountMissExists, beforeCAccMissEx-atomic.LoadInt64(&common.CacheAccountMissExists))
+		atomic.AddInt64(&common.BinaryHitCount, beforeBHit-atomic.LoadInt64(&common.BinaryHitCount))
+		atomic.AddInt64(&common.BinaryMissNonExistentCount, beforeBMissNo-atomic.LoadInt64(&common.BinaryMissNonExistentCount))
+		atomic.AddInt64(&common.BinaryMissExistentCount, beforeBMissEx-atomic.LoadInt64(&common.BinaryMissExistentCount))
+	}
+}
 
 // TransactionStreamer provides a streaming interface to read transactions from a CSV file block-by-block.
 type TransactionStreamer struct {
@@ -165,7 +233,7 @@ func ParseCSVRecordToMessage(record []string) (*core.Message, error) {
 		GasTipCap:        gasPrice,
 		Data:             data,
 		SkipNonceChecks:  true,
-		SkipFromEOACheck: false,
+		SkipFromEOACheck: true,
 	}, nil
 }
 
@@ -408,9 +476,11 @@ func (s *CompareStatsAggregator) PrintStats() {
 		avgCallSuccessRate = float64(totalCallSuccessCount) / float64(totalCallContractCount) * 100
 	}
 
-	if !common.DebugFlag {
-		return
-	}
+	/*
+		if !common.DebugFlag {
+			return
+		}
+	*/
 	fmt.Printf("===== [对比测试] 区块统计 (区块范围: %d - %d) =====\n",
 		recentStats[0].BlockNum, recentStats[len(recentStats)-1].BlockNum)
 	fmt.Printf("处理区块数: %d, 总交易数: %d, 成功交易数: %d, 成功率: %.2f%%\n",

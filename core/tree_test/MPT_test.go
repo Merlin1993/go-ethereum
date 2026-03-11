@@ -30,7 +30,7 @@ const (
 	method2BatchSize  = 5000  // Data volume written per batch
 	method2Iterations = 20000 // Number of iterations
 
-	mptDir = "/home/ASCT/mpt_stress" // "F:\\trie_stress_data\\mpt"
+	mptDir = "/home/ASCT/mpt_stress/cachedata" // "F:\\trie_stress_data\\mpt"
 )
 
 // Database keys

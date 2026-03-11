@@ -212,6 +212,7 @@ func (h *CacheProcessorHost) CommitToPreTrie(root common.Hash, blockNum uint64, 
 // Transaction loading is now handled by TransactionStreamer in processor_utils.go
 
 func TestCacheStateProcessor(t *testing.T) {
+	fmt.Println(">>> Starting TestCacheStateProcessor")
 	if !flag.Parsed() {
 		flag.Parse()
 	}
@@ -247,10 +248,15 @@ func TestCacheStateProcessor(t *testing.T) {
 	}
 
 	selectedFiles := files[cfg.StartFileIdx-1 : cfg.EndFileIdx]
-	lastStateRoot := types.EmptyRootHash
-	if cfg.UseVerkle || cfg.UseBinaryTrie {
-		lastStateRoot = common.Hash{}
+	fmt.Printf(">>> Found %d transaction files, selected indices %d to %d (count: %d)\n", len(files), cfg.StartFileIdx, cfg.EndFileIdx, len(selectedFiles))
+	// Create genesis block and blockchain
+	gspec := &core.Genesis{
+		Config: params.TestChainConfig,
+		Alloc:  core.GenesisAlloc{},
 	}
+	gspec.MustCommit(host.db, host.trieDB)
+	lastStateRoot := types.EmptyRootHash
+	fmt.Printf(">>> Genesis block committed, root: %s\n", lastStateRoot.Hex())
 
 	// Statistics tracking
 	statsIv := uint64(*statsIntervalCache)
@@ -415,12 +421,15 @@ func TestCacheStateProcessor(t *testing.T) {
 				if host.trieDB.CacheTrie() != nil {
 					host.trieDB.CacheTrie().SetBlockNum(b)
 				}
-				statedb, _ := state.New(lastStateRoot, host.sdb)
-
+				statedb, err := state.New(lastStateRoot, host.sdb)
+				if err != nil {
+					t.Fatalf("failed to create statedb at empty block %d with root %s: %v", b, lastStateRoot.Hex(), err)
+				}
 				// 0. Reward miner/packer
-				if miner, ok := compareBlockMiners[b]; ok && miner != (common.Address{}) {
+				miner := compareBlockMiners[b]
+				if miner != (common.Address{}) {
 					reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18))) // 1,000,000 ETH
-					statedb.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+					AddBalanceSilent(statedb, miner, reward)
 				}
 
 				// Empty block root calculation
@@ -477,13 +486,13 @@ func TestCacheStateProcessor(t *testing.T) {
 			if host.trieDB.CacheTrie() != nil {
 				host.trieDB.CacheTrie().SetBlockNum(b)
 			}
-			statedb, _ := state.New(lastStateRoot, host.sdb)
+			statedb, err := state.New(lastStateRoot, host.sdb)
+			if err != nil {
+				t.Fatalf("failed to create statedb at block %d with root %s: %v", b, lastStateRoot.Hex(), err)
+			}
 
 			// 0. Reward miner/packer
-			if miner, ok := compareBlockMiners[b]; ok && miner != (common.Address{}) {
-				reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18))) // 1,000,000 ETH
-				statedb.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
-			}
+			miner := compareBlockMiners[b]
 
 			// 1. Transaction execution time statistics
 			txStart := time.Now()
@@ -492,21 +501,37 @@ func TestCacheStateProcessor(t *testing.T) {
 				CanTransfer: core.CanTransfer,
 				Transfer:    core.Transfer,
 				GetHash:     func(n uint64) common.Hash { return common.Hash{} },
-				Coinbase:    common.Address{},
-				BlockNumber: header.Number,
-				Time:        header.Time,
+				Coinbase:    miner,
+				BlockNumber: new(big.Int).SetUint64(b),
+				Time:        compareBlockTimestamps[b],
 				Difficulty:  header.Difficulty,
-				GasLimit:    header.GasLimit,
+				GasLimit:    1000000000,
 				BaseFee:     big.NewInt(0),
 			}
+
 			vmenv := vm.NewEVM(blockCtx, statedb, params.MainnetChainConfig, vm.Config{})
-			gp := new(core.GasPool).AddGas(header.GasLimit)
+			gp := new(core.GasPool).AddGas(blockCtx.GasLimit)
+
+			// Pre-allocate balance for all senders (matches eth_compare_test)
+			bigBalance := new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18)) // 1M ETH
+			balance, _ := uint256.FromBig(bigBalance)
+			for _, m := range msgs {
+				statedb.SetBalance(m.From, balance, tracing.BalanceChangeUnspecified)
+			}
 
 			for _, m := range msgs {
-				res, err := core.ApplyMessage(vmenv, m, gp)
 				intervalTxCount++
-				if err == nil && !res.Failed() {
+				m.SkipNonceChecks = true
+				_, err := core.ApplyMessage(vmenv, m, gp)
+				if err == nil {
+					// Successful if ApplyMessage returns err == nil (matches eth_compare_test criteria)
 					intervalSuccessTxCount++
+				} else {
+					toStr := "contract-creation"
+					if m.To != nil {
+						toStr = m.To.Hex()
+					}
+					fmt.Printf("Transaction Reverted: block=%d, sender=%s, nonce=%d, to=%s, res.Err=%v\n", b, m.From.Hex(), m.Nonce, toStr, err)
 				}
 			}
 

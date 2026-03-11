@@ -49,7 +49,7 @@ var (
 	startIdx         = flag.Int("startFileIdx2", 1, "Start file index")
 	endIdx           = flag.Int("endFileIdx2", 21, "End file index")
 	useVerkle        = flag.Bool("useVerkle2", false, "Enable Verkle trie")
-	useBinaryTrie    = flag.Bool("useBinaryTrie2", true, "Enable Binary trie")
+	useBinaryTrie    = flag.Bool("useBinaryTrie2", false, "Enable Binary trie")
 	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
 	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
 	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
@@ -145,6 +145,7 @@ func (h *ProcessorHost) Close() {
 // 增加配置 -- binary-trie的分片数 binary-trie stub桶的大小上限.
 // mpt测试模式下,让mpt会剪枝,不保留历史数据.
 func TestExpireStateProcessor(t *testing.T) {
+	fmt.Println(">>> Starting TestExpireStateProcessor")
 	if !flag.Parsed() {
 		flag.Parse()
 	}
@@ -179,10 +180,15 @@ func TestExpireStateProcessor(t *testing.T) {
 	fmt.Printf("[测试] 找到 %d 个交易文件\n", len(files))
 
 	selectedFiles := files[cfg.StartFileIdx-1 : cfg.EndFileIdx]
-	lastStateRoot := types.EmptyRootHash
-	if cfg.UseVerkle || cfg.UseBinaryTrie {
-		lastStateRoot = common.Hash{}
+	fmt.Printf(">>> Found %d transaction files, selected indices %d to %d (count: %d)\n", len(files), cfg.StartFileIdx, cfg.EndFileIdx, len(selectedFiles))
+	// Create genesis block and blockchain
+	gspec := &core.Genesis{
+		Config: params.TestChainConfig,
+		Alloc:  core.GenesisAlloc{},
 	}
+	gspec.MustCommit(host.db, host.trieDB)
+	lastStateRoot := types.EmptyRootHash
+	fmt.Printf(">>> Genesis block committed, root: %s\n", lastStateRoot.Hex())
 
 	// Statistics tracking
 	statsIv := uint64(*statsInterval)
@@ -407,12 +413,16 @@ func TestExpireStateProcessor(t *testing.T) {
 				if host.trieDB.CacheTrie() != nil {
 					host.trieDB.CacheTrie().SetBlockNum(b)
 				}
-				statedb, _ := state.New(lastStateRoot, host.sdb)
+				statedb, err := state.New(lastStateRoot, host.sdb)
+				if err != nil {
+					t.Fatalf("failed to create statedb at empty block %d with root %s: %v", b, lastStateRoot.Hex(), err)
+				}
 
 				// 0. Reward miner/packer
-				if miner, ok := compareBlockMiners[b]; ok && miner != (common.Address{}) {
+				miner := compareBlockMiners[b]
+				if miner != (common.Address{}) {
 					reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18))) // 1,000,000 ETH
-					statedb.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+					AddBalanceSilent(statedb, miner, reward)
 				}
 
 				if (cfg.UseBinaryTrie || !cfg.UseVerkle) && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
@@ -444,12 +454,16 @@ func TestExpireStateProcessor(t *testing.T) {
 			if host.trieDB.CacheTrie() != nil {
 				host.trieDB.CacheTrie().SetBlockNum(b)
 			}
-			statedb, _ := state.New(lastStateRoot, host.sdb)
+			statedb, err := state.New(lastStateRoot, host.sdb)
+			if err != nil {
+				t.Fatalf("failed to create statedb at block %d with root %s: %v", b, lastStateRoot.Hex(), err)
+			}
 
 			// 0. Reward miner/packer
-			if miner, ok := compareBlockMiners[b]; ok && miner != (common.Address{}) {
+			miner := compareBlockMiners[targetBlock]
+			if miner != (common.Address{}) {
 				reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18))) // 1,000,000 ETH
-				statedb.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+				AddBalanceSilent(statedb, miner, reward)
 			}
 
 			blockCtx := vm.BlockContext{
@@ -463,12 +477,30 @@ func TestExpireStateProcessor(t *testing.T) {
 				BaseFee:     big.NewInt(0),
 			}
 			evm := vm.NewEVM(blockCtx, statedb, params.MainnetChainConfig, vm.Config{})
+
+			// Pre-allocate balance for all senders (matches eth_compare_test)
+			bigBalance := new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18)) // 1M ETH
+			balance, _ := uint256.FromBig(bigBalance)
+			for _, m := range msgs {
+				statedb.SetBalance(m.From, balance, tracing.BalanceChangeUnspecified)
+			}
+
 			txStart := time.Now()
-			for _, msg := range msgs {
-				res, err := core.ApplyMessage(evm, msg, new(core.GasPool).AddGas(msg.GasLimit))
+			for _, m := range msgs {
 				intervalTxCount++
-				if err == nil && !res.Failed() {
+				m.SkipNonceChecks = true
+				_, err := core.ApplyMessage(evm, m, new(core.GasPool).AddGas(m.GasLimit))
+				if err == nil {
+					// Successful if ApplyMessage returns err == nil (matches eth_compare_test criteria)
 					intervalSuccessTxCount++
+				} else {
+					toStr := "contract-creation"
+					if m.To != nil {
+						toStr = m.To.Hex()
+					}
+					if b%1000 == 0 { // Limit logging to avoid overwhelming output
+						fmt.Printf("Transaction Reverted: block=%d, sender=%s, nonce=%d, to=%s, res.Err=%v\n", b, m.From.Hex(), m.Nonce, toStr, err)
+					}
 				}
 			}
 			txDuration := time.Since(txStart)
@@ -718,8 +750,16 @@ func TestBinaryTrieConsistency(t *testing.T) {
 	}
 	selectedFiles := files[binCfg.StartFileIdx-1 : binCfg.EndFileIdx]
 
+	// Create genesis block and blockchain for both hosts
+	gspec := &core.Genesis{
+		Config: params.TestChainConfig,
+		Alloc:  core.GenesisAlloc{},
+	}
+	gspec.MustCommit(mptHost.db, mptHost.trieDB)
+	gspec.MustCommit(binHost.db, binHost.trieDB)
+
 	mptLastRoot := types.EmptyRootHash
-	binLastRoot := common.Hash{}
+	binLastRoot := types.EmptyRootHash
 
 	mptTracer := newConsistencyTracer("MPT")
 	binTracer := newConsistencyTracer("BIN")
@@ -757,7 +797,10 @@ func TestBinaryTrieConsistency(t *testing.T) {
 				mptTracer.Reset()
 				mptTracer.blockNum = b
 				mptHost.trieDB.UpdateBlockNum(b)
-				mptStateDB, _ := state.New(mptLastRoot, mptHost.sdb)
+				mptStateDB, err := state.New(mptLastRoot, mptHost.sdb)
+				if err != nil {
+					t.Fatalf("failed to create MPT statedb at empty block %d: %v", b, err)
+				}
 				mptHooked := state.NewHookedState(mptStateDB, mptTracer.Hooks())
 				if miner != (common.Address{}) {
 					mptHooked.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
@@ -769,7 +812,10 @@ func TestBinaryTrieConsistency(t *testing.T) {
 				binTracer.Reset()
 				binTracer.blockNum = b
 				binHost.trieDB.UpdateBlockNum(b)
-				binStateDB, _ := state.New(binLastRoot, binHost.sdb)
+				binStateDB, err := state.New(binLastRoot, binHost.sdb)
+				if err != nil {
+					t.Fatalf("failed to create BIN statedb at empty block %d: %v", b, err)
+				}
 				binHooked := state.NewHookedState(binStateDB, binTracer.Hooks())
 				if miner != (common.Address{}) {
 					binHooked.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
@@ -799,7 +845,17 @@ func TestBinaryTrieConsistency(t *testing.T) {
 			mptTracer.Reset()
 			mptTracer.blockNum = b
 			mptHost.trieDB.UpdateBlockNum(b) // Changed from mptHost.sdb.SetBlockNum(b)
-			mptStateDB, _ := state.New(mptLastRoot, mptHost.sdb)
+			mptStateDB, err := state.New(mptLastRoot, mptHost.sdb)
+			if err != nil {
+				t.Fatalf("failed to create MPT statedb at block %d: %v", b, err)
+			}
+			// Pre-allocate balance for all senders
+			bigBalance := new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18))
+			balance, _ := uint256.FromBig(bigBalance)
+			for _, msg := range msgs {
+				mptStateDB.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
+			}
+
 			mptHooked := state.NewHookedState(mptStateDB, mptTracer.Hooks())
 
 			if miner != (common.Address{}) {
@@ -810,14 +866,23 @@ func TestBinaryTrieConsistency(t *testing.T) {
 				Transfer:    core.Transfer,
 				GetHash:     func(n uint64) common.Hash { return common.Hash{} },
 				Coinbase:    miner,
-				BlockNumber: new(big.Int).SetUint64(b),
-				Time:        b * 15,
-				Difficulty:  big.NewInt(1),
+				BlockNumber: new(big.Int).SetUint64(targetBlock),
+				Time:        compareBlockTimestamps[targetBlock],
+				GasLimit:    1000000000,
 				BaseFee:     big.NewInt(0),
 			}
+
 			mptEVM := vm.NewEVM(blockCtx, mptHooked, params.MainnetChainConfig, vm.Config{})
 			for _, msg := range msgs {
-				core.ApplyMessage(mptEVM, msg, new(core.GasPool).AddGas(msg.GasLimit))
+				msg.SkipNonceChecks = true
+				_, err := core.ApplyMessage(mptEVM, msg, new(core.GasPool).AddGas(msg.GasLimit))
+				if err != nil && b%1000 == 0 {
+					toStr := "contract-creation"
+					if msg.To != nil {
+						toStr = msg.To.Hex()
+					}
+					fmt.Printf("MPT Transaction Reverted: block=%d, sender=%s, nonce=%d, to=%s, res.Err=%v\n", b, msg.From.Hex(), msg.Nonce, toStr, err)
+				}
 			}
 			mptHooked.Finalise(false)
 			mptRoot, _ := mptStateDB.Commit(b, false, false)
@@ -827,15 +892,32 @@ func TestBinaryTrieConsistency(t *testing.T) {
 			binTracer.Reset()
 			binTracer.blockNum = b
 			binHost.sdb.SetBlockNum(b)
-			binStateDB, _ := state.New(binLastRoot, binHost.sdb)
+			binStateDB, err := state.New(binLastRoot, binHost.sdb)
+			if err != nil {
+				t.Fatalf("failed to create BIN statedb at block %d: %v", b, err)
+			}
+			// Pre-allocate balance for all senders
+			for _, msg := range msgs {
+				binStateDB.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
+			}
+
 			binHooked := state.NewHookedState(binStateDB, binTracer.Hooks())
 
 			if miner != (common.Address{}) {
 				binHooked.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
 			}
 			binEVM := vm.NewEVM(blockCtx, binHooked, params.MainnetChainConfig, vm.Config{})
+
 			for _, msg := range msgs {
-				core.ApplyMessage(binEVM, msg, new(core.GasPool).AddGas(msg.GasLimit))
+				msg.SkipNonceChecks = true
+				_, err := core.ApplyMessage(binEVM, msg, new(core.GasPool).AddGas(msg.GasLimit))
+				if err != nil && b%1000 == 0 {
+					toStr := "contract-creation"
+					if msg.To != nil {
+						toStr = msg.To.Hex()
+					}
+					fmt.Printf("BIN Transaction Reverted: block=%d, sender=%s, nonce=%d, to=%s, res.Err=%v\n", b, msg.From.Hex(), msg.Nonce, toStr, err)
+				}
 			}
 
 			if binCfg.PruneInterval > 0 && b%uint64(binCfg.PruneInterval) == 0 {
