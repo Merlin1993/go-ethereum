@@ -286,6 +286,91 @@ func TestCacheStateProcessor(t *testing.T) {
 		"StorReads", "StorWrites", "StorMissNo", "StorCacheHit", "StorMissEx",
 	})
 
+	reportStats := func() {
+		if intervalBlocks == 0 {
+			return
+		}
+		fmt.Printf("Blocks: %d - %d (Processed Blocks Count)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
+		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
+		fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
+
+		// CacheTrie stats
+		acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, _, _, _, _,
+			totAcctReads, totStorReads, totAcctUpd, totStorUpd,
+			totalReads, totalUpdates := state.GetCacheStats()
+
+		deltaAcctHit := acctHit - lastAcctHit
+		deltaAcctMissEx := acctMissEx - lastAcctMissEx
+		deltaAcctMissNo := acctMissNo - lastAcctMissNo
+		totalAcct := deltaAcctHit + deltaAcctMissEx + deltaAcctMissNo
+
+		deltaStorHit := storHit - lastStorHit
+		deltaStorMissEx := storMissEx - lastStorMissEx
+		deltaStorMissNo := storMissNo - lastStorMissNo
+		totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
+
+		fmt.Printf("  [5 Metrics Summary]:\n")
+		fmt.Printf("    1. 读取次数 (Total Reads): %d\n", totalReads-lastTotReads)
+		fmt.Printf("    2. 写入次数 (Total Writes): %d\n", totalUpdates-lastTotUpdates)
+		fmt.Printf("    3. 读取不中的次数 (MissNo): %d\n", (acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo))
+		fmt.Printf("    4. 读取中了在缓存 (CacheHit): %d\n", (acctHit+storHit)-(lastAcctHit+lastStorHit))
+		fmt.Printf("    5. 读取中了不在缓存 (MissEx): %d\n", (acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx))
+
+		if totalAcct > 0 {
+			fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
+				deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
+				deltaAcctMissEx, float64(deltaAcctMissEx)*100/float64(totalAcct),
+				deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct),
+				totAcctReads-lastTotAcctReads, totAcctUpd-lastTotAcctUpd)
+		}
+		if totalStor > 0 {
+			fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
+				deltaStorHit, float64(deltaStorHit)*100/float64(totalStor),
+				deltaStorMissEx, float64(deltaStorMissEx)*100/float64(totalStor),
+				deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor),
+				totStorReads-lastTotStorReads, totStorUpd-lastTotStorUpd)
+		}
+
+		// Write to CSV
+		record := []string{
+			strconv.FormatUint(totalProcessedBlocks-intervalBlocks, 10),
+			strconv.FormatUint(totalProcessedBlocks-1, 10),
+			// Aggregated
+			strconv.FormatInt(totalReads-lastTotReads, 10),
+			strconv.FormatInt(totalUpdates-lastTotUpdates, 10),
+			strconv.FormatInt((acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo), 10),
+			strconv.FormatInt((acctHit+storHit)-(lastAcctHit+lastStorHit), 10),
+			strconv.FormatInt((acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx), 10),
+			// Account specific
+			strconv.FormatInt(totAcctReads-lastTotAcctReads, 10),
+			strconv.FormatInt(totAcctUpd-lastTotAcctUpd, 10),
+			strconv.FormatInt(acctMissNo-lastAcctMissNo, 10),
+			strconv.FormatInt(acctHit-lastAcctHit, 10),
+			strconv.FormatInt(acctMissEx-lastAcctMissEx, 10),
+			// Storage specific
+			strconv.FormatInt(totStorReads-lastTotStorReads, 10),
+			strconv.FormatInt(totStorUpd-lastTotStorUpd, 10),
+			strconv.FormatInt(storMissNo-lastStorMissNo, 10),
+			strconv.FormatInt(storHit-lastStorHit, 10),
+			strconv.FormatInt(storMissEx-lastStorMissEx, 10),
+		}
+		writer.Write(record)
+		writer.Flush()
+
+		// Reset stats
+		intervalBlocks = 0
+		totalTxTime = 0
+		maxTxTime = 0
+		totalRootTime = 0
+		maxRootTime = 0
+
+		lastAcctHit, lastAcctMissEx, lastAcctMissNo = acctHit, acctMissEx, acctMissNo
+		lastStorHit, lastStorMissEx, lastStorMissNo = storHit, storMissEx, storMissNo
+		lastTotAcctReads, lastTotStorReads = totAcctReads, totStorReads
+		lastTotAcctUpd, lastTotStorUpd = totAcctUpd, totStorUpd
+		lastTotReads, lastTotUpdates = totalReads, totalUpdates
+	}
+
 	for _, file := range selectedFiles {
 		t.Logf("Processing file: %s", file)
 		ts, err := NewTransactionStreamer(file)
@@ -300,11 +385,78 @@ func TestCacheStateProcessor(t *testing.T) {
 		compareLoadBlockTimestampsFromFile(cfg.DataDir, fileIdx)
 
 		// Process blocks sequentially from the streamer
+		currentBlock, ok := ts.PeekBlockNum()
+		if !ok {
+			continue // skip empty file
+		}
+
+		start10k := time.Now()
 		for {
-			b, ok := ts.PeekBlockNum()
+			targetBlock, ok := ts.PeekBlockNum()
 			if !ok {
 				break
 			}
+
+			// Process empty blocks between transactions
+			for currentBlock < targetBlock {
+				b := currentBlock
+				if b%100000 == 0 {
+					fmt.Printf("[测试] 正在处理区块 %d (总计已处理: %d) 耗时: %v... (空块)\n", b, totalProcessedBlocks, time.Since(start10k))
+					start10k = time.Now()
+				}
+				host.trieDB.UpdateBlockNum(b)
+				if host.trieDB.CacheTrie() != nil {
+					host.trieDB.CacheTrie().SetBlockNum(b)
+				}
+				statedb, _ := state.New(lastStateRoot, host.sdb)
+
+				// 0. Reward miner/packer
+				if miner, ok := compareBlockMiners[b]; ok && miner != (common.Address{}) {
+					reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18))) // 1,000,000 ETH
+					statedb.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+				}
+
+				// Empty block root calculation
+				if cfg.UseCacheTrie {
+					_, resultHash, _ := statedb.PreCommit(false)
+					root := lastStateRoot
+					if resultHash != (common.Hash{}) {
+						root = resultHash
+					}
+					// Handle code commitment
+					codes := host.trieDB.CacheTrie().PopCodes()
+					if len(codes) > 0 {
+						batch := host.db.NewBatch()
+						for codeHash, code := range codes {
+							rawdb.WriteCode(batch, codeHash, code)
+						}
+						batch.Write()
+					}
+					deleteKVList := statedb.GetCachedDeleteKVList()
+					if cfg.UseVerkle || cfg.UseBinaryTrie {
+						host.CommitToPreTrie(root, b, deleteKVList)
+					} else {
+						go host.CommitToPreTrie(root, b, deleteKVList)
+					}
+					lastStateRoot = root
+				} else {
+					statedb.PreCommit(false)
+					root, _ := statedb.PostCommit(b, false, false)
+					lastStateRoot = root
+					if b%100 == 0 {
+						host.trieDB.Commit(root, false)
+					}
+				}
+				intervalBlocks++
+				totalProcessedBlocks++
+				currentBlock++
+				if intervalBlocks >= statsIv {
+					reportStats()
+				}
+			}
+
+			// Process the block with transactions
+			b := targetBlock
 			msgs, _ := ts.PopBlock(b)
 
 			header := &types.Header{
@@ -314,7 +466,10 @@ func TestCacheStateProcessor(t *testing.T) {
 				Difficulty: big.NewInt(1),
 			}
 
-			host.sdb.SetBlockNum(b)
+			host.trieDB.UpdateBlockNum(b)
+			if host.trieDB.CacheTrie() != nil {
+				host.trieDB.CacheTrie().SetBlockNum(b)
+			}
 			statedb, _ := state.New(lastStateRoot, host.sdb)
 
 			// 0. Reward miner/packer
@@ -361,7 +516,7 @@ func TestCacheStateProcessor(t *testing.T) {
 				}
 
 				// Handle code commitment
-				codes := host.sdb.TrieDB().CacheTrie().PopCodes()
+				codes := host.trieDB.CacheTrie().PopCodes()
 				if len(codes) > 0 {
 					batch := host.db.NewBatch()
 					for codeHash, code := range codes {
@@ -394,156 +549,15 @@ func TestCacheStateProcessor(t *testing.T) {
 
 			intervalBlocks++
 			totalProcessedBlocks++
+			currentBlock++
 			if intervalBlocks >= statsIv {
-				fmt.Printf("Blocks: %d - %d\n", totalProcessedBlocks-statsIv, totalProcessedBlocks-1)
-				fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
-				fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
-
-				// CacheTrie stats
-				acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, _, _, _, _,
-					totAcctReads, totStorReads, totAcctUpd, totStorUpd,
-					totalReads, totalUpdates := state.GetCacheStats()
-
-				deltaAcctHit := acctHit - lastAcctHit
-				deltaAcctMissEx := acctMissEx - lastAcctMissEx
-				deltaAcctMissNo := acctMissNo - lastAcctMissNo
-				totalAcct := deltaAcctHit + deltaAcctMissEx + deltaAcctMissNo
-
-				deltaStorHit := storHit - lastStorHit
-				deltaStorMissEx := storMissEx - lastStorMissEx
-				deltaStorMissNo := storMissNo - lastStorMissNo
-				totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
-
-				fmt.Printf("  [5 Metrics Summary]:\n")
-				fmt.Printf("    1. 读取次数 (Total Reads): %d\n", totalReads-lastTotReads)
-				fmt.Printf("    2. 写入次数 (Total Writes): %d\n", totalUpdates-lastTotUpdates)
-				fmt.Printf("    3. 读取不中的次数 (MissNo): %d\n", (acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo))
-				fmt.Printf("    4. 读取中了在缓存 (CacheHit): %d\n", (acctHit+storHit)-(lastAcctHit+lastStorHit))
-				fmt.Printf("    5. 读取中了不在缓存 (MissEx): %d\n", (acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx))
-
-				if totalAcct > 0 {
-					fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
-						deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
-						deltaAcctMissEx, float64(deltaAcctMissEx)*100/float64(totalAcct),
-						deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct),
-						totAcctReads-lastTotAcctReads, totAcctUpd-lastTotAcctUpd)
-				}
-				if totalStor > 0 {
-					fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
-						deltaStorHit, float64(deltaStorHit)*100/float64(totalStor),
-						deltaStorMissEx, float64(deltaStorMissEx)*100/float64(totalStor),
-						deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor),
-						totStorReads-lastTotStorReads, totStorUpd-lastTotStorUpd)
-				}
-
-				// Write to CSV
-				record := []string{
-					strconv.FormatUint(totalProcessedBlocks-statsIv, 10),
-					strconv.FormatUint(totalProcessedBlocks-1, 10),
-					// Aggregated
-					strconv.FormatInt(totalReads-lastTotReads, 10),
-					strconv.FormatInt(totalUpdates-lastTotUpdates, 10),
-					strconv.FormatInt((acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo), 10),
-					strconv.FormatInt((acctHit+storHit)-(lastAcctHit+lastStorHit), 10),
-					strconv.FormatInt((acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx), 10),
-					// Account specific
-					strconv.FormatInt(totAcctReads-lastTotAcctReads, 10),
-					strconv.FormatInt(totAcctUpd-lastTotAcctUpd, 10),
-					strconv.FormatInt(acctMissNo-lastAcctMissNo, 10),
-					strconv.FormatInt(acctHit-lastAcctHit, 10),
-					strconv.FormatInt(acctMissEx-lastAcctMissEx, 10),
-					// Storage specific
-					strconv.FormatInt(totStorReads-lastTotStorReads, 10),
-					strconv.FormatInt(totStorUpd-lastTotStorUpd, 10),
-					strconv.FormatInt(storMissNo-lastStorMissNo, 10),
-					strconv.FormatInt(storHit-lastStorHit, 10),
-					strconv.FormatInt(storMissEx-lastStorMissEx, 10),
-				}
-				writer.Write(record)
-				writer.Flush()
-
-				// Reset stats
-				intervalBlocks = 0
-				totalTxTime = 0
-				maxTxTime = 0
-				totalRootTime = 0
-				maxRootTime = 0
-
-				lastAcctHit, lastAcctMissEx, lastAcctMissNo = acctHit, acctMissEx, acctMissNo
-				lastStorHit, lastStorMissEx, lastStorMissNo = storHit, storMissEx, storMissNo
-				lastTotAcctReads, lastTotStorReads = totAcctReads, totStorReads
-				lastTotAcctUpd, lastTotStorUpd = totAcctUpd, totStorUpd
-				lastTotReads, lastTotUpdates = totalReads, totalUpdates
+				reportStats()
 			}
 		}
 	}
 	// Final statistics report for the last partial interval
 	if intervalBlocks > 0 {
-		fmt.Printf("Final Partial Interval (Blocks: %d - %d)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
-		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
-		fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
-
-		// Final CacheTrie stats
-		acctHit, acctMissEx, acctMissNo, storHit, storMissEx, storMissNo, _, _, _, _,
-			totAcctReads, totStorReads, totAcctUpd, totStorUpd,
-			totalReads, totalUpdates := state.GetCacheStats()
-
-		fmt.Printf("  [5 Metrics Summary]:\n")
-		fmt.Printf("    1. 读取次数 (Total Reads): %d\n", totalReads-lastTotReads)
-		fmt.Printf("    2. 写入次数 (Total Writes): %d\n", totalUpdates-lastTotUpdates)
-		fmt.Printf("    3. 读取不中的次数 (MissNo): %d\n", (acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo))
-		fmt.Printf("    4. 读取中了在缓存 (CacheHit): %d\n", (acctHit+storHit)-(lastAcctHit+lastStorHit))
-		fmt.Printf("    5. 读取中了不在缓存 (MissEx): %d\n", (acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx))
-		deltaAcctHit := acctHit - lastAcctHit
-		deltaAcctMissEx := acctMissEx - lastAcctMissEx
-		deltaAcctMissNo := acctMissNo - lastAcctMissNo
-		totalAcct := deltaAcctHit + deltaAcctMissEx + deltaAcctMissNo
-
-		deltaStorHit := storHit - lastStorHit
-		deltaStorMissEx := storMissEx - lastStorMissEx
-		deltaStorMissNo := storMissNo - lastStorMissNo
-		totalStor := deltaStorHit + deltaStorMissEx + deltaStorMissNo
-
-		if totalAcct > 0 {
-			fmt.Printf("  Cache Account  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
-				deltaAcctHit, float64(deltaAcctHit)*100/float64(totalAcct),
-				deltaAcctMissEx, float64(deltaAcctMissEx)*100/float64(totalAcct),
-				deltaAcctMissNo, float64(deltaAcctMissNo)*100/float64(totalAcct),
-				totAcctReads-lastTotAcctReads, totAcctUpd-lastTotAcctUpd)
-		}
-		if totalStor > 0 {
-			fmt.Printf("  Cache Storage  - Hit: %d (%.2f%%), MissEx: %d (%.2f%%), MissNo: %d (%.2f%%), TotRead: %d, TotUpd: %d\n",
-				deltaStorHit, float64(deltaStorHit)*100/float64(totalStor),
-				deltaStorMissEx, float64(deltaStorMissEx)*100/float64(totalStor),
-				deltaStorMissNo, float64(deltaStorMissNo)*100/float64(totalStor),
-				totStorReads-lastTotStorReads, totStorUpd-lastTotStorUpd)
-		}
-
-		// Final Write to CSV
-		record := []string{
-			strconv.FormatUint(totalProcessedBlocks-intervalBlocks, 10),
-			strconv.FormatUint(totalProcessedBlocks-1, 10),
-			// Aggregated
-			strconv.FormatInt(totalReads-lastTotReads, 10),
-			strconv.FormatInt(totalUpdates-lastTotUpdates, 10),
-			strconv.FormatInt((acctMissNo+storMissNo)-(lastAcctMissNo+lastStorMissNo), 10),
-			strconv.FormatInt((acctHit+storHit)-(lastAcctHit+lastStorHit), 10),
-			strconv.FormatInt((acctMissEx+storMissEx)-(lastAcctMissEx+lastStorMissEx), 10),
-			// Account specific
-			strconv.FormatInt(totAcctReads-lastTotAcctReads, 10),
-			strconv.FormatInt(totAcctUpd-lastTotAcctUpd, 10),
-			strconv.FormatInt(acctMissNo-lastAcctMissNo, 10),
-			strconv.FormatInt(acctHit-lastAcctHit, 10),
-			strconv.FormatInt(acctMissEx-lastAcctMissEx, 10),
-			// Storage specific
-			strconv.FormatInt(totStorReads-lastTotStorReads, 10),
-			strconv.FormatInt(totStorUpd-lastTotStorUpd, 10),
-			strconv.FormatInt(storMissNo-lastStorMissNo, 10),
-			strconv.FormatInt(storHit-lastStorHit, 10),
-			strconv.FormatInt(storMissEx-lastStorMissEx, 10),
-		}
-		writer.Write(record)
-		writer.Flush()
+		reportStats()
 	}
 	t.Logf("Final state root: %s", lastStateRoot.String())
 }

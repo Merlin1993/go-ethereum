@@ -187,19 +187,17 @@ func TestExpireStateProcessor(t *testing.T) {
 	// Statistics tracking
 	statsIv := uint64(*statsInterval)
 	var (
-		intervalBlocks     uint64
-		intervalStartBlock uint64
-		firstBlockSet      bool
-		lastProcessedBlock uint64
-
-		totalRootTime  time.Duration
-		maxRootTime    time.Duration
-		totalPruneTime time.Duration
-		maxPruneTime   time.Duration
-		pruneCount     uint64
-
+		intervalBlocks       uint64
 		totalProcessedBlocks uint64
 		epochID              uint64
+		totalTxTime          time.Duration
+		maxTxTime            time.Duration
+		totalRootTime        time.Duration
+		maxRootTime          time.Duration
+		totalPruneTime       time.Duration
+		maxPruneTime         time.Duration
+		pruneCount           uint64
+		totalStorageSize     int64 // Cumulative storage size
 	)
 
 	// CSV file setup
@@ -222,274 +220,29 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Cycle_FP_Count", "Max_FP_In_Single_Block",
 	})
 
-	for _, file := range selectedFiles {
-		t.Logf("Processing file: %s", file)
-		ts, err := NewTransactionStreamer(file)
-		if err != nil {
-			t.Errorf("failed to open transaction streamer for %s: %v", file, err)
-			continue
+	reportStats := func() {
+		if intervalBlocks == 0 {
+			return
 		}
-		defer ts.Close()
-
-		// Load block metadata (timestamps and miners) once per file
-		fileIdx := compareGetFileIndex(file)
-		compareLoadBlockTimestampsFromFile(cfg.DataDir, fileIdx)
-
-		start10k := time.Now()
-		// Process blocks sequentially from the streamer
-		for {
-			b, ok := ts.PeekBlockNum()
-			if !ok {
-				break
-			}
-			if !firstBlockSet {
-				intervalStartBlock = b
-				firstBlockSet = true
-			}
-			lastProcessedBlock = b
-
-			if b%100000 == 0 {
-				fmt.Printf("[测试] 正在处理区块 %d (总计已处理: %d) 耗时: %v...\n", b, totalProcessedBlocks, time.Since(start10k))
-				start10k = time.Now()
-			}
-			msgs, _ := ts.PopBlock(b)
-			host.sdb.SetBlockNum(b)
-			statedb, _ := state.New(lastStateRoot, host.sdb)
-
-			// 0. Reward miner/packer
-			if miner, ok := compareBlockMiners[b]; ok && miner != (common.Address{}) {
-				reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18))) // 1,000,000 ETH
-				statedb.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
-			}
-
-			blockCtx := vm.BlockContext{
-				CanTransfer: core.CanTransfer,
-				Transfer:    core.Transfer,
-				GetHash:     func(n uint64) common.Hash { return common.Hash{} },
-				Coinbase:    compareBlockMiners[b],
-				BlockNumber: new(big.Int).SetUint64(b),
-				Time:        b * 15,
-				Difficulty:  big.NewInt(1),
-				BaseFee:     big.NewInt(0),
-			}
-			evm := vm.NewEVM(blockCtx, statedb, params.MainnetChainConfig, vm.Config{})
-			for _, msg := range msgs {
-				core.ApplyMessage(evm, msg, new(core.GasPool).AddGas(msg.GasLimit))
-			}
-
-			if (cfg.UseBinaryTrie || !cfg.UseVerkle) && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
-				pruneStart := time.Now()
-				statedb.PruneNextShard()
-				pruneDuration := time.Since(pruneStart)
-				totalPruneTime += pruneDuration
-				if pruneDuration > maxPruneTime {
-					maxPruneTime = pruneDuration
-				}
-				pruneCount++
-			}
-
-			// 2. State root calculation time statistics
-			rootStart := time.Now()
-			statedb.Finalise(false)
-			finaliseDuration := time.Since(rootStart)
-
-			commitStart := time.Now()
-			h, _ := statedb.Commit(b, false, false)
-			commitDuration := time.Since(commitStart)
-
-			rootDuration := time.Since(rootStart)
-
-			if b%100000 == 0 {
-				fmt.Printf("[测试] 区块 %d: 最终处理周期: %v, 树根计算: %v, 提交耗时: %v, 总计: %v\n",
-					b, finaliseDuration, commitDuration, rootDuration, rootDuration+finaliseDuration+commitDuration)
-			}
-			lastStateRoot = h
-
-			// 统计单区块假阳性最大次数与证明最大大小
-			fpInBlock := atomic.SwapInt64(&common.BinaryTrieFPInBlock, 0)
-			for {
-				maxFP := atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock)
-				if fpInBlock <= maxFP || atomic.CompareAndSwapInt64(&common.BinaryMaxFPInSingleBlock, maxFP, fpInBlock) {
-					break
-				}
-			}
-
-			blockProofSize := atomic.SwapInt64(&common.BinaryBlockProofSize, 0)
-			for {
-				maxBlockSize := atomic.LoadInt64(&common.BinaryBlockProofSizeMax)
-				if blockProofSize <= maxBlockSize || atomic.CompareAndSwapInt64(&common.BinaryBlockProofSizeMax, maxBlockSize, blockProofSize) {
-					break
-				}
-			}
-
-			// Optional treeDB commit
-			if b%1000 == 0 {
-				host.trieDB.Commit(h, false)
-			}
-
-			totalRootTime += rootDuration
-			if rootDuration > maxRootTime {
-				maxRootTime = rootDuration
-			}
-
-			intervalBlocks++
-			totalProcessedBlocks++
-			if b > 0 && (b+1)%statsIv == 0 {
-				epochID++
-				storageSize, _ := getDirSize(cfg.DbDir)
-
-				fmt.Printf("周期 %d (区块范围: %d - %d)\n", epochID, intervalStartBlock, b)
-				fmt.Printf("  累计存储占用: %d 字节\n", storageSize)
-				fmt.Printf("  平均根计算耗时: %.2f ms\n", float64(totalRootTime.Milliseconds())/float64(intervalBlocks))
-				fmt.Printf("  最大根计算耗时: %v\n", maxRootTime)
-
-				avgBinaryPruneTime := 0.0
-				if pruneCount > 0 {
-					avgBinaryPruneTime = float64(atomic.LoadInt64(&common.BinaryPruneTime)) / float64(pruneCount) / 1000.0 // ns -> us
-				}
-				fmt.Printf("  平均二进制裁剪耗时: %.2f us\n", avgBinaryPruneTime)
-				fmt.Printf("  最大二进制裁剪耗时: %.2f us\n", float64(atomic.LoadInt64(&common.BinaryPruneTimeMax))/1000.0)
-				fmt.Printf("  命中热状态次数: %d\n", atomic.LoadInt64(&common.BinaryHitCount))
-				fmt.Printf("  未命中且数据不存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissNonExistentCount))
-				fmt.Printf("  未命中但数据存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissExistentCount))
-
-				totalReads := atomic.LoadInt64(&common.BinaryHitCount) + atomic.LoadInt64(&common.BinaryMissNonExistentCount) + atomic.LoadInt64(&common.BinaryMissExistentCount)
-				avgGenTime := 0.0
-				if totalReads > 0 {
-					avgGenTime = (float64(atomic.LoadInt64(&common.BinaryProofGenTime)) / float64(totalReads)) / 1_000_000.0 // us -> ms
-				}
-				maxGenTime := float64(atomic.LoadInt64(&common.BinaryProofGenTimeMax)) / 1_000_000.0
-
-				avgVerifTime := 0.0
-				if atomic.LoadInt64(&common.BinaryMissExistentCount) > 0 {
-					avgVerifTime = (float64(atomic.LoadInt64(&common.BinaryProofVerifTime)) / float64(atomic.LoadInt64(&common.BinaryMissExistentCount))) / 1_000_000.0 // us -> ms
-				}
-				maxVerifTime := float64(atomic.LoadInt64(&common.BinaryProofVerifTimeMax)) / 1_000_000.0
-
-				fmt.Printf("  平均证明生成耗时: %.4f ms\n", avgGenTime)
-				fmt.Printf("  最大证明生成耗时: %.4f ms\n", maxGenTime)
-				fmt.Printf("  平均复活验证耗时: %.4f ms\n", avgVerifTime)
-				fmt.Printf("  最大复活验证耗时: %.4f ms\n", maxVerifTime)
-
-				// Proof size metrics
-				avgProofSizeBlock := float64(atomic.LoadInt64(&common.BinaryTotalProofSize)) / float64(intervalBlocks)
-				maxProofSizeBlock := atomic.LoadInt64(&common.BinaryBlockProofSizeMax)
-				fmt.Printf("  平均每区块证明大小: %.2f bytes\n", avgProofSizeBlock)
-				fmt.Printf("  单区块证明最大大小: %d bytes\n", maxProofSizeBlock)
-
-				// Five-number summary for item proof sizes
-				common.BinaryStatsMu.Lock()
-				sizes := make([]int64, len(common.BinaryItemProofSizes))
-				copy(sizes, common.BinaryItemProofSizes)
-				common.BinaryStatsMu.Unlock()
-
-				var minS, p25S, medS, p75S, maxS int64
-				if len(sizes) > 0 {
-					sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
-					minS = sizes[0]
-					maxS = sizes[len(sizes)-1]
-					medS = sizes[len(sizes)/2]
-					p25S = sizes[len(sizes)/4]
-					p75S = sizes[3*len(sizes)/4]
-				}
-				fmt.Printf("  Item_Proof_Size 五数概括: Min=%d, P25=%d, Median=%d, P75=%d, Max=%d\n", minS, p25S, medS, p75S, maxS)
-
-				fmt.Printf("  假阳性触发次数: %d\n", atomic.LoadInt64(&common.BinaryCycleFPCount))
-				fmt.Printf("  单区块假阳性最大次数: %d\n", atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock))
-
-				common.BinaryStatsMu.Lock()
-				fpDistCount := len(common.BinaryFPDistribution)
-				var fpAvgBucketSize float64
-				if fpDistCount > 0 {
-					var sum int64
-					for _, size := range common.BinaryFPDistribution {
-						sum += size
-					}
-					fpAvgBucketSize = float64(sum) / float64(fpDistCount)
-				}
-				common.BinaryStatsMu.Unlock()
-				fmt.Printf("  假阳性归档桶平均大小: %.2f (样本数: %d)\n", fpAvgBucketSize, fpDistCount)
-
-				// 写入 CSV
-				record := []string{
-					strconv.FormatUint(epochID, 10),
-					strconv.FormatInt(storageSize, 10),
-					fmt.Sprintf("%.2f", float64(totalRootTime.Milliseconds())/float64(intervalBlocks)),
-					strconv.FormatInt(maxRootTime.Milliseconds(), 10),
-					fmt.Sprintf("%.2f", avgBinaryPruneTime),
-					strconv.FormatInt(atomic.LoadInt64(&common.BinaryPruneTimeMax)/1000, 10),
-					strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
-					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
-					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
-					fmt.Sprintf("%.4f", avgGenTime),
-					fmt.Sprintf("%.4f", maxGenTime),
-					fmt.Sprintf("%.4f", avgVerifTime),
-					fmt.Sprintf("%.4f", maxVerifTime),
-					fmt.Sprintf("%.2f", avgProofSizeBlock),
-					strconv.FormatInt(maxProofSizeBlock, 10),
-					strconv.FormatInt(minS, 10),
-					strconv.FormatInt(p25S, 10),
-					strconv.FormatInt(medS, 10),
-					strconv.FormatInt(p75S, 10),
-					strconv.FormatInt(maxS, 10),
-					strconv.FormatInt(atomic.LoadInt64(&common.BinaryCycleFPCount), 10),
-					strconv.FormatInt(atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock), 10),
-				}
-				writer.Write(record)
-				writer.Flush()
-
-				// 重置统计变量
-				intervalBlocks = 0
-				totalRootTime = 0
-				maxRootTime = 0
-				totalPruneTime = 0
-				maxPruneTime = 0
-				pruneCount = 0
-
-				atomic.StoreInt64(&common.BinaryHitCount, 0)
-				atomic.StoreInt64(&common.BinaryMissNonExistentCount, 0)
-				atomic.StoreInt64(&common.BinaryMissExistentCount, 0)
-				atomic.StoreInt64(&common.BinaryCycleFPCount, 0)
-				atomic.StoreInt64(&common.BinaryMaxFPInSingleBlock, 0)
-				atomic.StoreInt64(&common.BinaryProofGenTime, 0)
-				atomic.StoreInt64(&common.BinaryProofGenTimeMax, 0)
-				atomic.StoreInt64(&common.BinaryProofVerifTime, 0)
-				atomic.StoreInt64(&common.BinaryProofVerifTimeMax, 0)
-				atomic.StoreInt64(&common.BinaryProofVerifTimeMax, 0)
-				atomic.StoreInt64(&common.BinaryTotalProofSize, 0)
-				atomic.StoreInt64(&common.BinaryBlockProofSizeMax, 0)
-				atomic.StoreInt64(&common.BinaryPruneTime, 0)
-				atomic.StoreInt64(&common.BinaryPruneTimeMax, 0)
-				common.BinaryStatsMu.Lock()
-				common.BinaryItemProofSizes = nil
-				common.BinaryItemProofSizeMin = 0
-				common.BinaryItemProofSizeMax = 0
-				common.BinaryStatsMu.Unlock()
-
-				intervalStartBlock = b + 1
-				// 每 10w 区块刷新一次假阳性分布
-				if (b+1)%100000 == 0 {
-					flushGlobalFPDistribution()
-				}
-			}
-		}
-	}
-	// 最后不足一个周期的统计报告
-	if intervalBlocks > 0 {
 		epochID++
 		storageSize, _ := getDirSize(cfg.DbDir)
+		totalStorageSize = storageSize // Update cumulative storage size
 
-		fmt.Printf("最终周期 %d (区块范围: %d - %d)\n", epochID, intervalStartBlock, lastProcessedBlock)
-		fmt.Printf("  累计存储占用: %d 字节\n", storageSize)
+		fmt.Printf("Blocks: %d - %d (Processed Blocks Count)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
+		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
 		fmt.Printf("  平均根计算耗时: %.2f ms\n", float64(totalRootTime.Milliseconds())/float64(intervalBlocks))
 		fmt.Printf("  最大根计算耗时: %v\n", maxRootTime)
+		fmt.Printf("  累计存储占用: %d 字节\n", totalStorageSize)
 
-		avgBinaryPruneTimeSummary := 0.0
+		avgBinaryPruneTime := 0.0
 		if pruneCount > 0 {
-			avgBinaryPruneTimeSummary = float64(atomic.LoadInt64(&common.BinaryPruneTime)) / float64(pruneCount) / 1000.0 // ns -> us
+			avgBinaryPruneTime = float64(totalPruneTime) / float64(pruneCount) / float64(time.Microsecond) // ns -> us
 		}
-		fmt.Printf("  平均二进制裁剪耗时: %.2f us\n", avgBinaryPruneTimeSummary)
-		fmt.Printf("  最大二进制裁剪耗时: %.2f us\n", float64(atomic.LoadInt64(&common.BinaryPruneTimeMax))/1000.0)
+		fmt.Printf("  平均二进制裁剪耗时: %.2f us\n", avgBinaryPruneTime)
+		fmt.Printf("  最大二进制裁剪耗时: %.2f us\n", float64(maxPruneTime)/float64(time.Microsecond))
+		fmt.Printf("  命中热状态次数: %d\n", atomic.LoadInt64(&common.BinaryHitCount))
+		fmt.Printf("  未命中且数据不存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissNonExistentCount))
+		fmt.Printf("  未命中但数据存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissExistentCount))
 
 		totalReads := atomic.LoadInt64(&common.BinaryHitCount) + atomic.LoadInt64(&common.BinaryMissNonExistentCount) + atomic.LoadInt64(&common.BinaryMissExistentCount)
 		avgGenTime := 0.0
@@ -554,8 +307,8 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(storageSize, 10),
 			fmt.Sprintf("%.2f", float64(totalRootTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxRootTime.Milliseconds(), 10),
-			fmt.Sprintf("%.2f", avgBinaryPruneTimeSummary),
-			strconv.FormatInt(atomic.LoadInt64(&common.BinaryPruneTimeMax)/1000, 10),
+			fmt.Sprintf("%.2f", avgBinaryPruneTime),
+			strconv.FormatInt(maxPruneTime.Microseconds(), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
@@ -565,6 +318,8 @@ func TestExpireStateProcessor(t *testing.T) {
 			fmt.Sprintf("%.4f", maxVerifTime),
 			fmt.Sprintf("%.2f", avgProofSizeBlock),
 			strconv.FormatInt(maxProofSizeBlock, 10),
+			strconv.FormatUint(totalProcessedBlocks-intervalBlocks, 10),
+			strconv.FormatUint(totalProcessedBlocks-1, 10),
 			strconv.FormatInt(minS, 10),
 			strconv.FormatInt(p25S, 10),
 			strconv.FormatInt(medS, 10),
@@ -575,6 +330,212 @@ func TestExpireStateProcessor(t *testing.T) {
 		}
 		writer.Write(record)
 		writer.Flush()
+
+		// 重置统计变量
+		intervalBlocks = 0
+		totalRootTime = 0
+		maxRootTime = 0
+		totalPruneTime = 0
+		maxPruneTime = 0
+		pruneCount = 0
+		totalTxTime = 0 // Reset Tx Execution stats
+		maxTxTime = 0   // Reset Tx Execution stats
+
+		atomic.StoreInt64(&common.BinaryHitCount, 0)
+		atomic.StoreInt64(&common.BinaryMissNonExistentCount, 0)
+		atomic.StoreInt64(&common.BinaryMissExistentCount, 0)
+		atomic.StoreInt64(&common.BinaryCycleFPCount, 0)
+		atomic.StoreInt64(&common.BinaryMaxFPInSingleBlock, 0)
+		atomic.StoreInt64(&common.BinaryProofGenTime, 0)
+		atomic.StoreInt64(&common.BinaryProofGenTimeMax, 0)
+		atomic.StoreInt64(&common.BinaryProofVerifTime, 0)
+		atomic.StoreInt64(&common.BinaryProofVerifTimeMax, 0)
+		atomic.StoreInt64(&common.BinaryTotalProofSize, 0)
+		atomic.StoreInt64(&common.BinaryBlockProofSizeMax, 0)
+		atomic.StoreInt64(&common.BinaryPruneTime, 0)
+		atomic.StoreInt64(&common.BinaryPruneTimeMax, 0)
+		common.BinaryStatsMu.Lock()
+		common.BinaryItemProofSizes = nil
+		common.BinaryItemProofSizeMin = 0
+		common.BinaryItemProofSizeMax = 0
+		common.BinaryStatsMu.Unlock()
+	}
+
+	for _, file := range selectedFiles {
+		t.Logf("Processing file: %s", file)
+		ts, err := NewTransactionStreamer(file)
+		if err != nil {
+			t.Errorf("failed to open transaction streamer for %s: %v", file, err)
+			continue
+		}
+		defer ts.Close()
+
+		// Load block metadata (timestamps and miners) once per file
+		fileIdx := compareGetFileIndex(file)
+		compareLoadBlockTimestampsFromFile(cfg.DataDir, fileIdx)
+
+		start10k := time.Now()
+		// Process blocks sequentially from the streamer
+		currentBlock, ok := ts.PeekBlockNum()
+		if !ok {
+			continue // skip empty file
+		}
+
+		for {
+			targetBlock, ok := ts.PeekBlockNum()
+			if !ok {
+				break
+			}
+
+			// Process empty blocks between transactions
+			for currentBlock < targetBlock {
+				b := currentBlock
+
+				if b%100000 == 0 {
+					fmt.Printf("[测试] 正在处理区块 %d (总计已处理: %d) 耗时: %v... (空块)\n", b, totalProcessedBlocks, time.Since(start10k))
+					start10k = time.Now()
+				}
+
+				host.trieDB.UpdateBlockNum(b)
+				if host.trieDB.CacheTrie() != nil {
+					host.trieDB.CacheTrie().SetBlockNum(b)
+				}
+				statedb, _ := state.New(lastStateRoot, host.sdb)
+
+				// 0. Reward miner/packer
+				if miner, ok := compareBlockMiners[b]; ok && miner != (common.Address{}) {
+					reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18))) // 1,000,000 ETH
+					statedb.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+				}
+
+				if (cfg.UseBinaryTrie || !cfg.UseVerkle) && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
+					statedb.PruneNextShard()
+				}
+				statedb.Finalise(false)
+				h, _ := statedb.Commit(b, false, false)
+				lastStateRoot = h
+				if b%1000 == 0 {
+					host.trieDB.Commit(h, false)
+				}
+				intervalBlocks++
+				totalProcessedBlocks++
+				currentBlock++
+				if intervalBlocks >= statsIv {
+					reportStats()
+				}
+			}
+
+			// Process the block with transactions
+			b := targetBlock
+
+			if b%100000 == 0 {
+				fmt.Printf("[测试] 正在处理区块 %d (总计已处理: %d) 耗时: %v...\n", b, totalProcessedBlocks, time.Since(start10k))
+				start10k = time.Now()
+			}
+			msgs, _ := ts.PopBlock(b)
+			host.trieDB.UpdateBlockNum(b)
+			if host.trieDB.CacheTrie() != nil {
+				host.trieDB.CacheTrie().SetBlockNum(b)
+			}
+			statedb, _ := state.New(lastStateRoot, host.sdb)
+
+			// 0. Reward miner/packer
+			if miner, ok := compareBlockMiners[b]; ok && miner != (common.Address{}) {
+				reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18))) // 1,000,000 ETH
+				statedb.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+			}
+
+			blockCtx := vm.BlockContext{
+				CanTransfer: core.CanTransfer,
+				Transfer:    core.Transfer,
+				GetHash:     func(n uint64) common.Hash { return common.Hash{} },
+				Coinbase:    compareBlockMiners[b],
+				BlockNumber: new(big.Int).SetUint64(b),
+				Time:        b * 15,
+				Difficulty:  big.NewInt(1),
+				BaseFee:     big.NewInt(0),
+			}
+			evm := vm.NewEVM(blockCtx, statedb, params.MainnetChainConfig, vm.Config{})
+			txStart := time.Now()
+			for _, msg := range msgs {
+				core.ApplyMessage(evm, msg, new(core.GasPool).AddGas(msg.GasLimit))
+			}
+			txDuration := time.Since(txStart)
+			totalTxTime += txDuration
+			if txDuration > maxTxTime {
+				maxTxTime = txDuration
+			}
+
+			if (cfg.UseBinaryTrie || !cfg.UseVerkle) && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
+				pruneStart := time.Now()
+				statedb.PruneNextShard()
+				pruneDuration := time.Since(pruneStart)
+				totalPruneTime += pruneDuration
+				if pruneDuration > maxPruneTime {
+					maxPruneTime = pruneDuration
+				}
+				pruneCount++
+			}
+
+			// 2. State root calculation time statistics
+			rootStart := time.Now()
+			statedb.Finalise(false)
+			finaliseDuration := time.Since(rootStart)
+
+			commitStart := time.Now()
+			h, _ := statedb.Commit(b, false, false)
+			commitDuration := time.Since(commitStart)
+
+			rootDuration := time.Since(rootStart)
+
+			if b%100000 == 0 {
+				fmt.Printf("[测试] 区块 %d: 最终处理周期: %v, 树根计算: %v, 提交耗时: %v, 总计: %v\n",
+					b, finaliseDuration, commitDuration, rootDuration, rootDuration+finaliseDuration+commitDuration)
+			}
+			lastStateRoot = h
+
+			// 统计单区块假阳性最大次数与证明最大大小
+			fpInBlock := atomic.SwapInt64(&common.BinaryTrieFPInBlock, 0)
+			for {
+				maxFP := atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock)
+				if fpInBlock <= maxFP || atomic.CompareAndSwapInt64(&common.BinaryMaxFPInSingleBlock, maxFP, fpInBlock) {
+					break
+				}
+			}
+
+			blockProofSize := atomic.SwapInt64(&common.BinaryBlockProofSize, 0)
+			for {
+				maxBlockSize := atomic.LoadInt64(&common.BinaryBlockProofSizeMax)
+				if blockProofSize <= maxBlockSize || atomic.CompareAndSwapInt64(&common.BinaryBlockProofSizeMax, maxBlockSize, blockProofSize) {
+					break
+				}
+			}
+
+			// Optional treeDB commit
+			if b%1000 == 0 {
+				host.trieDB.Commit(h, false)
+			}
+
+			totalRootTime += rootDuration
+			if rootDuration > maxRootTime {
+				maxRootTime = rootDuration
+			}
+
+			intervalBlocks++
+			totalProcessedBlocks++
+			currentBlock++
+			if intervalBlocks >= statsIv {
+				reportStats()
+			}
+			// 每 10w 区块刷新一次假阳性分布
+			if (b+1)%100000 == 0 {
+				flushGlobalFPDistribution()
+			}
+		}
+	}
+	// 最后不足一个周期的统计报告
+	if intervalBlocks > 0 {
+		reportStats()
 	}
 	t.Logf("最终状态根: %s", lastStateRoot.String())
 	flushGlobalFPDistribution() // 结束后强制刷新一次
@@ -764,11 +725,61 @@ func TestBinaryTrieConsistency(t *testing.T) {
 		compareLoadBlockTimestampsFromFile(binCfg.DataDir, fileIdx)
 
 		// Process blocks sequentially from the streamer
+		currentBlock, ok := ts.PeekBlockNum()
+		if !ok {
+			continue // skip empty file
+		}
+
 		for {
-			b, ok := ts.PeekBlockNum()
+			targetBlock, ok := ts.PeekBlockNum()
 			if !ok {
 				break
 			}
+
+			// Process empty blocks between transactions
+			for currentBlock < targetBlock {
+				b := currentBlock
+				miner := compareBlockMiners[b]
+				reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18)))
+
+				// MPT
+				mptTracer.Reset()
+				mptTracer.blockNum = b
+				mptHost.trieDB.UpdateBlockNum(b)
+				mptStateDB, _ := state.New(mptLastRoot, mptHost.sdb)
+				mptHooked := state.NewHookedState(mptStateDB, mptTracer.Hooks())
+				if miner != (common.Address{}) {
+					mptHooked.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+				}
+				mptHooked.Finalise(false)
+				mptRoot, _ := mptStateDB.Commit(b, false, false)
+
+				// BIN
+				binTracer.Reset()
+				binTracer.blockNum = b
+				binHost.trieDB.UpdateBlockNum(b)
+				binStateDB, _ := state.New(binLastRoot, binHost.sdb)
+				binHooked := state.NewHookedState(binStateDB, binTracer.Hooks())
+				if miner != (common.Address{}) {
+					binHooked.AddBalance(miner, reward, tracing.BalanceChangeUnspecified)
+				}
+				if binCfg.PruneInterval > 0 && b%uint64(binCfg.PruneInterval) == 0 {
+					binStateDB.PruneNextShard()
+				}
+				binHooked.Finalise(false)
+				binRoot, _ := binStateDB.Commit(b, false, false)
+
+				mptLastRoot = mptRoot
+				binLastRoot = binRoot
+				if b%1000 == 0 {
+					mptHost.trieDB.Commit(mptRoot, false)
+					binHost.trieDB.Commit(binRoot, false)
+				}
+				currentBlock++
+			}
+
+			// Process the block with transactions
+			b := targetBlock
 			msgs, _ := ts.PopBlock(b)
 			miner := compareBlockMiners[b]
 			reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18)))
@@ -776,7 +787,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 			// A. Process with MPT
 			mptTracer.Reset()
 			mptTracer.blockNum = b
-			mptHost.sdb.SetBlockNum(b)
+			mptHost.trieDB.UpdateBlockNum(b) // Changed from mptHost.sdb.SetBlockNum(b)
 			mptStateDB, _ := state.New(mptLastRoot, mptHost.sdb)
 			mptHooked := state.NewHookedState(mptStateDB, mptTracer.Hooks())
 
@@ -854,6 +865,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 				binHost.trieDB.Commit(binRoot, false)
 				fmt.Printf("[Test] Consistency check passed up to block %d\n", b)
 			}
+			currentBlock++
 		}
 	}
 }
