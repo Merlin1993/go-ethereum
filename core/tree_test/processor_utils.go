@@ -3,6 +3,7 @@ package tree
 import (
 	"encoding/csv"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,11 +12,162 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/holiman/uint256"
 )
+
+// TransactionStreamer provides a streaming interface to read transactions from a CSV file block-by-block.
+type TransactionStreamer struct {
+	file   *os.File
+	reader *csv.Reader
+	peeked []string
+	eof    bool
+}
+
+// NewTransactionStreamer opens a CSV file and initializes a reader for streaming.
+func NewTransactionStreamer(filePath string) (*TransactionStreamer, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	reader := csv.NewReader(f)
+	// Skip header
+	_, err = reader.Read()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &TransactionStreamer{
+		file:   f,
+		reader: reader,
+	}, nil
+}
+
+// PeekBlockNum returns the block number of the next transaction record without consuming it.
+func (s *TransactionStreamer) PeekBlockNum() (uint64, bool) {
+	if s.eof {
+		return 0, false
+	}
+	if s.peeked != nil {
+		blockNum, _ := strconv.ParseUint(s.peeked[3], 10, 64)
+		return blockNum, true
+	}
+	record, err := s.reader.Read()
+	if err != nil {
+		s.eof = true
+		return 0, false
+	}
+	if len(record) < 10 || record[0] == "hash" {
+		return s.PeekBlockNum() // Recursively skip invalid records
+	}
+	s.peeked = record
+	blockNum, _ := strconv.ParseUint(record[3], 10, 64)
+	return blockNum, true
+}
+
+// PopBlock consumes and returns all transaction messages for the specified block.
+func (s *TransactionStreamer) PopBlock(targetBlock uint64) ([]*core.Message, bool) {
+	var msgs []*core.Message
+	found := false
+
+	// Use peeked record if it matches
+	if s.peeked != nil {
+		blockNum, _ := strconv.ParseUint(s.peeked[3], 10, 64)
+		if blockNum == targetBlock {
+			msg, err := ParseCSVRecordToMessage(s.peeked)
+			if err == nil {
+				msgs = append(msgs, msg)
+				found = true
+			}
+			s.peeked = nil
+		} else if blockNum > targetBlock {
+			return nil, false // Current block is already past target
+		} else {
+			// This shouldn't happen if blocks are sorted, but handle it by dropping
+			s.peeked = nil
+		}
+	}
+
+	for {
+		record, err := s.reader.Read()
+		if err != nil {
+			s.eof = true
+			break
+		}
+		if len(record) < 10 || record[0] == "hash" {
+			continue
+		}
+
+		blockNum, _ := strconv.ParseUint(record[3], 10, 64)
+		if blockNum == targetBlock {
+			msg, err := ParseCSVRecordToMessage(record)
+			if err == nil {
+				msgs = append(msgs, msg)
+				found = true
+			}
+		} else if blockNum > targetBlock {
+			s.peeked = record // Save for next call
+			break
+		}
+		// If blockNum < targetBlock, we just skip it (assuming sorted or we already processed it)
+	}
+	return msgs, found
+}
+
+// Close closes the underlying file.
+func (s *TransactionStreamer) Close() {
+	if s.file != nil {
+		s.file.Close()
+	}
+}
+
+// ParseCSVRecordToMessage parses a single CSV record into a core.Message.
+func ParseCSVRecordToMessage(record []string) (*core.Message, error) {
+	if len(record) < 10 {
+		return nil, fmt.Errorf("invalid record length")
+	}
+
+	from := common.HexToAddress(record[5])
+	var to *common.Address
+	if record[6] != "" && record[6] != "null" {
+		toAddr := common.HexToAddress(record[6])
+		to = &toAddr
+	}
+
+	value := new(big.Int)
+	value.SetString(record[7], 10)
+
+	gasLimit, _ := strconv.ParseUint(record[8], 10, 64)
+	if gasLimit == 0 {
+		gasLimit = 21000
+	}
+
+	gasPrice := new(big.Int)
+	gasPrice.SetString(record[9], 10)
+	if gasPrice.Sign() == 0 {
+		gasPrice = big.NewInt(1000000000)
+	}
+
+	nonce, _ := strconv.ParseUint(record[1], 10, 64)
+	data := common.FromHex(record[10])
+
+	return &core.Message{
+		To:               to,
+		From:             from,
+		Nonce:            nonce,
+		Value:            value,
+		GasLimit:         gasLimit,
+		GasPrice:         gasPrice,
+		GasFeeCap:        gasPrice,
+		GasTipCap:        gasPrice,
+		Data:             data,
+		SkipNonceChecks:  true,
+		SkipFromEOACheck: false,
+	}, nil
+}
 
 // getDirSize returns the total size of a directory in bytes.
 func getDirSize(path string) (int64, error) {

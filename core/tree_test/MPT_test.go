@@ -23,14 +23,14 @@ import (
 // Test configuration
 const (
 	// Method 1 configuration
-	method1BatchSize = 1_000      // Data volume processed per batch
-	method1TotalData = 10_000_000 // Total data volume (can be adjusted to 1 billion as needed)
+	method1BatchSize = 1_000         // Data volume processed per batch
+	method1TotalData = 1_000_000_000 // Total data volume (can be adjusted to 1 billion as needed)
 
 	// Method 2 configuration
 	method2BatchSize  = 5000  // Data volume written per batch
 	method2Iterations = 20000 // Number of iterations
 
-	mptDir = "F:\\trie_stress_data\\mpt"
+	mptDir = "/home/ASCT/mpt_stress" // "F:\\trie_stress_data\\mpt"
 )
 
 // Database keys
@@ -187,7 +187,7 @@ func TestMethod1(t *testing.T) {
 		}
 
 		if collector.ShouldReport() {
-			t.Logf("Period Summary (Total Items: %d), root: %x, metrics: %s", collector.totalInjected, root, collector.GetMetricsString())
+			t.Logf("Period Summary (Total Items: %d), metrics: %s", collector.totalInjected, collector.GetMetricsString())
 			collector.ResetWindow()
 		}
 	}

@@ -209,72 +209,7 @@ func (h *CacheProcessorHost) CommitToPreTrie(root common.Hash, blockNum uint64, 
 	runtime.GC()
 }
 
-// LoadCacheTransactionsFromCSV reads and parses transactions from a CSV file.
-func LoadCacheTransactionsFromCSV(file string) (map[uint64][]*core.Message, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	reader := csv.NewReader(f)
-	_, err = reader.Read() // skip header
-	if err != nil {
-		return nil, err
-	}
-
-	msgsByBlock := make(map[uint64][]*core.Message)
-	for {
-		record, err := reader.Read()
-		if err != nil {
-			break
-		}
-		if len(record) < 10 || record[0] == "hash" {
-			continue
-		}
-
-		blockNum, _ := strconv.ParseUint(record[3], 10, 64)
-		from := common.HexToAddress(record[5])
-		var to *common.Address
-		if record[6] != "" && record[6] != "null" {
-			toAddr := common.HexToAddress(record[6])
-			to = &toAddr
-		}
-
-		value := new(big.Int)
-		value.SetString(record[7], 10)
-
-		gasLimit, _ := strconv.ParseUint(record[8], 10, 64)
-		if gasLimit == 0 {
-			gasLimit = 21000
-		}
-
-		gasPrice := new(big.Int)
-		gasPrice.SetString(record[9], 10)
-		if gasPrice.Sign() == 0 {
-			gasPrice = big.NewInt(1000000000)
-		}
-
-		nonce, _ := strconv.ParseUint(record[1], 10, 64)
-		data := common.FromHex(record[10])
-
-		msg := &core.Message{
-			To:               to,
-			From:             from,
-			Nonce:            nonce,
-			Value:            value,
-			GasLimit:         gasLimit,
-			GasPrice:         gasPrice,
-			GasFeeCap:        gasPrice,
-			GasTipCap:        gasPrice,
-			Data:             data,
-			SkipNonceChecks:  true,
-			SkipFromEOACheck: false,
-		}
-		msgsByBlock[blockNum] = append(msgsByBlock[blockNum], msg)
-	}
-	return msgsByBlock, nil
-}
+// Transaction loading is now handled by TransactionStreamer in processor_utils.go
 
 func TestCacheStateProcessor(t *testing.T) {
 	if !flag.Parsed() {
@@ -353,28 +288,25 @@ func TestCacheStateProcessor(t *testing.T) {
 
 	for _, file := range selectedFiles {
 		t.Logf("Processing file: %s", file)
-		msgsByBlock, err := LoadCacheTransactionsFromCSV(file)
+		ts, err := NewTransactionStreamer(file)
 		if err != nil {
-			t.Errorf("failed to load transactions from %s: %v", file, err)
+			t.Errorf("failed to open transaction streamer for %s: %v", file, err)
 			continue
 		}
+		defer ts.Close()
 
 		// Load block metadata (timestamps and miners) once per file
 		fileIdx := compareGetFileIndex(file)
 		compareLoadBlockTimestampsFromFile(cfg.DataDir, fileIdx)
 
-		var minBlock, maxBlock uint64 = 1e18, 0
-		for b := range msgsByBlock {
-			if b < minBlock {
-				minBlock = b
+		// Process blocks sequentially from the streamer
+		for {
+			b, ok := ts.PeekBlockNum()
+			if !ok {
+				break
 			}
-			if b > maxBlock {
-				maxBlock = b
-			}
-		}
+			msgs, _ := ts.PopBlock(b)
 
-		for b := minBlock; b <= maxBlock; b++ {
-			msgs := msgsByBlock[b]
 			header := &types.Header{
 				Number:     new(big.Int).SetUint64(b),
 				GasLimit:   30000000,
