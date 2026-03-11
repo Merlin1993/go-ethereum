@@ -267,6 +267,8 @@ func TestCacheStateProcessor(t *testing.T) {
 		lastTotAcctReads, lastTotStorReads, lastTotAcctUpd, lastTotStorUpd int64
 		lastTotReads, lastTotUpdates                                       int64
 		totalProcessedBlocks                                               uint64
+		intervalTxCount                                                    uint64
+		intervalSuccessTxCount                                             uint64
 	)
 
 	// CSV file setup
@@ -292,6 +294,9 @@ func TestCacheStateProcessor(t *testing.T) {
 		}
 		fmt.Printf("Blocks: %d - %d (Processed Blocks Count)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
 		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
+		if intervalTxCount > 0 {
+			fmt.Printf("  Tx Success Rate - %.2f%% (%d/%d)\n", float64(intervalSuccessTxCount)*100/float64(intervalTxCount), intervalSuccessTxCount, intervalTxCount)
+		}
 		fmt.Printf("  Root Calculate - Avg: %v, Max: %v\n", totalRootTime/time.Duration(intervalBlocks), maxRootTime)
 
 		// CacheTrie stats
@@ -363,6 +368,8 @@ func TestCacheStateProcessor(t *testing.T) {
 		maxTxTime = 0
 		totalRootTime = 0
 		maxRootTime = 0
+		intervalTxCount = 0
+		intervalSuccessTxCount = 0
 
 		lastAcctHit, lastAcctMissEx, lastAcctMissNo = acctHit, acctMissEx, acctMissNo
 		lastStorHit, lastStorMissEx, lastStorMissNo = storHit, storMissEx, storMissNo
@@ -496,7 +503,11 @@ func TestCacheStateProcessor(t *testing.T) {
 			gp := new(core.GasPool).AddGas(header.GasLimit)
 
 			for _, m := range msgs {
-				core.ApplyMessage(vmenv, m, gp)
+				res, err := core.ApplyMessage(vmenv, m, gp)
+				intervalTxCount++
+				if err == nil && !res.Failed() {
+					intervalSuccessTxCount++
+				}
 			}
 
 			txDuration := time.Since(txStart)

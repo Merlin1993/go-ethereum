@@ -187,17 +187,19 @@ func TestExpireStateProcessor(t *testing.T) {
 	// Statistics tracking
 	statsIv := uint64(*statsInterval)
 	var (
-		intervalBlocks       uint64
-		totalProcessedBlocks uint64
-		epochID              uint64
-		totalTxTime          time.Duration
-		maxTxTime            time.Duration
-		totalRootTime        time.Duration
-		maxRootTime          time.Duration
-		totalPruneTime       time.Duration
-		maxPruneTime         time.Duration
-		pruneCount           uint64
-		totalStorageSize     int64 // Cumulative storage size
+		intervalBlocks         uint64
+		totalProcessedBlocks   uint64
+		epochID                uint64
+		totalTxTime            time.Duration
+		maxTxTime              time.Duration
+		totalRootTime          time.Duration
+		maxRootTime            time.Duration
+		totalPruneTime         time.Duration
+		maxPruneTime           time.Duration
+		pruneCount             uint64
+		totalStorageSize       int64 // Cumulative storage size
+		intervalTxCount        uint64
+		intervalSuccessTxCount uint64
 	)
 
 	// CSV file setup
@@ -228,8 +230,11 @@ func TestExpireStateProcessor(t *testing.T) {
 		storageSize, _ := getDirSize(cfg.DbDir)
 		totalStorageSize = storageSize // Update cumulative storage size
 
-		fmt.Printf("Blocks: %d - %d (Processed Blocks Count)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
+		fmt.Printf("  Blocks: %d - %d (Processed Blocks Count)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
 		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
+		if intervalTxCount > 0 {
+			fmt.Printf("  Tx Success Rate - %.2f%% (%d/%d)\n", float64(intervalSuccessTxCount)*100/float64(intervalTxCount), intervalSuccessTxCount, intervalTxCount)
+		}
 		fmt.Printf("  平均根计算耗时: %.2f ms\n", float64(totalRootTime.Milliseconds())/float64(intervalBlocks))
 		fmt.Printf("  最大根计算耗时: %v\n", maxRootTime)
 		fmt.Printf("  累计存储占用: %d 字节\n", totalStorageSize)
@@ -340,6 +345,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		pruneCount = 0
 		totalTxTime = 0 // Reset Tx Execution stats
 		maxTxTime = 0   // Reset Tx Execution stats
+		intervalTxCount = 0
+		intervalSuccessTxCount = 0
 
 		atomic.StoreInt64(&common.BinaryHitCount, 0)
 		atomic.StoreInt64(&common.BinaryMissNonExistentCount, 0)
@@ -458,7 +465,11 @@ func TestExpireStateProcessor(t *testing.T) {
 			evm := vm.NewEVM(blockCtx, statedb, params.MainnetChainConfig, vm.Config{})
 			txStart := time.Now()
 			for _, msg := range msgs {
-				core.ApplyMessage(evm, msg, new(core.GasPool).AddGas(msg.GasLimit))
+				res, err := core.ApplyMessage(evm, msg, new(core.GasPool).AddGas(msg.GasLimit))
+				intervalTxCount++
+				if err == nil && !res.Failed() {
+					intervalSuccessTxCount++
+				}
 			}
 			txDuration := time.Since(txStart)
 			totalTxTime += txDuration
