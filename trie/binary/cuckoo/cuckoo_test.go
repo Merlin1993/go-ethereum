@@ -22,7 +22,7 @@ import (
 )
 
 func TestFilterBasic(t *testing.T) {
-	f := New()
+	f := New(32, 4)
 	data := []byte("hello")
 
 	if f.Lookup(data) {
@@ -47,7 +47,7 @@ func TestFilterBasic(t *testing.T) {
 }
 
 func TestFilterCapacity(t *testing.T) {
-	f := New()
+	f := New(32, 4)
 	count := 0
 	for i := 0; i < 100; i++ {
 		data := []byte(fmt.Sprintf("data-%d", i))
@@ -71,7 +71,7 @@ func TestFilterCapacity(t *testing.T) {
 }
 
 func TestFalsePositiveRate(t *testing.T) {
-	f := New()
+	f := New(32, 4)
 	numInserted := 100
 	for i := 0; i < numInserted; i++ {
 		data := []byte(fmt.Sprintf("data-%d", i))
@@ -96,7 +96,7 @@ func TestFalsePositiveRate(t *testing.T) {
 }
 
 func TestReset(t *testing.T) {
-	f := New()
+	f := New(32, 4)
 	f.Insert([]byte("a"))
 	f.Insert([]byte("b"))
 	f.Reset()
@@ -110,21 +110,21 @@ func TestReset(t *testing.T) {
 }
 
 func TestEncodeDecode(t *testing.T) {
-	f1 := New()
+	f1 := New(32, 4)
 	elements := []string{"apple", "banana", "cherry", "date"}
 	for _, el := range elements {
 		f1.Insert([]byte(el))
 	}
 
 	data := f1.Encode()
-	// 预期大小: 16 (位图) + 4 (元素) * 2 (字节/uint16) = 24 字节
-	expectedSize := 16 + len(elements)*2
+	// Header(8) + Bitmask(128/8=16) + Fingerprints(4*2=8) = 32
+	expectedSize := 8 + 16 + len(elements)*2
 	if len(data) != expectedSize {
 		t.Fatalf("编码后的数据长度应为 %d, 实际为 %d", expectedSize, len(data))
 	}
 
-	f2 := New()
-	if err := f2.Decode(data); err != nil {
+	f2 := New(32, 4)
+	if err := f2.Decode(data, 0, 0); err != nil {
 		t.Fatalf("解码失败: %v", err)
 	}
 
@@ -143,9 +143,9 @@ func TestEncodeDecode(t *testing.T) {
 	}
 
 	// 测试空过滤器编码
-	f3 := New()
+	f3 := New(32, 4)
 	emptyData := f3.Encode()
-	if len(emptyData) != 16 {
-		t.Fatalf("空过滤器的编码长度应为 16, 实际为 %d", len(emptyData))
+	if len(emptyData) != 24 { // 8 (header) + 16 (bitmask)
+		t.Fatalf("空过滤器的编码长度应为 24, 实际为 %d", len(emptyData))
 	}
 }

@@ -33,15 +33,16 @@ import (
 
 // Config defines all necessary options for database.
 type Config struct {
-	Preimages        bool           // Flag whether the preimage of node key is recorded
-	IsVerkle         bool           // Flag whether the db is holding a verkle tree
-	CacheTrie        bool           // Flag whether to use CacheTrie instead of normal Trie
-	ReadCache        bool           // Flag whether to enable reading from cache
-	StartNum         uint64         // Start number for CacheTrie
-	HashDB           *hashdb.Config // Configs for hash-based scheme
-	PathDB           *pathdb.Config // Configs for experimental path-based scheme
-	IsBinary         bool           // Flag whether the db is holding a binary trie
-	BinaryArchiveDir string         // Directory for binary trie archive storage
+	Preimages            bool                   // Flag whether the preimage of node key is recorded
+	IsVerkle             bool                   // Flag whether the db is holding a verkle tree
+	CacheTrie            bool                   // Flag whether to use CacheTrie instead of normal Trie
+	ReadCache            bool                   // Flag whether to enable reading from cache
+	StartNum             uint64                 // Start number for CacheTrie
+	HashDB               *hashdb.Config         // Configs for hash-based scheme
+	PathDB               *pathdb.Config         // Configs for experimental path-based scheme
+	IsBinary             bool                   // Flag whether the db is holding a binary trie
+	BinaryArchiveDir     string                 // Directory for binary trie archive storage
+	BinaryAblationConfig *database.BinaryConfig // Configuration for binary trie ablation
 }
 
 // HashDefaults represents a config for using hash-based scheme with
@@ -514,4 +515,9 @@ func (db *Database) SetBinaryTrie(trie interface{}) {
 // GetBinaryTrie retrieves the persistent binary trie instance from the database.
 func (db *Database) GetBinaryTrie() interface{} {
 	return db.activeBT
+}
+
+// BinaryAblationConfig returns the configuration for binary trie ablation.
+func (db *Database) BinaryAblationConfig() *database.BinaryConfig {
+	return db.config.BinaryAblationConfig
 }

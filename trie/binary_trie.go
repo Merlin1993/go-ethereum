@@ -64,6 +64,29 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 	// For now, we use a simple adapter for the KVStore and ArchiveDB
 	kvAdapter := &binaryDBAdapter{db: db, root: root}
 	config := binary.DefaultConfig()
+
+	// Try to get config from DB
+	type configDB interface {
+		BinaryAblationConfig() *database.BinaryConfig
+	}
+	if cdb, ok := db.(configDB); ok {
+		dbConf := cdb.BinaryAblationConfig()
+		if dbConf != nil {
+			if dbConf.ShardDepth > 0 {
+				config.ShardDepth = dbConf.ShardDepth
+			}
+			if dbConf.ArchiveBucketSize > 0 {
+				config.ArchiveBucketSize = dbConf.ArchiveBucketSize
+			}
+			if dbConf.CuckooBuckets > 0 {
+				config.CuckooBuckets = dbConf.CuckooBuckets
+			}
+			if dbConf.CuckooSlots > 0 {
+				config.CuckooSlots = dbConf.CuckooSlots
+			}
+		}
+	}
+
 	if archive != nil {
 		config.ArchiveDB = &binaryDBAdapterArchive{db: archive}
 	} else {

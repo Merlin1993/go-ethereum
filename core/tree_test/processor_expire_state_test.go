@@ -29,6 +29,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/database"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
@@ -49,11 +50,17 @@ var (
 	startIdx         = flag.Int("startFileIdx2", 1, "Start file index")
 	endIdx           = flag.Int("endFileIdx2", 21, "End file index")
 	useVerkle        = flag.Bool("useVerkle2", false, "Enable Verkle trie")
-	useBinaryTrie    = flag.Bool("useBinaryTrie2", false, "Enable Binary trie")
+	useBinaryTrie    = flag.Bool("useBinaryTrie2", true, "Enable Binary trie")
 	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
 	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
 	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
-	pruneInterval    = flag.Int("pruneInterval", 5, "Blocks between Trie.PruneNextShard() calls")
+	pruneInterval    = flag.Int("pruneInterval", 1, "Blocks between Trie.PruneNextShard() calls")
+
+	// Binary Trie Ablation flags
+	shardDepth        = flag.Int("shardDepth", 20, "Binary trie shard depth")
+	archiveBucketSize = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
+	cuckooBuckets     = flag.Int("cuckooBuckets", 32, "Binary trie cuckoo filter buckets")
+	cuckooSlots       = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
 )
 
 func TestMain(m *testing.M) {
@@ -75,6 +82,12 @@ type ProcessorConfig struct {
 	BinaryArchiveDir string
 	StartNum         uint64
 	PruneInterval    int
+
+	// Ablation params
+	ShardDepth        int
+	ArchiveBucketSize int
+	CuckooBuckets     int
+	CuckooSlots       int
 }
 
 func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
@@ -107,8 +120,14 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 		ReadCache:        false,
 		StartNum:         cfg.StartNum,
 		BinaryArchiveDir: cfg.BinaryArchiveDir,
-		PathDB:           pdb,
-		HashDB:           hdb,
+		BinaryAblationConfig: &database.BinaryConfig{
+			ShardDepth:        cfg.ShardDepth,
+			ArchiveBucketSize: cfg.ArchiveBucketSize,
+			CuckooBuckets:     cfg.CuckooBuckets,
+			CuckooSlots:       cfg.CuckooSlots,
+		},
+		PathDB: pdb,
+		HashDB: hdb,
 	})
 
 	firstRootHash := types.EmptyRootHash
@@ -150,16 +169,20 @@ func TestExpireStateProcessor(t *testing.T) {
 		flag.Parse()
 	}
 	cfg := &ProcessorConfig{
-		DbDir:            *dbDir,
-		DataDir:          *dataDir,
-		StartFileIdx:     *startIdx,
-		EndFileIdx:       *endIdx,
-		UseVerkle:        *useVerkle,
-		UseBinaryTrie:    *useBinaryTrie,
-		UseMemory:        *useMemory,
-		BinaryArchiveDir: *binaryArchiveDir,
-		StartNum:         46147,
-		PruneInterval:    *pruneInterval,
+		DbDir:             *dbDir,
+		DataDir:           *dataDir,
+		StartFileIdx:      *startIdx,
+		EndFileIdx:        *endIdx,
+		UseVerkle:         *useVerkle,
+		UseBinaryTrie:     *useBinaryTrie,
+		UseMemory:         *useMemory,
+		BinaryArchiveDir:  *binaryArchiveDir,
+		StartNum:          46147,
+		PruneInterval:     *pruneInterval,
+		ShardDepth:        *shardDepth,
+		ArchiveBucketSize: *archiveBucketSize,
+		CuckooBuckets:     *cuckooBuckets,
+		CuckooSlots:       *cuckooSlots,
 	}
 
 	common.UseVerkle = cfg.UseVerkle
@@ -433,6 +456,11 @@ func TestExpireStateProcessor(t *testing.T) {
 				lastStateRoot = h
 				if b%1000 == 0 {
 					host.trieDB.Commit(h, false)
+					if !cfg.UseBinaryTrie && !cfg.UseVerkle {
+						// MPT Mode: Prune historical data to save space.
+						// hashdb.Cap(0) flushes old nodes.
+						host.trieDB.Cap(0)
+					}
 				}
 				intervalBlocks++
 				totalProcessedBlocks++
@@ -557,6 +585,10 @@ func TestExpireStateProcessor(t *testing.T) {
 			// Optional treeDB commit
 			if b%1000 == 0 {
 				host.trieDB.Commit(h, false)
+				if !cfg.UseBinaryTrie && !cfg.UseVerkle {
+					// MPT Mode: Prune historical data.
+					host.trieDB.Cap(0)
+				}
 			}
 
 			totalRootTime += rootDuration

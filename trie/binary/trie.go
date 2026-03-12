@@ -31,6 +31,8 @@ type Config struct {
 	ShardDepth        int          // Number of bits for shard routing (default 16)
 	ArchiveBucketSize int          // Max number of items in an archive bucket before splitting (default 100)
 	ArchiveDB         ArchiveStore // Separate store for archive data
+	CuckooBuckets     int          // Number of buckets in cuckoo filter (default 32)
+	CuckooSlots       int          // Slots per bucket in cuckoo filter (default 4)
 }
 
 // DefaultConfig returns a Config with default values.
@@ -38,6 +40,8 @@ func DefaultConfig() *Config {
 	return &Config{
 		ShardDepth:        16,
 		ArchiveBucketSize: 100,
+		CuckooBuckets:     32,
+		CuckooSlots:       4,
 	}
 }
 
@@ -317,8 +321,8 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 				if filter == nil {
 					bucket.cacheMu.Lock()
 					if bucket.cachedFilter == nil {
-						f := cuckoo.New()
-						if err := f.Decode(bucket.Filter); err == nil {
+						f := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
+						if err := f.Decode(bucket.Filter, s.config.CuckooBuckets, s.config.CuckooSlots); err == nil {
 							bucket.cachedFilter = f
 						}
 					}

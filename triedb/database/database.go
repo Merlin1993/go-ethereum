@@ -22,6 +22,14 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
+// BinaryConfig holds the configuration parameters for binary trie ablation.
+type BinaryConfig struct {
+	ShardDepth        int // Shard depth for binary trie
+	ArchiveBucketSize int // Archive bucket size for binary trie
+	CuckooBuckets     int // Cuckoo filter buckets for binary trie
+	CuckooSlots       int // Cuckoo filter slots for binary trie
+}
+
 // NodeReader wraps the Node method of a backing trie reader.
 type NodeReader interface {
 	// Node retrieves the trie node blob with the provided trie identifier,

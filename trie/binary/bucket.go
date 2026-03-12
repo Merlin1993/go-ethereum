@@ -87,9 +87,9 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 		}
 		bucket.Filter = bucket.cachedFilter.Encode()
 	} else {
-		filter := cuckoo.New()
+		filter := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
 		if len(bucket.Filter) > 0 {
-			filter.Decode(bucket.Filter)
+			filter.Decode(bucket.Filter, s.config.CuckooBuckets, s.config.CuckooSlots)
 		}
 		for _, it := range newItems {
 			filter.Insert(it.Suffix)
@@ -159,9 +159,9 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 		}
 		bucket.Filter = bucket.cachedFilter.Encode()
 	} else {
-		filter := cuckoo.New()
+		filter := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
 		if len(bucket.Filter) > 0 {
-			filter.Decode(bucket.Filter)
+			filter.Decode(bucket.Filter, s.config.CuckooBuckets, s.config.CuckooSlots)
 		}
 		for _, it := range deleteItems {
 			filter.Delete(it.Suffix)
@@ -266,7 +266,7 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	bucket.cacheMu.Lock()
 	defer bucket.cacheMu.Unlock()
 
-	filter := cuckoo.New()
+	filter := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
 	var hashes []common.Hash
 
 	for _, item := range items {
