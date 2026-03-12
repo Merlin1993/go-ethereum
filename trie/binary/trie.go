@@ -45,6 +45,23 @@ func DefaultConfig() *Config {
 	}
 }
 
+// ResolveArchiveBucketSize returns the restricted bucket size based on cuckoo configuration.
+func (c *Config) ResolveArchiveBucketSize() int {
+	if c.CuckooSlots == 2 && c.CuckooBuckets == 8 {
+		return 10
+	}
+	if c.CuckooSlots == 4 && c.CuckooBuckets == 8 {
+		return 30
+	}
+	if c.CuckooSlots == 4 && c.CuckooBuckets == 16 {
+		return 60
+	}
+	if c.CuckooSlots == 4 && c.CuckooBuckets == 32 {
+		return 100
+	}
+	return c.ArchiveBucketSize
+}
+
 // TrieStats holds statistics about the Trie.
 type TrieStats struct {
 	BucketCount      int   // Total number of archive buckets
@@ -1503,8 +1520,8 @@ func (s *Shard) pruneAndArchive(node Node, global byte, depth int, pathFromShard
 			}
 		}
 
-		// B. 如果 len >= config.ArchiveBucketSize，本层无法追加，则下探
-		if len(merged) >= s.config.ArchiveBucketSize {
+		// B. 如果 len >= s.config.ResolveArchiveBucketSize()，本层无法追加，则下探
+		if len(merged) >= s.config.ResolveArchiveBucketSize() {
 			// 修改：mountAtDeepest 现在由于使用了相对于分片的 Suffix，不再需要 shiftBits
 			n.Left = s.mountAtDeepest(n.Left, depth+n.PathBits+1, leftArchived)
 			n.Right = s.mountAtDeepest(n.Right, depth+n.PathBits+1, rightArchived)
@@ -1581,7 +1598,7 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 	}
 	// Initialize the 16-ary TopTree for O(Dirty) root hash computation
 	batch := t.db.NewBatch()
-	t.topTree = NewTopTree(hasher, batch)
+	t.topTree = NewTopTree(hasher, batch, t.config.ShardDepth)
 	if len(root) > 0 {
 		t.Load(root)
 	}
@@ -1620,7 +1637,7 @@ func (t *Trie) Load(root []byte) error {
 	// Reset internal state before loading new root
 	t.shards = make(map[int]*Shard)
 	t.shardRoots = make(map[int][]byte)
-	t.topTree = NewTopTree(t.hasher, t.db.NewBatch())
+	t.topTree = NewTopTree(t.hasher, t.db.NewBatch(), t.config.ShardDepth)
 
 	if len(data) == (1<<t.config.ShardDepth)*32 {
 		for i := 0; i < (1 << t.config.ShardDepth); i++ {
@@ -1681,7 +1698,7 @@ func (t *Trie) parseTopTree(data []byte, level int, prefix int) (*TopNode, error
 			}
 		}
 
-		if level == 3 {
+		if level == (t.config.ShardDepth+3)/4-1 {
 			shardID := (prefix << 4) | i
 			if !empty {
 				t.shardRoots[shardID] = append([]byte(nil), h...)
@@ -1876,7 +1893,7 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 
 	// [OPTIMIZATION] 16-ary Top Tree Aggregation replacing flat 2MB hash
 	if t.topTree == nil {
-		t.topTree = NewTopTree(t.hasher, batch) // Initialize on demand or in NewTrie
+		t.topTree = NewTopTree(t.hasher, batch, t.config.ShardDepth) // Initialize on demand or in NewTrie
 	} else {
 		t.topTree.db = batch // Update batcher reference
 	}
@@ -1963,11 +1980,9 @@ func (t *Trie) Hash() ([]byte, error) {
 		}
 	}
 
-	// Use TopTree to compute root (assumes Compute is non-destructive to TopTree internal state if we don't save it)
-	// Actually TopTree.Compute writes to t.topTree.db (the batch).
-	// For Hash(), we use a dummy batch.
+	// [OPTIMIZATION] 16-ary Top Tree Aggregation replacing flat 2MB hash
 	dummy := &dummyBatcher{}
-	topTree := NewTopTree(t.hasher, dummy)
+	topTree := NewTopTree(t.hasher, dummy, t.config.ShardDepth)
 	return topTree.Compute(tempShardRoots, t.dirtyList, dummy)
 }
 
@@ -2249,7 +2264,7 @@ func (s *Shard) mountAtDeepest(node Node, depth int, newItems []ArchivedKV) Node
 			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, newItems[0].Suffix, depth)
 			if matched == bucket.PathBits {
 				// 命中：尝试“盲追加”
-				if bucket.Count+uint64(len(newItems)) <= uint64(s.config.ArchiveBucketSize) {
+				if bucket.Count+uint64(len(newItems)) <= uint64(s.config.ResolveArchiveBucketSize()) {
 					s.blindAppendToBucket(bucket, newItems)
 					bucket.SetDirty(true)
 					n.SetDirty(true)
