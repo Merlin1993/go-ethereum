@@ -275,6 +275,8 @@ func TestCacheStateProcessor(t *testing.T) {
 		totalProcessedBlocks                                               uint64
 		intervalTxCount                                                    uint64
 		intervalSuccessTxCount                                             uint64
+		globalTxCount                                                      uint64
+		globalSuccessTxCount                                               uint64
 	)
 
 	// CSV file setup
@@ -521,11 +523,13 @@ func TestCacheStateProcessor(t *testing.T) {
 
 			for _, m := range msgs {
 				intervalTxCount++
+				globalTxCount++
 				m.SkipNonceChecks = true
 				_, err := core.ApplyMessage(vmenv, m, gp)
 				if err == nil {
 					// Successful if ApplyMessage returns err == nil (matches eth_compare_test criteria)
 					intervalSuccessTxCount++
+					globalSuccessTxCount++
 				} else {
 					toStr := "contract-creation"
 					if m.To != nil {
@@ -595,5 +599,20 @@ func TestCacheStateProcessor(t *testing.T) {
 	if intervalBlocks > 0 {
 		reportStats()
 	}
-	t.Logf("Final state root: %s", lastStateRoot.String())
+	fmt.Printf("\n>>> FINAL TRANSACTION SUCCESS RATE SUMMARY <<<\n")
+	if globalTxCount > 0 {
+		fmt.Printf("Total Transactions: %d\n", globalTxCount)
+		fmt.Printf("Successful Transactions: %d\n", globalSuccessTxCount)
+		fmt.Printf("Global Success Rate: %.2f%%\n", float64(globalSuccessTxCount)*100/float64(globalTxCount))
+		if float64(globalSuccessTxCount)/float64(globalTxCount) >= 0.95 {
+			fmt.Printf("Status: SUCCESS (>= 95%%)\n")
+		} else {
+			fmt.Printf("Status: WARNING (< 95%%)\n")
+		}
+	} else {
+		fmt.Printf("No transactions were processed.\n")
+	}
+	fmt.Printf(">>> END SUMMARY <<<\n\n")
+
+	t.Logf("Final state root: %s", lastStateRoot.Hex())
 }

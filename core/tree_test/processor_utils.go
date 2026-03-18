@@ -1,6 +1,7 @@
 package tree
 
 import (
+	"bufio"
 	"encoding/csv"
 	"fmt"
 	"math/big"
@@ -87,105 +88,122 @@ func SetCodeSilent(sdb *state.StateDB, addr common.Address, code []byte) {
 	}
 }
 
-// TransactionStreamer provides a streaming interface to read transactions from a CSV file block-by-block.
-type TransactionStreamer struct {
-	file   *os.File
-	reader *csv.Reader
-	peeked []string
-	eof    bool
+type txIndex struct {
+	blockNum uint64
+	offset   int64
 }
 
-// NewTransactionStreamer opens a CSV file and initializes a reader for streaming.
+// TransactionStreamer provides a streaming interface to read transactions from a CSV file block-by-block.
+type TransactionStreamer struct {
+	file    *os.File
+	indices []txIndex
+	curr    int // Index into indices slice
+}
+
+// NewTransactionStreamer opens a CSV file and initializes an index for memory-efficient streaming.
 func NewTransactionStreamer(filePath string) (*TransactionStreamer, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
 	}
-	reader := csv.NewReader(f)
-	// Skip header
-	_, err = reader.Read()
+
+	var indices []txIndex
+
+	// Fast indexing pass using bufio.Reader
+	bufr := bufio.NewReader(f)
+
+	// Skip header line
+	_, _, err = bufr.ReadLine()
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
+
+	offset, _ := f.Seek(0, os.SEEK_CUR)
+	// Adjust offset based on what's left in the buffer
+	offset -= int64(bufr.Buffered())
+
+	for {
+		lineOffset := offset
+		line, err := bufr.ReadBytes('\n')
+		if err != nil && len(line) == 0 {
+			break
+		}
+		offset += int64(len(line))
+
+		sline := string(line)
+		if len(sline) < 10 || strings.HasPrefix(sline, "hash") {
+			continue
+		}
+
+		// Fast block number extraction (block number is the 4th column, index 3)
+		parts := strings.SplitN(sline, ",", 5)
+		if len(parts) < 4 {
+			continue
+		}
+		blockNum, _ := strconv.ParseUint(parts[3], 10, 64)
+		indices = append(indices, txIndex{blockNum: blockNum, offset: lineOffset})
+	}
+
+	// Sort indices by block number
+	sort.Slice(indices, func(i, j int) bool {
+		if indices[i].blockNum == indices[j].blockNum {
+			return indices[i].offset < indices[j].offset
+		}
+		return indices[i].blockNum < indices[j].blockNum
+	})
+
 	return &TransactionStreamer{
-		file:   f,
-		reader: reader,
+		file:    f,
+		indices: indices,
+		curr:    0,
 	}, nil
 }
 
 // PeekBlockNum returns the block number of the next transaction record without consuming it.
 func (s *TransactionStreamer) PeekBlockNum() (uint64, bool) {
-	if s.eof {
+	if s.curr >= len(s.indices) {
 		return 0, false
 	}
-	if s.peeked != nil {
-		blockNum, _ := strconv.ParseUint(s.peeked[3], 10, 64)
-		return blockNum, true
-	}
-	record, err := s.reader.Read()
-	if err != nil {
-		s.eof = true
-		return 0, false
-	}
-	if len(record) < 10 || record[0] == "hash" {
-		return s.PeekBlockNum() // Recursively skip invalid records
-	}
-	s.peeked = record
-	blockNum, _ := strconv.ParseUint(record[3], 10, 64)
-	return blockNum, true
+	return s.indices[s.curr].blockNum, true
 }
 
 // PopBlock consumes and returns all transaction messages for the specified block.
 func (s *TransactionStreamer) PopBlock(targetBlock uint64) ([]*core.Message, bool) {
-	var msgs []*core.Message
-	found := false
-
-	// Use peeked record if it matches
-	if s.peeked != nil {
-		blockNum, _ := strconv.ParseUint(s.peeked[3], 10, 64)
-		if blockNum == targetBlock {
-			msg, err := ParseCSVRecordToMessage(s.peeked)
-			if err == nil {
-				msgs = append(msgs, msg)
-				found = true
-			}
-			s.peeked = nil
-		} else if blockNum > targetBlock {
-			return nil, false // Current block is already past target
-		} else {
-			// This shouldn't happen if blocks are sorted, but handle it by dropping
-			s.peeked = nil
-		}
+	if s.curr >= len(s.indices) || s.indices[s.curr].blockNum != targetBlock {
+		return nil, false
 	}
 
-	for {
-		record, err := s.reader.Read()
+	var msgs []*core.Message
+	// Use a shared buffer for reading lines to reduce allocations
+	bufr := bufio.NewReader(s.file)
+
+	for s.curr < len(s.indices) && s.indices[s.curr].blockNum == targetBlock {
+		_, err := s.file.Seek(s.indices[s.curr].offset, os.SEEK_SET)
 		if err != nil {
-			s.eof = true
-			break
-		}
-		if len(record) < 10 || record[0] == "hash" {
+			s.curr++
 			continue
 		}
-
-		blockNum, _ := strconv.ParseUint(record[3], 10, 64)
-		if blockNum == targetBlock {
-			msg, err := ParseCSVRecordToMessage(record)
+		bufr.Reset(s.file)
+		line, _, err := bufr.ReadLine()
+		if err == nil {
+			// Fast parse the line
+			reader := csv.NewReader(strings.NewReader(string(line)))
+			record, err := reader.Read()
 			if err == nil {
-				msgs = append(msgs, msg)
-				found = true
+				msg, err := ParseCSVRecordToMessage(record)
+				if err == nil {
+					msgs = append(msgs, msg)
+				}
 			}
-		} else if blockNum > targetBlock {
-			s.peeked = record // Save for next call
-			break
 		}
-		// If blockNum < targetBlock, we just skip it (assuming sorted or we already processed it)
+		s.curr++
 	}
-	return msgs, found
+
+	return msgs, len(msgs) > 0
 }
 
-// Close closes the underlying file.
+// Close closes the underlying file handle.
 func (s *TransactionStreamer) Close() {
 	if s.file != nil {
 		s.file.Close()
