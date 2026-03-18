@@ -59,7 +59,7 @@ var (
 	// Binary Trie Ablation flags
 	shardDepth        = flag.Int("shardDepth", 20, "Binary trie shard depth")
 	archiveBucketSize = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
-	cuckooBuckets     = flag.Int("cuckooBuckets", 32, "Binary trie cuckoo filter buckets")
+	cuckooBuckets     = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
 	cuckooSlots       = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
 )
 
@@ -679,8 +679,10 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 			t.count++
 			t.hasher.Write(addr[:])
 			t.hasher.Write(common.LeftPadBytes(new.Bytes(), 32))
-			if t.blockNum >= 54340 && t.blockNum <= 54345 {
-				fmt.Printf("[%s] Block %d BalanceChange: addr=%s, reason=%d\n", t.prefix, t.blockNum, addr.Hex(), reason)
+
+			if t.blockNum == 50107 || t.blockNum == 46170 {
+				msg := fmt.Sprintf("[%s] Block %d BalanceChange: addr=%s, reason=%d, new=%v\n", t.prefix, t.blockNum, addr.Hex(), reason, new)
+				t.logToFile(msg)
 			}
 		},
 		OnNonceChangeV2: func(addr common.Address, prev, new uint64, reason tracing.NonceChangeReason) {
@@ -689,16 +691,20 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 			var b [8]byte
 			binary.BigEndian.PutUint64(b[:], new)
 			t.hasher.Write(b[:])
-			if common.DebugFlag {
-				fmt.Printf("[Tracer] NonceChange: addr=%s, new=%d, reason=%d\n", addr.Hex(), new, reason)
+
+			if t.blockNum == 50107 || t.blockNum == 46170 {
+				msg := fmt.Sprintf("[%s] Block %d NonceChange: addr=%s, new=%d, reason=%d\n", t.prefix, t.blockNum, addr.Hex(), new, reason)
+				t.logToFile(msg)
 			}
 		},
 		OnCodeChange: func(addr common.Address, prevCodeHash common.Hash, prevCode []byte, codeHash common.Hash, code []byte) {
 			t.count++
 			t.hasher.Write(addr[:])
 			t.hasher.Write(codeHash[:])
-			if common.DebugFlag {
-				fmt.Printf("[Tracer] CodeChange: addr=%s, new=%s\n", addr.Hex(), codeHash.Hex())
+
+			if t.blockNum == 50107 {
+				msg := fmt.Sprintf("[%s] Block %d CodeChange: addr=%s, new=%s\n", t.prefix, t.blockNum, addr.Hex(), codeHash.Hex())
+				t.logToFile(msg)
 			}
 		},
 		OnStorageChange: func(addr common.Address, slot common.Hash, prev, new common.Hash) {
@@ -706,12 +712,20 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 			t.hasher.Write(addr[:])
 			t.hasher.Write(slot[:])
 			t.hasher.Write(new[:])
-			targetAddr := common.HexToAddress("0x59622442B567187157b85d6928A6c56e1E0841CA")
-			targetSlot := common.HexToHash("0x0000000000000000000000000000000000000000000000000000000000000002")
-			if (addr == targetAddr && slot == targetSlot) || (t.blockNum >= 54340 && t.blockNum <= 54345) {
-				fmt.Printf("[%s] Block %d StorageChange: addr=%s, slot=%s, prev=%s, new=%s\n", t.prefix, t.blockNum, addr.Hex(), slot.Hex(), prev.Hex(), new.Hex())
+
+			if t.blockNum == 50107 || t.blockNum == 46170 {
+				msg := fmt.Sprintf("[%s] Block %d StorageChange: addr=%s, slot=%s, prev=%s, new=%s\n", t.prefix, t.blockNum, addr.Hex(), slot.Hex(), prev.Hex(), new.Hex())
+				t.logToFile(msg)
 			}
 		},
+	}
+}
+
+func (t *consistencyTracer) logToFile(msg string) {
+	f, _ := os.OpenFile("debug_b50107.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if f != nil {
+		f.WriteString(msg)
+		f.Close()
 	}
 }
 
@@ -791,7 +805,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 	gspec.MustCommit(binHost.db, binHost.trieDB)
 
 	mptLastRoot := types.EmptyRootHash
-	binLastRoot := types.EmptyRootHash
+	binLastRoot := common.Hash{}
 
 	mptTracer := newConsistencyTracer("MPT")
 	binTracer := newConsistencyTracer("BIN")
@@ -856,13 +870,29 @@ func TestBinaryTrieConsistency(t *testing.T) {
 					binStateDB.PruneNextShard()
 				}
 				binHooked.Finalise(false)
-				binRoot, _ := binStateDB.Commit(b, false, false)
+				binRoot, err := binStateDB.Commit(b, false, false)
+				if err != nil {
+					t.Fatalf("Block %d (empty): BIN Commit failed: %v", b, err)
+				}
+				mptSummary := mptTracer.Summary(b, mptRoot)
+				binSummary := binTracer.Summary(b, binRoot)
+
+				if mptSummary.WriteCount != binSummary.WriteCount {
+					t.Fatalf("Block %d (empty): WriteCount mismatch! MPT=%d, BIN=%d", b, mptSummary.WriteCount, binSummary.WriteCount)
+				}
+				if mptSummary.WriteHash != binSummary.WriteHash {
+					t.Fatalf("Block %d (empty): WriteHash mismatch! MPT=%s, BIN=%s, binRoot=%s", b, mptSummary.WriteHash.Hex(), binSummary.WriteHash.Hex(), binRoot.Hex())
+				}
 
 				mptLastRoot = mptRoot
 				binLastRoot = binRoot
 				if b%1000 == 0 {
+					fmt.Printf("[Test] Processing empty block %d, binRoot=%s\n", b, binRoot.Hex())
 					mptHost.trieDB.Commit(mptRoot, false)
 					binHost.trieDB.Commit(binRoot, false)
+				}
+				if b > 0 && binLastRoot != (common.Hash{}) && binRoot == (common.Hash{}) {
+					t.Fatalf("Block %d (empty): binRoot became zero! binLastRoot was %s", b, binLastRoot.Hex())
 				}
 				currentBlock++
 			}
@@ -923,6 +953,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 			// B. Process with Binary Trie
 			binTracer.Reset()
 			binTracer.blockNum = b
+			binSuccessCount := 0
 			binHost.sdb.SetBlockNum(b)
 			binStateDB, err := state.New(binLastRoot, binHost.sdb)
 			if err != nil {
@@ -942,13 +973,24 @@ func TestBinaryTrieConsistency(t *testing.T) {
 
 			for _, msg := range msgs {
 				msg.SkipNonceChecks = true
-				_, err := core.ApplyMessage(binEVM, msg, new(core.GasPool).AddGas(msg.GasLimit))
-				if err != nil && b%1000 == 0 {
-					toStr := "contract-creation"
-					if msg.To != nil {
-						toStr = msg.To.Hex()
+				res, applyErr := core.ApplyMessage(binEVM, msg, new(core.GasPool).AddGas(msg.GasLimit))
+				if applyErr != nil || (res != nil && res.Err != nil) {
+					errMsg := applyErr
+					if errMsg == nil {
+						errMsg = res.Err
 					}
-					fmt.Printf("BIN Transaction Reverted: block=%d, sender=%s, nonce=%d, to=%s, res.Err=%v\n", b, msg.From.Hex(), msg.Nonce, toStr, err)
+					if b == 50107 {
+						fmt.Printf("[BIN] Block 50107 Msg Fail: sender=%s, nonce=%d, err=%v\n", msg.From.Hex(), msg.Nonce, errMsg)
+					}
+					if b%1000 == 0 {
+						toStr := "contract-creation"
+						if msg.To != nil {
+							toStr = msg.To.Hex()
+						}
+						fmt.Printf("BIN Transaction Reverted: block=%d, sender=%s, nonce=%d, to=%s, res.Err=%v\n", b, msg.From.Hex(), msg.Nonce, toStr, errMsg)
+					}
+				} else {
+					binSuccessCount++
 				}
 			}
 
@@ -963,12 +1005,20 @@ func TestBinaryTrieConsistency(t *testing.T) {
 			}
 			binSummary := binTracer.Summary(b, binRoot)
 
+			mptLastRoot = mptRoot
+			binLastRoot = binRoot
+
+			if b%1000 == 0 {
+				mptHost.trieDB.Commit(mptRoot, false)
+				binHost.trieDB.Commit(binRoot, false)
+			}
+
 			// C. Compare
 			if mptSummary.WriteCount != binSummary.WriteCount {
 				t.Fatalf("Block %d: WriteCount mismatch! MPT=%d, BIN=%d", b, mptSummary.WriteCount, binSummary.WriteCount)
 			}
 			if mptSummary.WriteHash != binSummary.WriteHash {
-				t.Fatalf("Block %d: WriteHash mismatch! MPT=%s, BIN=%s (WriteCount=%d), binRoot=%s", b, mptSummary.WriteHash.Hex(), binSummary.WriteHash.Hex(), mptSummary.WriteCount, binRoot.Hex())
+				t.Fatalf("Block %d: WriteHash mismatch! MPT=%s, BIN=%s (WriteCount=%d), binSuccess=%d, binRoot=%s", b, mptSummary.WriteHash.Hex(), binSummary.WriteHash.Hex(), mptSummary.WriteCount, binSuccessCount, binRoot.Hex())
 			}
 
 			if b == 52313 {

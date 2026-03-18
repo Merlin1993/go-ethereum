@@ -278,7 +278,7 @@ func TestCacheStateProcessor(t *testing.T) {
 	)
 
 	// CSV file setup
-	csvFile, err := os.Create("cache_stats_cache_only.csv")
+	csvFile, err := os.Create("cache_stats_cache_only_65536.csv")
 	if err != nil {
 		t.Fatalf("failed to create csv file: %v", err)
 	}

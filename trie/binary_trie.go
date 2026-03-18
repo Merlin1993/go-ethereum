@@ -19,6 +19,7 @@ package trie
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,7 +63,7 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 	}
 
 	// For now, we use a simple adapter for the KVStore and ArchiveDB
-	kvAdapter := &binaryDBAdapter{db: db, root: root}
+	kvAdapter := &binaryDBAdapter{db: db, root: root, archive: archive}
 	config := binary.DefaultConfig()
 
 	// Try to get config from DB
@@ -105,12 +106,17 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 }
 
 type binaryDBAdapter struct {
-	db     database.NodeDatabase
-	root   common.Hash
-	reader database.NodeReader
-	disk   ethdb.Database
-	values map[common.Hash][]byte
-	mu     sync.RWMutex
+	db      database.NodeDatabase
+	root    common.Hash
+	reader  database.NodeReader
+	disk    ethdb.Database
+	archive ethdb.Database
+	values  map[common.Hash][]byte
+	mu      sync.RWMutex
+}
+
+func (a *binaryDBAdapter) archiveDB() ethdb.Database {
+	return a.archive
 }
 
 func (a *binaryDBAdapter) diskDB() ethdb.Database {
@@ -146,7 +152,14 @@ func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
 	// Try Disk first for potentially uncommitted/standalone nodes (like TopTree container)
 	if db := a.diskDB(); db != nil {
 		data, err := db.Get(key)
-		if err == nil {
+		if err == nil && data != nil {
+			return data, nil
+		}
+	}
+	// Try Archive
+	if db := a.archiveDB(); db != nil {
+		data, err := db.Get(key)
+		if err == nil && data != nil {
 			return data, nil
 		}
 	}
@@ -154,6 +167,7 @@ func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
 	if a.reader == nil {
 		r, err := a.db.NodeReader(a.root)
 		if err != nil {
+			fmt.Printf("[DEBUG] adapter.Get NodeReader failed for root %s: %v\n", a.root.Hex(), err)
 			return nil, err
 		}
 		a.reader = r
@@ -161,7 +175,12 @@ func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
 	if a.reader == nil {
 		return nil, nil
 	}
-	return a.reader.Node(common.Hash{}, nil, common.BytesToHash(key))
+	h := common.BytesToHash(key)
+	data, err := a.reader.Node(common.Hash{}, nil, h)
+	if data == nil {
+		// fmt.Printf("[DEBUG] adapter.Get No node for root=%s hash=%s\n", a.root.Hex(), h.Hex())
+	}
+	return data, err
 }
 func (a *binaryDBAdapter) Delete(key []byte) error {
 	if db := a.diskDB(); db != nil {
@@ -249,7 +268,9 @@ type nodeSetBatcher struct {
 func (b *nodeSetBatcher) Put(key, value []byte) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.nodes.AddNode(key, trienode.New(common.BytesToHash(key), value))
+	h := common.BytesToHash(key)
+	// fmt.Printf("[DEBUG] nodeSetBatcher.Put hash=%s len=%d\n", h.Hex(), len(value))
+	b.nodes.AddNode(key, trienode.New(h, value))
 	return nil
 }
 func (b *nodeSetBatcher) Delete(key []byte) error {
@@ -349,7 +370,11 @@ func (t *BinaryTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 	isDirty := t.trie.IsDirty()
 	if !isDirty {
 		h, _ := t.trie.Commit()
-		return common.BytesToHash(h), nil
+		root := common.BytesToHash(h)
+		if root != (common.Hash{}) {
+			// fmt.Printf("[DEBUG] BinaryTrie.Commit non-dirty root=%s\n", root.Hex())
+		}
+		return root, nil
 	}
 
 	if db := t.trieDB(); db != nil {
@@ -357,10 +382,12 @@ func (t *BinaryTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 		nodes := trienode.NewNodeSet(common.Hash{})
 		batch := &nodeSetBatcher{db: db, nodes: nodes}
 
-		h, err := t.trie.CommitToBatch(batch, true)
+		h, err := t.trie.CommitToBatch(batch, false)
 		if err != nil {
+			fmt.Printf("[DEBUG] BinaryTrie.Commit error: %v\n", err)
 			return common.Hash{}, nil
 		}
+		root := common.BytesToHash(h)
 
 		// Flush buffered values into NodeSet
 		if adapter, ok := t.trie.Database().(*binaryDBAdapter); ok {
@@ -372,7 +399,10 @@ func (t *BinaryTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 			adapter.mu.Unlock()
 		}
 
-		return common.BytesToHash(h), nodes
+		if len(nodes.Nodes) > 0 {
+			// fmt.Printf("[DEBUG] BinaryTrie.Commit dirty root=%s updates=%d\n", root.Hex(), len(nodes.Nodes))
+		}
+		return root, nodes
 	}
 	// Fallback for non-triedb case
 	h, _ := t.trie.CommitToBatch(nil, true)

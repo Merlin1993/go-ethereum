@@ -39,9 +39,9 @@ func (db *LevelDBAdapter) DeleteBucket(hash []byte) error {
 // 内存使用爆炸,查看下是不是哪里有问题.
 func TestTrieStress(t *testing.T) {
 	// 1. 测试参数
-	TargetItems := 500000000 // 总目标量 (5亿)
-	EpochItems := 1000000    // 一个统计周期 (100万条)
-	BatchSize := 2000        // 每个 Commit 的数据量
+	TargetItems := 1000000000 // 总目标量 (5亿)
+	EpochItems := 100000      // 一个统计周期 (100万条)
+	BatchSize := 1000         // 每个 Commit 的数据量
 
 	baseDir := "F:\\trie_stress_data"
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
@@ -187,8 +187,8 @@ func TestTrieStress(t *testing.T) {
 		writer.Write(record)
 		writer.Flush()
 
-		fmt.Printf("周期完成: 已注入 %dM, 耗时 %v, 内存 RSS %dMB, 状态磁盘 %dMB, 归档磁盘 %dMB\n",
-			totalInjected/1000000,
+		fmt.Printf("周期完成: 已注入 %d, 耗时 %v, 内存 RSS %dMB, 状态磁盘 %dMB, 归档磁盘 %dMB\n",
+			totalInjected/100000,
 			time.Since(epochStartTime),
 			memInfo.RSS/(1024*1024),
 			stateSize/(1024*1024),

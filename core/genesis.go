@@ -143,6 +143,8 @@ func hashAlloc(ga *types.GenesisAlloc, isVerkle bool) (common.Hash, error) {
 	emptyRoot := types.EmptyRootHash
 	if isVerkle {
 		emptyRoot = types.EmptyVerkleHash
+	} else if config != nil && config.IsBinary {
+		emptyRoot = common.Hash{}
 	}
 	db := rawdb.NewMemoryDatabase()
 	statedb, err := state.New(emptyRoot, state.NewDatabase(triedb.NewDatabase(db, config), nil))
@@ -168,6 +170,8 @@ func flushAlloc(ga *types.GenesisAlloc, triedb *triedb.Database) (common.Hash, e
 	emptyRoot := types.EmptyRootHash
 	if triedb.IsVerkle() {
 		emptyRoot = types.EmptyVerkleHash
+	} else if triedb.IsBinary() {
+		emptyRoot = common.Hash{}
 	}
 	statedb, err := state.New(emptyRoot, state.NewDatabase(triedb, nil))
 	if err != nil {

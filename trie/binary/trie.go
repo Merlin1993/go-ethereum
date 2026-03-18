@@ -33,6 +33,7 @@ type Config struct {
 	ArchiveDB         ArchiveStore // Separate store for archive data
 	CuckooBuckets     int          // Number of buckets in cuckoo filter (default 32)
 	CuckooSlots       int          // Slots per bucket in cuckoo filter (default 4)
+	ShardCacheLimit   int          // [NEW] Maximum number of shards to keep in memory
 }
 
 // DefaultConfig returns a Config with default values.
@@ -42,6 +43,7 @@ func DefaultConfig() *Config {
 		ArchiveBucketSize: 100,
 		CuckooBuckets:     32,
 		CuckooSlots:       4,
+		ShardCacheLimit:   1024, // [NEW] Default 1024 shards
 	}
 }
 
@@ -153,13 +155,25 @@ func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte
 	return s, nil
 }
 
+// ClearCaches 清除分片内存中的缓存数据。
+func (s *Shard) ClearCaches() {
+	if s.root != nil {
+		if in, ok := s.root.(*InternalNode); ok {
+			in.ClearCaches()
+		}
+	}
+	s.staleSet = make(map[string]struct{})
+}
+
 // loadNode 根据哈希从 DB 读取并反序列化节点。
 func (s *Shard) loadNode(hash []byte) (Node, error) {
 	data, err := s.db.Get(hash)
 	if err != nil {
+		// fmt.Printf("[DEBUG] Shard %d loadNode failed for hash %x: %v\n", s.id, hash, err)
 		return nil, err
 	}
 	if data == nil {
+		// fmt.Printf("[DEBUG] Shard %d loadNode returned nil data for hash %x\n", s.id, hash)
 		return nil, ErrNodeNotFound
 	}
 	node, err := DeserializeNode(data)
@@ -273,7 +287,10 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 				}
 
 				if next == nil && len(nextHash) > 0 {
-					loaded, _ := s.loadNode(nextHash)
+					loaded, err := s.loadNode(nextHash)
+					if err != nil {
+						return nil, err
+					}
 					if loaded != nil {
 						if bit == 0 {
 							n.Left = loaded
@@ -305,7 +322,10 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, error) {
 			}
 
 			if next == nil && len(nextHash) > 0 {
-				loaded, _ := s.loadNode(nextHash)
+				loaded, err := s.loadNode(nextHash)
+				if err != nil {
+					return nil, err
+				}
 				if loaded != nil {
 					if bit == 0 {
 						n.Left = loaded
@@ -695,7 +715,11 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		bit := s.getBit(key, depth)
 		if bit == 0 {
 			if n.Left == nil && len(n.LeftHash) > 0 {
-				n.Left, _ = s.loadNode(n.LeftHash)
+				loaded, err := s.loadNode(n.LeftHash)
+				if err != nil {
+					return nil, err
+				}
+				n.Left = loaded
 			}
 			newLeft, err := s.insert(n.Left, key, depth+1, valueHash)
 			if err != nil {
@@ -704,7 +728,11 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 			n.Left = newLeft
 		} else {
 			if n.Right == nil && len(n.RightHash) > 0 {
-				n.Right, _ = s.loadNode(n.RightHash)
+				loaded, err := s.loadNode(n.RightHash)
+				if err != nil {
+					return nil, err
+				}
+				n.Right = loaded
 			}
 			newRight, err := s.insert(n.Right, key, depth+1, valueHash)
 			if err != nil {
@@ -1048,19 +1076,23 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		}
 		h := s.hasher.Hash(data)
 		n.SetHash(h)
-		n.SetDirty(false)
-		n.SetOriginalHash(h)
 
 		// 1. 写入主数据库（承诺部分）
-		if err := batch.Put(h, data); err != nil {
-			return nil, err
+		if batch != nil {
+			n.SetDirty(false)
+			n.SetOriginalHash(h)
+			if err := batch.Put(h, data); err != nil {
+				return nil, err
+			}
 		}
 
 		return h, nil
 
 	case *InternalNode:
 		// 在持久化前，根据子节点刷新 epoch（避免在每次插入/删除时重复计算）
-		s.updateEpoch(n)
+		if batch != nil {
+			s.updateEpoch(n)
+		}
 
 		// Commit children
 		if n.Left != nil {
@@ -1068,9 +1100,10 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 			if err != nil {
 				return nil, err
 			}
+			n.LeftHash = h
+			n.LeftEpoch = n.Left.Epoch()
 			if destructive {
-				n.LeftHash = h
-				n.LeftEpoch = n.Left.Epoch()
+				n.Left = nil
 			}
 		}
 		if n.Right != nil {
@@ -1078,9 +1111,10 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 			if err != nil {
 				return nil, err
 			}
+			n.RightHash = h
+			n.RightEpoch = n.Right.Epoch()
 			if destructive {
-				n.RightHash = h
-				n.RightEpoch = n.Right.Epoch()
+				n.Right = nil
 			}
 		}
 
@@ -1092,12 +1126,12 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 
 		// Hash
 		h := s.hasher.Hash(data)
-		if destructive {
-			n.SetHash(h)
+		n.SetHash(h)
+
+		// Write to DB
+		if batch != nil {
 			n.SetDirty(false)
 			n.SetOriginalHash(h) // It's now persisted (logically)
-
-			// Write to DB
 			err = batch.Put(h, data)
 			if err != nil {
 				return nil, err
@@ -1107,7 +1141,9 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 
 	case *LeafNode:
 		// 在持久化前根据当前分片剪枝状态与全局年度位刷新叶子 epoch
-		s.updateEpoch(n)
+		if batch != nil {
+			s.updateEpoch(n)
+		}
 
 		// 序列化叶子节点
 		data, err := n.Serialize()
@@ -1117,12 +1153,12 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 
 		// Hash
 		h := s.hasher.Hash(data)
-		if destructive {
-			n.SetHash(h)
+		n.SetHash(h)
+
+		// Write to DB
+		if batch != nil {
 			n.SetDirty(false)
 			n.SetOriginalHash(h)
-
-			// Write to DB
 			err = batch.Put(h, data)
 			if err != nil {
 				return nil, err
@@ -1904,12 +1940,35 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		return nil, fmt.Errorf("top tree compute error: %w", err)
 	}
 
-	// [OPTIMIZATION] Only clear dirty state if destructive (actual commit)
+	// 1. Automatically flush archives if a commit is performed
+	// This prevents memory accumulation of pendingArchives in shards.
+	t.FlushArchives()
+
+	// 2. Clear dirty shards after commit
+	t.dirtyShards = make(map[int]struct{})
+	t.dirtyList = make([]int, 0, 128)
+	t.rootDirty = false
+
+	// [OPTIMIZATION] Only clear shard cache and top tree if destructive (actual commit)
 	if destructive {
-		// Clear dirty shards after commit
-		t.dirtyShards = make(map[int]struct{})
-		t.dirtyList = make([]int, 0, 128)
-		t.rootDirty = false
+
+		// 3. Shard Eviction: Clear the shard cache if it exceeds the limit.
+		// Since reorg-safety is not required for this experiment, we can drop
+		// oldest/all non-dirty shards.
+		if t.config.ShardCacheLimit > 0 && len(t.shards) > t.config.ShardCacheLimit {
+			// In experimental mode, we can be aggressive.
+			// To be safer, we only clear if we are significantly over the limit,
+			// or just clear all non-dirty ones.
+			for id, s := range t.shards {
+				// Don't clear if it was recently dirty (optional, but safer)
+				if s != nil {
+					s.ClearCaches()
+					s.root = nil
+				}
+				delete(t.shards, id)
+			}
+			t.shards = make(map[int]*Shard)
+		}
 	}
 
 	// [PERSISTENCE] Store the top-level 16-ary root
@@ -1999,6 +2058,13 @@ func (t *Trie) PruneNextShard() error {
 	err = s.Prune(t.globalEpochBit)
 	if err != nil {
 		return err
+	}
+	// [FIX] Mark the shard as dirty in the Trie controller so its new root
+	// is persisted and it's not discarded without Commit.
+	if _, ok := t.dirtyShards[shardID]; !ok {
+		t.dirtyShards[shardID] = struct{}{}
+		t.dirtyList = append(t.dirtyList, shardID)
+		t.rootDirty = true
 	}
 	// 若本分片在当前年度首次完成剪枝，计数 +1
 	if !wasPruned && s.isPruned {

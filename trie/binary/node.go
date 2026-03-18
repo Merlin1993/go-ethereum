@@ -168,6 +168,25 @@ func (n *InternalNode) Serialize() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// ClearCaches 清除侧挂桶的缓存。
+func (n *InternalNode) ClearCaches() {
+	for _, bucket := range n.StubList {
+		if bucket != nil {
+			bucket.ClearCaches()
+		}
+	}
+	if n.Left != nil {
+		if ln, ok := n.Left.(*InternalNode); ok {
+			ln.ClearCaches()
+		}
+	}
+	if n.Right != nil {
+		if rn, ok := n.Right.(*InternalNode); ok {
+			rn.ClearCaches()
+		}
+	}
+}
+
 // LeafNode 存储路径后缀（位序列）与值哈希。
 // 字段说明：
 // - Path/PathBits：叶子路径的位后缀（起始于当前子树深度），PathBytes 为按高位在前的字节压缩
@@ -370,6 +389,14 @@ func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 	buf.Write(n.hash)
 
 	return buf.Bytes(), nil
+}
+
+// ClearCaches 清除桶内部缓存的过滤器和数据项。
+func (n *ArchiveBucketNode) ClearCaches() {
+	n.cacheMu.Lock()
+	defer n.cacheMu.Unlock()
+	n.cachedFilter = nil
+	n.cachedItems = nil
 }
 
 // DeserializeNode 将字节序列解码为节点实例。

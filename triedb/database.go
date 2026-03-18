@@ -219,7 +219,7 @@ func NewFixedDatabase(diskdb ethdb.Database, config *Config) *Database {
 	// 65536 * 8 = 2.5个月 /32 = 16384
 	//65536 * 4 = 1个月 = 8196
 	if config.CacheTrie {
-		db.cacheTrie = cachetrie.NewFixedSizeCacheTrie(config.StartNum, 16384, 100000000)
+		db.cacheTrie = cachetrie.NewFixedSizeCacheTrie(config.StartNum, 65536, 100000000)
 	}
 
 	return db
