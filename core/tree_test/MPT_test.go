@@ -100,8 +100,8 @@ func BenchmarkMPT_Update(b *testing.B) {
 		b.N, insertDuration, insertDuration/time.Duration(b.N), root)
 }
 
-// Method 1: Batch write and commit
-func TestMethod1(t *testing.T) {
+// TestTrieStressMPT: Batch write and commit with sliding window updates
+func TestTrieStressMPT(t *testing.T) {
 	// Create temporary directory
 	os.RemoveAll(mptDir)
 	os.MkdirAll(mptDir, os.ModePerm)
@@ -140,7 +140,8 @@ func TestMethod1(t *testing.T) {
 	var finalRoot common.Hash = lastRoot
 	totalStart := time.Now()
 
-	collector := NewMetricsCollector(100000, mptDir)
+	collector := NewMetricsCollector(100000, mptDir, "mpt_stress.csv")
+	defer collector.Close()
 
 	// Batch write data
 	for i := 0; i < method1TotalData; i += method1BatchSize {
@@ -149,12 +150,26 @@ func TestMethod1(t *testing.T) {
 			batchSize = method1TotalData - i
 		}
 
-		// Write data
+		// 1. Insert new keys (1000 items)
+		newKeys := make([][]byte, batchSize)
 		for j := 0; j < batchSize; j++ {
 			key, value := generateIndexData(i + j)
 			tr.Update(key, value)
+			newKeys[j] = key
 		}
-		collector.AddInjected(batchSize)
+
+		// 2. Randomly update 1,000 keys from the pool (if pool is sufficient)
+		// This maintains a 1:1 ratio as requested.
+		updateKeys := collector.GetRandomKeys(batchSize)
+		if len(updateKeys) > 0 {
+			for _, key := range updateKeys {
+				_, val := generateRandomData()
+				tr.Update(key, val)
+			}
+			collector.AddUpdated(updateKeys)
+		}
+
+		collector.AddInjected(batchSize, newKeys)
 
 		// Commit and get root hash
 		rootStart := time.Now()

@@ -24,8 +24,8 @@ const (
 	verkleDir = "F:\\trie_stress_data\\verkle"
 )
 
-// Method 1: batch writes and commit
-func TestVerkleMethod1(t *testing.T) {
+// TestTrieStressVerkle: batch writes and commit with sliding window updates
+func TestTrieStressVerkle(t *testing.T) {
 	// Create temporary directory
 	os.RemoveAll(verkleDir)
 	os.MkdirAll(verkleDir, os.ModePerm)
@@ -63,7 +63,8 @@ func TestVerkleMethod1(t *testing.T) {
 	var finalRoot common.Hash = lastRoot
 	totalStart := time.Now()
 
-	collector := NewMetricsCollector(100000, verkleDir)
+	collector := NewMetricsCollector(100000, verkleDir, "verkle_stress.csv")
+	defer collector.Close()
 
 	// Use a fixed address for testing
 	testAddr := common.Address{}
@@ -75,14 +76,29 @@ func TestVerkleMethod1(t *testing.T) {
 			batchSize = method1TotalData - i
 		}
 
-		// Write data
+		// 1. Insert new keys (1000 items)
+		newKeys := make([][]byte, batchSize)
 		for j := 0; j < batchSize; j++ {
 			key, value := generateRandomData()
 			if err := vt.UpdateStorage(testAddr, key, value); err != nil {
 				t.Fatalf("failed to update storage: %v", err)
 			}
+			newKeys[j] = key
 		}
-		collector.AddInjected(batchSize)
+
+		// 2. Randomly update 1,000 keys from the pool
+		updateKeys := collector.GetRandomKeys(batchSize)
+		if len(updateKeys) > 0 {
+			for _, key := range updateKeys {
+				_, val := generateRandomData()
+				if err := vt.UpdateStorage(testAddr, key, val); err != nil {
+					t.Fatalf("failed to update storage: %v", err)
+				}
+			}
+			collector.AddUpdated(updateKeys)
+		}
+
+		collector.AddInjected(batchSize, newKeys)
 
 		// Commit and get root hash
 		rootStart := time.Now()
