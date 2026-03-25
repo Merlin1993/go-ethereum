@@ -132,8 +132,8 @@ func (n *InternalNode) Serialize() ([]byte, error) {
 	buf.WriteByte(n.epoch & 0x7F)
 
 	// PathBits: Uvarint
-	scratch := make([]byte, binary.MaxVarintLen64)
-	nBits := binary.PutUvarint(scratch, uint64(n.PathBits))
+	var scratch [binary.MaxVarintLen64]byte
+	nBits := binary.PutUvarint(scratch[:], uint64(n.PathBits))
 	buf.Write(scratch[:nBits])
 
 	// Path: Raw bytes
@@ -150,7 +150,7 @@ func (n *InternalNode) Serialize() ([]byte, error) {
 
 	// [NEW] StubList 序列化
 	// 写入桶的数量
-	nBits = binary.PutUvarint(scratch, uint64(len(n.StubList)))
+	nBits = binary.PutUvarint(scratch[:], uint64(len(n.StubList)))
 	buf.Write(scratch[:nBits])
 
 	// 依次写入每个桶的数据（桶内包含了路径和 ArchivedData）
@@ -160,7 +160,7 @@ func (n *InternalNode) Serialize() ([]byte, error) {
 			return nil, err
 		}
 		// 写入桶数据的长度
-		nBits = binary.PutUvarint(scratch, uint64(len(bData)))
+		nBits = binary.PutUvarint(scratch[:], uint64(len(bData)))
 		buf.Write(scratch[:nBits])
 		buf.Write(bData)
 	}

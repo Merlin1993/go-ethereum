@@ -44,7 +44,7 @@ func TestTrieStressBinary(t *testing.T) {
 	EpochItems := 100000      // 一个统计周期 (100万条)
 	BatchSize := 1000         // 每个 Commit 的数据量
 
-	baseDir := "F:\\trie_stress_data"
+	baseDir := "F:\\trie_stress_data_final_v3"
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		t.Fatalf("Failed to create F drive directory: %v. Stress test must run on F: drive.", err)
 	}
@@ -105,7 +105,7 @@ func TestTrieStressBinary(t *testing.T) {
 	defer writer.Flush()
 
 	header := []string{
-		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Max_Root_ms",
+		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Prune_ms", "Commit_ms", "Flush_ms", "Max_Root_ms",
 		"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
 		"State_MB", "Archive_MB", "RSS_MB", "Heap_MB",
 	}
@@ -118,10 +118,12 @@ func TestTrieStressBinary(t *testing.T) {
 	var mem runtime.MemStats
 
 	totalInjected := 0
+	batch := trie.db.NewBatch() // Assuming trie.db is the KVStore for state
+	defer batch.Reset()
 
 	for epoch := 0; totalInjected < TargetItems; epoch++ {
 		var (
-			calcTimes   []time.Duration
+			calcTimes   [][]time.Duration
 			maxCalcTime time.Duration
 		)
 
@@ -161,15 +163,34 @@ func TestTrieStressBinary(t *testing.T) {
 			}
 
 			// 触发剪枝 (模拟持续负载下的归档)
+			startPrune := time.Now()
 			trie.PruneNextShard()
+			pruneDur := time.Since(startPrune)
 
 			// 计算根耗时统计
 			startCommit := time.Now()
-			trie.Commit()
-			trie.FlushArchives()
-			dur := time.Since(startCommit)
+			// trie.Commit()  <-- Original
+			// root, err := trie.CommitToBatch(batch, true)
+			trie.CommitToBatch(batch, true)
+			commitDur := time.Since(startCommit)
 
-			calcTimes = append(calcTimes, dur)
+			startFlush := time.Now()
+			trie.FlushArchives()
+			flushDur := time.Since(startFlush)
+
+			// Optional: Write batch every 10 commits or every epoch
+			// For this optimization test, let's write every 10 commits (10,000 items)
+			if (totalInjected+BatchSize)%(10*BatchSize) == 0 {
+				startWrite := time.Now()
+				batch.Write()
+				batch.Reset()
+				writeDur := time.Since(startWrite)
+				commitDur += writeDur
+			}
+
+			dur := pruneDur + commitDur + flushDur
+
+			calcTimes = append(calcTimes, []time.Duration{dur, pruneDur, commitDur, flushDur})
 			if dur > maxCalcTime {
 				maxCalcTime = dur
 			}
@@ -183,11 +204,14 @@ func TestTrieStressBinary(t *testing.T) {
 		}
 
 		fTimes := make([]float64, len(calcTimes))
-		var sumDur float64
+		var sumDur, sumPrune, sumCommit, sumFlush float64
 		for idx, d := range calcTimes {
-			val := float64(d.Nanoseconds()) / 1000000.0
+			val := float64(d[0].Nanoseconds()) / 1000000.0
 			fTimes[idx] = val
 			sumDur += val
+			sumPrune += float64(d[1].Nanoseconds()) / 1000000.0
+			sumCommit += float64(d[2].Nanoseconds()) / 1000000.0
+			sumFlush += float64(d[3].Nanoseconds()) / 1000000.0
 		}
 		sort.Float64s(fTimes)
 		n := len(fTimes)
@@ -197,6 +221,10 @@ func TestTrieStressBinary(t *testing.T) {
 		}
 
 		avgCalc := sumDur / float64(n)
+		avgPrune := sumPrune / float64(n)
+		avgCommit := sumCommit / float64(n)
+		avgFlush := sumFlush / float64(n)
+
 		p95 := getPercentile(0.95)
 		p99 := getPercentile(0.99)
 		minVal := fTimes[0]
@@ -219,6 +247,9 @@ func TestTrieStressBinary(t *testing.T) {
 			fmt.Sprintf("%d", endItem),
 			fmt.Sprintf("%d", totalInjected),
 			fmt.Sprintf("%.2f", avgCalc),
+			fmt.Sprintf("%.2f", avgPrune),
+			fmt.Sprintf("%.2f", avgCommit),
+			fmt.Sprintf("%.2f", avgFlush),
 			fmt.Sprintf("%.2f", maxVal),
 			fmt.Sprintf("%.2f", p95),
 			fmt.Sprintf("%.2f", p99),
@@ -234,13 +265,13 @@ func TestTrieStressBinary(t *testing.T) {
 		writer.Write(record)
 		writer.Flush()
 
-		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Injected: %.2fM, Pool: %d, Avg: %.2fms, P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
+		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Injected: %.2fM, Pool: %d, Avg: %.2fms (Prune: %.2fms, Commit: %.2fms, Flush: %.2fms), P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
 			startItem, endItem,
 			bytesToReadable(uint64(stateSize)),
 			bytesToReadable(uint64(archiveSize)),
 			float64(totalInjected)/1000000.0,
 			len(keyPool),
-			avgCalc,
+			avgCalc, avgPrune, avgCommit, avgFlush,
 			p95,
 			p99,
 			minVal,

@@ -10,14 +10,17 @@ const (
 	TopTreeHeaderPrefix = 0xD0
 )
 
+var zeroHash = make([]byte, 32)
+
 // TopNode represents an internal node in the 16-ary top tree.
 // At Level < maxLevel, Children points to other TopNodes.
 // At Level == maxLevel, the "children" are the actual 32-byte shard hashes.
 type TopNode struct {
-	Level    int          // 0 is the root
-	Children [16]*TopNode // Pointer to child nodes (nil if empty)
-	Hash     []byte       // Cached hash of this node
-	Dirty    bool         // Check if node needs to be re-hashed
+	Level       int          // 0 is the root
+	Children    [16]*TopNode // Pointer to child nodes (nil if empty)
+	Hash        []byte       // Cached hash of this node
+	Dirty       bool         // Check if node needs to be re-hashed
+	ShardHashes [16][]byte   // [NEW] Cache shard hashes at maxLevel
 }
 
 func newTopNode(level int) *TopNode {
@@ -40,10 +43,16 @@ func (n *TopNode) Serialize(shardRoots map[int][]byte, nodePrefix int, maxLevel 
 			// At maxLevel, the children are the actual shard hashes
 			shardID := (nodePrefix << 4) | i
 			h := shardRoots[shardID]
+			if h == nil {
+				h = n.ShardHashes[i]
+			} else {
+				n.ShardHashes[i] = h
+			}
+
 			if h != nil {
 				buf.Write(h)
 			} else {
-				buf.Write(make([]byte, 32)) // Empty shard
+				buf.Write(zeroHash)
 			}
 		} else {
 			// At levels < maxLevel, the children are TopNodes
@@ -51,7 +60,7 @@ func (n *TopNode) Serialize(shardRoots map[int][]byte, nodePrefix int, maxLevel 
 			if child != nil && len(child.Hash) == 32 {
 				buf.Write(child.Hash)
 			} else {
-				buf.Write(make([]byte, 32)) // Empty child
+				buf.Write(zeroHash)
 			}
 		}
 	}
@@ -196,8 +205,12 @@ func (t *TopTree) loadNode(hash []byte, level int, db KVStore) (*TopNode, error)
 		}
 	} else {
 		// At max level, children are just 32-byte hashes stored in data
-		// These will be accessed via GetShardRoot by looking directly into the serialized data if needed,
-		// or we can just cache them if we want. For now, let's just keep the node.
+		for i := 0; i < 16; i++ {
+			shardHash := data[1+i*32 : 1+(i+1)*32]
+			if !bytes.Equal(shardHash, zeroHash) {
+				n.ShardHashes[i] = append([]byte{}, shardHash...)
+			}
+		}
 	}
 
 	return n, nil

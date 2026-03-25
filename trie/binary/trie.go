@@ -20,6 +20,8 @@ type Trie struct {
 	pruneShardIdx  int
 	globalEpochBit byte
 	pruning        bool
+
+	dirtyShards map[int]struct{}
 }
 
 // NewTrie creates a new Binary Trie with the given database and configuration.
@@ -35,6 +37,7 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 		shards:         make([]*Shard, 1<<config.ShardDepth),
 		globalEpochBit: 0,
 		pruning:        pruning,
+		dirtyShards:    make(map[int]struct{}),
 	}
 	t.topTree = NewTopTree(hasher, nil, config.ShardDepth)
 
@@ -99,6 +102,9 @@ func (t *Trie) Put(key []byte, value []byte) error {
 	if err != nil {
 		return err
 	}
+	t.shardsMu.Lock()
+	t.dirtyShards[shardID] = struct{}{}
+	t.shardsMu.Unlock()
 	return shard.Put(key, value)
 }
 
@@ -109,6 +115,9 @@ func (t *Trie) Delete(key []byte) error {
 	if err != nil {
 		return err
 	}
+	t.shardsMu.Lock()
+	t.dirtyShards[shardID] = struct{}{}
+	t.shardsMu.Unlock()
 	return shard.Delete(key)
 }
 
@@ -132,11 +141,16 @@ func (t *Trie) Hash() ([]byte, error) {
 	shardRoots := make(map[int][]byte)
 	dirtyShards := make([]int, 0)
 
+	// We only need to compute roots for shards that have changed
+	// or were previously loaded but not committed.
+	// For simplicity, we can use dirtyShards here too, but Hash() doesn't clear them.
 	t.shardsMu.RLock()
-	for i, s := range t.shards {
+	for i := range t.dirtyShards {
+		s := t.shards[i]
 		if s != nil {
 			h, err := s.Hash()
 			if err != nil {
+				t.shardsMu.RUnlock()
 				return nil, err
 			}
 			if h != nil {
@@ -155,6 +169,10 @@ func (t *Trie) Commit() ([]byte, error) {
 	batch := t.db.NewBatch()
 	defer batch.Reset()
 
+	// Flush archives FIRST before committing shards (which might clear dirty set)
+	if err := t.FlushArchives(); err != nil {
+		return nil, err
+	}
 	rootHash, err := t.CommitToBatch(batch, true)
 	if err != nil {
 		return nil, err
@@ -172,20 +190,80 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	shardRoots := make(map[int][]byte)
 	dirtyShards := make([]int, 0)
 
+	var (
+		mu         sync.Mutex
+		wg         sync.WaitGroup
+		errs       []error
+		errMu      sync.Mutex
+		numWorkers = 8
+	)
+
 	t.shardsMu.RLock()
-	for i, s := range t.shards {
-		if s != nil {
-			h, err := s.CommitToBatch(batch, destructive)
-			if err != nil {
-				return nil, err
-			}
-			if h != nil {
-				shardRoots[i] = h
-				dirtyShards = append(dirtyShards, i)
-			}
-		}
+	dirtyShardsList := make([]int, 0, len(t.dirtyShards))
+	for i := range t.dirtyShards {
+		dirtyShardsList = append(dirtyShardsList, i)
 	}
 	t.shardsMu.RUnlock()
+
+	// Parallel commit shards
+	shardChan := make(chan int, len(dirtyShardsList))
+	for _, i := range dirtyShardsList {
+		shardChan <- i
+	}
+	close(shardChan)
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Worker local state
+			localShardRoots := make(map[int][]byte)
+			localDirtyShards := make([]int, 0)
+
+			// Mock batcher to collect puts
+			workerBatch := &memBatcher{puts: make([]memKV, 0, 5000)}
+
+			for i := range shardChan {
+				s := t.shards[i]
+				if s != nil {
+					h, err := s.CommitToBatch(workerBatch, destructive)
+					if err != nil {
+						errMu.Lock()
+						errs = append(errs, err)
+						errMu.Unlock()
+						return
+					}
+					if h != nil {
+						localShardRoots[i] = h
+						localDirtyShards = append(localDirtyShards, i)
+					}
+				}
+			}
+
+			// Merge back to global state
+			mu.Lock()
+			for k, v := range localShardRoots {
+				shardRoots[k] = v
+			}
+			dirtyShards = append(dirtyShards, localDirtyShards...)
+			for _, item := range workerBatch.puts {
+				batch.Put(item.k, item.v)
+			}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	if len(errs) > 0 {
+		return nil, errs[0]
+	}
+
+	if destructive {
+		t.shardsMu.Lock()
+		t.dirtyShards = make(map[int]struct{})
+		t.shardsMu.Unlock()
+	}
 
 	return t.topTree.Compute(shardRoots, dirtyShards, batch)
 }
@@ -197,6 +275,10 @@ func (t *Trie) PruneNextShard() error {
 	if err != nil {
 		return err
 	}
+
+	t.shardsMu.Lock()
+	t.dirtyShards[idx] = struct{}{}
+	t.shardsMu.Unlock()
 
 	err = shard.Prune()
 
@@ -252,13 +334,32 @@ func (t *Trie) getShardPrefix(shardID int) []byte {
 // FlushArchives persists all pending archive data to ArchiveDB.
 func (t *Trie) FlushArchives() error {
 	t.shardsMu.RLock()
-	defer t.shardsMu.RUnlock()
-	for _, s := range t.shards {
-		if s != nil {
-			if err := s.FlushArchives(); err != nil {
-				return err
+	dirtyShardsList := make([]int, 0, len(t.dirtyShards))
+	for i := range t.dirtyShards {
+		dirtyShardsList = append(dirtyShardsList, i)
+	}
+	t.shardsMu.RUnlock()
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, len(dirtyShardsList))
+
+	for _, i := range dirtyShardsList {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			s := t.shards[idx]
+			if s != nil {
+				if err := s.FlushArchives(); err != nil {
+					errChan <- err
+				}
 			}
-		}
+		}(i)
+	}
+	wg.Wait()
+	close(errChan)
+
+	if len(errChan) > 0 {
+		return <-errChan
 	}
 	return nil
 }
@@ -270,6 +371,9 @@ func (t *Trie) Activate(key []byte, value []byte) error {
 	if err != nil {
 		return err
 	}
+	t.shardsMu.Lock()
+	t.dirtyShards[shardID] = struct{}{}
+	t.shardsMu.Unlock()
 	return shard.Activate(key, value)
 }
 
@@ -300,3 +404,21 @@ func (t *Trie) Hasher() Hasher {
 func (t *Trie) Config() *Config {
 	return t.config
 }
+
+type memKV struct {
+	k, v []byte
+}
+
+type memBatcher struct {
+	puts []memKV
+}
+
+func (m *memBatcher) Put(key []byte, value []byte) error {
+	m.puts = append(m.puts, memKV{k: key, v: value})
+	return nil
+}
+
+func (m *memBatcher) Delete(key []byte) error { return nil }
+func (m *memBatcher) Write() error            { return nil }
+func (m *memBatcher) Reset()                  { m.puts = nil }
+func (m *memBatcher) ValueSize() int          { return 0 }

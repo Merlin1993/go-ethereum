@@ -967,6 +967,7 @@ func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		}
 		s.staleSet = make(map[string]struct{})
 	}
+
 	return rootHash, nil
 }
 
