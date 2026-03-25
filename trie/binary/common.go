@@ -3,7 +3,13 @@ package binary
 import (
 	"sync"
 
+	"errors"
 	"github.com/ethereum/go-ethereum/crypto"
+)
+
+var (
+	// ErrNodeNotFound is returned if a node hash could not be found in the database.
+	ErrNodeNotFound = errors.New("node not found")
 )
 
 // Hasher is the interface that wraps the basic Hash method.

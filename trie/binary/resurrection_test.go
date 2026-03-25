@@ -41,6 +41,17 @@ func TestResurrectionMetrics(t *testing.T) {
 		t.Fatalf("Expected 1 archived item, got %d", stats.ArchivedDataSize)
 	}
 
+	// Manual DB check
+	// Find the shard
+	shardID := trie.getShardID(key)
+	shard := trie.shards[shardID]
+	if shard == nil {
+		t.Fatalf("Shard %d not loaded", shardID)
+	}
+	// The root of the shard should be an ArchiveBucketNode or an InternalNode containing it
+	// But let's check what's in pendingArchives etc.
+	t.Logf("Shard %d pendingArchives: %d", shardID, len(shard.pendingArchives))
+
 	// 4. Get the data (Resurrection)
 	got, err := trie.Get(key)
 	if err != nil {

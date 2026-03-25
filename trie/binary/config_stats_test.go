@@ -3,13 +3,11 @@ package binary
 import (
 	"crypto/rand"
 	"testing"
-
-	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 )
 
 func TestConfigAndStats(t *testing.T) {
 	// 1. Test ShardDepth configuration
-	db := &MemoryDBAdapter{memorydb.New()}
+	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := &Config{
 		ShardDepth:        4,

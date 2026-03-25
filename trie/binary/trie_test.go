@@ -105,7 +105,7 @@ func TestTrieStressBinary(t *testing.T) {
 	defer writer.Flush()
 
 	header := []string{
-		"Total_Injected", "Avg_Root_ms", "Max_Root_ms",
+		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Max_Root_ms",
 		"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
 		"Disk_MB", "RSS_MB", "Heap_MB",
 	}
@@ -211,7 +211,11 @@ func TestTrieStressBinary(t *testing.T) {
 		runtime.ReadMemStats(&mem)
 
 		// 记录 CSV
+		startItem := totalInjected - EpochItems
+		endItem := totalInjected - 1
 		record := []string{
+			fmt.Sprintf("%d", startItem),
+			fmt.Sprintf("%d", endItem),
 			fmt.Sprintf("%d", totalInjected),
 			fmt.Sprintf("%.2f", avgCalc),
 			fmt.Sprintf("%.2f", maxVal),
@@ -228,7 +232,8 @@ func TestTrieStressBinary(t *testing.T) {
 		writer.Write(record)
 		writer.Flush()
 
-		fmt.Printf("Storage: %s, Total: %.2fM, Pool: %d, Avg: %.2fms, P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
+		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: Storage: %s, Total: %.2fM, Pool: %d, Avg: %.2fms, P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
+			startItem, endItem,
 			bytesToReadable(uint64(stateSize)),
 			float64(totalInjected)/1000000.0,
 			len(keyPool),

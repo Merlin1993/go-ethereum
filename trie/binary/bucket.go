@@ -298,6 +298,9 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	bucket.SetHash(h)
 
 	bucketData, _ := s.serializeArchivedKV(items)
+	if s.pendingArchives == nil {
+		s.pendingArchives = make(map[string][]byte)
+	}
 	s.pendingArchives[string(h)] = bucketData
 }
 

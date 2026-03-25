@@ -384,6 +384,11 @@ func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 	buf.WriteByte(byte(len(n.Commitment)))
 	buf.Write(n.Commitment)
 
+	// Filter Length + Filter
+	nBits = binary.PutUvarint(scratch, uint64(len(n.Filter)))
+	buf.Write(scratch[:nBits])
+	buf.Write(n.Filter)
+
 	// [NEW] Hash：为了在节点重排/加载后能直接通过 metadata 找到 raw 数据
 	buf.WriteByte(byte(len(n.hash)))
 	buf.Write(n.hash)

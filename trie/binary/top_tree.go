@@ -2,6 +2,7 @@ package binary
 
 import (
 	"bytes"
+	"errors"
 )
 
 const (
@@ -81,6 +82,9 @@ func NewTopTree(hasher Hasher, db Batcher, shardDepth int) *TopTree {
 // Compute dynamically updates the 16-ary tree based on the dirty shards and
 // computes the new root hash. It only processes paths that are marked dirty.
 func (t *TopTree) Compute(shardRoots map[int][]byte, dirtyShards []int, batch Batcher) ([]byte, error) {
+	if t.root == nil {
+		t.root = newTopNode(0)
+	}
 	// 1. Mark dirty paths bottom-up
 	// We need to trace from the root to the leaves (maxLevel) for every dirty shard,
 	// creating nodes if they don't exist and marking them dirty.
@@ -145,4 +149,92 @@ func (t *TopTree) hashNode(n *TopNode, shardRoots map[int][]byte, prefix int, ba
 	}
 
 	return n.Hash, nil
+}
+
+// Load recursively reconstructs the TopTree structure from a given root hash.
+func (t *TopTree) Load(rootHash []byte, db KVStore) error {
+	if len(rootHash) == 0 {
+		return nil
+	}
+	newRoot, err := t.loadNode(rootHash, 0, db)
+	if err != nil {
+		return err
+	}
+	t.root = newRoot
+	return nil
+}
+
+func (t *TopTree) loadNode(hash []byte, level int, db KVStore) (*TopNode, error) {
+	if len(hash) == 0 || bytes.Equal(hash, make([]byte, 32)) {
+		return nil, nil
+	}
+	data, err := db.Get(hash)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	// Basic validation of header
+	if data[0] != byte(0xD0+level) {
+		return nil, errors.New("invalid top node header")
+	}
+
+	n := newTopNode(level)
+	n.Hash = hash
+	n.Dirty = false
+
+	if level < t.maxLevel {
+		for i := 0; i < 16; i++ {
+			childHash := data[1+i*32 : 1+(i+1)*32]
+			child, err := t.loadNode(childHash, level+1, db)
+			if err != nil {
+				return nil, err
+			}
+			n.Children[i] = child
+		}
+	} else {
+		// At max level, children are just 32-byte hashes stored in data
+		// These will be accessed via GetShardRoot by looking directly into the serialized data if needed,
+		// or we can just cache them if we want. For now, let's just keep the node.
+	}
+
+	return n, nil
+}
+
+// GetShardRoot retrieves the persisted hash for a given shard ID.
+func (t *TopTree) GetShardRoot(id int, db KVStore) ([]byte, error) {
+	curr := t.root
+	if curr == nil {
+		return nil, nil
+	}
+
+	numNibbles := t.maxLevel + 1
+	for i := 0; i < t.maxLevel; i++ {
+		shift := (numNibbles - 1 - i) * 4
+		idx := (id >> shift) & 0x0F
+		curr = curr.Children[idx]
+		if curr == nil {
+			return nil, nil
+		}
+	}
+
+	// At max level, we need to read the shard hash from the node's serialized data
+	if len(curr.Hash) == 0 {
+		return nil, nil
+	}
+	data, err := db.Get(curr.Hash)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	idx := id & 0x0F
+	h := data[1+idx*32 : 1+(idx+1)*32]
+	if bytes.Equal(h, make([]byte, 32)) {
+		return nil, nil
+	}
+	return h, nil
 }

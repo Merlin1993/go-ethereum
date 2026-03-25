@@ -3,12 +3,10 @@ package binary
 import (
 	"bytes"
 	"testing"
-
-	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 )
 
 func TestPrefixKeys(t *testing.T) {
-	db := &MemoryDBAdapter{memorydb.New()}
+	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	trie := NewTrie(nil, db, hasher, config, false)

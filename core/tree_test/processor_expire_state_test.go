@@ -504,7 +504,10 @@ func TestExpireStateProcessor(t *testing.T) {
 				BlockNumber: new(big.Int).SetUint64(b),
 				Time:        b * 15,
 				Difficulty:  big.NewInt(1),
+				Random:      &common.Hash{},
+				GasLimit:    1000000000,
 				BaseFee:     big.NewInt(0),
+				BlobBaseFee: big.NewInt(0),
 			}
 			evm := vm.NewEVM(blockCtx, statedb, params.MainnetChainConfig, vm.Config{})
 
@@ -949,8 +952,11 @@ func TestBinaryTrieConsistency(t *testing.T) {
 				Coinbase:    miner,
 				BlockNumber: new(big.Int).SetUint64(targetBlock),
 				Time:        compareBlockTimestamps[targetBlock],
+				Difficulty:  big.NewInt(1),
+				Random:      &common.Hash{},
 				GasLimit:    1000000000,
 				BaseFee:     big.NewInt(0),
+				BlobBaseFee: big.NewInt(0),
 			}
 
 			mptEVM := vm.NewEVM(blockCtx, mptHooked, params.MainnetChainConfig, vm.Config{})
