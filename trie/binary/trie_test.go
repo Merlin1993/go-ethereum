@@ -107,7 +107,7 @@ func TestTrieStressBinary(t *testing.T) {
 	header := []string{
 		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Max_Root_ms",
 		"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
-		"Disk_MB", "RSS_MB", "Heap_MB",
+		"State_MB", "Archive_MB", "RSS_MB", "Heap_MB",
 	}
 	writer.Write(header)
 
@@ -206,6 +206,7 @@ func TestTrieStressBinary(t *testing.T) {
 		q3 := getPercentile(0.75)
 
 		stateSize := getDirSize(stateDir)
+		archiveSize := getDirSize(archiveDir)
 		proc.MemoryInfo() // 刷新
 		memInfo, _ := proc.MemoryInfo()
 		runtime.ReadMemStats(&mem)
@@ -226,15 +227,17 @@ func TestTrieStressBinary(t *testing.T) {
 			fmt.Sprintf("%.2f", median),
 			fmt.Sprintf("%.2f", q3),
 			fmt.Sprintf("%d", stateSize/(1024*1024)),
+			fmt.Sprintf("%d", archiveSize/(1024*1024)),
 			fmt.Sprintf("%d", memInfo.RSS/(1024*1024)),
 			fmt.Sprintf("%d", mem.HeapAlloc/(1024*1024)),
 		}
 		writer.Write(record)
 		writer.Flush()
 
-		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: Storage: %s, Total: %.2fM, Pool: %d, Avg: %.2fms, P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
+		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Injected: %.2fM, Pool: %d, Avg: %.2fms, P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
 			startItem, endItem,
 			bytesToReadable(uint64(stateSize)),
+			bytesToReadable(uint64(archiveSize)),
 			float64(totalInjected)/1000000.0,
 			len(keyPool),
 			avgCalc,
