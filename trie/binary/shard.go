@@ -948,10 +948,6 @@ func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		return nil, nil
 	}
 
-	if s.pruning {
-		s.Prune()
-	}
-
 	nodeCount := 0
 	rootHash, err := s.commit(s.root, batch, &nodeCount, destructive)
 	if err != nil {

@@ -83,6 +83,17 @@ func (s *Shard) pruneAndArchive(node Node, depth int) (Node, []ArchivedKV, error
 		// 否则，递归处理子节点
 		var allItems []ArchivedKV
 
+		// [OPTIMIZATION] 如果整个子树都是“新鲜”的，则跳过递归
+		if global == 1 {
+			if (n.epoch >> 1) == 1 { // bit 1: all children are 1
+				return n, nil, nil
+			}
+		} else { // global == 0
+			if (n.epoch & 1) == 0 { // bit 0: no child is 1 -> all are 0
+				return n, nil, nil
+			}
+		}
+
 		// 处理左子树
 		if n.Left != nil || len(n.LeftHash) > 0 {
 			if n.Left == nil {
