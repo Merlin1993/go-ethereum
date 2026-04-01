@@ -14,10 +14,6 @@ func (s *Shard) Prune() error {
 			return err
 		}
 	}
-	if s.root == nil {
-		return nil
-	}
-
 	// 递归剪枝
 	newRoot, items, err := s.pruneAndArchive(s.root, s.config.ShardDepth)
 	if err != nil {
@@ -26,24 +22,38 @@ func (s *Shard) Prune() error {
 
 	if newRoot == nil && len(items) > 0 {
 		// All content archived.
-		s.root = s.buildArchiveSubtree(items, nil, 0)
+		s.root = s.buildArchiveSubtree(items, []byte{}, 0)
 	} else if newRoot != nil && len(items) > 0 {
 		// Root exists, but have top-level archived items.
 		if in, ok := newRoot.(*InternalNode); ok {
 			archNode := s.buildArchiveSubtree(items, in.Path, in.PathBits)
 			if b, ok := archNode.(*ArchiveBucketNode); ok {
 				in.StubList = append(in.StubList, b)
+				in.SetDirty(true)
 			} else if subIn, ok := archNode.(*InternalNode); ok {
-				// If it split into a subtree, we merge it or attach it.
-				// For simplicity, we attach it to StubList but StubList only takes buckets.
-				// Wait! StubList should probably take Nodes? No, design says buckets.
-				// If buildArchiveSubtree returns an InternalNode, we need to merge it.
 				s.mergeArchiveSubtree(in, subIn)
 			}
-			in.SetDirty(true)
 			s.root = in
 		} else {
-			s.root = newRoot
+			// newRoot is a LeafNode, but we have items.
+			// Must create a new InternalNode to hold both.
+			root := s.pool.GetInternal()
+			root.SetDirty(true)
+			archNode := s.buildArchiveSubtree(items, []byte{}, 0)
+			if b, ok := archNode.(*ArchiveBucketNode); ok {
+				root.StubList = append(root.StubList, b)
+			} else if subIn, ok := archNode.(*InternalNode); ok {
+				s.mergeArchiveSubtree(root, subIn)
+			}
+
+			// We need to re-insert the newRoot into the root
+			leaf := newRoot.(*LeafNode)
+			var err error
+			// Re-insert the leaf into the new root. insert starts at 0 if root is new.
+			s.root, err = s.insert(root, leaf.Path, 0, leaf.ValueHash)
+			if err != nil {
+				return err
+			}
 		}
 	} else {
 		s.root = newRoot
@@ -56,67 +66,53 @@ func (s *Shard) pruneAndArchive(node Node, depth int) (Node, []ArchivedKV, error
 	if node == nil {
 		return nil, nil, nil
 	}
-
 	global := s.globalEpochBit()
 
 	switch n := node.(type) {
 	case *LeafNode:
-		if (n.epoch & 1) != global {
-			// 过期叶子：直接作为归档项返回
-			it := ArchivedKV{
-				Suffix:     append([]byte{}, n.Path...),
-				SuffixBits: n.PathBits,
-				Value:      append([]byte{}, n.ValueHash...),
+		// 如果叶子节点的 Epoch 太旧，则归档
+		if n.Epoch() != s.globalEpochBit() {
+			items, err := s.collectLeavesRecursive(n, false) // Prepend n.Path
+			if err != nil {
+				return nil, nil, err
 			}
-			return nil, []ArchivedKV{it}, nil
+			return nil, items, nil
 		}
 		return n, nil, nil
 
 	case *InternalNode:
 		// 如果子树中所有节点都不是当前年度位，则整个子树归档
 		if (n.epoch & 1) != global {
-			var items []ArchivedKV
-			s.collectLeaves(n, 0, &items)
+			items, err := s.collectLeaves(n)
+			if err != nil {
+				return nil, nil, err
+			}
 			return nil, items, nil
 		}
-
-		// 否则，递归处理子节点
 		var allItems []ArchivedKV
-
-		// [OPTIMIZATION] 如果整个子树都是“新鲜”的，则跳过递归
-		if global == 1 {
-			if (n.epoch >> 1) == 1 { // bit 1: all children are 1
-				return n, nil, nil
-			}
-		} else { // global == 0
-			if (n.epoch & 1) == 0 { // bit 0: no child is 1 -> all are 0
-				return n, nil, nil
-			}
-		}
-
 		// 处理左子树
 		if n.Left != nil || len(n.LeftHash) > 0 {
 			if n.Left == nil {
 				loaded, err := s.loadNode(n.LeftHash)
 				if err != nil {
-					return n, nil, err
+					return nil, nil, err
 				}
 				n.Left = loaded
 			}
-			newLeft, items, err := s.pruneAndArchive(n.Left, depth+1+n.PathBits)
+			newLeft, leftItems, err := s.pruneAndArchive(n.Left, depth+1+n.PathBits)
 			if err != nil {
 				return n, nil, err
 			}
 			// 给 items 增加 0 位前缀
-			for i := range items {
-				items[i].Suffix = s.prependBit(items[i].Suffix, items[i].SuffixBits, 0, nil)
-				items[i].SuffixBits++
+			for i := range leftItems {
+				leftItems[i].Suffix = s.prependBit(leftItems[i].Suffix, leftItems[i].SuffixBits, 0, nil)
+				leftItems[i].SuffixBits++
 				if n.PathBits > 0 {
-					items[i].Suffix = s.prependPath(items[i].Suffix, items[i].SuffixBits, n.Path, n.PathBits)
-					items[i].SuffixBits += n.PathBits
+					leftItems[i].Suffix = s.prependPath(leftItems[i].Suffix, leftItems[i].SuffixBits, n.Path, n.PathBits)
+					leftItems[i].SuffixBits += n.PathBits
 				}
 			}
-			allItems = append(allItems, items...)
+			allItems = append(allItems, leftItems...)
 			n.Left = newLeft
 			if newLeft == nil {
 				n.LeftHash = nil
@@ -129,33 +125,30 @@ func (s *Shard) pruneAndArchive(node Node, depth int) (Node, []ArchivedKV, error
 			if n.Right == nil {
 				loaded, err := s.loadNode(n.RightHash)
 				if err != nil {
-					return n, nil, err
+					return nil, nil, err
 				}
 				n.Right = loaded
 			}
-			newRight, items, err := s.pruneAndArchive(n.Right, depth+1+n.PathBits)
+			newRight, rightItems, err := s.pruneAndArchive(n.Right, depth+1+n.PathBits)
 			if err != nil {
 				return n, nil, err
 			}
 			// 给 items 增加 1 位前缀
-			for i := range items {
-				items[i].Suffix = s.prependBit(items[i].Suffix, items[i].SuffixBits, 1, nil)
-				items[i].SuffixBits++
+			for i := range rightItems {
+				rightItems[i].Suffix = s.prependBit(rightItems[i].Suffix, rightItems[i].SuffixBits, 1, nil)
+				rightItems[i].SuffixBits++
 				if n.PathBits > 0 {
-					items[i].Suffix = s.prependPath(items[i].Suffix, items[i].SuffixBits, n.Path, n.PathBits)
-					items[i].SuffixBits += n.PathBits
+					rightItems[i].Suffix = s.prependPath(rightItems[i].Suffix, rightItems[i].SuffixBits, n.Path, n.PathBits)
+					rightItems[i].SuffixBits += n.PathBits
 				}
 			}
-			allItems = append(allItems, items...)
+			allItems = append(allItems, rightItems...)
 			n.Right = newRight
 			if newRight == nil {
 				n.RightHash = nil
 				n.SetDirty(true)
 			}
 		}
-
-		// 如果当前节点变空了，且有 StubList，我们需要把 StubList 也转为 items 向上抛，或者就地转为桶
-		// 为了简单和一致，我们将所有归档项向上抛，直到遇到一个非空的 InternalNode。
 
 		// 收集已有的 StubList 中的项
 		for _, bucket := range n.StubList {
@@ -167,114 +160,130 @@ func (s *Shard) pruneAndArchive(node Node, depth int) (Node, []ArchivedKV, error
 			for _, bitm := range bucketItems {
 				bitm.Suffix = s.prependPath(bitm.Suffix, bitm.SuffixBits, bucket.Path, bucket.PathBits)
 				bitm.SuffixBits += bucket.PathBits
-				// 还要加上当前节点的 Path
-				if n.PathBits > 0 {
-					bitm.Suffix = s.prependPath(bitm.Suffix, bitm.SuffixBits, n.Path, n.PathBits)
-					bitm.SuffixBits += n.PathBits
-				}
 				allItems = append(allItems, bitm)
 			}
 		}
 		n.StubList = nil // 既然已经收集了，就清空
 
-		if n.Left == nil && n.Right == nil {
-			// 既然左右都空了，当前节点也没用了，继续向上传递 items
-			return nil, allItems, nil
-		}
-
-		// Otherwise, current node is hot, attach allItems as bucket(s)
-		if len(allItems) > 0 {
-			archNode := s.buildArchiveSubtree(allItems, n.Path, n.PathBits)
-			if b, ok := archNode.(*ArchiveBucketNode); ok {
-				n.StubList = append(n.StubList, b)
-			} else if subIn, ok := archNode.(*InternalNode); ok {
-				s.mergeArchiveSubtree(n, subIn)
+		// 如果由于修剪变空了，或是由于节点过期（Epoch 位不同），则收集所有剩余叶子并归档
+		if (n.Left == nil && n.Right == nil) || n.Epoch() != s.globalEpochBit() {
+			items, err := s.collectLeavesRecursive(n, false) // Prepend n.Path to return items relative to parent
+			if err != nil {
+				return nil, nil, err
 			}
-			n.SetDirty(true)
+			return nil, append(allItems, items...), nil
 		}
 
-		return s.shrink(n), nil, nil
-
-	case *ArchiveBucketNode:
-		// 已经归档的桶，不参与本次剪枝，直接原样返回
-		return n, nil, nil
+		// 收缩逻辑
+		return s.shrink(n), allItems, nil
 	}
-
 	return node, nil, nil
 }
 
-func (s *Shard) collectLeaves(node Node, depth int, items *[]ArchivedKV) {
+func (s *Shard) collectLeaves(node Node) ([]ArchivedKV, error) {
+	return s.collectLeavesRecursive(node, true)
+}
+
+func (s *Shard) collectLeavesRecursive(node Node, isTopLevel bool) ([]ArchivedKV, error) {
 	if node == nil {
-		return
+		return nil, nil
 	}
 
 	switch n := node.(type) {
 	case *LeafNode:
-		it := ArchivedKV{
-			Suffix:     append([]byte{}, n.Path...),
-			SuffixBits: n.PathBits,
+		var suffix []byte
+		var bits int
+		if !isTopLevel {
+			suffix = append([]byte{}, n.Path...)
+			bits = n.PathBits
+		}
+		item := ArchivedKV{
+			Suffix:     suffix,
+			SuffixBits: bits,
 			Value:      append([]byte{}, n.ValueHash...),
 		}
-		*items = append(*items, it)
+		return []ArchivedKV{item}, nil
+
 	case *InternalNode:
+		var allItems []ArchivedKV
 		if n.Left != nil || len(n.LeftHash) > 0 {
 			if n.Left == nil {
-				n.Left, _ = s.loadNode(n.LeftHash)
-			}
-			tmp := len(*items)
-			s.collectLeaves(n.Left, depth+1+n.PathBits, items)
-			for i := tmp; i < len(*items); i++ {
-				(*items)[i].Suffix = s.prependBit((*items)[i].Suffix, (*items)[i].SuffixBits, 0, nil)
-				(*items)[i].SuffixBits++
-				if n.PathBits > 0 {
-					(*items)[i].Suffix = s.prependPath((*items)[i].Suffix, (*items)[i].SuffixBits, n.Path, n.PathBits)
-					(*items)[i].SuffixBits += n.PathBits
+				loaded, err := s.loadNode(n.LeftHash)
+				if err != nil {
+					return nil, err
 				}
+				n.Left = loaded
 			}
+			left, err := s.collectLeavesRecursive(n.Left, false)
+			if err != nil {
+				return nil, err
+			}
+			for i := range left {
+				left[i].Suffix = s.prependBit(left[i].Suffix, left[i].SuffixBits, 0, nil)
+				left[i].SuffixBits++
+			}
+			allItems = append(allItems, left...)
 		}
 		if n.Right != nil || len(n.RightHash) > 0 {
 			if n.Right == nil {
-				n.Right, _ = s.loadNode(n.RightHash)
-			}
-			tmp := len(*items)
-			s.collectLeaves(n.Right, depth+1+n.PathBits, items)
-			for i := tmp; i < len(*items); i++ {
-				(*items)[i].Suffix = s.prependBit((*items)[i].Suffix, (*items)[i].SuffixBits, 1, nil)
-				(*items)[i].SuffixBits++
-				if n.PathBits > 0 {
-					(*items)[i].Suffix = s.prependPath((*items)[i].Suffix, (*items)[i].SuffixBits, n.Path, n.PathBits)
-					(*items)[i].SuffixBits += n.PathBits
+				loaded, err := s.loadNode(n.RightHash)
+				if err != nil {
+					return nil, err
 				}
+				n.Right = loaded
 			}
+			right, err := s.collectLeavesRecursive(n.Right, false)
+			if err != nil {
+				return nil, err
+			}
+			for i := range right {
+				right[i].Suffix = s.prependBit(right[i].Suffix, right[i].SuffixBits, 1, nil)
+				right[i].SuffixBits++
+			}
+			allItems = append(allItems, right...)
 		}
+
+		// Also collect items from StubList
 		for _, bucket := range n.StubList {
 			data, err := s.getBucketData(bucket.Hash())
 			if err != nil {
-				continue
+				return nil, err
 			}
 			bucketItems, _ := s.deserializeArchivedKV(data)
-			for _, bitm := range bucketItems {
-				bitm.Suffix = s.prependPath(bitm.Suffix, bitm.SuffixBits, bucket.Path, bucket.PathBits)
-				bitm.SuffixBits += bucket.PathBits
-				if n.PathBits > 0 {
-					bitm.Suffix = s.prependPath(bitm.Suffix, bitm.SuffixBits, n.Path, n.PathBits)
-					bitm.SuffixBits += n.PathBits
-				}
-				*items = append(*items, bitm)
+			for i := range bucketItems {
+				bucketItems[i].Suffix = s.prependPath(bucketItems[i].Suffix, bucketItems[i].SuffixBits, bucket.Path, bucket.PathBits)
+				bucketItems[i].SuffixBits += bucket.PathBits
+				allItems = append(allItems, bucketItems[i])
 			}
 		}
+		// FINAL STEP for InternalNode: prepend its OWN path if NOT top-level
+		if !isTopLevel && n.PathBits > 0 {
+			for i := range allItems {
+				allItems[i].Suffix = s.prependPath(allItems[i].Suffix, allItems[i].SuffixBits, n.Path, n.PathBits)
+				allItems[i].SuffixBits += n.PathBits
+			}
+		}
+		return allItems, nil
+
 	case *ArchiveBucketNode:
 		data, err := s.getBucketData(n.Hash())
 		if err != nil {
-			return
+			return nil, err
 		}
-		bucketItems, _ := s.deserializeArchivedKV(data)
-		for _, bitm := range bucketItems {
-			bitm.Suffix = s.prependPath(bitm.Suffix, bitm.SuffixBits, n.Path, n.PathBits)
-			bitm.SuffixBits += n.PathBits
-			*items = append(*items, bitm)
+		items, _ := s.deserializeArchivedKV(data)
+		if !isTopLevel && n.PathBits > 0 {
+			for i := range items {
+				// Prefix item suffix with bucket's path (relative to parent)
+				items[i].Suffix = s.prependPath(items[i].Suffix, items[i].SuffixBits, n.Path, n.PathBits)
+				items[i].SuffixBits += n.PathBits
+			}
+		} else if isTopLevel {
+			// Suffixes in bucket are relative to bucket. If called at top level,
+			// it means we want them relative to bucket, which is what they already are.
 		}
+		return items, nil
 	}
+	return nil, nil
 }
 
 // FlushArchives 将所有待写入的归档数据持久化到 ArchiveDB。
@@ -365,13 +374,23 @@ func (s *Shard) distributeStubs(oldNode *InternalNode, parent *InternalNode) {
 				bit := s.getBitFromBytes(bucket.Path, parentBits)
 				bucket.Path = s.shiftBits(bucket.Path, bucket.PathBits, parentBits+1, nil)
 				bucket.PathBits -= (parentBits + 1)
-				if bit == 0 {
-					s.mountBucket(parent.Left, bucket)
+
+				// [FIX] Ensure we don't lose the bucket if child is nil
+				target := parent.Left
+				if bit != 0 {
+					target = parent.Right
+				}
+
+				if target != nil {
+					s.mountBucket(target, bucket)
 				} else {
-					s.mountBucket(parent.Right, bucket)
+					// If child is nil, keep it in the parent's StubList instead of dropping it
+					parent.StubList = append(parent.StubList, bucket)
+					parent.SetDirty(true)
 				}
 			} else {
 				parent.StubList = append(parent.StubList, bucket)
+				parent.SetDirty(true)
 			}
 		} else {
 			remainingStubs = append(remainingStubs, bucket)
@@ -390,7 +409,20 @@ func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) N
 			Path:     append([]byte{}, path...),
 			PathBits: bits,
 		}
-		s.recomputeBucket(bucket, items)
+		// If bits > 0, we must shift the items to be relative to the bucket
+		if bits > 0 {
+			shiftedItems := make([]ArchivedKV, len(items))
+			for i, it := range items {
+				shiftedItems[i] = ArchivedKV{
+					Suffix:     s.shiftBits(it.Suffix, it.SuffixBits, bits, nil),
+					SuffixBits: it.SuffixBits - bits,
+					Value:      it.Value,
+				}
+			}
+			s.recomputeBucket(bucket, shiftedItems)
+		} else {
+			s.recomputeBucket(bucket, items)
+		}
 		bucket.SetDirty(true)
 		return bucket
 	}
@@ -418,7 +450,14 @@ func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) N
 
 	// If cannot split further, force split by count
 	if len(leftItems) == 0 || len(rightItems) == 0 {
+		if len(items) == 0 {
+			return nil
+		}
 		mid := len(items) / 2
+		// [FIX] Ensure at least one item on one side if odd
+		if mid == 0 && len(items) > 0 {
+			mid = 1
+		}
 		leftItems = items[:mid]
 		rightItems = items[mid:]
 		// Construct an internal node that just acts as an aggregator if bit-split failed
@@ -446,21 +485,62 @@ func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) N
 }
 
 func (s *Shard) mergeArchiveSubtree(target *InternalNode, sub *InternalNode) {
-	// If sub has children, we attach them. If it has StubList, we merge it.
-	// This is a simplified merge to ensure we don't lose nodes.
+	// [FIX] Always merge the StubList from sub into target
+	if len(sub.StubList) > 0 {
+		target.StubList = append(target.StubList, sub.StubList...)
+		target.SetDirty(true)
+	}
+	// If sub has children, we need to recursively merge them into target
+	// This ensures we don't lose the hot/cold nodes in the sub
 	if sub.Left != nil || len(sub.LeftHash) > 0 {
-		// This is tricky because target might already have a Left.
-		// For the purpose of pruning, we just want to ensure all items are reachable.
-		// If both have Left, we'd need a deep merge.
-		// BUT buildArchiveSubtree creates a FRESH tree.
-		// If we are attaching it to a HOT InternalNode, we should ideally merge the trees.
-
-		// Optimization: Just attach the sub's StubList if the tree is too complex.
-		target.StubList = append(target.StubList, sub.StubList...)
-		// And for children? We can't easily merge hot tree and archive tree here.
-		// So we'll just put the sub-buckets into StubList if they are individual buckets.
-	} else {
-		target.StubList = append(target.StubList, sub.StubList...)
+		if target.Left == nil && len(target.LeftHash) == 0 {
+			target.Left = sub.Left
+			target.LeftHash = sub.LeftHash
+			target.LeftEpoch = sub.LeftEpoch
+		} else {
+			// Deep merge required if both have Left
+			// For simplicity in this stabilization phase, let's just collect all leaves from sub if we can't easily merge.
+			if sub.Left != nil {
+				if subInternal, ok := sub.Left.(*InternalNode); ok {
+					if targetInternal, ok := target.Left.(*InternalNode); ok {
+						s.mergeArchiveSubtree(targetInternal, subInternal)
+					} else {
+						// Target Left is Leaf, can't easily merge, move sub items to target StubList
+						items, _ := s.collectLeaves(sub.Left)
+						for i := range items {
+							items[i].Suffix = s.prependBit(items[i].Suffix, items[i].SuffixBits, 0, nil)
+							items[i].SuffixBits++
+							if sub.PathBits > 0 {
+								items[i].Suffix = s.prependPath(items[i].Suffix, items[i].SuffixBits, sub.Path, sub.PathBits)
+								items[i].SuffixBits += sub.PathBits
+							}
+						}
+						if len(items) > 0 {
+							newSub := s.buildArchiveSubtree(items, []byte{}, 0)
+							if bucket, ok := newSub.(*ArchiveBucketNode); ok {
+								target.StubList = append(target.StubList, bucket)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if sub.Right != nil || len(sub.RightHash) > 0 {
+		if target.Right == nil && len(target.RightHash) == 0 {
+			target.Right = sub.Right
+			target.RightHash = sub.RightHash
+			target.RightEpoch = sub.RightEpoch
+		} else {
+			// deep merge...
+			if sub.Right != nil {
+				if subInternal, ok := sub.Right.(*InternalNode); ok {
+					if targetInternal, ok := target.Right.(*InternalNode); ok {
+						s.mergeArchiveSubtree(targetInternal, subInternal)
+					}
+				}
+			}
+		}
 	}
 }
 

@@ -19,7 +19,6 @@ package cuckoo
 import (
 	"encoding/binary"
 	"errors"
-	"math/rand"
 
 	"github.com/ethereum/go-ethereum/crypto"
 )
@@ -109,14 +108,12 @@ func (f *Filter) Insert(data []byte) error {
 	}
 
 	// 两边都满了，开始踢出（kick-out）逻辑
-	// 可以随机从 i1 或 i2 开始踢出
+	// 确定性地从 i1 开始踢出（原逻辑是随机选择 i1 或 i2）
 	i := i1
-	if rand.Intn(2) == 0 {
-		i = i2
-	}
 
 	for n := 0; n < maxKicks; n++ {
-		slot := rand.Intn(f.slotsPerBucket)
+		// 确定性地选择槽位（原逻辑是 rand.Intn(f.slotsPerBucket)）
+		slot := n % f.slotsPerBucket
 		f.buckets[i][slot], fp = fp, f.buckets[i][slot]
 		i = f.alternateIndex(i, fp)
 

@@ -127,7 +127,6 @@ func (n *InternalNode) SetOriginalHash(h []byte) {
 func (n *InternalNode) Serialize() ([]byte, error) {
 	var buf bytes.Buffer
 
-	// Header: [Type(1bit) | Epoch(7bits)]
 	// InternalNode Type=0, so just Epoch & 0x7F
 	buf.WriteByte(n.epoch & 0x7F)
 
@@ -389,10 +388,6 @@ func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 	buf.Write(scratch[:nBits])
 	buf.Write(n.Filter)
 
-	// [NEW] Hash：为了在节点重排/加载后能直接通过 metadata 找到 raw 数据
-	buf.WriteByte(byte(len(n.hash)))
-	buf.Write(n.hash)
-
 	return buf.Bytes(), nil
 }
 
@@ -490,17 +485,18 @@ func DeserializeNode(data []byte) (Node, error) {
 			}
 		}
 
-		return &InternalNode{
+		in := &InternalNode{
 			Path:       path,
 			PathBits:   int(pathBits),
 			LeftHash:   leftHash,
-			RightHash:  rightHash,
 			LeftEpoch:  leftEpoch,
+			RightHash:  rightHash,
 			RightEpoch: rightEpoch,
 			StubList:   stubs,
-			dirty:      false,
 			epoch:      epoch,
-		}, nil
+			dirty:      false,
+		}
+		return in, nil
 
 	} else if !isBucket { // LeafNode
 		epoch := header & 0x7F
@@ -576,25 +572,12 @@ func DeserializeNode(data []byte) (Node, error) {
 			}
 		}
 
-		// [NEW] 读取持久化的 hash
-		hashLenByte, err := reader.ReadByte()
-		if err != nil {
-			return nil, fmt.Errorf("read bucket hash len: %w", err)
-		}
-		h := make([]byte, int(hashLenByte))
-		if hashLenByte > 0 {
-			if _, err := reader.Read(h); err != nil {
-				return nil, fmt.Errorf("read bucket hash: %w", err)
-			}
-		}
-
 		return &ArchiveBucketNode{
 			Path:       path,
 			PathBits:   int(pathBits),
 			Filter:     filter,
 			Commitment: commitment,
 			Count:      count,
-			hash:       h,
 			dirty:      false,
 		}, nil
 	}

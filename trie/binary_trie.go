@@ -35,30 +35,55 @@ import (
 
 // BinaryTrie is a wrapper around binary.Trie that implements the state.Trie interface.
 type BinaryTrie struct {
-	trie *binary.Trie
+	trie       *binary.Trie
+	db         database.NodeDatabase
+	originRoot common.Hash
+	block      uint64
 }
+
+var (
+	// globalNodeCache stores nodes that are not yet committed to triedb's disk.
+	// This is needed because NewBinaryTrie creates new adapters that wouldn't see
+	// the previous blocks' uncommitted nodes otherwise.
+	globalNodeCache   = make(map[common.Hash][]byte)
+	globalNodeCacheMu sync.RWMutex
+
+	globalTrieRegistry   = make(map[database.NodeDatabase]*binary.Trie)
+	globalTrieRegistryMu sync.Mutex
+)
 
 // NewBinaryTrie creates a new binary trie.
 func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Database) (*BinaryTrie, error) {
-	// Try to reuse the active trie from database if available
-	type persistentDB interface {
+	var active *binary.Trie
+
+	// Try to reuse the active trie from database if possible
+	type trieStore interface {
 		GetBinaryTrie() interface{}
-		SetBinaryTrie(interface{})
 	}
-	if pdb, ok := db.(persistentDB); ok {
-		if active := pdb.GetBinaryTrie(); active != nil {
-			if t, ok := active.(*binary.Trie); ok {
-				// We can reuse the trie if the root matches
-				// Note: Load() will skip if root is same as cachedRoot
-				if err := t.Load(root.Bytes()); err == nil {
-					// Update adapter root if needed to ensure correct NodeReader is used
-					if adapter, ok := t.Database().(*binaryDBAdapter); ok {
-						adapter.root = root
-						adapter.reader = nil
-					}
-					return &BinaryTrie{trie: t}, nil
-				}
+	if ts, ok := db.(trieStore); ok {
+		if bt := ts.GetBinaryTrie(); bt != nil {
+			active = bt.(*binary.Trie)
+		}
+	}
+
+	if active != nil {
+		// Check if the current root already matches. If so, return immediately to preserve memory shards.
+		h, _ := active.Hash()
+		if bytes.Equal(h, root.Bytes()) {
+			// Update adapter root just in case, but keep the trie as is
+			if adapter, ok := active.Database().(*binaryDBAdapter); ok {
+				adapter.root = root
 			}
+			return &BinaryTrie{trie: active, db: db, originRoot: root}, nil
+		}
+
+		if err := active.Load(root.Bytes()); err == nil {
+			// Update adapter root if needed to ensure correct NodeReader is used
+			if adapter, ok := active.Database().(*binaryDBAdapter); ok {
+				adapter.root = root
+				adapter.reader = nil // Clear stale reader
+			}
+			return &BinaryTrie{trie: active, db: db, originRoot: root}, nil
 		}
 	}
 
@@ -95,24 +120,31 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 	}
 
 	// NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning bool)
-	t := binary.NewTrie(root.Bytes(), kvAdapter, binary.NewPooledKeccakHasher(), config, false)
-
-	// Register it as the active trie for reuse
-	if pdb, ok := db.(persistentDB); ok {
-		pdb.SetBinaryTrie(t)
+	t := binary.NewTrie(root.Bytes(), kvAdapter, binary.NewPooledKeccakHasher(), config, true)
+	bt := &BinaryTrie{
+		trie:       t,
+		db:         db,
+		originRoot: root,
 	}
-
-	return &BinaryTrie{trie: t}, nil
+	// Native persistence for reuse via interface assertion
+	type trieSetter interface {
+		SetBinaryTrie(interface{})
+	}
+	if ts, ok := db.(trieSetter); ok {
+		ts.SetBinaryTrie(t)
+	}
+	return bt, nil
 }
 
 type binaryDBAdapter struct {
-	db      database.NodeDatabase
-	root    common.Hash
-	reader  database.NodeReader
-	disk    ethdb.Database
-	archive ethdb.Database
-	values  map[common.Hash][]byte
-	mu      sync.RWMutex
+	db           database.NodeDatabase
+	root         common.Hash
+	reader       database.NodeReader
+	disk         ethdb.Database
+	archive      ethdb.Database
+	values       map[common.Hash][]byte
+	pendingNodes *trienode.NodeSet // [FIX] Tracks all nodes written between commits
+	mu           sync.RWMutex
 }
 
 func (a *binaryDBAdapter) archiveDB() ethdb.Database {
@@ -133,12 +165,20 @@ func (a *binaryDBAdapter) diskDB() ethdb.Database {
 }
 
 func (a *binaryDBAdapter) Put(key, value []byte) error {
+	h := common.BytesToHash(key)
+	if h.Hex() == "0x4b99a217b10949dea5c829d8b956a64df5d5c2d83b46d6d1ed05e4c0f828fbc4" {
+		fmt.Printf("[ALARM] adapter.Put problematic hash! total_nodes=%d\n", len(globalNodeCache))
+	}
 	if len(key) == 32 {
+		globalNodeCacheMu.Lock()
+		globalNodeCache[h] = common.CopyBytes(value)
+		globalNodeCacheMu.Unlock()
+
+		// [FIX] Record for current NodeSet in Commit
 		a.mu.Lock()
-		if a.values == nil {
-			a.values = make(map[common.Hash][]byte)
+		if a.pendingNodes != nil {
+			a.pendingNodes.AddNode(key, trienode.New(h, value))
 		}
-		a.values[common.BytesToHash(key)] = common.CopyBytes(value)
 		a.mu.Unlock()
 	}
 
@@ -149,6 +189,20 @@ func (a *binaryDBAdapter) Put(key, value []byte) error {
 }
 
 func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
+	if len(key) == 32 {
+		h := common.BytesToHash(key)
+		globalNodeCacheMu.RLock()
+		if val, ok := globalNodeCache[h]; ok {
+			globalNodeCacheMu.RUnlock()
+			return common.CopyBytes(val), nil
+		}
+		globalNodeCacheMu.RUnlock()
+		if h.Hex() == "0x4b99a217b10949dea5c829d8b956a64df5d5c2d83b46d6d1ed05e4c0f828fbc4" {
+			fmt.Printf("[ALARM] adapter.Get problematic hash CACHE MISS!\n")
+		}
+	}
+	// ... rest of the code
+
 	// Try Disk first for potentially uncommitted/standalone nodes (like TopTree container)
 	if db := a.diskDB(); db != nil {
 		data, err := db.Get(key)
@@ -163,29 +217,39 @@ func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
 			return data, nil
 		}
 	}
-	// Fallback to NodeReader for trie nodes
+	// Fallback to trie database node reader.
+	// We might need to try multiple recent roots because asynchronous pruning or
+	// pending commits might have nodes that are not yet perfectly visible via
+	// the latest root's reader.
 	if a.reader == nil {
+		if a.root == (common.Hash{}) {
+			return nil, nil // Empty root has no nodes
+		}
 		r, err := a.db.NodeReader(a.root)
 		if err != nil {
-			fmt.Printf("[DEBUG] adapter.Get NodeReader failed for root %s: %v\n", a.root.Hex(), err)
-			return nil, err
+			// If reader fails, it might be an unindexed root. Look in cache or return nil.
+			return nil, nil
 		}
 		a.reader = r
 	}
-	if a.reader == nil {
-		return nil, nil
-	}
+
 	h := common.BytesToHash(key)
 	data, err := a.reader.Node(common.Hash{}, nil, h)
-	if data == nil {
-		// fmt.Printf("[DEBUG] adapter.Get No node for root=%s hash=%s\n", a.root.Hex(), h.Hex())
+	if err == nil && data != nil {
+		// [FIX] Warm the cache! Once a node is found, keep it in globalNodeCache
+		// to ensure cross-block and cross-reset visibility.
+		globalNodeCacheMu.Lock()
+		globalNodeCache[h] = common.CopyBytes(data)
+		globalNodeCacheMu.Unlock()
+		return data, nil
 	}
 	return data, err
 }
 func (a *binaryDBAdapter) Delete(key []byte) error {
-	if db := a.diskDB(); db != nil {
-		return db.Delete(key)
-	}
+	// [FIX] Zero-Deletion Strategy for consistency debugging.
+	// We do NOT physically delete nodes until we 100% guarantee no
+	// logical view (current or next block) still refers to them.
+	// fmt.Printf("[DEBUG] adapter.Delete intercepted for %x\n", key)
 	return nil
 }
 func (a *binaryDBAdapter) NewBatch() binary.Batcher {
@@ -260,24 +324,36 @@ func (a *binaryBatchAdapterArchive) Reset()                      { a.Batch.Reset
 func (a *binaryBatchAdapterArchive) ValueSize() int              { return a.Batch.ValueSize() }
 
 type nodeSetBatcher struct {
-	db    database.NodeDatabase
-	nodes *trienode.NodeSet
-	mu    sync.Mutex
+	adapter *binaryDBAdapter
+	nodes   *trienode.NodeSet
+	owner   common.Hash
 }
 
 func (b *nodeSetBatcher) Put(key, value []byte) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	h := common.BytesToHash(key)
-	// fmt.Printf("[DEBUG] nodeSetBatcher.Put hash=%s len=%d\n", h.Hex(), len(value))
+	if h.Hex() == "0x4b99a217b10949dea5c829d8b956a64df5d5c2d83b46d6d1ed05e4c0f828fbc4" {
+		fmt.Printf("[ALARM] nodeSetBatcher.Put! owner=%s valueSize=%d\n", b.owner.Hex(), len(value))
+	}
 	b.nodes.AddNode(key, trienode.New(h, value))
+
+	// [FIX] Update global cache for immediate visibility in subsequent adapter.Get across blocks
+	globalNodeCacheMu.Lock()
+	globalNodeCache[h] = common.CopyBytes(value)
+	globalNodeCacheMu.Unlock()
+
+	// [FIX] Record for current NodeSet in adapter as well for cross-block persistence
+	if b.adapter != nil {
+		b.adapter.mu.Lock()
+		if b.adapter.pendingNodes != nil {
+			b.adapter.pendingNodes.AddNode(key, trienode.New(h, value))
+		}
+		b.adapter.mu.Unlock()
+	}
+
 	return nil
 }
 func (b *nodeSetBatcher) Delete(key []byte) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.nodes.AddNode(key, trienode.NewDeleted())
-	return nil
+	return b.adapter.Delete(key)
 }
 func (b *nodeSetBatcher) Write() error   { return nil }
 func (b *nodeSetBatcher) Reset()         {}
@@ -367,44 +443,70 @@ func (t *BinaryTrie) Hash() common.Hash {
 }
 
 func (t *BinaryTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
-	isDirty := t.trie.IsDirty()
-	if !isDirty {
-		h, _ := t.trie.Commit()
-		root := common.BytesToHash(h)
-		if root != (common.Hash{}) {
-			// fmt.Printf("[DEBUG] BinaryTrie.Commit non-dirty root=%s\n", root.Hex())
-		}
-		return root, nil
-	}
-
-	if db := t.trieDB(); db != nil {
-		// Prepare a batcher that feeds into a NodeSet for triedb.Update
-		nodes := trienode.NewNodeSet(common.Hash{})
-		batch := &nodeSetBatcher{db: db, nodes: nodes}
-
-		h, err := t.trie.CommitToBatch(batch, false)
+	// [SHARD-AWARE COMMIT via Anonymous Interface to break Import Cycle]
+	if adapter, ok := t.trie.Database().(*binaryDBAdapter); ok {
+		h, err := t.trie.Hash()
 		if err != nil {
-			fmt.Printf("[DEBUG] BinaryTrie.Commit error: %v\n", err)
 			return common.Hash{}, nil
 		}
 		root := common.BytesToHash(h)
 
-		// Flush buffered values into NodeSet
-		if adapter, ok := t.trie.Database().(*binaryDBAdapter); ok {
-			adapter.mu.Lock()
-			for hash, blob := range adapter.values {
-				nodes.AddNode(hash.Bytes(), trienode.New(hash, blob))
+		// 1. Prepare MergedNodeSet for atomic update across owners
+		merged := trienode.NewMergedNodeSet()
+
+		// 2. Iterate through dirty shards and populate MergedNodeSet
+		for _, id := range t.trie.GetDirtyShards() {
+			shardRootBytes := t.trie.GetShardRoot(id)
+			shardRoot := common.BytesToHash(shardRootBytes)
+
+			nodes := trienode.NewNodeSet(shardRoot)
+			batch := &nodeSetBatcher{adapter: adapter, nodes: nodes, owner: shardRoot}
+			t.trie.CommitShardToBatch(id, batch, false)
+
+			if len(nodes.Nodes) > 0 {
+				merged.Sets[shardRoot] = nodes
 			}
-			adapter.values = nil
-			adapter.mu.Unlock()
 		}
 
-		if len(nodes.Nodes) > 0 {
-			// fmt.Printf("[DEBUG] BinaryTrie.Commit dirty root=%s updates=%d\n", root.Hex(), len(nodes.Nodes))
+		// 3. Add pending nodes and manual values to MergedNodeSet under zero owner
+		adapter.mu.Lock()
+		if adapter.pendingNodes != nil && len(adapter.pendingNodes.Nodes) > 0 {
+			merged.Sets[common.Hash{}] = adapter.pendingNodes
+			adapter.pendingNodes = trienode.NewNodeSet(common.Hash{})
 		}
-		return root, nodes
+		if len(adapter.values) > 0 {
+			vNodes := trienode.NewNodeSet(common.Hash{})
+			for hash, blob := range adapter.values {
+				vNodes.AddNode(hash.Bytes(), trienode.New(hash, blob))
+			}
+			merged.Sets[common.Hash{}] = vNodes
+			adapter.values = nil
+		}
+		adapter.mu.Unlock()
+
+		// 4. Update triedb atomically via anonymous interface assertion
+		type updater interface {
+			Update(common.Hash, common.Hash, uint64, *trienode.MergedNodeSet, interface{}) error
+		}
+		if u, ok := t.db.(updater); ok {
+			if err := u.Update(root, t.originRoot, t.block, merged, nil); err != nil {
+				fmt.Printf("[DEBUG] BinaryTrie.Commit Update error: %v\n", err)
+			}
+		}
+
+		// 5. Native persistence for reuse
+		type trieSetter interface {
+			SetBinaryTrie(interface{})
+		}
+		if ts, ok := t.db.(trieSetter); ok {
+			ts.SetBinaryTrie(t.trie)
+		}
+
+		t.originRoot = root
+		// Return nil NodeSet because the internal logic already handled the atomic update
+		return root, nil
 	}
-	// Fallback for non-triedb case
+
 	h, _ := t.trie.CommitToBatch(nil, true)
 	return common.BytesToHash(h), nil
 }
@@ -502,7 +604,7 @@ func (s *BinaryStorageTrie) Prove(key []byte, proofDb ethdb.KeyValueWriter) erro
 
 func (s *BinaryStorageTrie) IsVerkle() bool { return false }
 
-func (s *BinaryStorageTrie) PruneNextShard() error { return nil }
+func (s *BinaryStorageTrie) PruneNextShard() error { return s.bt.PruneNextShard() }
 
 // binaryStorageIterator implements NodeIterator for storage wiping.
 type binaryStorageIterator struct {

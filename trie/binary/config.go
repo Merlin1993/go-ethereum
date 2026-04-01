@@ -20,7 +20,7 @@ type Config struct {
 // DefaultConfig returns a Config with default values.
 func DefaultConfig() *Config {
 	return &Config{
-		ShardDepth:        16,
+		ShardDepth:        8,
 		ArchiveBucketSize: 100,
 		CuckooBuckets:     32,
 		CuckooSlots:       4,

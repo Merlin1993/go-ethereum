@@ -1,6 +1,7 @@
 package binary
 
 import (
+	"bytes"
 	"sync"
 )
 
@@ -25,7 +26,6 @@ type Trie struct {
 }
 
 // NewTrie creates a new Binary Trie with the given database and configuration.
-// Original signature restored for test compatibility.
 func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning bool) *Trie {
 	if config == nil {
 		config = DefaultConfig()
@@ -47,13 +47,64 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 	return t
 }
 
+func (t *Trie) GetDirtyShards() []int {
+	t.shardsMu.RLock()
+	defer t.shardsMu.RUnlock()
+	list := make([]int, 0, len(t.dirtyShards))
+	for id := range t.dirtyShards {
+		list = append(list, id)
+	}
+	return list
+}
+
+func (t *Trie) GetShardRoot(id int) []byte {
+	shardRoot, _ := t.topTree.GetShardRoot(id, t.db)
+	return shardRoot
+}
+
+func (t *Trie) CommitShardToBatch(id int, batch Batcher, destructive bool) ([]byte, error) {
+	shard, err := t.getOrCreateShard(id)
+	if err != nil {
+		return nil, err
+	}
+	return shard.commit(shard.root, batch, nil, destructive)
+}
+
+func (t *Trie) GetShardID(key []byte) int {
+	if len(key) < t.config.ShardDepth {
+		return 0
+	}
+	// Extract first byte as shard ID for Fountain's default depth
+	return int(key[0])
+}
+
 // Load loads the Trie state from the database using a given root hash.
 func (t *Trie) Load(rootHash []byte) error {
 	if len(rootHash) == 0 {
 		return nil
 	}
+
+	// If current root is already what we're loading, skip reset
+	current, _ := t.Hash()
+	if bytes.Equal(current, rootHash) {
+		return nil
+	}
+
 	// Load the TopTree from DB
-	return t.topTree.Load(rootHash, t.db)
+	if err := t.topTree.Load(rootHash, t.db); err != nil {
+		return err
+	}
+
+	// [FIX] Invalidate all loaded shards so they pick up new roots from TopTree on next access
+	t.shardsMu.Lock()
+	defer t.shardsMu.Unlock()
+	for i, s := range t.shards {
+		if s != nil {
+			shardRoot, _ := t.topTree.GetShardRoot(i, t.db)
+			s.Reset(shardRoot)
+		}
+	}
+	return nil
 }
 
 func (t *Trie) getOrCreateShard(id int) (*Shard, error) {
@@ -87,7 +138,7 @@ func (t *Trie) getOrCreateShard(id int) (*Shard, error) {
 
 // Get finds the value for a given key.
 func (t *Trie) Get(key []byte) ([]byte, error) {
-	shardID := t.getShardID(key)
+	shardID := t.GetShardID(key)
 	shard, err := t.getOrCreateShard(shardID)
 	if err != nil {
 		return nil, err
@@ -97,7 +148,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 
 // Put updates or inserts a value for a given key.
 func (t *Trie) Put(key []byte, value []byte) error {
-	shardID := t.getShardID(key)
+	shardID := t.GetShardID(key)
 	shard, err := t.getOrCreateShard(shardID)
 	if err != nil {
 		return err
@@ -110,7 +161,7 @@ func (t *Trie) Put(key []byte, value []byte) error {
 
 // Delete removes a key and its value from the Trie.
 func (t *Trie) Delete(key []byte) error {
-	shardID := t.getShardID(key)
+	shardID := t.GetShardID(key)
 	shard, err := t.getOrCreateShard(shardID)
 	if err != nil {
 		return err
@@ -126,15 +177,7 @@ func (t *Trie) BatchDelete(key []byte) error {
 	return t.Delete(key)
 }
 
-func (t *Trie) getShardID(key []byte) int {
-	id := 0
-	for i := 0; i < t.config.ShardDepth; i++ {
-		if getBit(key, i) == 1 {
-			id |= (1 << (t.config.ShardDepth - 1 - i))
-		}
-	}
-	return id
-}
+// Redundant GetShardID removed.
 
 // Hash returns the root hash of the Trie.
 func (t *Trie) Hash() ([]byte, error) {
@@ -366,7 +409,7 @@ func (t *Trie) FlushArchives() error {
 
 // Activate moves an archived key back to the hot tree.
 func (t *Trie) Activate(key []byte, value []byte) error {
-	shardID := t.getShardID(key)
+	shardID := t.GetShardID(key)
 	shard, err := t.getOrCreateShard(shardID)
 	if err != nil {
 		return err

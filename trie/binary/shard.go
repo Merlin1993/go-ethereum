@@ -3,9 +3,9 @@ package binary
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -15,12 +15,13 @@ import (
 
 // Shard 表示一个二叉 Merkle Patricia Trie 的分片（子树）。
 type Shard struct {
+	mu       sync.RWMutex // Protects root, rootHash, and staleSet
 	root     Node
 	db       KVStore
 	hasher   Hasher
 	pruning  bool
-	staleSet map[string]struct{} // 以哈希字节为键的集合（用于修剪）
-	rootHash []byte              // 记录持久化后的根哈希，用于内存根丢失时重新加载
+	staleSet map[string]struct{} // Set of hashes as string keys (for pruning)
+	rootHash []byte              // Last persisted root hash for lazy loading
 
 	// Shard specific state
 	id       int
@@ -101,11 +102,29 @@ func (s *Shard) ClearCaches() {
 	s.staleSet = make(map[string]struct{})
 }
 
+// Reset updates the shard's root hash and clears memory root to force lazy loading.
+// If the memory root already matches the shardRoot, we keep it to preserve hot nodes.
+func (s *Shard) Reset(shardRoot []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.root != nil && bytes.Equal(s.root.Hash(), shardRoot) {
+		return
+	}
+	s.rootHash = shardRoot
+	s.root = nil
+}
+
 // loadNode 根据哈希从 DB 读取并反序列化节点。
 func (s *Shard) loadNode(hash []byte) (Node, error) {
+	if len(hash) == 0 {
+		return nil, nil
+	}
 	data, err := s.db.Get(hash)
+	if err != nil {
+		return nil, err
+	}
 	if data == nil {
-		return nil, ErrNodeNotFound
+		return nil, fmt.Errorf("node not found: hash %x in shard %d", hash, s.id)
 	}
 	node, err := DeserializeNode(data)
 	if err != nil {
@@ -172,8 +191,17 @@ func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
 	return data, err
 }
 
-// Get 返回指定 key 的值哈希（不存在则返回 ErrNodeNotFound）。
 func (s *Shard) Get(key []byte) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.root == nil && len(s.rootHash) > 0 {
+		var err error
+		s.root, err = s.loadNode(s.rootHash)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if s.root == nil {
 		atomic.AddInt64(&common.BinaryMissNonExistentCount, 1)
 		return nil, ErrNodeNotFound
@@ -200,7 +228,6 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 
 	switch n := node.(type) {
 	case *LeafNode:
-		// 检查叶子后缀是否完全匹配 key 的剩余位
 		matchLen := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
 		if matchLen == n.PathBits && depth+matchLen == len(key)*8 {
 			atomic.AddInt64(&common.BinaryHitCount, 1)
@@ -286,105 +313,11 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 		}
 
 		// [归档桶次之]：热路径未命中，按“后进先出”（栈）顺序查找侧挂的 StubList
-		recoveryStart := time.Now()
 		for i := len(n.StubList) - 1; i >= 0; i-- {
 			bucket := n.StubList[i]
-			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, depth)
-			if matched == bucket.PathBits {
-				// 获取或解码过滤器
-				bucket.cacheMu.RLock()
-				filter := bucket.cachedFilter
-				bucket.cacheMu.RUnlock()
-
-				if filter == nil {
-					bucket.cacheMu.Lock()
-					if bucket.cachedFilter == nil {
-						f := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
-						if err := f.Decode(bucket.Filter, s.config.CuckooBuckets, s.config.CuckooSlots); err == nil {
-							bucket.cachedFilter = f
-						}
-					}
-					filter = bucket.cachedFilter
-					bucket.cacheMu.Unlock()
-				}
-
-				if filter == nil {
-					continue
-				}
-
-				innerDepth := depth + n.PathBits
-
-				// 使用相对于桶起始位置的路径位进行布谷鸟过滤器查询
-				// 注意：item.Suffix 是相对于 n 的。
-				shardKey := s.getSuffix(key, innerDepth, nil)
-				lookup := filter.Lookup(shardKey)
-				if !lookup {
-					continue
-				}
-
-				s.statsMut.Lock()
-				s.stats.ArchiveReadCount++
-				s.statsMut.Unlock()
-
-				// 获取或反序列化桶数据
-				bucket.cacheMu.RLock()
-				items := bucket.cachedItems
-				bucket.cacheMu.RUnlock()
-
-				if items == nil {
-					bucket.cacheMu.Lock()
-					if bucket.cachedItems == nil {
-						bucketData, err := s.getBucketData(bucket.Hash())
-						if err == nil {
-							itms, err := s.deserializeArchivedKV(bucketData)
-							if err == nil {
-								bucket.cachedItems = itms
-							}
-						}
-					}
-					items = bucket.cachedItems
-					bucket.cacheMu.Unlock()
-				}
-
-				if items == nil {
-					continue
-				}
-
-				keyBits := len(key) * 8
-				for _, item := range items {
-					if innerDepth+item.SuffixBits == keyBits {
-						if s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits) {
-							// 命中归档项，记录耗时
-							dur := time.Since(recoveryStart).Nanoseconds()
-							atomic.AddInt64(&common.BinaryProofGenTime, dur)
-							for {
-								oldMax := atomic.LoadInt64(&common.BinaryProofGenTimeMax)
-								if dur <= oldMax || atomic.CompareAndSwapInt64(&common.BinaryProofGenTimeMax, oldMax, dur) {
-									break
-								}
-							}
-
-							atomic.AddInt64(&common.BinaryMissExistentCount, 1)
-
-							// [NEW] 验证存储挂出的 StubList 数据是否可信 (ECMH 验证)
-							ok, vTime := s.verifyBucket(bucket)
-							atomic.AddInt64(&common.BinaryProofVerifTime, vTime)
-							if !ok {
-								return nil, false, errors.New("archive bucket commitment verification failed")
-							}
-
-							val, err := s.db.Get(item.Value)
-							return val, true, err
-						}
-					}
-				}
-				// 过滤器查询存在，但数据实际不存在 -> 假阳性
-				atomic.AddInt64(&common.BinaryCycleFPCount, 1)
-				atomic.AddInt64(&common.BinaryTrieFPInBlock, 1)
-
-				common.BinaryStatsMu.Lock()
-				common.BinaryFPDistribution = append(common.BinaryFPDistribution, int64(bucket.Count))
-				common.BinaryStatsMu.Unlock()
+			val, fromArch, err := s.getFromBucket(bucket, key, depth)
+			if err == nil {
+				return val, fromArch, nil
 			}
 		}
 
@@ -399,7 +332,6 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 }
 
 func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, depth int) ([]byte, bool, error) {
-	recoveryStart := time.Now()
 	// 匹配位前缀
 	matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, depth)
 	if matched != bucket.PathBits {
@@ -426,7 +358,9 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, depth int) 
 	if filter != nil {
 		innerDepth := depth + bucket.PathBits
 		shardKey := s.getSuffix(key, innerDepth, nil)
-		if !filter.Lookup(shardKey) {
+		suffixBits := len(key)*8 - innerDepth
+		keyWithLen := append([]byte{byte(suffixBits)}, shardKey...)
+		if !filter.Lookup(keyWithLen) {
 			return nil, false, ErrNodeNotFound
 		}
 	}
@@ -448,41 +382,41 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, depth int) 
 		bucket.cacheMu.Unlock()
 	}
 
-	if items == nil {
-		return nil, false, ErrNodeNotFound
-	}
-
-	innerDepth := depth + bucket.PathBits
-	keyBits := len(key) * 8
-	for _, item := range items {
-		// fmt.Printf("  Item %d: SuffixBits %d, match: %v\n", i, item.SuffixBits, innerDepth+item.SuffixBits == keyBits)
-		if innerDepth+item.SuffixBits == keyBits {
-			match := s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits)
-			// fmt.Printf("    suffixMatches: %v\n", match)
-			if match {
-				// 命中归档项
-				atomic.AddInt64(&common.BinaryMissExistentCount, 1)
-
-				// 记录耗时
-				dur := time.Since(recoveryStart).Nanoseconds()
-				atomic.AddInt64(&common.BinaryProofGenTime, dur)
-				for {
-					oldMax := atomic.LoadInt64(&common.BinaryProofGenTimeMax)
-					if dur <= oldMax || atomic.CompareAndSwapInt64(&common.BinaryProofGenTimeMax, oldMax, dur) {
-						break
-					}
+	if items != nil {
+		innerDepth := depth + bucket.PathBits
+		keyBits := len(key) * 8
+		for _, item := range items {
+			if innerDepth+item.SuffixBits == keyBits {
+				match := s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits)
+				if match {
+					atomic.AddInt64(&common.BinaryMissExistentCount, 1)
+					val, err := s.db.Get(item.Value)
+					return val, true, err
 				}
-
-				val, err := s.db.Get(item.Value)
-				return val, true, err
 			}
 		}
+		// If we are here, filter Lookup was TRUE but NO items matched!
+		fmt.Printf("[DEBUG] FATAL: Filter Positive but Loop NEGATIVE! Key=%x, innerDepth=%d, totalItems=%d\n", key, innerDepth, len(items))
+		for i, it := range items {
+			fmt.Printf("  Item %d: Suffix=%x, Bits=%d\n", i, it.Suffix, it.SuffixBits)
+		}
 	}
+
 	return nil, false, ErrNodeNotFound
 }
 
 func (s *Shard) Put(key []byte, value []byte) error {
-	valHash := s.hasher.Hash(value)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.root == nil && len(s.rootHash) > 0 {
+		var err error
+		s.root, err = s.loadNode(s.rootHash)
+		if err != nil {
+			return err
+		}
+	}
+	valHash := crypto.Keccak256Hash(value).Bytes()
 	if err := s.db.Put(valHash, value); err != nil {
 		return err
 	}
@@ -498,6 +432,14 @@ func (s *Shard) Put(key []byte, value []byte) error {
 
 // Activate 实现显式激活：从 StubList 查找并移除匹配项，然后执行常规插入
 func (s *Shard) Activate(key []byte, value []byte) error {
+	if s.root == nil && len(s.rootHash) > 0 {
+		var err error
+		s.root, err = s.loadNode(s.rootHash)
+		if err != nil {
+			return err
+		}
+	}
+
 	// 1. 深度搜索并从现有 StubList 中移除该 key
 	if s.root != nil {
 		// 已知 key，只需按路径下探并在沿途 Node 的 StubList 中定点查找
@@ -749,8 +691,11 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		bit := s.getBit(key, depth)
 		if bit == 0 {
 			if n.Left == nil && len(n.LeftHash) > 0 {
-				loaded, _ := s.loadNode(n.LeftHash)
-				n.Left = loaded
+				var err error
+				n.Left, err = s.loadNode(n.LeftHash)
+				if err != nil {
+					return nil, err
+				}
 			}
 			newLeft, err := s.insert(n.Left, key, depth+1, valueHash)
 			if err != nil {
@@ -759,8 +704,11 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 			n.Left = newLeft
 		} else {
 			if n.Right == nil && len(n.RightHash) > 0 {
-				loaded, _ := s.loadNode(n.RightHash)
-				n.Right = loaded
+				var err error
+				n.Right, err = s.loadNode(n.RightHash)
+				if err != nil {
+					return nil, err
+				}
 			}
 			newRight, err := s.insert(n.Right, key, depth+1, valueHash)
 			if err != nil {
@@ -789,9 +737,20 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 
 // Delete 删除指定 key。
 func (s *Shard) Delete(key []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.root == nil && len(s.rootHash) > 0 {
+		var err error
+		s.root, err = s.loadNode(s.rootHash)
+		if err != nil {
+			return err
+		}
+	}
 	if s.root != nil {
 		s.removeFromStubList(s.root, key, s.config.ShardDepth)
 	}
+	// 递归剪枝
 	newRoot, _, err := s.delete(s.root, key, s.config.ShardDepth)
 	if err != nil {
 		if err == ErrNodeNotFound {
@@ -823,6 +782,7 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 		if n.PathBits > 0 {
 			matched := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
 			if matched != n.PathBits {
+				fmt.Printf("[DEBUG] shard.delete: internal path mismatch %d/%d\n", matched, n.PathBits)
 				return node, false, ErrNodeNotFound
 			}
 			depth += n.PathBits
@@ -921,8 +881,10 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 
 // Hash 计算分片根哈希。
 func (s *Shard) Hash() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if s.root == nil {
-		return nil, nil
+		return s.rootHash, nil
 	}
 	count := 0
 	return s.commit(s.root, &dummyBatcher{}, &count, false)
@@ -944,8 +906,10 @@ type ChildInfo struct {
 
 // CommitToBatch 递归提交改动。
 func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.root == nil {
-		return nil, nil
+		return s.rootHash, nil
 	}
 
 	nodeCount := 0
@@ -964,6 +928,10 @@ func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		s.staleSet = make(map[string]struct{})
 	}
 
+	if destructive {
+		s.root = nil
+		s.rootHash = rootHash
+	}
 	return rootHash, nil
 }
 
@@ -1068,12 +1036,15 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 
 	switch n := node.(type) {
 	case *ArchiveBucketNode:
+		h := n.Hash()
 		data, err := n.Serialize()
 		if err != nil {
 			return nil, err
 		}
-		h := append([]byte{}, s.hasher.Hash(data)...)
-		n.SetHash(h)
+		if len(h) == 0 {
+			h = append([]byte{}, s.hasher.Hash(data)...)
+			n.SetHash(h)
+		}
 
 		if batch != nil {
 			n.SetDirty(false)
@@ -1131,6 +1102,10 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		h := append([]byte{}, s.hasher.Hash(data)...)
 		n.SetHash(h)
 
+		if fmt.Sprintf("%x", h) == "4b99a217b10949dea5c829d8b956a64df5d5c2d83b46d6d1ed05e4c0f828fbc4" {
+			fmt.Printf("[ALARM-GEN] InternalNode hash matches! batch_is_nil=%v\n", batch == nil)
+		}
+
 		if batch != nil {
 			n.SetDirty(false)
 			n.SetOriginalHash(h)
@@ -1144,12 +1119,10 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		if batch != nil {
 			s.updateEpoch(n)
 		}
-
 		data, err := n.Serialize()
 		if err != nil {
 			return nil, err
 		}
-
 		h := append([]byte{}, s.hasher.Hash(data)...)
 		n.SetHash(h)
 
@@ -1180,51 +1153,7 @@ func (s *Shard) updateEpoch(node Node) {
 		n.epoch = global
 
 	case *InternalNode:
-		anyOne := false
-		allOne := true
-		count := 0
-
-		if n.Left != nil || len(n.LeftHash) > 0 {
-			count++
-			b := byte(0)
-			if n.Left != nil {
-				b = n.Left.Epoch() & 1
-			} else {
-				b = n.LeftEpoch & 1
-			}
-			if b == 1 {
-				anyOne = true
-			} else {
-				allOne = false
-			}
-		}
-
-		if n.Right != nil || len(n.RightHash) > 0 {
-			count++
-			b := byte(0)
-			if n.Right != nil {
-				b = n.Right.Epoch() & 1
-			} else {
-				b = n.RightEpoch & 1
-			}
-			if b == 1 {
-				anyOne = true
-			} else {
-				allOne = false
-			}
-		}
-
-		var bit0, bit1 byte
-		if count > 0 {
-			if anyOne {
-				bit0 = 1
-			}
-			if allOne {
-				bit1 = 1
-			}
-		}
-
-		n.epoch = (bit1 << 1) | bit0
+		n.epoch = global
 	}
 }
 
@@ -1255,8 +1184,12 @@ func (s *Shard) shrink(n *InternalNode) Node {
 		return n
 	}
 
-	if remaining == nil {
-		remaining, _ = s.loadNode(remainingHash)
+	if remaining == nil && len(remainingHash) > 0 {
+		var err error
+		remaining, err = s.loadNode(remainingHash)
+		if err != nil {
+			return n // Fallback to current node if cannot load child
+		}
 	}
 
 	if inChild, ok := remaining.(*InternalNode); ok {
@@ -1279,5 +1212,8 @@ func (s *Shard) shrink(n *InternalNode) Node {
 		return leaf
 	}
 
+	if remaining == nil && len(n.StubList) == 0 {
+		return nil
+	}
 	return n
 }

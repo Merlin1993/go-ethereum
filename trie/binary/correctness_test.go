@@ -181,7 +181,7 @@ func TestLongCommonPrefix(t *testing.T) {
 	}
 
 	// Check if they are in the same shard (first 2 bytes)
-	if trie.getShardID(key1) != trie.getShardID(key2) {
+	if trie.GetShardID(key1) != trie.GetShardID(key2) {
 		t.Errorf("Keys should be in the same shard for this test to be effective")
 	}
 }
@@ -248,10 +248,11 @@ func TestPersistence(t *testing.T) {
 	// But our NewTrie doesn't take root hashes, so shard.root will be nil.
 	// Wait, the current NewTrie implementation:
 	/*
-		for i := 0; i < 65536; i++ {
-			s, _ := NewShard(i, db, hasher, nil, pruning, func() byte { return t.globalEpochBit })
-			t.shards[i] = s
-		}
+		/*
+			for i := 0; i < (1 << trie.config.ShardDepth); i++ {
+				s, _ := NewShard(i, db, hasher, nil, pruning, func() byte { return t.globalEpochBit })
+				t.shards[i] = s
+			}
 	*/
 	// It doesn't load roots. In a real implementation it should.
 	// Let's verify if we can manually set a root hash or if we need to mock it.
@@ -292,7 +293,7 @@ func TestPruningBasic(t *testing.T) {
 	trie.SetGlobalEpoch(1)
 
 	// Perform shard pruning
-	shardID := int(key[0])<<8 | int(key[1])
+	shardID := trie.GetShardID(key)
 	trie.pruneShardIdx = shardID
 	err := trie.PruneNextShard()
 	if err != nil {
@@ -366,7 +367,7 @@ func TestLazyLoading(t *testing.T) {
 	trie.Put(key, val)
 	trie.Commit()
 
-	shardID := int(key[0])<<8 | int(key[1])
+	shardID := trie.GetShardID(key)
 	shard := trie.shards[shardID]
 	rootHash := shard.root.Hash()
 	shard.root = nil
@@ -578,7 +579,7 @@ func TestDataActivation(t *testing.T) {
 
 	// 2. Perform activation
 	newVal := []byte("activated-and-updated")
-	shardID := int(key[0])<<8 | int(key[1])
+	shardID := trie.GetShardID(key)
 	err := trie.shards[shardID].Activate(key, newVal)
 	if err != nil {
 		t.Fatalf("Activate failed: %v", err)

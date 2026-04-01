@@ -167,26 +167,23 @@ func TestTrieStressBinary(t *testing.T) {
 			trie.PruneNextShard()
 			pruneDur := time.Since(startPrune)
 
-			// 计算根耗时统计
-			startCommit := time.Now()
-			// trie.Commit()  <-- Original
-			// root, err := trie.CommitToBatch(batch, true)
-			trie.CommitToBatch(batch, true)
-			commitDur := time.Since(startCommit)
-
 			startFlush := time.Now()
 			trie.FlushArchives()
 			flushDur := time.Since(startFlush)
 
-			// Optional: Write batch every 10 commits or every epoch
-			// For this optimization test, let's write every 10 commits (10,000 items)
-			if (totalInjected+BatchSize)%(10*BatchSize) == 0 {
-				startWrite := time.Now()
-				batch.Write()
-				batch.Reset()
-				writeDur := time.Since(startWrite)
-				commitDur += writeDur
+			// 计算根耗时统计
+			startCommit := time.Now()
+			trie.CommitToBatch(batch, true)
+			commitDur := time.Since(startCommit)
+
+			// 为了让 PruneNextShard 能读到最新落盘的数据，每个 Batch 都立即写入
+			startWrite := time.Now()
+			if err := batch.Write(); err != nil {
+				t.Fatalf("Failed to write batch: %v", err)
 			}
+			batch.Reset()
+			writeDur := time.Since(startWrite)
+			commitDur += writeDur // Add write duration to commitDur
 
 			dur := pruneDur + commitDur + flushDur
 

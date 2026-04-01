@@ -39,7 +39,7 @@ func TestArchiveViaPrune(t *testing.T) {
 	trie.Commit()
 	trie.FlushArchives()
 
-	// 验证 Get 依然能搜到数据 (穿透 StubList)
+	// 4. 验证数据仍然可读（自动触发赎回或直接读取归档）
 	for i := 0; i < 60; i++ {
 		val, err := trie.Get(keys[i])
 		if err != nil {

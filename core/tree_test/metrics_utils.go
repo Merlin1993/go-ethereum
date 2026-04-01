@@ -48,7 +48,7 @@ func NewMetricsCollector(windowSize int, baseDir string, csvName string) *Metric
 			c.csvFile = f
 			c.csvWriter = csv.NewWriter(f)
 			header := []string{
-				"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Max_Root_ms",
+				"Total_Injected", "Avg_Root_ms", "Max_Root_ms",
 				"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
 				"Disk_MB", "RSS_MB", "Heap_MB",
 			}
@@ -137,8 +137,6 @@ func (c *MetricsCollector) GetMetricsString() string {
 	// Log to CSV
 	if c.csvWriter != nil {
 		c.csvWriter.Write([]string{
-			fmt.Sprintf("%d", c.lastReported),
-			fmt.Sprintf("%d", c.totalInjected-1),
 			fmt.Sprintf("%d", c.totalInjected),
 			fmt.Sprintf("%.2f", stats.Avg),
 			fmt.Sprintf("%.2f", stats.Max),

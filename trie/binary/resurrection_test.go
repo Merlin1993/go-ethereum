@@ -43,7 +43,7 @@ func TestResurrectionMetrics(t *testing.T) {
 
 	// Manual DB check
 	// Find the shard
-	shardID := trie.getShardID(key)
+	shardID := trie.GetShardID(key)
 	shard := trie.shards[shardID]
 	if shard == nil {
 		t.Fatalf("Shard %d not loaded", shardID)

@@ -270,11 +270,12 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	var hashes []common.Hash
 
 	for _, item := range items {
-		// 这里使用相对于分片起始深度的全路径位进行过滤和承诺
-		filter.Insert(item.Suffix)
+		// Include SuffixBits to avoid ambiguity (e.g. 1-bit '1' vs 8-bit '10000000')
+		keyWithLen := append([]byte{byte(item.SuffixBits)}, item.Suffix...)
+		filter.Insert(keyWithLen)
 
 		// ECMH: K + Hash(V)
-		h := crypto.Keccak256Hash(append(item.Suffix, item.Value...))
+		h := crypto.Keccak256Hash(append(keyWithLen, item.Value...))
 		hashes = append(hashes, h)
 	}
 
