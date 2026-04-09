@@ -369,7 +369,7 @@ func TestLazyLoading(t *testing.T) {
 
 	shardID := trie.GetShardID(key)
 	shard := trie.shards[shardID]
-	rootHash := shard.root.Hash()
+	rootHash, _ := shard.Hash()
 	shard.root = nil
 
 	// Manually trigger loading via NewShard and re-assigning
@@ -605,6 +605,7 @@ func TestTrieStatistics(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
+	config.ShardDepth = 16
 	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 

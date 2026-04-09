@@ -71,11 +71,21 @@ func (t *Trie) CommitShardToBatch(id int, batch Batcher, destructive bool) ([]by
 }
 
 func (t *Trie) GetShardID(key []byte) int {
-	if len(key) < t.config.ShardDepth {
+	bits := t.config.ShardDepth
+	if bits <= 0 {
 		return 0
 	}
-	// Extract first byte as shard ID for Fountain's default depth
-	return int(key[0])
+	id := 0
+	for i := 0; i < bits; i++ {
+		byteIdx := i / 8
+		bitIdx := 7 - (i % 8)
+		if byteIdx < len(key) {
+			if (key[byteIdx] & (1 << bitIdx)) != 0 {
+				id |= (1 << (bits - 1 - i))
+			}
+		}
+	}
+	return id
 }
 
 // Load loads the Trie state from the database using a given root hash.
@@ -127,7 +137,12 @@ func (t *Trie) getOrCreateShard(id int) (*Shard, error) {
 	shardRoot, _ := t.topTree.GetShardRoot(id, t.db)
 
 	s, err := NewShard(id, t.db, t.hasher, t.config, shardRoot, t.pruning, func() byte {
-		return t.globalEpochBit
+		// [Rolling Epoch] 为了防止“提前加热”导致无法归档，每个分片只有在正式被剪枝后才切换到新的 GlobalBit。
+		// 在当前周期内尚未被剪枝的分片应继续使用旧位的补。
+		if id < t.pruneShardIdx {
+			return t.globalEpochBit
+		}
+		return t.globalEpochBit ^ 1
 	})
 	if err != nil {
 		return nil, err
@@ -189,6 +204,7 @@ func (t *Trie) Hash() ([]byte, error) {
 	// For simplicity, we can use dirtyShards here too, but Hash() doesn't clear them.
 	t.shardsMu.RLock()
 	for i := range t.dirtyShards {
+		shardRoots[i] = make([]byte, 32) // Default to empty
 		s := t.shards[i]
 		if s != nil {
 			h, err := s.Hash()
@@ -196,10 +212,14 @@ func (t *Trie) Hash() ([]byte, error) {
 				t.shardsMu.RUnlock()
 				return nil, err
 			}
-			if h != nil {
+			if len(h) > 0 {
 				shardRoots[i] = h
 				dirtyShards = append(dirtyShards, i)
+			} else {
+				dirtyShards = append(dirtyShards, i)
 			}
+		} else {
+			dirtyShards = append(dirtyShards, i)
 		}
 	}
 	t.shardsMu.RUnlock()
@@ -261,9 +281,6 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 			defer wg.Done()
 
 			// Worker local state
-			localShardRoots := make(map[int][]byte)
-			localDirtyShards := make([]int, 0)
-
 			// Mock batcher to collect puts
 			workerBatch := &memBatcher{puts: make([]memKV, 0, 5000)}
 
@@ -277,19 +294,24 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 						errMu.Unlock()
 						return
 					}
-					if h != nil {
-						localShardRoots[i] = h
-						localDirtyShards = append(localDirtyShards, i)
+					mu.Lock()
+					if len(h) > 0 {
+						shardRoots[i] = h
+					} else {
+						shardRoots[i] = make([]byte, 32)
 					}
+					dirtyShards = append(dirtyShards, i)
+					mu.Unlock()
+				} else {
+					mu.Lock()
+					shardRoots[i] = make([]byte, 32)
+					dirtyShards = append(dirtyShards, i)
+					mu.Unlock()
 				}
 			}
 
 			// Merge back to global state
 			mu.Lock()
-			for k, v := range localShardRoots {
-				shardRoots[k] = v
-			}
-			dirtyShards = append(dirtyShards, localDirtyShards...)
 			for _, item := range workerBatch.puts {
 				batch.Put(item.k, item.v)
 			}
@@ -314,6 +336,10 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 // PruneNextShard prunes the next shard in cycle.
 func (t *Trie) PruneNextShard() error {
 	idx := t.pruneShardIdx
+	if idx == 0 {
+		t.globalEpochBit ^= 1
+	}
+
 	shard, err := t.getOrCreateShard(idx)
 	if err != nil {
 		return err
@@ -323,13 +349,13 @@ func (t *Trie) PruneNextShard() error {
 	t.dirtyShards[idx] = struct{}{}
 	t.shardsMu.Unlock()
 
-	err = shard.Prune()
+	err = shard.Prune(t.globalEpochBit)
+	if err != nil {
+		return err
+	}
 
 	t.pruneShardIdx = (idx + 1) % (1 << t.config.ShardDepth)
-	if t.pruneShardIdx == 0 {
-		t.globalEpochBit ^= 1
-	}
-	return err
+	return nil
 }
 
 // SetGlobalEpoch sets the global epoch bit, used by tests.
@@ -465,3 +491,8 @@ func (m *memBatcher) Delete(key []byte) error { return nil }
 func (m *memBatcher) Write() error            { return nil }
 func (m *memBatcher) Reset()                  { m.puts = nil }
 func (m *memBatcher) ValueSize() int          { return 0 }
+
+// GetGlobalEpochBit returns the current global epoch bit.
+func (t *Trie) GetGlobalEpochBit() byte {
+	return t.globalEpochBit
+}

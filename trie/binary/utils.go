@@ -1,5 +1,9 @@
 package binary
 
+import (
+	"fmt"
+)
+
 func (s *Shard) setBitInBytes(data []byte, bitIdx int, val byte) {
 	byteIdx := bitIdx / 8
 	bitOffset := 7 - (bitIdx % 8)
@@ -158,34 +162,34 @@ func (s *Shard) prefixBits(data []byte, bits int, buf []byte) []byte {
 	return res
 }
 
-// prependBit 在位序列前部增加一位。用于在树收缩或路径调整时重新计算路径。
-func (s *Shard) prependBit(data []byte, bits int, bit byte, buf []byte) []byte {
-	newBits := bits + 1
-	size := (newBits + 7) / 8
-	var res []byte
-	if cap(buf) >= size {
-		res = buf[:size]
-		for i := range res {
-			res[i] = 0
-		}
-	} else {
-		res = make([]byte, size)
+// prependBit 在位序列前部增加一位。
+func (s *Shard) prependBit(data []byte, bits int, bit byte) ([]byte, int) {
+	if bits < 0 {
+		panic(fmt.Sprintf("prependBit: negative bits %d, dataLen=%d", bits, len(data)))
 	}
-
+	newBits := bits + 1
+	if newBits > 256 {
+		panic(fmt.Sprintf("prependBit: path overflow %d bits", newBits))
+	}
+	res := make([]byte, (newBits+7)/8)
 	if bit == 1 {
 		res[0] |= 0x80
 	}
 	for i := 0; i < bits; i++ {
 		if s.getBitFromBytes(data, i) == 1 {
-			byteIdx := (i + 1) / 8
-			bitIdx := 7 - ((i + 1) % 8)
-			res[byteIdx] |= (1 << bitIdx)
+			bitPos := i + 1
+			byteIdx := bitPos / 8
+			bitOffset := 7 - (bitPos % 8)
+			res[byteIdx] |= (1 << bitOffset)
 		}
 	}
-	return res
+	return res, newBits
 }
 
 func (s *Shard) appendBit(data []byte, bits int, bit byte) ([]byte, int) {
+	if bits < 0 {
+		panic("appendBit: negative bits")
+	}
 	newBits := bits + 1
 	size := (newBits + 7) / 8
 	res := make([]byte, size)
@@ -213,24 +217,38 @@ func (s *Shard) copyBits(dst []byte, dstStart int, src []byte, srcBits int) {
 	}
 }
 
-func (s *Shard) prependPath(base []byte, baseBits int, prefix []byte, prefixBits int) []byte {
-	res := make([]byte, (baseBits+prefixBits+7)/8)
+func (s *Shard) prependPath(base []byte, baseBits int, prefix []byte, prefixBits int) ([]byte, int) {
+	if prefixBits < 0 || baseBits < 0 {
+		panic("prependPath: negative bits")
+	}
+	if prefixBits == 0 {
+		return base, baseBits
+	}
+	newBits := prefixBits + baseBits
+	if newBits > 256 {
+		panic(fmt.Sprintf("prependPath: path overflow %d bits (prefix=%d, base=%d)", newBits, prefixBits, baseBits))
+	}
+	res := make([]byte, (newBits+7)/8)
 	s.copyBits(res, 0, prefix, prefixBits)
 	s.copyBits(res, prefixBits, base, baseBits)
-	return res
+	return res, newBits
 }
 
-func (s *Shard) concatPath(path1 []byte, bits1 int, bit byte, path2 []byte, bits2 int) []byte {
+func (s *Shard) concatPath(path1 []byte, bits1 int, bit byte, path2 []byte, bits2 int) ([]byte, int) {
 	resBits := bits1 + 1 + bits2
+	if resBits > 256 {
+		panic(fmt.Sprintf("concatPath: path overflow %d bits (%d + 1 + %d)", resBits, bits1, bits2))
+	}
 	res := make([]byte, (resBits+7)/8)
 	s.copyBits(res, 0, path1, bits1)
 	if bit == 1 {
-		byteIdx := bits1 / 8
-		bitOffset := 7 - (bits1 % 8)
+		bitPos := bits1
+		byteIdx := bitPos / 8
+		bitOffset := 7 - (bitPos % 8)
 		res[byteIdx] |= (1 << bitOffset)
 	}
 	s.copyBits(res, bits1+1, path2, bits2)
-	return res
+	return res, resBits
 }
 
 func (s *Shard) suffixMatches(key []byte, depth int, path []byte, pathBits int) bool {

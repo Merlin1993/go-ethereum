@@ -596,11 +596,20 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		if matchBits == n.PathBits && depth+matchBits == len(key)*8 {
 			n.ValueHash = valueHash
 			n.SetDirty(true)
-			s.updateEpoch(n) // Update epoch
-			// 若叶子已持久化过，记录旧哈希用于修剪
+			s.updateEpoch(n)
 			if s.pruning && len(n.OriginalHash()) > 0 {
 				s.staleSet[string(n.OriginalHash())] = struct{}{}
 			}
+			return n, nil
+		}
+
+		// [Robust] 绝不分叉已达 256 位极限的节点内容。
+		if matchBits == n.PathBits {
+			n.ValueHash = valueHash
+			n.PathBits = len(key)*8 - depth
+			n.Path = s.getSuffix(key, depth, nil)
+			n.SetDirty(true)
+			s.updateEpoch(n)
 			return n, nil
 		}
 
@@ -659,7 +668,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 				n.Path = s.shiftBits(n.Path, n.PathBits, matched+1, nil)
 				n.PathBits -= (matched + 1)
 
-				s.distributeStubs(n, parent)
+				s.distributeStubs(n, parent, []byte{}, 0, oldBit)
 
 				if oldBit == 0 {
 					parent.Left = n
@@ -859,8 +868,8 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 			}
 
 			if leaf, ok := target.(*LeafNode); ok {
-				leaf.Path = s.concatPath(n.Path, n.PathBits, remaining.bit, leaf.Path, leaf.PathBits)
-				leaf.PathBits = n.PathBits + 1 + leaf.PathBits
+				newP, newB := s.concatPath(n.Path, n.PathBits, remaining.bit, leaf.Path, leaf.PathBits)
+				leaf.Path, leaf.PathBits = newP, newB
 				leaf.SetDirty(true)
 				if s.pruning && len(leaf.OriginalHash()) > 0 {
 					s.staleSet[string(leaf.OriginalHash())] = struct{}{}
@@ -949,14 +958,14 @@ func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value [
 	}
 	switch n := node.(type) {
 	case *LeafNode:
-		fullKey := s.prependPath(n.Path, n.PathBits, prefix, bits)
+		fullKey, _ := s.prependPath(n.Path, n.PathBits, prefix, bits)
 		val, _ := s.db.Get(n.ValueHash)
 		return fn(fullKey, val)
 	case *InternalNode:
 		newPrefix := prefix
 		newBits := bits
 		if n.PathBits > 0 {
-			newPrefix = s.prependPath(n.Path, n.PathBits, prefix, bits)
+			newPrefix, _ = s.prependPath(n.Path, n.PathBits, prefix, bits)
 			newBits += n.PathBits
 		}
 		// Left child (bit 0)
@@ -993,7 +1002,7 @@ func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value [
 			if err == nil {
 				kvs, _ := s.deserializeArchivedKV(data)
 				for _, kv := range kvs {
-					fullK := s.prependPath(kv.Suffix, kv.SuffixBits, newPrefix, newBits)
+					fullK, _ := s.prependPath(kv.Suffix, kv.SuffixBits, newPrefix, newBits)
 					if !fn(fullK, kv.Value) {
 						return false
 					}
@@ -1158,29 +1167,26 @@ func (s *Shard) updateEpoch(node Node) {
 }
 
 func (s *Shard) shrink(n *InternalNode) Node {
-	if len(n.StubList) > 0 {
-		return n
-	}
-
 	var remaining Node
 	var remainingBit byte
 	var remainingHash []byte
 
+	childCount := 0
 	if n.Left != nil || len(n.LeftHash) > 0 {
+		childCount++
 		remaining = n.Left
 		remainingHash = n.LeftHash
 		remainingBit = 0
 	}
 	if n.Right != nil || len(n.RightHash) > 0 {
-		if remaining != nil || len(remainingHash) > 0 {
-			return n
-		}
+		childCount++
 		remaining = n.Right
 		remainingHash = n.RightHash
 		remainingBit = 1
 	}
 
-	if n.PathBits > 0 {
+	// 如果没有或者有多个主树子节点，无法收缩。
+	if childCount != 1 {
 		return n
 	}
 
@@ -1188,13 +1194,45 @@ func (s *Shard) shrink(n *InternalNode) Node {
 		var err error
 		remaining, err = s.loadNode(remainingHash)
 		if err != nil {
-			return n // Fallback to current node if cannot load child
+			return n // 无法加载，降级
 		}
 	}
 
+	// 场景 1：如果当前节点含有归档桶 (StubList)，则绝不能完全压缩掉。
+	// 我们只能将其路径延展，维持其作为 InternalNode 的容器角色。
+	if len(n.StubList) > 0 {
+		switch child := remaining.(type) {
+		case *InternalNode:
+			// 合并路径并提升子节点的桶
+			newP, newB := s.concatPath(n.Path, n.PathBits, remainingBit, child.Path, child.PathBits)
+			s.moveStubs(child, n, remainingBit) // 注意：这里是将 child 的桶提升到 n
+			n.Path, n.PathBits = newP, newB
+			n.Left, n.LeftHash = child.Left, child.LeftHash
+			n.Right, n.RightHash = child.Right, child.RightHash
+			n.SetDirty(true)
+			return n
+
+		case *LeafNode:
+			// 路径延长以覆盖叶子，但保持 n 作为容器以承载 StubList
+			newP, newB := s.concatPath(n.Path, n.PathBits, remainingBit, child.Path, child.PathBits)
+			n.Path, n.PathBits = newP, newB
+			if remainingBit == 0 {
+				n.Left, n.LeftHash = child, nil
+				n.Right, n.RightHash = nil, nil
+			} else {
+				n.Left, n.LeftHash = nil, nil
+				n.Right, n.RightHash = child, nil
+			}
+			child.Path, child.PathBits = nil, 0
+			n.SetDirty(true)
+			return n
+		}
+	}
+
+	// 场景 2：没有归档桶的纯主树合并。可以将 InternalNode 完全压缩掉。
 	if inChild, ok := remaining.(*InternalNode); ok {
-		inChild.Path = s.prependBit(inChild.Path, inChild.PathBits, remainingBit, nil)
-		inChild.PathBits++
+		newCP, newCB := s.concatPath(n.Path, n.PathBits, remainingBit, inChild.Path, inChild.PathBits)
+		inChild.Path, inChild.PathBits = newCP, newCB
 		inChild.SetDirty(true)
 		if s.pruning && len(inChild.OriginalHash()) > 0 {
 			s.staleSet[string(inChild.OriginalHash())] = struct{}{}
@@ -1203,8 +1241,8 @@ func (s *Shard) shrink(n *InternalNode) Node {
 	}
 
 	if leaf, ok := remaining.(*LeafNode); ok {
-		leaf.Path = s.prependBit(leaf.Path, leaf.PathBits, remainingBit, nil)
-		leaf.PathBits++
+		newLP, newLB := s.concatPath(n.Path, n.PathBits, remainingBit, leaf.Path, leaf.PathBits)
+		leaf.Path, leaf.PathBits = newLP, newLB
 		leaf.SetDirty(true)
 		if s.pruning && len(leaf.OriginalHash()) > 0 {
 			s.staleSet[string(leaf.OriginalHash())] = struct{}{}
@@ -1212,8 +1250,51 @@ func (s *Shard) shrink(n *InternalNode) Node {
 		return leaf
 	}
 
-	if remaining == nil && len(n.StubList) == 0 {
-		return nil
-	}
 	return n
+}
+
+// moveStubs 将 n 上的桶移动到其子节点 child 上。
+func (s *Shard) moveStubs(n *InternalNode, child *InternalNode, bit byte) {
+	if len(n.StubList) > 0 {
+		child.StubList = append(child.StubList, n.StubList...)
+		n.StubList = nil // 清空
+		child.SetDirty(true)
+	}
+}
+
+// stripPrefix 从原路径中剥离指定的入口前缀。
+func (s *Shard) stripPrefix(path []byte, bits int, ignoreBit byte, prefix []byte, prefixBits int) ([]byte, int) {
+	// 在 V16.Final 中，如果 bits < prefixBits，说明前缀不匹配或非法。
+	if bits < prefixBits {
+		return nil, 0
+	}
+	return s.shiftBits(path, bits, prefixBits, nil), bits - prefixBits
+}
+
+func (s *Shard) distributeStubs(n *InternalNode, parent *InternalNode, prefix []byte, prefixBits int, bit byte) {
+	if len(n.StubList) > 0 {
+		parent.StubList = append(parent.StubList, n.StubList...)
+		n.StubList = nil
+		parent.SetDirty(true)
+	}
+}
+
+func (s *Shard) FlushArchives() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for h, data := range s.pendingArchives {
+		// [FIX] 使用独立的归档库存储，防止混入状态库
+		dataKey := append([]byte(h), 0x01)
+		if s.config.ArchiveDB != nil {
+			if err := s.config.ArchiveDB.PutBucket(dataKey, data); err != nil {
+				return err
+			}
+		} else {
+			if err := s.db.Put(dataKey, data); err != nil {
+				return err
+			}
+		}
+	}
+	s.pendingArchives = make(map[string][]byte)
+	return nil
 }

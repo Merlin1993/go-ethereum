@@ -20,7 +20,7 @@ type Config struct {
 // DefaultConfig returns a Config with default values.
 func DefaultConfig() *Config {
 	return &Config{
-		ShardDepth:        8,
+		ShardDepth:        16,
 		ArchiveBucketSize: 100,
 		CuckooBuckets:     32,
 		CuckooSlots:       4,
@@ -62,8 +62,10 @@ type TrieStats struct {
 // Stats returns the statistics for the entire Trie.
 func (t *Trie) Stats() *TrieStats {
 	stats := &TrieStats{}
-	for _, shard := range t.shards {
-		if shard != nil {
+	numShards := 1 << t.config.ShardDepth
+	for i := 0; i < numShards; i++ {
+		shard, err := t.getOrCreateShard(i)
+		if err == nil && shard != nil {
 			shard.accumulateStats(stats)
 		}
 	}
@@ -71,10 +73,24 @@ func (t *Trie) Stats() *TrieStats {
 }
 
 func (s *Shard) accumulateStats(stats *TrieStats) {
-	if s.root == nil {
+	s.mu.RLock()
+	if s.root == nil && len(s.rootHash) > 0 {
+		s.mu.RUnlock()
+		s.mu.Lock()
+		if s.root == nil {
+			node, _ := s.loadNode(s.rootHash)
+			s.root = node
+		}
+		s.mu.Unlock()
+		s.mu.RLock()
+	}
+	root := s.root
+	s.mu.RUnlock()
+
+	if root == nil {
 		return
 	}
-	s.nodeStats(s.root, 0, stats)
+	s.nodeStats(root, 0, stats)
 }
 
 func (s *Shard) nodeStats(node Node, currentPathBuckets int, stats *TrieStats) {

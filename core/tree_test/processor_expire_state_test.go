@@ -57,7 +57,7 @@ var (
 	pruneInterval    = flag.Int("pruneInterval", 1, "Blocks between Trie.PruneNextShard() calls")
 
 	// Binary Trie Ablation flags
-	shardDepth        = flag.Int("shardDepth", 20, "Binary trie shard depth")
+	shardDepth        = flag.Int("shardDepth", 8, "Binary trie shard depth")
 	archiveBucketSize = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
 	cuckooBuckets     = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
 	cuckooSlots       = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")

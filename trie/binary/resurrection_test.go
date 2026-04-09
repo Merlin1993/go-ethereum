@@ -32,14 +32,14 @@ func TestResurrectionMetrics(t *testing.T) {
 	trie.SetGlobalEpoch(1)
 	trie.pruneShardIdx = 1
 	trie.PruneNextShard()
-	trie.Commit()
-	trie.FlushArchives()
-
-	// 3. Verify it's in archive
+	// 3. Verify it's in archive (BEFORE destructive commit)
 	stats := trie.Stats()
 	if stats.ArchivedDataSize != 1 {
 		t.Fatalf("Expected 1 archived item, got %d", stats.ArchivedDataSize)
 	}
+
+	trie.Commit()
+	trie.FlushArchives()
 
 	// Manual DB check
 	// Find the shard

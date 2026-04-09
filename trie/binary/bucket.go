@@ -83,7 +83,8 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	// 1. 增量更新布谷鸟过滤器
 	if bucket.cachedFilter != nil {
 		for _, it := range newItems {
-			bucket.cachedFilter.Insert(it.Suffix)
+			keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+			bucket.cachedFilter.Insert(keyWithLen)
 		}
 		bucket.Filter = bucket.cachedFilter.Encode()
 	} else {
@@ -92,7 +93,8 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 			filter.Decode(bucket.Filter, s.config.CuckooBuckets, s.config.CuckooSlots)
 		}
 		for _, it := range newItems {
-			filter.Insert(it.Suffix)
+			keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+			filter.Insert(keyWithLen)
 		}
 		bucket.Filter = filter.Encode()
 	}
@@ -100,8 +102,9 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	// 2. 增量更新 ECMH 承诺
 	hashes := make([]common.Hash, 0, len(newItems))
 	for _, it := range newItems {
-		// K + Hash(V)
-		h := crypto.Keccak256Hash(append(it.Suffix, it.Value...))
+		// [FIX] 一致性：ECMH 必须包含 SuffixBits
+		keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+		h := crypto.Keccak256Hash(append(keyWithLen, it.Value...))
 		hashes = append(hashes, h)
 	}
 	committer := ecmh.New()
@@ -155,7 +158,8 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 	// 1. 增量更新布谷鸟过滤器
 	if bucket.cachedFilter != nil {
 		for _, it := range deleteItems {
-			bucket.cachedFilter.Delete(it.Suffix)
+			keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+			bucket.cachedFilter.Delete(keyWithLen)
 		}
 		bucket.Filter = bucket.cachedFilter.Encode()
 	} else {
@@ -164,7 +168,8 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 			filter.Decode(bucket.Filter, s.config.CuckooBuckets, s.config.CuckooSlots)
 		}
 		for _, it := range deleteItems {
-			filter.Delete(it.Suffix)
+			keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+			filter.Delete(keyWithLen)
 		}
 		bucket.Filter = filter.Encode()
 	}
@@ -172,7 +177,9 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 	// 2. 增量更新 ECMH 承诺 (减法)
 	hashes := make([]common.Hash, 0, len(deleteItems))
 	for _, it := range deleteItems {
-		h := crypto.Keccak256Hash(append(it.Suffix, it.Value...))
+		// [FIX] 一致性：ECMH 必须包含 SuffixBits
+		keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+		h := crypto.Keccak256Hash(append(keyWithLen, it.Value...))
 		hashes = append(hashes, h)
 	}
 	committer := ecmh.New()
@@ -265,6 +272,7 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	bucket.cacheMu.Lock()
 	defer bucket.cacheMu.Unlock()
+	bucket.dirty = true
 
 	filter := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
 	var hashes []common.Hash
@@ -326,8 +334,9 @@ func (s *Shard) verifyBucket(bucket *ArchiveBucketNode) (bool, int64) {
 
 	hashes := make([]common.Hash, 0, len(items))
 	for _, it := range items {
-		// K + Hash(V)
-		h := crypto.Keccak256Hash(append(it.Suffix, it.Value...))
+		// [FIX] 一致性：ECMH 必须包含 SuffixBits
+		keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+		h := crypto.Keccak256Hash(append(keyWithLen, it.Value...))
 		hashes = append(hashes, h)
 	}
 

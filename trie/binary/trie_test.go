@@ -84,6 +84,7 @@ func TestTrieStressBinary(t *testing.T) {
 	// 初始化 Trie
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
+	config.ShardDepth = 8 // 降低分片深度以加速裁剪周期触发 (2^8 = 256)
 	config.ArchiveDB = &LevelDBAdapter{adb}
 	trie := NewTrie(nil, &LevelDBAdapter{sdb}, hasher, config, true)
 
@@ -128,6 +129,15 @@ func TestTrieStressBinary(t *testing.T) {
 		)
 
 		for i := 0; i < EpochItems; i += BatchSize {
+			// 触发剪枝 (模拟持续负载下的归档)
+			startPrune := time.Now()
+			trie.PruneNextShard()
+			pruneDur := time.Since(startPrune)
+
+			startFlush := time.Now()
+			trie.FlushArchives()
+			flushDur := time.Since(startFlush)
+
 			// 1. Insert new keys (BatchSize items)
 			newKeys := make([][]byte, BatchSize)
 			for j := 0; j < BatchSize; j++ {
@@ -162,18 +172,9 @@ func TestTrieStressBinary(t *testing.T) {
 				}
 			}
 
-			// 触发剪枝 (模拟持续负载下的归档)
-			startPrune := time.Now()
-			trie.PruneNextShard()
-			pruneDur := time.Since(startPrune)
-
-			startFlush := time.Now()
-			trie.FlushArchives()
-			flushDur := time.Since(startFlush)
-
 			// 计算根耗时统计
 			startCommit := time.Now()
-			trie.CommitToBatch(batch, true)
+			trie.CommitToBatch(batch, false)
 			commitDur := time.Since(startCommit)
 
 			// 为了让 PruneNextShard 能读到最新落盘的数据，每个 Batch 都立即写入
@@ -235,6 +236,26 @@ func TestTrieStressBinary(t *testing.T) {
 		proc.MemoryInfo() // 刷新
 		memInfo, _ := proc.MemoryInfo()
 		runtime.ReadMemStats(&mem)
+
+		// 归档增长强校验 (Panic Check)
+		// 只有在完成两个完整裁剪周期后，归档数据才应该有规模性增长。
+		cycleItems := (1 << config.ShardDepth) * BatchSize
+		if totalInjected > 2*cycleItems {
+			stats := trie.Stats()
+			// 在 50% 的更新率下，理论归档期望约为 0.5 * cycleItems。
+			// 这里设定 10% 为硬性红线，若低于此值则判定归档逻辑失效。
+			minExpected := int64(float64(cycleItems) * 0.1)
+			if stats.ArchivedDataSize < minExpected {
+				panic(fmt.Sprintf("\n[ARCHIVE FAILURE] 归档增长异常过低!\n"+
+					"当前注入总量: %d\n"+
+					"裁剪轮询周期: %d (ShardDepth: %d, Batch: %d)\n"+
+					"理论最小归档期望: %d\n"+
+					"实际物理归档项数: %d (Buckets: %d)\n"+
+					"当前 GlobalEpochBit: %d\n"+
+					"排查建议: 检查 pruneAndArchive 的裁剪判定、Epoch 翻转位或 StubList 的持久化逻辑。",
+					totalInjected, cycleItems, config.ShardDepth, BatchSize, minExpected, stats.ArchivedDataSize, stats.BucketCount, trie.GetGlobalEpochBit()))
+			}
+		}
 
 		// 记录 CSV
 		startItem := totalInjected - EpochItems
