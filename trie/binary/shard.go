@@ -1002,7 +1002,8 @@ func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value [
 			if err == nil {
 				kvs, _ := s.deserializeArchivedKV(data)
 				for _, kv := range kvs {
-					fullK, _ := s.prependPath(kv.Suffix, kv.SuffixBits, newPrefix, newBits)
+					// bucket.Path is the absolute path; kv.Suffix is relative to bucket.Path
+					fullK, _ := s.prependPath(kv.Suffix, kv.SuffixBits, bucket.Path, bucket.PathBits)
 					if !fn(fullK, kv.Value) {
 						return false
 					}
@@ -1099,9 +1100,8 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 			}
 		}
 
-		if batch != nil {
-			s.updateEpoch(n)
-		}
+		// [FIX] Do NOT updateEpoch during commit — epoch reflects access pattern, not persistence.
+		// Updating epoch here would cause Prune to skip nodes that haven't been accessed.
 
 		data, err := n.Serialize()
 		if err != nil {
@@ -1125,9 +1125,7 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		return h, nil
 
 	case *LeafNode:
-		if batch != nil {
-			s.updateEpoch(n)
-		}
+		// [FIX] Do NOT updateEpoch during commit — same reason as InternalNode.
 		data, err := n.Serialize()
 		if err != nil {
 			return nil, err

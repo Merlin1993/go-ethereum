@@ -17,9 +17,9 @@ func (s *Shard) Prune(global byte) error {
 		return nil
 	}
 
-	if (s.root.Epoch() & 1) == global {
-		return nil
-	}
+	// [FIX] Do NOT early-return based on root.Epoch() alone.
+	// Insert operations update the root's epoch, but child nodes may still have
+	// stale epochs that need pruning. pruneAndArchive checks per-node epoch correctly.
 
 	// 1. 获取当前分片的物理前缀 (Absolute Prefix)
 	prefix, prefixBits := s.getShardPrefix()
@@ -44,7 +44,7 @@ func (s *Shard) Prune(global byte) error {
 			// 在 V17 中，items 已经是 256 位，将其挂载到 root。
 			// 对 InternalNode，将其挂入 StubList。
 			if in, ok := s.root.(*InternalNode); ok {
-				s.collectAndAttachToStubList(in, items, 0)
+				s.collectAndAttachToStubList(in, items, prefix, prefixBits)
 			}
 		}
 	}
@@ -87,11 +87,10 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 
 	case *InternalNode:
 		var err error
-		if (n.epoch & 1) != global {
-			// 内部节点完全过期：收集所有子孙
-			items, err := s.collectLeavesRecursive(n, prefix, prefixBits)
-			return nil, items, err
-		}
+		// [FIX] Do NOT use InternalNode.epoch for fast-path archival.
+		// insert() updates InternalNode.epoch along the traversal path, which
+		// makes them appear "current" even when their leaf children are stale.
+		// Always recurse into children to check individual leaf epochs.
 
 		// 计算当前节点的内部全缀 (n.Path) 位，但不提前组合到 prefix，
 		// 以便分别传递给左/右子树。
@@ -116,8 +115,8 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		}
 
 		if newLeft == nil && len(leftItems) > 0 {
-			// 由于 items 已经是绝对路径，直接由 buildArchiveSubtree 处理
-			s.collectAndAttachToStubList(n, leftItems, 0)
+			// items are already absolute paths; pass lp/lb as the absolute bucket entry path
+			s.collectAndAttachToStubList(n, leftItems, lp, lb)
 		} else {
 			n.Left = newLeft
 			allItems = append(allItems, leftItems...)
@@ -137,7 +136,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		}
 
 		if newRight == nil && len(rightItems) > 0 {
-			s.collectAndAttachToStubList(n, rightItems, 1)
+			s.collectAndAttachToStubList(n, rightItems, rp, rb)
 		} else {
 			n.Right = newRight
 			allItems = append(allItems, rightItems...)
@@ -249,7 +248,7 @@ func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) N
 	}
 
 	// 达到桶大小限制，或者达到 256 位极限，停止分裂。
-	if len(items) <= s.config.ArchiveBucketSize || s.config.ArchiveBucketSize <= 0 || bits >= 256 {
+	if len(items) <= s.config.ArchiveBucketSize || s.config.ArchiveBucketSize <= 0 || bits >= MaxPathBits {
 		// 重要：存入桶之前，剥离物理前缀路径，确保桶内仅存储相对 Suffix。
 		localItems := make([]ArchivedKV, len(items))
 		for i := range items {
@@ -309,15 +308,14 @@ func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) N
 	return n
 }
 
-func (s *Shard) collectAndAttachToStubList(parent *InternalNode, items []ArchivedKV, prefixBit byte) {
+func (s *Shard) collectAndAttachToStubList(parent *InternalNode, items []ArchivedKV, absPath []byte, absBits int) {
 	if len(items) == 0 {
 		return
 	}
-	// 计算新归档桶的入口绝对路径。
-	// 注意：items 已是 256 位，buildArchiveSubtree 会执行最终 strip。
-	bucketPath, bucketBits := s.appendBit(parent.Path, parent.PathBits, prefixBit)
+	// absPath/absBits is the absolute path for the archive entry point.
+	// items are already absolute paths; buildArchiveSubtree will strip absPath.
 
-	archNode := s.buildArchiveSubtree(items, bucketPath, bucketBits)
+	archNode := s.buildArchiveSubtree(items, absPath, absBits)
 	if bucket, ok := archNode.(*ArchiveBucketNode); ok {
 		parent.StubList = append(parent.StubList, bucket)
 	} else if in, ok := archNode.(*InternalNode); ok {

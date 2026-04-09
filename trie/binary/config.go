@@ -1,5 +1,10 @@
 package binary
 
+// MaxPathBits is the maximum number of bits a key path can have in the binary trie.
+// Storage keys use compositeKey = address(20 bytes) + slot(32 bytes) = 52 bytes = 416 bits.
+// This must be the ceiling for all path-related overflow checks.
+const MaxPathBits = 416
+
 // ArchiveStore identifies the interface to store and retrieve archived bucket data.
 type ArchiveStore interface {
 	PutBucket(hash []byte, data []byte) error

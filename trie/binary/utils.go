@@ -168,7 +168,7 @@ func (s *Shard) prependBit(data []byte, bits int, bit byte) ([]byte, int) {
 		panic(fmt.Sprintf("prependBit: negative bits %d, dataLen=%d", bits, len(data)))
 	}
 	newBits := bits + 1
-	if newBits > 256 {
+	if newBits > MaxPathBits {
 		panic(fmt.Sprintf("prependBit: path overflow %d bits", newBits))
 	}
 	res := make([]byte, (newBits+7)/8)
@@ -225,7 +225,7 @@ func (s *Shard) prependPath(base []byte, baseBits int, prefix []byte, prefixBits
 		return base, baseBits
 	}
 	newBits := prefixBits + baseBits
-	if newBits > 256 {
+	if newBits > MaxPathBits {
 		panic(fmt.Sprintf("prependPath: path overflow %d bits (prefix=%d, base=%d)", newBits, prefixBits, baseBits))
 	}
 	res := make([]byte, (newBits+7)/8)
@@ -236,7 +236,7 @@ func (s *Shard) prependPath(base []byte, baseBits int, prefix []byte, prefixBits
 
 func (s *Shard) concatPath(path1 []byte, bits1 int, bit byte, path2 []byte, bits2 int) ([]byte, int) {
 	resBits := bits1 + 1 + bits2
-	if resBits > 256 {
+	if resBits > MaxPathBits {
 		panic(fmt.Sprintf("concatPath: path overflow %d bits (%d + 1 + %d)", resBits, bits1, bits2))
 	}
 	res := make([]byte, (resBits+7)/8)
