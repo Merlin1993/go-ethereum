@@ -55,12 +55,14 @@ var (
 	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
 	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
 	pruneInterval    = flag.Int("pruneInterval", 1, "Blocks between Trie.PruneNextShard() calls")
+	maxBlocks        = flag.Int("blocks", 0, "Maximum number of blocks to process during processor or consistency tests (0 = all)")
 
 	// Binary Trie Ablation flags
-	shardDepth        = flag.Int("shardDepth", 8, "Binary trie shard depth")
-	archiveBucketSize = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
-	cuckooBuckets     = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
-	cuckooSlots       = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
+	shardDepth            = flag.Int("shardDepth", 8, "Binary trie shard depth")
+	archiveBucketSize     = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
+	archiveItemCacheLimit = flag.Int("archiveItemCacheLimit", 0, "Binary trie decoded archive item cache limit; 0 disables item caching, negative keeps all")
+	cuckooBuckets         = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
+	cuckooSlots           = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
 )
 
 func TestMain(m *testing.M) {
@@ -82,12 +84,14 @@ type ProcessorConfig struct {
 	BinaryArchiveDir string
 	StartNum         uint64
 	PruneInterval    int
+	MaxBlocks        int
 
 	// Ablation params
-	ShardDepth        int
-	ArchiveBucketSize int
-	CuckooBuckets     int
-	CuckooSlots       int
+	ShardDepth            int
+	ArchiveBucketSize     int
+	ArchiveItemCacheLimit int
+	CuckooBuckets         int
+	CuckooSlots           int
 }
 
 func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
@@ -121,10 +125,11 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 		StartNum:         cfg.StartNum,
 		BinaryArchiveDir: cfg.BinaryArchiveDir,
 		BinaryAblationConfig: &database.BinaryConfig{
-			ShardDepth:        cfg.ShardDepth,
-			ArchiveBucketSize: cfg.ArchiveBucketSize,
-			CuckooBuckets:     cfg.CuckooBuckets,
-			CuckooSlots:       cfg.CuckooSlots,
+			ShardDepth:            cfg.ShardDepth,
+			ArchiveBucketSize:     cfg.ArchiveBucketSize,
+			ArchiveItemCacheLimit: cfg.ArchiveItemCacheLimit,
+			CuckooBuckets:         cfg.CuckooBuckets,
+			CuckooSlots:           cfg.CuckooSlots,
 		},
 		PathDB: pdb,
 		HashDB: hdb,
@@ -169,20 +174,22 @@ func TestExpireStateProcessor(t *testing.T) {
 		flag.Parse()
 	}
 	cfg := &ProcessorConfig{
-		DbDir:             *dbDir,
-		DataDir:           *dataDir,
-		StartFileIdx:      *startIdx,
-		EndFileIdx:        *endIdx,
-		UseVerkle:         *useVerkle,
-		UseBinaryTrie:     *useBinaryTrie,
-		UseMemory:         *useMemory,
-		BinaryArchiveDir:  *binaryArchiveDir,
-		StartNum:          46147,
-		PruneInterval:     *pruneInterval,
-		ShardDepth:        *shardDepth,
-		ArchiveBucketSize: *archiveBucketSize,
-		CuckooBuckets:     *cuckooBuckets,
-		CuckooSlots:       *cuckooSlots,
+		DbDir:                 *dbDir,
+		DataDir:               *dataDir,
+		StartFileIdx:          *startIdx,
+		EndFileIdx:            *endIdx,
+		UseVerkle:             *useVerkle,
+		UseBinaryTrie:         *useBinaryTrie,
+		UseMemory:             *useMemory,
+		BinaryArchiveDir:      *binaryArchiveDir,
+		StartNum:              46147,
+		PruneInterval:         *pruneInterval,
+		MaxBlocks:             *maxBlocks,
+		ShardDepth:            *shardDepth,
+		ArchiveBucketSize:     *archiveBucketSize,
+		ArchiveItemCacheLimit: *archiveItemCacheLimit,
+		CuckooBuckets:         *cuckooBuckets,
+		CuckooSlots:           *cuckooSlots,
 	}
 
 	common.UseVerkle = cfg.UseVerkle
@@ -399,6 +406,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		common.BinaryStatsMu.Unlock()
 	}
 
+processFiles:
 	for _, file := range selectedFiles {
 		t.Logf("Processing file: %s", file)
 		ts, err := NewTransactionStreamer(file)
@@ -427,6 +435,9 @@ func TestExpireStateProcessor(t *testing.T) {
 
 			// Process empty blocks between transactions
 			for currentBlock < targetBlock {
+				if cfg.MaxBlocks > 0 && int(totalProcessedBlocks) >= cfg.MaxBlocks {
+					break processFiles
+				}
 				b := currentBlock
 
 				if b%100000 == 0 {
@@ -473,6 +484,9 @@ func TestExpireStateProcessor(t *testing.T) {
 			}
 
 			// Process the block with transactions
+			if cfg.MaxBlocks > 0 && int(totalProcessedBlocks) >= cfg.MaxBlocks {
+				break processFiles
+			}
 			b := targetBlock
 
 			if b%100000 == 0 {
@@ -780,6 +794,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 		BinaryArchiveDir: "",
 		StartNum:         46147,
 		PruneInterval:    0,
+		MaxBlocks:        *maxBlocks,
 	}
 	os.RemoveAll(mptCfg.DbDir)
 	defer os.RemoveAll(mptCfg.DbDir)
@@ -791,16 +806,18 @@ func TestBinaryTrieConsistency(t *testing.T) {
 
 	// 2. Binary Trie Host setup
 	binCfg := &ProcessorConfig{
-		DbDir:            filepath.Join(os.TempDir(), "bin_consistency_db"),
-		DataDir:          *dataDir,
-		StartFileIdx:     *startIdx,
-		EndFileIdx:       *endIdx,
-		UseVerkle:        false,
-		UseBinaryTrie:    true,
-		UseMemory:        false,
-		BinaryArchiveDir: filepath.Join(os.TempDir(), "bin_consistency_archive"),
-		StartNum:         46147,
-		PruneInterval:    0,
+		DbDir:                 filepath.Join(os.TempDir(), "bin_consistency_db"),
+		DataDir:               *dataDir,
+		StartFileIdx:          *startIdx,
+		EndFileIdx:            *endIdx,
+		UseVerkle:             false,
+		UseBinaryTrie:         true,
+		UseMemory:             false,
+		BinaryArchiveDir:      filepath.Join(os.TempDir(), "bin_consistency_archive"),
+		StartNum:              46147,
+		PruneInterval:         0,
+		MaxBlocks:             *maxBlocks,
+		ArchiveItemCacheLimit: 0,
 	}
 	os.RemoveAll(binCfg.DbDir)
 	os.RemoveAll(binCfg.BinaryArchiveDir)
@@ -832,6 +849,9 @@ func TestBinaryTrieConsistency(t *testing.T) {
 	mptTracer := newConsistencyTracer("MPT")
 	binTracer := newConsistencyTracer("BIN")
 
+	processedBlocks := 0
+
+consistencyFiles:
 	for _, file := range selectedFiles {
 		ts, err := NewTransactionStreamer(file)
 		if err != nil {
@@ -857,6 +877,9 @@ func TestBinaryTrieConsistency(t *testing.T) {
 
 			// Process empty blocks between transactions
 			for currentBlock < targetBlock {
+				if binCfg.MaxBlocks > 0 && processedBlocks >= binCfg.MaxBlocks {
+					break consistencyFiles
+				}
 				b := currentBlock
 				miner := compareBlockMiners[b]
 				reward, _ := uint256.FromBig(new(big.Int).Mul(big.NewInt(1e6), big.NewInt(1e18)))
@@ -916,10 +939,14 @@ func TestBinaryTrieConsistency(t *testing.T) {
 				if b > 0 && binLastRoot != (common.Hash{}) && binRoot == (common.Hash{}) {
 					t.Fatalf("Block %d (empty): binRoot became zero! binLastRoot was %s", b, binLastRoot.Hex())
 				}
+				processedBlocks++
 				currentBlock++
 			}
 
 			// Process the block with transactions
+			if binCfg.MaxBlocks > 0 && processedBlocks >= binCfg.MaxBlocks {
+				break consistencyFiles
+			}
 			b := targetBlock
 			msgs, _ := ts.PopBlock(b)
 			miner := compareBlockMiners[b]
@@ -1065,6 +1092,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 				binHost.trieDB.Commit(binRoot, false)
 				fmt.Printf("[Test] Consistency check passed up to block %d\n", b)
 			}
+			processedBlocks++
 			currentBlock++
 		}
 	}

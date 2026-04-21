@@ -63,6 +63,16 @@ type deleteTask struct {
 	deleteItems []ArchivedKV
 }
 
+func archiveDataKey(hash []byte) []byte {
+	if len(hash) == 0 {
+		return nil
+	}
+	key := make([]byte, len(hash)+1)
+	copy(key, hash)
+	key[len(hash)] = 0x01
+	return key
+}
+
 // NewShard 创建一个新的 Shard（若提供 rootHash 则从 DB 加载根节点）。
 func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte, pruning bool, globalEpochBit func() byte) (*Shard, error) {
 	s := &Shard{
@@ -187,7 +197,7 @@ func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
 	if s.config.ArchiveDB == nil {
 		return nil, errors.New("archive db not set")
 	}
-	data, err := s.config.ArchiveDB.GetBucket(hash)
+	data, err := s.config.ArchiveDB.GetBucket(archiveDataKey(hash))
 	return data, err
 }
 
@@ -331,9 +341,9 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 	}
 }
 
-func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, depth int) ([]byte, bool, error) {
+func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]byte, bool, error) {
 	// 匹配位前缀
-	matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, depth)
+	matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, 0)
 	if matched != bucket.PathBits {
 		return nil, false, ErrNodeNotFound
 	}
@@ -356,10 +366,10 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, depth int) 
 	}
 
 	if filter != nil {
-		innerDepth := depth + bucket.PathBits
+		innerDepth := bucket.PathBits
 		shardKey := s.getSuffix(key, innerDepth, nil)
 		suffixBits := len(key)*8 - innerDepth
-		keyWithLen := append([]byte{byte(suffixBits)}, shardKey...)
+		keyWithLen := archiveItemKey(suffixBits, shardKey)
 		if !filter.Lookup(keyWithLen) {
 			return nil, false, ErrNodeNotFound
 		}
@@ -375,15 +385,20 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, depth int) 
 			bucketData, err := s.getBucketData(bucket.Hash())
 			if err == nil {
 				itms, _ := s.deserializeArchivedKV(bucketData)
-				bucket.cachedItems = itms
+				if s.shouldCacheArchivedItems(len(itms)) {
+					bucket.cachedItems = itms
+				}
+				items = itms
 			}
 		}
-		items = bucket.cachedItems
+		if items == nil {
+			items = bucket.cachedItems
+		}
 		bucket.cacheMu.Unlock()
 	}
 
 	if items != nil {
-		innerDepth := depth + bucket.PathBits
+		innerDepth := bucket.PathBits
 		keyBits := len(key) * 8
 		for _, item := range items {
 			if innerDepth+item.SuffixBits == keyBits {
@@ -395,11 +410,11 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, depth int) 
 				}
 			}
 		}
-		// If we are here, filter Lookup was TRUE but NO items matched!
-		fmt.Printf("[DEBUG] FATAL: Filter Positive but Loop NEGATIVE! Key=%x, innerDepth=%d, totalItems=%d\n", key, innerDepth, len(items))
-		for i, it := range items {
-			fmt.Printf("  Item %d: Suffix=%x, Bits=%d\n", i, it.Suffix, it.SuffixBits)
-		}
+		atomic.AddInt64(&common.BinaryCycleFPCount, 1)
+		atomic.AddInt64(&common.BinaryTrieFPInBlock, 1)
+		common.BinaryStatsMu.Lock()
+		common.BinaryFPDistribution = append(common.BinaryFPDistribution, int64(len(items)))
+		common.BinaryStatsMu.Unlock()
 	}
 
 	return nil, false, ErrNodeNotFound
@@ -468,7 +483,7 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 		// [定点移除]：只需检查当前节点侧挂的 StubList 是否包含匹配的前缀
 		for i := 0; i < len(n.StubList); i++ {
 			bucket := n.StubList[i]
-			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, depth)
+			matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, 0)
 			if matched == bucket.PathBits {
 				bucket.cacheMu.RLock()
 				items := bucket.cachedItems
@@ -482,7 +497,7 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 					items, _ = s.deserializeArchivedKV(bucketData)
 				}
 
-				innerDepth := depth + bucket.PathBits
+				innerDepth := bucket.PathBits
 				keyBits := len(key) * 8
 				for _, item := range items {
 					if innerDepth+item.SuffixBits == keyBits && s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits) {
@@ -491,7 +506,7 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 
 						if bucket.Count == 0 {
 							if s.config.ArchiveDB != nil {
-								s.config.ArchiveDB.DeleteBucket(bucket.Hash())
+								s.config.ArchiveDB.DeleteBucket(archiveDataKey(bucket.Hash()))
 							}
 							n.StubList = append(n.StubList[:i], n.StubList[i+1:]...)
 						}
@@ -539,7 +554,7 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 		}
 	case *ArchiveBucketNode:
 		// 如果根节点直接就是桶
-		matched := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
+		matched := s.commonPrefixLen(n.Path, n.PathBits, key, 0)
 		if matched == n.PathBits {
 			n.cacheMu.RLock()
 			items := n.cachedItems
@@ -553,14 +568,14 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 				items, _ = s.deserializeArchivedKV(bucketData)
 			}
 
-			innerDepth := depth + n.PathBits
+			innerDepth := n.PathBits
 			keyBits := len(key) * 8
 			for _, item := range items {
 				if innerDepth+item.SuffixBits == keyBits && s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits) {
 					s.blindDeleteFromBucket(n, []ArchivedKV{item})
 					if n.Count == 0 {
 						if s.config.ArchiveDB != nil {
-							s.config.ArchiveDB.DeleteBucket(n.Hash())
+							s.config.ArchiveDB.DeleteBucket(archiveDataKey(n.Hash()))
 						}
 						// 此处无法直接移除 node，需由调用者处理 s.root = nil
 					}
@@ -791,7 +806,6 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 		if n.PathBits > 0 {
 			matched := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
 			if matched != n.PathBits {
-				fmt.Printf("[DEBUG] shard.delete: internal path mismatch %d/%d\n", matched, n.PathBits)
 				return node, false, ErrNodeNotFound
 			}
 			depth += n.PathBits
@@ -1111,10 +1125,6 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		h := append([]byte{}, s.hasher.Hash(data)...)
 		n.SetHash(h)
 
-		if fmt.Sprintf("%x", h) == "4b99a217b10949dea5c829d8b956a64df5d5c2d83b46d6d1ed05e4c0f828fbc4" {
-			fmt.Printf("[ALARM-GEN] InternalNode hash matches! batch_is_nil=%v\n", batch == nil)
-		}
-
 		if batch != nil {
 			n.SetDirty(false)
 			n.SetOriginalHash(h)
@@ -1282,7 +1292,7 @@ func (s *Shard) FlushArchives() error {
 	defer s.mu.Unlock()
 	for h, data := range s.pendingArchives {
 		// [FIX] 使用独立的归档库存储，防止混入状态库
-		dataKey := append([]byte(h), 0x01)
+		dataKey := archiveDataKey([]byte(h))
 		if s.config.ArchiveDB != nil {
 			if err := s.config.ArchiveDB.PutBucket(dataKey, data); err != nil {
 				return err

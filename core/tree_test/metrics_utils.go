@@ -10,6 +10,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/shirou/gopsutil/process"
 )
 
 // MetricsCollector tracks various performance metrics
@@ -167,6 +169,19 @@ func (c *MetricsCollector) GetMetricsString() string {
 		stats.Max,
 		bytesToReadable(rss),
 		bytesToReadable(m.HeapAlloc))
+}
+
+// GetRSS returns the current process RSS in bytes.
+func GetRSS() uint64 {
+	proc, err := process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		return 0
+	}
+	info, err := proc.MemoryInfo()
+	if err != nil || info == nil {
+		return 0
+	}
+	return info.RSS
 }
 
 func (c *MetricsCollector) calculateStats() Stats {

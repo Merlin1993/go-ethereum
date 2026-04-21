@@ -2,6 +2,7 @@ package binary
 
 import (
 	"encoding/csv"
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
@@ -14,6 +15,34 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/shirou/gopsutil/process"
 )
+
+var (
+	stressItems                 = flag.Int("stressItems", 1000000000, "Total items to inject in TestTrieStressBinary")
+	stressEpochItems            = flag.Int("stressEpochItems", 100000, "Items per metrics window in TestTrieStressBinary")
+	stressBatchSize             = flag.Int("stressBatchSize", 1000, "Items per commit batch in TestTrieStressBinary")
+	stressBaseDir               = flag.String("stressBaseDir", "F:\\trie_stress_data_final_v3", "Base directory for TestTrieStressBinary")
+	stressMaxPool               = flag.Int("stressMaxPool", 10000000, "Maximum sliding key pool size in TestTrieStressBinary")
+	stressShardDepth            = flag.Int("stressShardDepth", 8, "Shard depth for TestTrieStressBinary")
+	stressArchiveItemCacheLimit = flag.Int("stressArchiveItemCacheLimit", 0, "Decoded archive item cache limit for TestTrieStressBinary; 0 disables item caching, negative keeps all")
+	stressDestructiveCommit     = flag.Bool("stressDestructiveCommit", false, "Unload committed shard nodes during TestTrieStressBinary commits")
+	stressAsyncIO               = flag.Bool("stressAsyncIO", false, "Pipeline archive flush and LevelDB batch writes behind the next foreground cycle")
+)
+
+type stressAsyncResult struct {
+	err error
+	dur time.Duration
+}
+
+type stressTiming struct {
+	total    time.Duration
+	wall     time.Duration
+	prune    time.Duration
+	commit   time.Duration
+	flush    time.Duration
+	write    time.Duration
+	rawFlush time.Duration
+	rawWrite time.Duration
+}
 
 // LevelDBAdapter adapts leveldb.Database to KVStore interface
 type LevelDBAdapter struct {
@@ -44,9 +73,19 @@ func TestTrieStressBinary(t *testing.T) {
 	EpochItems := 100000      // 一个统计周期 (100万条)
 	BatchSize := 1000         // 每个 Commit 的数据量
 
-	baseDir := "F:\\trie_stress_data_final_v3"
+	TargetItems = *stressItems
+	EpochItems = *stressEpochItems
+	BatchSize = *stressBatchSize
+	if TargetItems <= 0 || EpochItems <= 0 || BatchSize <= 0 {
+		t.Fatalf("stressItems, stressEpochItems and stressBatchSize must all be positive")
+	}
+	if *stressAsyncIO && *stressDestructiveCommit {
+		t.Fatalf("stressAsyncIO requires in-memory shards; do not combine it with stressDestructiveCommit")
+	}
+
+	baseDir := *stressBaseDir
 	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		t.Fatalf("Failed to create F drive directory: %v. Stress test must run on F: drive.", err)
+		t.Fatalf("Failed to create stress base directory %s: %v", baseDir, err)
 	}
 
 	// Create fixed directories for the stress test results
@@ -84,12 +123,18 @@ func TestTrieStressBinary(t *testing.T) {
 	// 初始化 Trie
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
+	config.ArchiveItemCacheLimit = *stressArchiveItemCacheLimit
 	config.ShardDepth = 8 // 降低分片深度以加速裁剪周期触发 (2^8 = 256)
+	config.ShardDepth = *stressShardDepth
 	config.ArchiveDB = &LevelDBAdapter{adb}
 	trie := NewTrie(nil, &LevelDBAdapter{sdb}, hasher, config, true)
 
 	// 3. Sliding window setup
 	maxPool := 10000000 // 10M keys
+	maxPool = *stressMaxPool
+	if maxPool < BatchSize {
+		maxPool = BatchSize
+	}
 	keyPool := make([][]byte, 0, maxPool)
 	poolIndex := 0
 
@@ -106,7 +151,7 @@ func TestTrieStressBinary(t *testing.T) {
 	defer writer.Flush()
 
 	header := []string{
-		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Prune_ms", "Commit_ms", "Flush_ms", "Max_Root_ms",
+		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Avg_LoopWall_ms", "Prune_ms", "Commit_ms", "Flush_ms", "Write_ms", "Raw_Flush_ms", "Raw_Write_ms", "Max_Root_ms",
 		"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
 		"State_MB", "Archive_MB", "RSS_MB", "Heap_MB",
 	}
@@ -121,22 +166,45 @@ func TestTrieStressBinary(t *testing.T) {
 	totalInjected := 0
 	batch := trie.db.NewBatch() // Assuming trie.db is the KVStore for state
 	defer batch.Reset()
+	var pendingWrite <-chan stressAsyncResult
+	startAsync := func(fn func() error) <-chan stressAsyncResult {
+		ch := make(chan stressAsyncResult, 1)
+		go func() {
+			start := time.Now()
+			ch <- stressAsyncResult{err: fn(), dur: time.Since(start)}
+		}()
+		return ch
+	}
 
 	for epoch := 0; totalInjected < TargetItems; epoch++ {
 		var (
-			calcTimes   [][]time.Duration
+			calcTimes   []stressTiming
 			maxCalcTime time.Duration
 		)
 
 		for i := 0; i < EpochItems; i += BatchSize {
+			loopStart := time.Now()
+
 			// 触发剪枝 (模拟持续负载下的归档)
 			startPrune := time.Now()
 			trie.PruneNextShard()
 			pruneDur := time.Since(startPrune)
 
-			startFlush := time.Now()
-			trie.FlushArchives()
-			flushDur := time.Since(startFlush)
+			var (
+				flushCh     <-chan stressAsyncResult
+				rawFlushDur time.Duration
+				flushDur    time.Duration
+			)
+			if *stressAsyncIO {
+				flushCh = startAsync(trie.FlushArchives)
+			} else {
+				startFlush := time.Now()
+				if err := trie.FlushArchives(); err != nil {
+					t.Fatalf("Failed to flush archives: %v", err)
+				}
+				flushDur = time.Since(startFlush)
+				rawFlushDur = flushDur
+			}
 
 			// 1. Insert new keys (BatchSize items)
 			newKeys := make([][]byte, BatchSize)
@@ -174,21 +242,60 @@ func TestTrieStressBinary(t *testing.T) {
 
 			// 计算根耗时统计
 			startCommit := time.Now()
-			trie.CommitToBatch(batch, false)
+			trie.CommitToBatch(batch, *stressDestructiveCommit)
 			commitDur := time.Since(startCommit)
 
-			// 为了让 PruneNextShard 能读到最新落盘的数据，每个 Batch 都立即写入
-			startWrite := time.Now()
-			if err := batch.Write(); err != nil {
-				t.Fatalf("Failed to write batch: %v", err)
+			if flushCh != nil {
+				waitStart := time.Now()
+				res := <-flushCh
+				flushDur = time.Since(waitStart)
+				rawFlushDur = res.dur
+				if res.err != nil {
+					t.Fatalf("Failed to flush archives: %v", res.err)
+				}
 			}
-			batch.Reset()
-			writeDur := time.Since(startWrite)
-			commitDur += writeDur // Add write duration to commitDur
 
-			dur := pruneDur + commitDur + flushDur
+			var rawWriteDur, writeDur time.Duration
+			if *stressAsyncIO {
+				if pendingWrite != nil {
+					waitStart := time.Now()
+					res := <-pendingWrite
+					writeDur = time.Since(waitStart)
+					rawWriteDur = res.dur
+					if res.err != nil {
+						t.Fatalf("Failed to write async batch: %v", res.err)
+					}
+				}
+				writeBatch := batch
+				pendingWrite = startAsync(func() error {
+					err := writeBatch.Write()
+					writeBatch.Reset()
+					return err
+				})
+				batch = trie.db.NewBatch()
+			} else {
+				startWrite := time.Now()
+				if err := batch.Write(); err != nil {
+					t.Fatalf("Failed to write batch: %v", err)
+				}
+				batch.Reset()
+				writeDur = time.Since(startWrite)
+				rawWriteDur = writeDur
+			}
 
-			calcTimes = append(calcTimes, []time.Duration{dur, pruneDur, commitDur, flushDur})
+			dur := pruneDur + commitDur + flushDur + writeDur
+			wallDur := time.Since(loopStart)
+
+			calcTimes = append(calcTimes, stressTiming{
+				total:    dur,
+				wall:     wallDur,
+				prune:    pruneDur,
+				commit:   commitDur,
+				flush:    flushDur,
+				write:    writeDur,
+				rawFlush: rawFlushDur,
+				rawWrite: rawWriteDur,
+			})
 			if dur > maxCalcTime {
 				maxCalcTime = dur
 			}
@@ -203,13 +310,18 @@ func TestTrieStressBinary(t *testing.T) {
 
 		fTimes := make([]float64, len(calcTimes))
 		var sumDur, sumPrune, sumCommit, sumFlush float64
+		var sumWall, sumWrite, sumRawFlush, sumRawWrite float64
 		for idx, d := range calcTimes {
-			val := float64(d[0].Nanoseconds()) / 1000000.0
+			val := float64(d.total.Nanoseconds()) / 1000000.0
 			fTimes[idx] = val
 			sumDur += val
-			sumPrune += float64(d[1].Nanoseconds()) / 1000000.0
-			sumCommit += float64(d[2].Nanoseconds()) / 1000000.0
-			sumFlush += float64(d[3].Nanoseconds()) / 1000000.0
+			sumWall += float64(d.wall.Nanoseconds()) / 1000000.0
+			sumPrune += float64(d.prune.Nanoseconds()) / 1000000.0
+			sumCommit += float64(d.commit.Nanoseconds()) / 1000000.0
+			sumFlush += float64(d.flush.Nanoseconds()) / 1000000.0
+			sumWrite += float64(d.write.Nanoseconds()) / 1000000.0
+			sumRawFlush += float64(d.rawFlush.Nanoseconds()) / 1000000.0
+			sumRawWrite += float64(d.rawWrite.Nanoseconds()) / 1000000.0
 		}
 		sort.Float64s(fTimes)
 		n := len(fTimes)
@@ -219,9 +331,13 @@ func TestTrieStressBinary(t *testing.T) {
 		}
 
 		avgCalc := sumDur / float64(n)
+		avgWall := sumWall / float64(n)
 		avgPrune := sumPrune / float64(n)
 		avgCommit := sumCommit / float64(n)
 		avgFlush := sumFlush / float64(n)
+		avgWrite := sumWrite / float64(n)
+		avgRawFlush := sumRawFlush / float64(n)
+		avgRawWrite := sumRawWrite / float64(n)
 
 		p95 := getPercentile(0.95)
 		p99 := getPercentile(0.99)
@@ -265,9 +381,13 @@ func TestTrieStressBinary(t *testing.T) {
 			fmt.Sprintf("%d", endItem),
 			fmt.Sprintf("%d", totalInjected),
 			fmt.Sprintf("%.2f", avgCalc),
+			fmt.Sprintf("%.2f", avgWall),
 			fmt.Sprintf("%.2f", avgPrune),
 			fmt.Sprintf("%.2f", avgCommit),
 			fmt.Sprintf("%.2f", avgFlush),
+			fmt.Sprintf("%.2f", avgWrite),
+			fmt.Sprintf("%.2f", avgRawFlush),
+			fmt.Sprintf("%.2f", avgRawWrite),
 			fmt.Sprintf("%.2f", maxVal),
 			fmt.Sprintf("%.2f", p95),
 			fmt.Sprintf("%.2f", p99),
@@ -283,13 +403,13 @@ func TestTrieStressBinary(t *testing.T) {
 		writer.Write(record)
 		writer.Flush()
 
-		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Injected: %.2fM, Pool: %d, Avg: %.2fms (Prune: %.2fms, Commit: %.2fms, Flush: %.2fms), P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
+		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Injected: %.2fM, Pool: %d, Avg: %.2fms, Wall: %.2fms (Prune: %.2fms, Commit: %.2fms, FlushWait: %.2fms, WriteWait: %.2fms, RawFlush: %.2fms, RawWrite: %.2fms), P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
 			startItem, endItem,
 			bytesToReadable(uint64(stateSize)),
 			bytesToReadable(uint64(archiveSize)),
 			float64(totalInjected)/1000000.0,
 			len(keyPool),
-			avgCalc, avgPrune, avgCommit, avgFlush,
+			avgCalc, avgWall, avgPrune, avgCommit, avgFlush, avgWrite, avgRawFlush, avgRawWrite,
 			p95,
 			p99,
 			minVal,
@@ -300,6 +420,13 @@ func TestTrieStressBinary(t *testing.T) {
 			memInfo.RSS/(1024*1024),
 			mem.HeapAlloc/(1024*1024),
 		)
+	}
+	if pendingWrite != nil {
+		res := <-pendingWrite
+		if res.err != nil {
+			t.Fatalf("Failed to write final async batch: %v", res.err)
+		}
+		pendingWrite = nil
 	}
 }
 

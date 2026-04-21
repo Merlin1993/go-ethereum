@@ -96,6 +96,18 @@ func setupTrie() (*Trie, Hasher) {
 	return NewTrie(nil, db, hasher, config, true), hasher
 }
 
+func archiveShardForTest(trie *Trie, shardID int) error {
+	// Fresh writes start on epoch bit 1 under the rolling-epoch policy. Pruning
+	// shard 0 flips the global bit inside PruneNextShard; other shards do not.
+	if shardID == 0 {
+		trie.SetGlobalEpoch(1)
+	} else {
+		trie.SetGlobalEpoch(0)
+	}
+	trie.pruneShardIdx = shardID
+	return trie.PruneNextShard()
+}
+
 func TestBasicOperations(t *testing.T) {
 	trie, _ := setupTrie()
 
@@ -289,13 +301,9 @@ func TestPruningBasic(t *testing.T) {
 		t.Fatalf("Data missing before prune")
 	}
 
-	// Change epoch
-	trie.SetGlobalEpoch(1)
-
 	// Perform shard pruning
 	shardID := trie.GetShardID(key)
-	trie.pruneShardIdx = shardID
-	err := trie.PruneNextShard()
+	err := archiveShardForTest(trie, shardID)
 	if err != nil {
 		t.Fatalf("Prune failed: %v", err)
 	}
@@ -405,12 +413,8 @@ func TestSubtreePruning(t *testing.T) {
 	trie.Put(key2, val2)
 	trie.Commit()
 
-	// Change global to 1 to trigger archiving
-	trie.SetGlobalEpoch(1)
-
 	shardID := int(key1[0])<<8 | int(key1[1])
-	trie.pruneShardIdx = shardID
-	err := trie.PruneNextShard()
+	err := archiveShardForTest(trie, shardID)
 	if err != nil {
 		t.Fatalf("Prune failed: %v", err)
 	}
@@ -520,9 +524,9 @@ func TestArchiveBucketSplitAndMovement(t *testing.T) {
 	trie.FlushArchives()
 
 	// Switch epoch and trigger archiving
-	trie.SetGlobalEpoch(1)
-	trie.pruneShardIdx = 0
-	trie.PruneNextShard()
+	if err := archiveShardForTest(trie, 0); err != nil {
+		t.Fatalf("Prune failed: %v", err)
+	}
 	trie.Commit()
 	trie.FlushArchives()
 
@@ -565,9 +569,9 @@ func TestDataActivation(t *testing.T) {
 	trie.SetGlobalEpoch(0)
 	trie.Commit()
 	trie.FlushArchives()
-	trie.SetGlobalEpoch(1)
-	trie.pruneShardIdx = 0
-	trie.PruneNextShard()
+	if err := archiveShardForTest(trie, 0); err != nil {
+		t.Fatalf("Prune failed: %v", err)
+	}
 	trie.Commit()
 	trie.FlushArchives()
 
@@ -626,9 +630,9 @@ func TestTrieStatistics(t *testing.T) {
 	trie.SetGlobalEpoch(0)
 	trie.Commit()
 	trie.FlushArchives()
-	trie.SetGlobalEpoch(1)
-	trie.pruneShardIdx = 0x0102
-	trie.PruneNextShard()
+	if err := archiveShardForTest(trie, 0x0102); err != nil {
+		t.Fatalf("Prune failed: %v", err)
+	}
 	trie.Commit()
 	trie.FlushArchives()
 
@@ -684,9 +688,7 @@ func TestAutomaticRedemption(t *testing.T) {
 	trie.FlushArchives()
 
 	// 2. 增加 Epoch 并执行剪枝，将数据转入归档桶
-	trie.SetGlobalEpoch(1)
-	trie.pruneShardIdx = 0
-	if err := trie.PruneNextShard(); err != nil {
+	if err := archiveShardForTest(trie, 0); err != nil {
 		t.Fatalf("Prune failed: %v", err)
 	}
 	trie.Commit()

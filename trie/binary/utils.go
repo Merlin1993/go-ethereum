@@ -191,6 +191,9 @@ func (s *Shard) appendBit(data []byte, bits int, bit byte) ([]byte, int) {
 		panic("appendBit: negative bits")
 	}
 	newBits := bits + 1
+	if newBits > MaxPathBits {
+		panic(fmt.Sprintf("appendBit: path overflow %d bits", newBits))
+	}
 	size := (newBits + 7) / 8
 	res := make([]byte, size)
 	copy(res, data)

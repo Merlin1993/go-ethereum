@@ -14,22 +14,24 @@ type ArchiveStore interface {
 
 // Config holds the configuration parameters for the Trie.
 type Config struct {
-	ShardDepth        int          // Number of bits for shard routing (default 16)
-	ArchiveBucketSize int          // Max number of items in an archive bucket before splitting (default 100)
-	ArchiveDB         ArchiveStore // Separate store for archive data
-	CuckooBuckets     int          // Number of buckets in cuckoo filter (default 32)
-	CuckooSlots       int          // Slots per bucket in cuckoo filter (default 4)
-	ShardCacheLimit   int          // [NEW] Maximum number of shards to keep in memory
+	ShardDepth            int          // Number of bits for shard routing (default 16)
+	ArchiveBucketSize     int          // Max number of items in an archive bucket before splitting (default 100)
+	ArchiveItemCacheLimit int          // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
+	ArchiveDB             ArchiveStore // Separate store for archive data
+	CuckooBuckets         int          // Number of buckets in cuckoo filter (default 32)
+	CuckooSlots           int          // Slots per bucket in cuckoo filter (default 4)
+	ShardCacheLimit       int          // [NEW] Maximum number of shards to keep in memory
 }
 
 // DefaultConfig returns a Config with default values.
 func DefaultConfig() *Config {
 	return &Config{
-		ShardDepth:        16,
-		ArchiveBucketSize: 100,
-		CuckooBuckets:     32,
-		CuckooSlots:       4,
-		ShardCacheLimit:   1024, // [NEW] Default 1024 shards
+		ShardDepth:            16,
+		ArchiveBucketSize:     100,
+		ArchiveItemCacheLimit: -1,
+		CuckooBuckets:         32,
+		CuckooSlots:           4,
+		ShardCacheLimit:       1024, // [NEW] Default 1024 shards
 	}
 }
 

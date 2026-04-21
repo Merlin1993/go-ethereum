@@ -137,7 +137,9 @@ func NewNodePool() *NodePool {
 func (p *NodePool) GetInternal() *InternalNode {
 	raw := p.internalPool.Get()
 	if raw == nil {
-		return &InternalNode{}
+		n := &InternalNode{}
+		n.Reset()
+		return n
 	}
 	n := raw.(*InternalNode)
 	n.Reset()
@@ -153,7 +155,9 @@ func (p *NodePool) PutInternal(n *InternalNode) {
 func (p *NodePool) GetLeaf() *LeafNode {
 	raw := p.leafPool.Get()
 	if raw == nil {
-		return &LeafNode{}
+		n := &LeafNode{}
+		n.Reset()
+		return n
 	}
 	n := raw.(*LeafNode)
 	n.Reset()

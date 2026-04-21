@@ -24,7 +24,7 @@ func (s *Shard) Prune(global byte) error {
 	// 1. 获取当前分片的物理前缀 (Absolute Prefix)
 	prefix, prefixBits := s.getShardPrefix()
 
-	// 2. 递归剪枝并收集 256 位全路径项
+	// 2. 递归剪枝并收集 MaxPathBits 范围内的绝对全路径项
 	newRoot, items, err := s.pruneAndArchive(s.root, prefix, prefixBits, global)
 	if err != nil {
 		return err
@@ -41,7 +41,7 @@ func (s *Shard) Prune(global byte) error {
 	} else {
 		s.root = newRoot
 		if len(items) > 0 {
-			// 在 V17 中，items 已经是 256 位，将其挂载到 root。
+			// items 已经是绝对路径，将其挂载到 root。
 			// 对 InternalNode，将其挂入 StubList。
 			if in, ok := s.root.(*InternalNode); ok {
 				s.collectAndAttachToStubList(in, items, prefix, prefixBits)
@@ -65,7 +65,7 @@ func (s *Shard) getShardPrefix() ([]byte, int) {
 	return res, depth
 }
 
-// pruneAndArchive 递归处理节点，items 返回值始终是 256 位绝对路径。
+// pruneAndArchive 递归处理节点，items 返回值始终是 MaxPathBits 范围内的绝对路径。
 func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global byte) (Node, []ArchivedKV, error) {
 	if node == nil {
 		return nil, nil, nil
@@ -74,7 +74,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 	switch n := node.(type) {
 	case *LeafNode:
 		if (n.Epoch() & 1) != global {
-			// 组装 256 位绝对路径
+			// 组装绝对路径
 			absP, absB := s.prependPath(n.Path, n.PathBits, prefix, prefixBits)
 			item := ArchivedKV{
 				Suffix:     absP,
@@ -87,6 +87,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 
 	case *InternalNode:
 		var err error
+		origStubCount := len(n.StubList)
 		// [FIX] Do NOT use InternalNode.epoch for fast-path archival.
 		// insert() updates InternalNode.epoch along the traversal path, which
 		// makes them appear "current" even when their leaf children are stale.
@@ -142,7 +143,8 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 			allItems = append(allItems, rightItems...)
 		}
 
-		if n.Left != newLeft || n.Right != newRight {
+		if n.Left != newLeft || n.Right != newRight || len(n.StubList) != origStubCount ||
+			(newLeft != nil && newLeft.IsDirty()) || (newRight != nil && newRight.IsDirty()) {
 			n.LeftHash, n.RightHash = nil, nil
 			n.SetDirty(true)
 		}
@@ -225,7 +227,7 @@ func (s *Shard) collectLeavesRecursive(node Node, prefix []byte, prefixBits int)
 			return nil, err
 		}
 
-		// 统一导出为 256 位物理路径：n.Path (桶绝对路径) + item.Suffix (桶相对后缀)
+		// 统一导出为绝对物理路径：n.Path (桶绝对路径) + item.Suffix (桶相对后缀)
 		results := make([]ArchivedKV, len(items))
 		for i := range items {
 			newS, newB := s.prependPath(items[i].Suffix, items[i].SuffixBits, n.Path, n.PathBits)
@@ -247,7 +249,7 @@ func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) N
 		return nil
 	}
 
-	// 达到桶大小限制，或者达到 256 位极限，停止分裂。
+	// 达到桶大小限制，或者达到 MaxPathBits 极限，停止分裂。
 	if len(items) <= s.config.ArchiveBucketSize || s.config.ArchiveBucketSize <= 0 || bits >= MaxPathBits {
 		// 重要：存入桶之前，剥离物理前缀路径，确保桶内仅存储相对 Suffix。
 		localItems := make([]ArchivedKV, len(items))

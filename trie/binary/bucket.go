@@ -75,6 +75,29 @@ func (s *Shard) deserializeArchivedKV(data []byte) ([]ArchivedKV, error) {
 	return items, nil
 }
 
+func (s *Shard) shouldCacheArchivedItems(count int) bool {
+	switch limit := s.config.ArchiveItemCacheLimit; {
+	case limit < 0:
+		return true
+	case limit == 0:
+		return false
+	default:
+		return count <= limit
+	}
+}
+
+func archiveItemKey(suffixBits int, suffix []byte) []byte {
+	if suffixBits < 0 {
+		panic("archiveItemKey: negative suffix bits")
+	}
+	var scratch [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(scratch[:], uint64(suffixBits))
+	key := make([]byte, n+len(suffix))
+	copy(key, scratch[:n])
+	copy(key[n:], suffix)
+	return key
+}
+
 // blindAppendToBucket 实现“盲追加”：只更新元数据（过滤器、ECMH、Count），无需加载原始数据。
 func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []ArchivedKV) {
 	bucket.cacheMu.Lock()
@@ -83,7 +106,7 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	// 1. 增量更新布谷鸟过滤器
 	if bucket.cachedFilter != nil {
 		for _, it := range newItems {
-			keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+			keyWithLen := archiveItemKey(it.SuffixBits, it.Suffix)
 			bucket.cachedFilter.Insert(keyWithLen)
 		}
 		bucket.Filter = bucket.cachedFilter.Encode()
@@ -93,7 +116,7 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 			filter.Decode(bucket.Filter, s.config.CuckooBuckets, s.config.CuckooSlots)
 		}
 		for _, it := range newItems {
-			keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+			keyWithLen := archiveItemKey(it.SuffixBits, it.Suffix)
 			filter.Insert(keyWithLen)
 		}
 		bucket.Filter = filter.Encode()
@@ -103,7 +126,7 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	hashes := make([]common.Hash, 0, len(newItems))
 	for _, it := range newItems {
 		// [FIX] 一致性：ECMH 必须包含 SuffixBits
-		keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+		keyWithLen := archiveItemKey(it.SuffixBits, it.Suffix)
 		h := crypto.Keccak256Hash(append(keyWithLen, it.Value...))
 		hashes = append(hashes, h)
 	}
@@ -116,7 +139,12 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 
 	// 4. 更新缓存的数据项（如果已加载）
 	if bucket.cachedItems != nil {
-		bucket.cachedItems = append(bucket.cachedItems, newItems...)
+		cachedItems := append(bucket.cachedItems, newItems...)
+		if s.shouldCacheArchivedItems(len(cachedItems)) {
+			bucket.cachedItems = cachedItems
+		} else {
+			bucket.cachedItems = nil
+		}
 	}
 
 	// 5. 记录追加任务
@@ -158,7 +186,7 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 	// 1. 增量更新布谷鸟过滤器
 	if bucket.cachedFilter != nil {
 		for _, it := range deleteItems {
-			keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+			keyWithLen := archiveItemKey(it.SuffixBits, it.Suffix)
 			bucket.cachedFilter.Delete(keyWithLen)
 		}
 		bucket.Filter = bucket.cachedFilter.Encode()
@@ -168,7 +196,7 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 			filter.Decode(bucket.Filter, s.config.CuckooBuckets, s.config.CuckooSlots)
 		}
 		for _, it := range deleteItems {
-			keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+			keyWithLen := archiveItemKey(it.SuffixBits, it.Suffix)
 			filter.Delete(keyWithLen)
 		}
 		bucket.Filter = filter.Encode()
@@ -178,7 +206,7 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 	hashes := make([]common.Hash, 0, len(deleteItems))
 	for _, it := range deleteItems {
 		// [FIX] 一致性：ECMH 必须包含 SuffixBits
-		keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+		keyWithLen := archiveItemKey(it.SuffixBits, it.Suffix)
 		h := crypto.Keccak256Hash(append(keyWithLen, it.Value...))
 		hashes = append(hashes, h)
 	}
@@ -204,7 +232,11 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 				newItems = append(newItems, it)
 			}
 		}
-		bucket.cachedItems = newItems
+		if s.shouldCacheArchivedItems(len(newItems)) {
+			bucket.cachedItems = newItems
+		} else {
+			bucket.cachedItems = nil
+		}
 	}
 
 	// 4. 记录删除任务
@@ -279,7 +311,7 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 
 	for _, item := range items {
 		// Include SuffixBits to avoid ambiguity (e.g. 1-bit '1' vs 8-bit '10000000')
-		keyWithLen := append([]byte{byte(item.SuffixBits)}, item.Suffix...)
+		keyWithLen := archiveItemKey(item.SuffixBits, item.Suffix)
 		filter.Insert(keyWithLen)
 
 		// ECMH: K + Hash(V)
@@ -292,7 +324,11 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 
 	// 更新缓存
 	bucket.cachedFilter = filter
-	bucket.cachedItems = items
+	if s.shouldCacheArchivedItems(len(items)) {
+		bucket.cachedItems = items
+	} else {
+		bucket.cachedItems = nil
+	}
 
 	// ECMH 承诺
 	comm, _ := s.ecmh.Add(nil, hashes)
@@ -335,7 +371,7 @@ func (s *Shard) verifyBucket(bucket *ArchiveBucketNode) (bool, int64) {
 	hashes := make([]common.Hash, 0, len(items))
 	for _, it := range items {
 		// [FIX] 一致性：ECMH 必须包含 SuffixBits
-		keyWithLen := append([]byte{byte(it.SuffixBits)}, it.Suffix...)
+		keyWithLen := archiveItemKey(it.SuffixBits, it.Suffix)
 		h := crypto.Keccak256Hash(append(keyWithLen, it.Value...))
 		hashes = append(hashes, h)
 	}

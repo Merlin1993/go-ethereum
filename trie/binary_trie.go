@@ -104,6 +104,7 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 			if dbConf.ArchiveBucketSize > 0 {
 				config.ArchiveBucketSize = dbConf.ArchiveBucketSize
 			}
+			config.ArchiveItemCacheLimit = dbConf.ArchiveItemCacheLimit
 			if dbConf.CuckooBuckets > 0 {
 				config.CuckooBuckets = dbConf.CuckooBuckets
 			}
@@ -166,9 +167,6 @@ func (a *binaryDBAdapter) diskDB() ethdb.Database {
 
 func (a *binaryDBAdapter) Put(key, value []byte) error {
 	h := common.BytesToHash(key)
-	if h.Hex() == "0x4b99a217b10949dea5c829d8b956a64df5d5c2d83b46d6d1ed05e4c0f828fbc4" {
-		fmt.Printf("[ALARM] adapter.Put problematic hash! total_nodes=%d\n", len(globalNodeCache))
-	}
 	if len(key) == 32 {
 		globalNodeCacheMu.Lock()
 		globalNodeCache[h] = common.CopyBytes(value)
@@ -197,9 +195,6 @@ func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
 			return common.CopyBytes(val), nil
 		}
 		globalNodeCacheMu.RUnlock()
-		if h.Hex() == "0x4b99a217b10949dea5c829d8b956a64df5d5c2d83b46d6d1ed05e4c0f828fbc4" {
-			fmt.Printf("[ALARM] adapter.Get problematic hash CACHE MISS!\n")
-		}
 	}
 	// ... rest of the code
 
@@ -331,9 +326,6 @@ type nodeSetBatcher struct {
 
 func (b *nodeSetBatcher) Put(key, value []byte) error {
 	h := common.BytesToHash(key)
-	if h.Hex() == "0x4b99a217b10949dea5c829d8b956a64df5d5c2d83b46d6d1ed05e4c0f828fbc4" {
-		fmt.Printf("[ALARM] nodeSetBatcher.Put! owner=%s valueSize=%d\n", b.owner.Hex(), len(value))
-	}
 	b.nodes.AddNode(key, trienode.New(h, value))
 
 	// [FIX] Update global cache for immediate visibility in subsequent adapter.Get across blocks

@@ -31,8 +31,8 @@ func TestConfigAndStats(t *testing.T) {
 	trie.Commit()
 
 	// 3. Trigger pruning to create archive buckets
-	// Initially global bit was 0, so items have bit0=1.
-	// To archive them, we set global bit to 1 and prune.
+	// Fresh writes start on epoch bit 1; seeding global to 1 makes shard 0
+	// flip to 0, and the rest of this pruning pass archives the same epoch.
 	trie.SetGlobalEpoch(1)
 	// Prune all shards
 	for i := 0; i < 16; i++ {

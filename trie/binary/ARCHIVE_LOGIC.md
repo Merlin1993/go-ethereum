@@ -34,6 +34,11 @@
         *   如果部分变冷，热的分支保留，冷的分支转换为 **ArchiveBucketNode** 挂载到该节点的 `StubList`。
 3.  **路径更新**: 在归档项上抛过程中，使用 `prependBit` 和 `prependPath` 动态维护其相对于分片根部的完整路径。
 
+### 路径位数上限 (`MaxPathBits`)
+*   **统一边界**: 路径相关操作以 `MaxPathBits` 为硬上限，当前配置为 416 位。
+*   **覆盖范围**: 账户路径通常为 160 位；Storage composite key 使用 `address(20 bytes) + slot(32 bytes)`，总计 52 bytes / 416 位。
+*   **溢出保护**: `prependBit`、`appendBit`、`prependPath`、`concatPath` 均必须在超过 `MaxPathBits` 时立即失败，避免归档路径在深层存储键下溢出或截断。
+
 ### 节点收缩 (`tryShrink`) 与 StubList 上浮
 *   **路径压缩**: 当一个内部节点只有一个热分支时，触发路径压缩（Collapse）。
 *   **StubList 上浮**: 如果被压缩或删除的节点携带有归档桶（`StubList`），这些桶的内容不会被丢弃，而是被重新打散并“上浮”返回给递归上层。最终，这些内容会根据补全后的路径重新挂载到更高层的归档桶中，确保树结构的极致紧凑。
@@ -49,7 +54,7 @@
 
 ### ArchiveBucketNode (归档桶)
 *   **增量更新**: 系统支持增量修改（`pendingAppends/pendingDeletes`），避免每次微小变动都触发全量桶重建。
-*   **Filter**: 包含 Cuckoo Filter，Key 采用 `[后缀位数] + [后缀内容]` 编码以防碰撞。
+*   **Filter**: 包含 Cuckoo Filter，Key 采用 `[uvarint(后缀位数)] + [后缀内容]` 编码以防碰撞，并支持 `MaxPathBits` 范围内的路径长度。
 *   **盲删除**: 在 `Activate` 过程中，通过元数据更新而非全量加载来实现桶内项的移除。
 
 ---
@@ -111,7 +116,7 @@
 *   **核心逻辑**: 采用“双路并行”对比。
     *   **对比对象**: 标准 MPT (无归档) vs. Binary Trie (有归档)。
     *   **追踪技术**: 使用 `consistencyTracer` 挂载在 EVM 钩子上，为每区块的状态变更生成一个反映全量改动的 `WriteHash`。
-    *   **验证点**: 每一区块结束时，强制校验两个引擎的 **State Root** 和 **WriteHash**。
+    *   **验证点**: 每一区块结束时，强制校验两个引擎的 **WriteCount** 和 **WriteHash**。由于标准 MPT 与 Binary Trie 的节点结构和哈希域不同，二者的结构性 State Root 不作为相等性判据。
 *   **排查用途**: 若出现不一致，通过打印 `consistencyTracer` 的日志（如 `debug_b50107.txt`）可以精确定位是哪一笔交易的哪个状态（余额、Nonce 等）导致了分歧。
 
 ### 压测与性能实验
@@ -148,7 +153,7 @@
 *   **测试项**：`TestBinaryTrieConsistency`
 *   **通过标准**：
     1.  **规模**：运行至少 **1~5 万个区块**。
-    2.  **结果**：全程 **0 报错**，且每一块的 State Root 与 MPT 完全一致。
+    2.  **结果**：全程 **0 报错**，且每一块的 `WriteCount` 与 `WriteHash` 均与 MPT 路线完全一致。
 *   **运行建议**：使用 `-blocks 50000` 等参数限制运行范围。
 
 ### 8.2 压测基础验证
@@ -170,8 +175,8 @@
 
 ### 8.1 一致性实验 (`TestBinaryTrieConsistency`)
 *   **通过标准 (Pass Criteria)**:
-    1.  **State Root 零偏差**: 处理主网任意区块区间后，Binary Trie 算出的 RootHash 必须与标准 MPT 完全一致。
-    2.  **WriteHash 校验**: `consistencyTracer` 记录的所有账户、存储变更的哈希指纹必须与 MPT 线路 100% 匹配。
+    1.  **WriteCount 零偏差**: 处理主网任意区块区间后，Binary Trie 记录的状态写入次数必须与标准 MPT 完全一致。
+    2.  **WriteHash 校验**: `consistencyTracer` 记录的所有账户、存储变更的哈希指纹必须与 MPT 线路 100% 匹配。State Root 仅作为各自引擎的持久化锚点记录，不要求跨结构相等。
     3.  **零异常报错**: 运行过程中不允许出现任何 "Node Not Found" 或持久化层面的加载/序列化错误。
 *   **观测细节**: 异常发生时，通过 `consistencyTracer` 输出的交易索引（Tx Index）快速定位状态分歧点。
 

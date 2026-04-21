@@ -3,6 +3,7 @@ package binary
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"testing"
 )
 
@@ -21,15 +22,8 @@ func TestArchiveViaPrune(t *testing.T) {
 	}
 	trie.Commit()
 
-	// 增加 Epoch
-	trie.SetGlobalEpoch(1)
-	trie.Commit()
-	trie.FlushArchives()
-
 	// 执行分片归档
-	trie.pruneShardIdx = 0
-	err := trie.PruneNextShard()
-	if err != nil {
+	if err := archiveShardForTest(trie, 0); err != nil {
 		t.Fatalf("Prune failed: %v", err)
 	}
 
@@ -52,6 +46,27 @@ func TestArchiveViaPrune(t *testing.T) {
 	}
 }
 
+func TestArchiveItemKeyUsesVarintSuffixBits(t *testing.T) {
+	suffix := []byte{0xab, 0xcd}
+
+	key0 := archiveItemKey(0, suffix)
+	key256 := archiveItemKey(256, suffix)
+	if bytes.Equal(key0, key256) {
+		t.Fatalf("archive item keys collided for suffix bit lengths 0 and 256")
+	}
+
+	bits, n := binary.Uvarint(key256)
+	if n <= 0 {
+		t.Fatalf("failed to decode suffix bit length from key")
+	}
+	if bits != 256 {
+		t.Fatalf("decoded suffix bits mismatch: got %d, want 256", bits)
+	}
+	if !bytes.Equal(key256[n:], suffix) {
+		t.Fatalf("suffix payload mismatch: got %x, want %x", key256[n:], suffix)
+	}
+}
+
 func TestExplicitActivate(t *testing.T) {
 	trie, _ := setupTrie()
 
@@ -66,9 +81,9 @@ func TestExplicitActivate(t *testing.T) {
 	}
 	trie.Commit()
 	trie.FlushArchives()
-	trie.SetGlobalEpoch(1)
-	trie.pruneShardIdx = 0
-	trie.PruneNextShard()
+	if err := archiveShardForTest(trie, 0); err != nil {
+		t.Fatalf("Prune failed: %v", err)
+	}
 	trie.Commit()
 	trie.FlushArchives()
 

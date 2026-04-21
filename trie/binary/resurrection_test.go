@@ -28,10 +28,10 @@ func TestResurrectionMetrics(t *testing.T) {
 	trie.Commit()
 	trie.FlushArchives()
 
-	// Move to archive by changing global epoch and pruning
-	trie.SetGlobalEpoch(1)
-	trie.pruneShardIdx = 1
-	trie.PruneNextShard()
+	// Move to archive under the rolling-epoch policy.
+	if err := archiveShardForTest(trie, 1); err != nil {
+		t.Fatalf("Prune failed: %v", err)
+	}
 	// 3. Verify it's in archive (BEFORE destructive commit)
 	stats := trie.Stats()
 	if stats.ArchivedDataSize != 1 {
