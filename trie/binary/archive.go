@@ -125,7 +125,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 				return nil, nil, err
 			}
 		}
-		lp, lb := s.prependBit(currentP, currentB, 0)
+		lp, lb := s.appendBit(currentP, currentB, 0)
 		newLeft, leftItems, err := s.pruneAndArchive(n.Left, lp, lb, global)
 		if err != nil {
 			return nil, nil, err
@@ -134,6 +134,8 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		if newLeft == nil && len(leftItems) > 0 {
 			// items are already absolute paths; pass lp/lb as the absolute bucket entry path
 			s.collectAndAttachToStubList(n, leftItems, lp, lb)
+			n.Left, n.LeftHash = nil, nil
+			n.LeftEpoch = 0
 		} else {
 			n.Left = newLeft
 			allItems = append(allItems, leftItems...)
@@ -146,7 +148,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 				return nil, nil, err
 			}
 		}
-		rp, rb := s.prependBit(currentP, currentB, 1)
+		rp, rb := s.appendBit(currentP, currentB, 1)
 		newRight, rightItems, err := s.pruneAndArchive(n.Right, rp, rb, global)
 		if err != nil {
 			return nil, nil, err
@@ -154,6 +156,8 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 
 		if newRight == nil && len(rightItems) > 0 {
 			s.collectAndAttachToStubList(n, rightItems, rp, rb)
+			n.Right, n.RightHash = nil, nil
+			n.RightEpoch = 0
 		} else {
 			n.Right = newRight
 			allItems = append(allItems, rightItems...)
@@ -212,13 +216,13 @@ func (s *Shard) collectLeavesRecursive(node Node, prefix []byte, prefixBits int)
 			currentP, currentB = s.prependPath(n.Path, n.PathBits, prefix, prefixBits)
 		}
 
-		lp, lb := s.prependBit(currentP, currentB, 0)
+		lp, lb := s.appendBit(currentP, currentB, 0)
 		left, err := s.collectLeavesRecursive(n.Left, lp, lb)
 		if err != nil {
 			return nil, err
 		}
 
-		rp, rb := s.prependBit(currentP, currentB, 1)
+		rp, rb := s.appendBit(currentP, currentB, 1)
 		right, err := s.collectLeavesRecursive(n.Right, rp, rb)
 		if err != nil {
 			return nil, err

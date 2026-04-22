@@ -203,7 +203,7 @@ func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
 		return s.serializeArchivedKV(newItems)
 	}
 	if s.config.ArchiveDB == nil {
-		return nil, errors.New("archive db not set")
+		return s.db.Get(archiveDataKey(hash))
 	}
 	data, err := s.config.ArchiveDB.GetBucket(archiveDataKey(hash))
 	return data, err
@@ -991,6 +991,9 @@ func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		if err := s.commitPendingValues(batch); err != nil {
 			return nil, err
 		}
+		if err := s.commitStaleDeletes(batch); err != nil {
+			return nil, err
+		}
 		return s.rootHash, nil
 	}
 
@@ -1000,14 +1003,8 @@ func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		return nil, err
 	}
 
-	if s.pruning && destructive {
-		for h := range s.staleSet {
-			err := batch.Delete([]byte(h))
-			if err != nil {
-				return nil, err
-			}
-		}
-		s.staleSet = make(map[string]struct{})
+	if err := s.commitStaleDeletes(batch); err != nil {
+		return nil, err
 	}
 
 	if err := s.commitPendingValues(batch); err != nil {
@@ -1019,6 +1016,19 @@ func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		s.rootHash = rootHash
 	}
 	return rootHash, nil
+}
+
+func (s *Shard) commitStaleDeletes(batch Batcher) error {
+	if !s.pruning || batch == nil || len(s.staleSet) == 0 {
+		return nil
+	}
+	for h := range s.staleSet {
+		if err := batch.Delete([]byte(h)); err != nil {
+			return err
+		}
+	}
+	s.staleSet = make(map[string]struct{})
+	return nil
 }
 
 // ForEach iterates over all leaves in the shard.
@@ -1313,6 +1323,13 @@ func (s *Shard) shrink(n *InternalNode) Node {
 
 	// 如果没有或者有多个主树子节点，无法收缩。
 	if childCount != 1 {
+		return n
+	}
+
+	// A node with side-mounted archive buckets must remain reachable at its
+	// current path. Merging it into the only hot child would make buckets from
+	// the pruned sibling unreachable from the parent traversal path.
+	if len(n.StubList) > 0 {
 		return n
 	}
 

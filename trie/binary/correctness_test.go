@@ -530,6 +530,15 @@ func TestArchiveBucketSplitAndMovement(t *testing.T) {
 	trie.Commit()
 	trie.FlushArchives()
 
+	// Verify stats before reads, since Get automatically activates archived data.
+	stats := trie.Stats()
+	if stats.BucketCount < 2 {
+		t.Errorf("Expected at least 2 buckets, got %d", stats.BucketCount)
+	}
+	if stats.ArchivedDataSize != 3 {
+		t.Errorf("Expected 3 archived items, got %d", stats.ArchivedDataSize)
+	}
+
 	// Verify data is still accessible via Get (penetrate bucket search)
 	for i := 0; i < 3; i++ {
 		val := []byte(string(rune('a' + i)))
@@ -540,15 +549,6 @@ func TestArchiveBucketSplitAndMovement(t *testing.T) {
 		if !bytes.Equal(got, val) {
 			t.Errorf("Value %d mismatch: got %x, want %x", i, got, val)
 		}
-	}
-
-	// Verify stats, ensure multiple buckets were created
-	stats := trie.Stats()
-	if stats.BucketCount < 2 {
-		t.Errorf("Expected at least 2 buckets, got %d", stats.BucketCount)
-	}
-	if stats.ArchivedDataSize != 3 {
-		t.Errorf("Expected 3 archived items, got %d", stats.ArchivedDataSize)
 	}
 }
 

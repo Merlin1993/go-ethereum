@@ -206,3 +206,48 @@
 
 > [!TIP]
 > **本地快速自测**: 如果修改了 StubList 处理逻辑，建议将 `ShardDepth` 暂时调低至 4 或 8（如前所述），通过几十个区块的短程注入即可触发 Epoch 翻转与收缩（Shrink）上浮逻辑。
+
+## 10. Hot Tree Stabilization Fix (2026-04-22)
+
+This section records the invariants added after the stress run where `State`,
+RSS/Heap, and latency continued to grow through millions of injected items.
+
+* **Archived child subtrees must be detached from the hot tree**: after a cold
+  left/right subtree is converted into an `ArchiveBucketNode` and side-mounted
+  in `StubList`, the corresponding child pointer, child hash, and child epoch
+  must be cleared. Keeping the child alive makes `LeafCount`, state nodes,
+  prune traversal cost, and heap usage grow linearly with total injected items.
+* **Archive bucket paths are absolute and extend forward**: child traversal from
+  an accumulated absolute prefix must use `appendBit`, not `prependBit`.
+  `prependBit` reverses the child direction relative to the absolute key and
+  can make archived buckets unreachable once the hot child is detached.
+* **Nodes with side-mounted buckets are not shrinkable**: an `InternalNode` with
+  a non-empty `StubList` is an addressable anchor for archived sibling data.
+  Collapsing it into the only remaining hot child can bypass those buckets
+  during lookup.
+* **Stale node deletes are required for async/non-destructive commits too**:
+  stress mode can commit through a batch while `destructive=false`; stale node
+  hashes still have to be deleted from LevelDB, otherwise the physical state DB
+  keeps old trie nodes indefinitely. LevelDB may reclaim disk space only after
+  compaction, so the expected signal is a much slower growth rate, not an
+  immediate file-size shrink.
+* **ArchiveDB=nil must still support bucket lookup**: when no external archive
+  DB is configured, `FlushArchives` stores `archiveDataKey(hash)` in the state
+  DB. Reads must use that same fallback path.
+
+### 10.1 Expected Stress Signal
+
+With `ShardDepth=8`, `stressEpochItems=100000`, `stressBatchSize=1000`, and
+async IO enabled, a 1M item local run should show:
+
+* `LeafCount` stabilizing after the archive cycle starts instead of following
+  total injected items linearly.
+* `ArchiveItems` increasing roughly linearly as cold data is moved out of the
+  hot tree.
+* `Avg` staying around the 20-30ms band on the local benchmark setup, with
+  occasional IO/GC outliers still possible.
+
+Observed verification after the fix:
+
+* 300k items: `LeafCount=130657`, `ArchiveItems=171578`, `Avg=24.55ms`.
+* 1M items: `LeafCount=131830`, `ArchiveItems=877807`, `Avg=25.62ms`.
