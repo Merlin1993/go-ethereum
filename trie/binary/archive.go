@@ -92,6 +92,22 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		// insert() updates InternalNode.epoch along the traversal path, which
 		// makes them appear "current" even when their leaf children are stale.
 		// Always recurse into children to check individual leaf epochs.
+		if mask, ok := s.subtreeEpochMask(n); ok {
+			hotMask := leafEpochMask(global)
+			if mask&^hotMask == 0 {
+				return n, nil, nil
+			}
+			if len(n.StubList) == 0 && mask&hotMask == 0 {
+				items, err := s.collectLeavesRecursive(n, prefix, prefixBits)
+				if err != nil {
+					return nil, nil, err
+				}
+				if s.pruning && len(n.OriginalHash()) > 0 {
+					s.staleSet[string(n.OriginalHash())] = struct{}{}
+				}
+				return nil, items, nil
+			}
+		}
 
 		// 计算当前节点的内部全缀 (n.Path) 位，但不提前组合到 prefix，
 		// 以便分别传递给左/右子树。
@@ -146,6 +162,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		if n.Left != newLeft || n.Right != newRight || len(n.StubList) != origStubCount ||
 			(newLeft != nil && newLeft.IsDirty()) || (newRight != nil && newRight.IsDirty()) {
 			n.LeftHash, n.RightHash = nil, nil
+			s.refreshInternalEpochMask(n)
 			n.SetDirty(true)
 		}
 

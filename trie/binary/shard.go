@@ -663,6 +663,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 			splitNode.Right = oldLeaf
 		}
 		s.updateEpoch(splitNode)
+		s.refreshInternalEpochMask(splitNode)
 		return splitNode, nil
 
 	case *InternalNode:
@@ -707,6 +708,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 				}
 
 				s.updateEpoch(parent)
+				s.refreshInternalEpochMask(parent)
 				return parent, nil
 			}
 			depth += n.PathBits
@@ -742,6 +744,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		}
 
 		s.updateEpoch(n)
+		s.refreshInternalEpochMask(n)
 		return s.shrink(n), nil
 
 	case *ArchiveBucketNode:
@@ -873,6 +876,7 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 		if count == 1 {
 			if n.PathBits > 0 {
 				s.updateEpoch(n)
+				s.refreshInternalEpochMask(n)
 				return n, true, nil
 			}
 
@@ -892,10 +896,12 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 			}
 
 			s.updateEpoch(n)
+			s.refreshInternalEpochMask(n)
 			return n, true, nil
 		}
 
 		s.updateEpoch(n)
+		s.refreshInternalEpochMask(n)
 		return n, true, nil
 	default:
 		return node, false, errors.New("unknown node type")
@@ -1061,6 +1067,7 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 	switch n := node.(type) {
 	case *ArchiveBucketNode:
 		h := n.Hash()
+
 		data, err := n.Serialize()
 		if err != nil {
 			return nil, err
@@ -1091,6 +1098,8 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 			if destructive {
 				n.Left = nil
 			}
+		} else if len(n.LeftHash) == 0 {
+			n.LeftEpoch = 0
 		}
 		if n.Right != nil {
 			h, err := s.commit(n.Right, batch, nodeCount, destructive)
@@ -1102,6 +1111,8 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 			if destructive {
 				n.Right = nil
 			}
+		} else if len(n.RightHash) == 0 {
+			n.RightEpoch = 0
 		}
 
 		// [NEW] 也需提交 StubList 中的 bucket
@@ -1116,6 +1127,7 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 
 		// [FIX] Do NOT updateEpoch during commit — epoch reflects access pattern, not persistence.
 		// Updating epoch here would cause Prune to skip nodes that haven't been accessed.
+		s.refreshInternalEpochMask(n)
 
 		data, err := n.Serialize()
 		if err != nil {
@@ -1170,8 +1182,57 @@ func (s *Shard) updateEpoch(node Node) {
 		n.epoch = global
 
 	case *InternalNode:
-		n.epoch = global
+		n.epoch = (n.epoch &^ epochTimeBit) | (global & epochTimeBit)
 	}
+}
+
+func (s *Shard) subtreeEpochMask(node Node) (byte, bool) {
+	switch n := node.(type) {
+	case nil:
+		return 0, true
+	case *LeafNode:
+		return leafEpochMask(n.Epoch()), true
+	case *ArchiveBucketNode:
+		return 0, true
+	case *InternalNode:
+		if mask, ok := storedSubtreeEpochMask(n.Epoch()); ok {
+			return mask, true
+		}
+		return s.computeInternalEpochMask(n)
+	default:
+		return 0, false
+	}
+}
+
+func (s *Shard) childEpochMask(node Node, epoch byte, hasHash bool) (byte, bool) {
+	if node != nil {
+		return s.subtreeEpochMask(node)
+	}
+	if !hasHash {
+		return 0, true
+	}
+	if mask, ok := storedSubtreeEpochMask(epoch); ok {
+		return mask, true
+	}
+	return 0, false
+}
+
+func (s *Shard) computeInternalEpochMask(n *InternalNode) (byte, bool) {
+	leftMask, leftOK := s.childEpochMask(n.Left, n.LeftEpoch, len(n.LeftHash) > 0)
+	rightMask, rightOK := s.childEpochMask(n.Right, n.RightEpoch, len(n.RightHash) > 0)
+	if !leftOK || !rightOK {
+		return 0, false
+	}
+	return leftMask | rightMask, true
+}
+
+func (s *Shard) refreshInternalEpochMask(n *InternalNode) {
+	mask, ok := s.computeInternalEpochMask(n)
+	if !ok {
+		n.epoch = clearStoredSubtreeEpochMask(n.epoch)
+		return
+	}
+	n.epoch = setStoredSubtreeEpochMask(n.epoch, mask)
 }
 
 func (s *Shard) shrink(n *InternalNode) Node {
@@ -1218,6 +1279,7 @@ func (s *Shard) shrink(n *InternalNode) Node {
 			n.Left, n.LeftHash = child.Left, child.LeftHash
 			n.Right, n.RightHash = child.Right, child.RightHash
 			n.SetDirty(true)
+			s.refreshInternalEpochMask(n)
 			return n
 
 		case *LeafNode:
@@ -1233,6 +1295,7 @@ func (s *Shard) shrink(n *InternalNode) Node {
 			}
 			child.Path, child.PathBits = nil, 0
 			n.SetDirty(true)
+			s.refreshInternalEpochMask(n)
 			return n
 		}
 	}
@@ -1245,6 +1308,7 @@ func (s *Shard) shrink(n *InternalNode) Node {
 		if s.pruning && len(inChild.OriginalHash()) > 0 {
 			s.staleSet[string(inChild.OriginalHash())] = struct{}{}
 		}
+		s.refreshInternalEpochMask(inChild)
 		return inChild
 	}
 

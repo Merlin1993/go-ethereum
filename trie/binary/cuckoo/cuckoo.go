@@ -19,6 +19,7 @@ package cuckoo
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/crypto"
 )
@@ -30,8 +31,24 @@ const (
 )
 
 var (
-	ErrFull = errors.New("cuckoo filter is full")
+	ErrFull                    = errors.New("cuckoo filter is full")
+	alternateHashOnce          sync.Once
+	alternateHashByFingerprint [1 << 16]uint32
 )
+
+func initAlternateHashes() {
+	var fpBytes [2]byte
+	for fp := range alternateHashByFingerprint {
+		binary.BigEndian.PutUint16(fpBytes[:], uint16(fp))
+		h := crypto.Keccak256Hash(fpBytes[:])
+		alternateHashByFingerprint[fp] = binary.BigEndian.Uint32(h[0:4])
+	}
+}
+
+func alternateHash(fp uint16) uint32 {
+	alternateHashOnce.Do(initAlternateHashes)
+	return alternateHashByFingerprint[fp]
+}
 
 // Filter 是一个紧凑的布谷鸟过滤器。
 type Filter struct {
@@ -62,7 +79,7 @@ func New(buckets, slots int) *Filter {
 
 // hash 返回数据的原始哈希值和指纹。
 func (f *Filter) hash(data []byte) (uint, uint16) {
-	h := crypto.Keccak256(data)
+	h := crypto.Keccak256Hash(data)
 	// 使用前 4 个字节计算桶索引
 	i1 := uint(binary.BigEndian.Uint32(h[0:4])) & uint(f.numBuckets-1)
 	// 使用接下来的 2 个字节作为指纹
@@ -76,12 +93,9 @@ func (f *Filter) hash(data []byte) (uint, uint16) {
 // alternateIndex 返回给定的索引和指纹的备选索引。
 // 这实现了 Partial-Key Cuckoo Hashing: i2 = i1 ^ hash(fp)
 func (f *Filter) alternateIndex(i uint, fp uint16) uint {
-	fpBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(fpBytes, fp)
-	h := crypto.Keccak256(fpBytes)
 	// 异或操作确保我们可以从 i1 计算出 i2，反之亦然。
 	// 由于 numBuckets 是 2 的幂，使用位与操作将其限制在范围内。
-	return (i ^ uint(binary.BigEndian.Uint32(h[0:4]))) & uint(f.numBuckets-1)
+	return (i ^ uint(alternateHash(fp))) & uint(f.numBuckets-1)
 }
 
 // Insert 将数据添加到过滤器中。
@@ -196,7 +210,7 @@ func (f *Filter) Encode() []byte {
 	totalSlots := f.numBuckets * f.slotsPerBucket
 	bitmaskSize := (totalSlots + 7) / 8
 	bitmask := make([]byte, bitmaskSize)
-	var fingerprints []byte
+	fingerprints := make([]byte, 0, f.count*2)
 
 	for i := 0; i < f.numBuckets; i++ {
 		for s := 0; s < f.slotsPerBucket; s++ {
@@ -205,9 +219,9 @@ func (f *Filter) Encode() []byte {
 				// 在位图中设置对应位
 				bitmask[slotIdx/8] |= (1 << (7 - (slotIdx % 8)))
 				// 追加指纹数据
-				fpBytes := make([]byte, 2)
-				binary.BigEndian.PutUint16(fpBytes, f.buckets[i][s])
-				fingerprints = append(fingerprints, fpBytes...)
+				var fpBytes [2]byte
+				binary.BigEndian.PutUint16(fpBytes[:], f.buckets[i][s])
+				fingerprints = append(fingerprints, fpBytes[:]...)
 			}
 		}
 	}

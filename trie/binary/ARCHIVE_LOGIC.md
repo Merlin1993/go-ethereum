@@ -12,6 +12,7 @@
 ### 纪元位 (Epoch Bit)
 *   每个节点（`LeafNode`, `InternalNode`）都有一个 `epoch` 字段。
 *   `globalEpochBit` (0 或 1) 用于区分冷热数据。
+*   `InternalNode.epoch` 的预留位缓存子树 epoch mask，用于快速判断子树是全热、全冷还是冷热混合；旧节点缺少 valid 标记时会回退到递归检查。
 *   **状态对齐关系**:
     *   **裁剪前**: 在一个裁剪周期内，尚未遍历到的分片包含旧纪元的数据（`epoch != globalEpochBit`）。此时插入的新数据会使用当前全局位，导致分片内数据暂时“纪元不一致”。
     *   **裁剪中**: `Shard.Prune(global)` 被调用，所有冷数据（旧纪元）被移入归档桶，分片内的热数据状态完成对齐。
@@ -55,6 +56,7 @@
 ### ArchiveBucketNode (归档桶)
 *   **增量更新**: 系统支持增量修改（`pendingAppends/pendingDeletes`），避免每次微小变动都触发全量桶重建。
 *   **Filter**: 包含 Cuckoo Filter，Key 采用 `[uvarint(后缀位数)] + [后缀内容]` 编码以防碰撞，并支持 `MaxPathBits` 范围内的路径长度。
+    *   **Fingerprint Hash Cache**: `alternateIndex` 仍使用原 Keccak(fp) 算法以兼容既有过滤器编码，但 16-bit fingerprint 的 65536 个哈希前缀会被全局缓存，避免归档桶重算时重复对 2 字节输入执行 Keccak。
 *   **盲删除**: 在 `Activate` 过程中，通过元数据更新而非全量加载来实现桶内项的移除。
 
 ---
@@ -96,6 +98,9 @@
 
 ### 全状态完整性保证 (ECMH)
 每个 Shard 维护一个基于椭圆曲线的多集哈希（ECMH）。它对“热路径节点数据 + 冷路径归档数据”统一生成累加承诺，确保存储引擎在不遍历树的情况下也能验证冷热混合状态的正确性。
+*   **并行映射**: 批量 `Add/Delete/Verify` 时，`hashToPoint` 映射可并行计算，最终仍按确定顺序累加点，保持 ECMH 的顺序无关语义不变。
+*   **内存取舍**: 当前不启用全局 point cache，避免数百万唯一归档项把内存再次顶高。
+*   **低分配输入**: 归档项的 filter key、ECMH hash 输入和 `ArchivedKV` 序列化采用可复用缓冲/精确预分配，减少桶重算和 pending archive 写入时的短命切片。
 
 ### 并发模型
 *   **分片并行**: `Trie.shardsMu` 仅控制分片容器，各分片拥有独立读写锁 `Shard.mu`，支持多线程并行 Commit 或 Prune。

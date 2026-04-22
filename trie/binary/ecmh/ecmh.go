@@ -20,6 +20,8 @@ import (
 	"crypto/ecdsa"
 	"errors"
 	"math/big"
+	"runtime"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -33,13 +35,21 @@ var (
 // 它可以将一组哈希值映射到椭圆曲线上的点并进行累加，结果与添加顺序无关。
 type Committer struct {
 	curve crypto.EllipticCurve
+	p     *big.Int
 }
 
 // New 创建一个新的 ECMH 承诺器。
 func New() *Committer {
+	curve := crypto.S256()
 	return &Committer{
-		curve: crypto.S256(),
+		curve: curve,
+		p:     curve.Params().P,
 	}
+}
+
+type curvePoint struct {
+	x *big.Int
+	y *big.Int
 }
 
 // Add 为给定的承诺增加多个哈希。如果旧承诺为空，则从零点开始。
@@ -50,9 +60,9 @@ func (c *Committer) Add(commitment []byte, hashes []common.Hash) ([]byte, error)
 		return nil, err
 	}
 
-	for _, h := range hashes {
-		pkX, pkY := c.hashToPoint(h)
-		currX, currY = c.curve.Add(currX, currY, pkX, pkY)
+	points := c.hashesToPoints(hashes)
+	for _, point := range points {
+		currX, currY = c.curve.Add(currX, currY, point.x, point.y)
 	}
 
 	return c.encode(currX, currY), nil
@@ -66,12 +76,11 @@ func (c *Committer) Delete(commitment []byte, hashes []common.Hash) ([]byte, err
 		return nil, err
 	}
 
-	p := c.curve.Params().P
-	for _, h := range hashes {
-		pkX, pkY := c.hashToPoint(h)
+	points := c.hashesToPoints(hashes)
+	for _, point := range points {
 		// 减法等同于加上点的反元素 (x, -y % p)
-		negY := new(big.Int).Mod(new(big.Int).Neg(pkY), p)
-		currX, currY = c.curve.Add(currX, currY, pkX, negY)
+		negY := new(big.Int).Mod(new(big.Int).Neg(point.y), c.p)
+		currX, currY = c.curve.Add(currX, currY, point.x, negY)
 	}
 
 	return c.encode(currX, currY), nil
@@ -94,24 +103,57 @@ func (c *Committer) Verify(hashes []common.Hash, commitment []byte) bool {
 	return true
 }
 
+func (c *Committer) hashesToPoints(hashes []common.Hash) []curvePoint {
+	points := make([]curvePoint, len(hashes))
+	if len(hashes) == 0 {
+		return points
+	}
+	if len(hashes) < 8 || runtime.GOMAXPROCS(0) <= 1 {
+		for i, h := range hashes {
+			x, y := c.hashToPoint(h)
+			points[i] = curvePoint{x: x, y: y}
+		}
+		return points
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(hashes) {
+		workers = len(hashes)
+	}
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * len(hashes) / workers
+		end := (worker + 1) * len(hashes) / workers
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				x, y := c.hashToPoint(hashes[i])
+				points[i] = curvePoint{x: x, y: y}
+			}
+		}(start, end)
+	}
+	wg.Wait()
+	return points
+}
+
 // hashToPoint 使用 "Try-and-increment" 方法将哈希映射到 secp256k1 曲线上的点。
 func (c *Committer) hashToPoint(h common.Hash) (x, y *big.Int) {
-	p := c.curve.Params().P
 	data := h[:]
 	for {
 		x = new(big.Int).SetBytes(data)
-		if x.Cmp(p) < 0 {
+		if x.Cmp(c.p) < 0 {
 			// 计算 y^2 = (x^3 + 7) % p
 			x3 := new(big.Int).Mul(x, x)
 			x3.Mul(x3, x)
 			x3.Add(x3, big.NewInt(7))
-			x3.Mod(x3, p)
+			x3.Mod(x3, c.p)
 
-			y = new(big.Int).ModSqrt(x3, p)
+			y = new(big.Int).ModSqrt(x3, c.p)
 			if y != nil {
 				// 确定性地选择 y。选择偶数 y 以保证唯一性。
 				if y.Bit(0) != 0 {
-					y.Sub(p, y)
+					y.Sub(c.p, y)
 				}
 				return x, y
 			}

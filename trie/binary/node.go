@@ -14,7 +14,32 @@ const (
 	NodeTypeInternal      = 0x00
 	NodeTypeLeaf          = 0x01
 	NodeTypeArchiveBucket = 0x02 // [NEW] 归档桶节点类型
+
+	epochTimeBit          = 0x01
+	epochSubtreeMaskBits  = 0x06
+	epochSubtreeMaskShift = 1
+	epochSubtreeMaskValid = 0x08
 )
+
+func leafEpochMask(epoch byte) byte {
+	return 1 << (epoch & epochTimeBit)
+}
+
+func storedSubtreeEpochMask(epoch byte) (byte, bool) {
+	if epoch&epochSubtreeMaskValid == 0 {
+		return 0, false
+	}
+	return (epoch & epochSubtreeMaskBits) >> epochSubtreeMaskShift, true
+}
+
+func setStoredSubtreeEpochMask(epoch byte, mask byte) byte {
+	epoch &^= epochSubtreeMaskBits | epochSubtreeMaskValid
+	return epoch | epochSubtreeMaskValid | ((mask & 0x03) << epochSubtreeMaskShift)
+}
+
+func clearStoredSubtreeEpochMask(epoch byte) byte {
+	return epoch &^ (epochSubtreeMaskBits | epochSubtreeMaskValid)
+}
 
 // Node 接口：统一描述二叉 Trie 节点的核心行为
 // - Type：节点类型（内部/叶子）
