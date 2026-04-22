@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"sync"
 
+	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 )
@@ -55,6 +56,32 @@ type curvePoint struct {
 // Add 为给定的承诺增加多个哈希。如果旧承诺为空，则从零点开始。
 // 返回更新后的承诺。
 func (c *Committer) Add(commitment []byte, hashes []common.Hash) ([]byte, error) {
+	if len(hashes) == 0 {
+		return commitment, nil
+	}
+	if len(commitment) == 0 && len(hashes) == 1 {
+		point := c.hashToJacobianPoint(hashes[0])
+		return c.encodeJacobian(&point), nil
+	}
+	if len(commitment) == 0 && len(hashes) < 4 {
+		sum := c.hashesToJacobianSum(hashes, false)
+		return c.encodeJacobian(&sum), nil
+	}
+	if len(hashes) < 4 {
+		return c.addBigInt(commitment, hashes)
+	}
+	var curr secp256k1.JacobianPoint
+	if err := c.decodeJacobian(commitment, &curr); err != nil {
+		return nil, err
+	}
+
+	sum := c.hashesToJacobianSum(hashes, false)
+	secp256k1.AddNonConst(&curr, &sum, &curr)
+
+	return c.encodeJacobian(&curr), nil
+}
+
+func (c *Committer) addBigInt(commitment []byte, hashes []common.Hash) ([]byte, error) {
 	currX, currY, err := c.decode(commitment)
 	if err != nil {
 		return nil, err
@@ -71,6 +98,25 @@ func (c *Committer) Add(commitment []byte, hashes []common.Hash) ([]byte, error)
 // Delete 从给定的承诺中减去多个哈希处理。
 // 返回更新后的承诺。
 func (c *Committer) Delete(commitment []byte, hashes []common.Hash) ([]byte, error) {
+	if len(hashes) == 0 {
+		return commitment, nil
+	}
+	if len(hashes) < 4 {
+		return c.deleteBigInt(commitment, hashes)
+	}
+	var curr secp256k1.JacobianPoint
+	if err := c.decodeJacobian(commitment, &curr); err != nil {
+		return nil, err
+	}
+
+	sum := c.hashesToJacobianSum(hashes, true)
+	secp256k1.AddNonConst(&curr, &sum, &curr)
+	// 减法等同于加上点的反元素 (x, -y % p)
+
+	return c.encodeJacobian(&curr), nil
+}
+
+func (c *Committer) deleteBigInt(commitment []byte, hashes []common.Hash) ([]byte, error) {
 	currX, currY, err := c.decode(commitment)
 	if err != nil {
 		return nil, err
@@ -78,7 +124,6 @@ func (c *Committer) Delete(commitment []byte, hashes []common.Hash) ([]byte, err
 
 	points := c.hashesToPoints(hashes)
 	for _, point := range points {
-		// 减法等同于加上点的反元素 (x, -y % p)
 		negY := new(big.Int).Mod(new(big.Int).Neg(point.y), c.p)
 		currX, currY = c.curve.Add(currX, currY, point.x, negY)
 	}
@@ -137,8 +182,110 @@ func (c *Committer) hashesToPoints(hashes []common.Hash) []curvePoint {
 	return points
 }
 
-// hashToPoint 使用 "Try-and-increment" 方法将哈希映射到 secp256k1 曲线上的点。
+func (c *Committer) hashesToJacobianPoints(hashes []common.Hash) []secp256k1.JacobianPoint {
+	points := make([]secp256k1.JacobianPoint, len(hashes))
+	if len(hashes) == 0 {
+		return points
+	}
+	if len(hashes) < 8 || runtime.GOMAXPROCS(0) <= 1 {
+		for i, h := range hashes {
+			points[i] = c.hashToJacobianPoint(h)
+		}
+		return points
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(hashes) {
+		workers = len(hashes)
+	}
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * len(hashes) / workers
+		end := (worker + 1) * len(hashes) / workers
+		wg.Add(1)
+		go func(start, end int) {
+			defer wg.Done()
+			for i := start; i < end; i++ {
+				points[i] = c.hashToJacobianPoint(hashes[i])
+			}
+		}(start, end)
+	}
+	wg.Wait()
+	return points
+}
+
+func (c *Committer) hashesToJacobianSum(hashes []common.Hash, negate bool) secp256k1.JacobianPoint {
+	var sum secp256k1.JacobianPoint
+	if len(hashes) == 0 {
+		return sum
+	}
+	if len(hashes) < 8 || runtime.GOMAXPROCS(0) <= 1 {
+		for _, h := range hashes {
+			point := c.hashToJacobianPoint(h)
+			if negate {
+				point.Y.Negate(1).Normalize()
+			}
+			secp256k1.AddNonConst(&sum, &point, &sum)
+		}
+		return sum
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(hashes) {
+		workers = len(hashes)
+	}
+	partials := make([]secp256k1.JacobianPoint, workers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		start := worker * len(hashes) / workers
+		end := (worker + 1) * len(hashes) / workers
+		wg.Add(1)
+		go func(worker, start, end int) {
+			defer wg.Done()
+			var local secp256k1.JacobianPoint
+			for i := start; i < end; i++ {
+				point := c.hashToJacobianPoint(hashes[i])
+				if negate {
+					point.Y.Negate(1).Normalize()
+				}
+				secp256k1.AddNonConst(&local, &point, &local)
+			}
+			partials[worker] = local
+		}(worker, start, end)
+	}
+	wg.Wait()
+	for i := range partials {
+		secp256k1.AddNonConst(&sum, &partials[i], &sum)
+	}
+	return sum
+}
+
+func (c *Committer) hashToJacobianPoint(h common.Hash) secp256k1.JacobianPoint {
+	data := h
+	var compressed [33]byte
+	compressed[0] = 0x02 // even-y compressed key, matching the previous deterministic choice.
+	for {
+		copy(compressed[1:], data[:])
+		if key, err := secp256k1.ParsePubKey(compressed[:]); err == nil {
+			var point secp256k1.JacobianPoint
+			key.AsJacobian(&point)
+			return point
+		}
+		data = crypto.Keccak256Hash(data[:])
+	}
+}
+
 func (c *Committer) hashToPoint(h common.Hash) (x, y *big.Int) {
+	point := c.hashToJacobianPoint(h)
+	point.ToAffine()
+	var xBytes, yBytes [32]byte
+	point.X.PutBytes(&xBytes)
+	point.Y.PutBytes(&yBytes)
+	return new(big.Int).SetBytes(xBytes[:]), new(big.Int).SetBytes(yBytes[:])
+}
+
+// hashToPoint 使用 "Try-and-increment" 方法将哈希映射到 secp256k1 曲线上的点。
+func (c *Committer) hashToPointBigInt(h common.Hash) (x, y *big.Int) {
 	data := h[:]
 	for {
 		x = new(big.Int).SetBytes(data)
@@ -177,6 +324,15 @@ func (c *Committer) encode(x, y *big.Int) []byte {
 	return crypto.CompressPubkey(pk)
 }
 
+func (c *Committer) encodeJacobian(point *secp256k1.JacobianPoint) []byte {
+	if point.Z.IsZero() || (point.X.IsZero() && point.Y.IsZero()) {
+		return nil
+	}
+	point.ToAffine()
+	pubKey := secp256k1.NewPublicKey(&point.X, &point.Y)
+	return pubKey.SerializeCompressed()
+}
+
 // decode 将压缩格式的承诺解码为曲线上的点。
 // 如果承诺为空，则返回无穷远点（0, 0）。
 func (c *Committer) decode(commitment []byte) (x, y *big.Int, err error) {
@@ -188,4 +344,17 @@ func (c *Committer) decode(commitment []byte) (x, y *big.Int, err error) {
 		return nil, nil, errInvalidCommitment
 	}
 	return pk.X, pk.Y, nil
+}
+
+func (c *Committer) decodeJacobian(commitment []byte, point *secp256k1.JacobianPoint) error {
+	*point = secp256k1.JacobianPoint{}
+	if len(commitment) == 0 {
+		return nil
+	}
+	pubKey, err := secp256k1.ParsePubKey(commitment)
+	if err != nil {
+		return errInvalidCommitment
+	}
+	pubKey.AsJacobian(point)
+	return nil
 }

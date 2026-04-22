@@ -159,3 +159,15 @@ func BenchmarkECMHUpdate(b *testing.B) {
 		_, _ = committer.Add(c, []common.Hash{h2})
 	}
 }
+
+func TestHashToPointFastMatchesBigInt(t *testing.T) {
+	committer := New()
+	for i := 0; i < 128; i++ {
+		h := randomHash()
+		fastX, fastY := committer.hashToPoint(h)
+		refX, refY := committer.hashToPointBigInt(h)
+		if fastX.Cmp(refX) != 0 || fastY.Cmp(refY) != 0 {
+			t.Fatalf("hashToPoint mismatch at %d: fast=(%x,%x), ref=(%x,%x)", i, fastX, fastY, refX, refY)
+		}
+	}
+}

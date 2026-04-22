@@ -122,10 +122,28 @@ func appendArchiveItemHashInput(dst []byte, keyWithLen []byte, value []byte) []b
 	return dst
 }
 
+func (s *Shard) ensureBucketHash(bucket *ArchiveBucketNode) []byte {
+	if bucket == nil {
+		return nil
+	}
+	if h := bucket.Hash(); len(h) > 0 {
+		return h
+	}
+	meta, err := bucket.Serialize()
+	if err != nil {
+		return nil
+	}
+	h := append([]byte{}, s.hasher.Hash(meta)...)
+	bucket.SetHash(h)
+	return h
+}
+
 // blindAppendToBucket 实现“盲追加”：只更新元数据（过滤器、ECMH、Count），无需加载原始数据。
 func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []ArchivedKV) {
 	bucket.cacheMu.Lock()
 	defer bucket.cacheMu.Unlock()
+
+	oldHash := s.ensureBucketHash(bucket)
 
 	var keyBuf []byte
 	var hashBuf []byte
@@ -180,8 +198,6 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	}
 
 	// 5. 记录追加任务
-	oldHash := bucket.Hash()
-
 	// 清除旧哈希以重新计算元数据哈希
 	bucket.SetHash(nil)
 	meta, _ := bucket.Serialize()
@@ -214,6 +230,8 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []ArchivedKV) {
 	bucket.cacheMu.Lock()
 	defer bucket.cacheMu.Unlock()
+
+	oldHash := s.ensureBucketHash(bucket)
 
 	// 1. 增量更新布谷鸟过滤器
 	var keyBuf []byte
@@ -278,9 +296,6 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 			bucket.cachedItems = nil
 		}
 	}
-
-	// 4. 记录删除任务
-	oldHash := bucket.Hash()
 
 	// 清除旧哈希以重新计算元数据哈希
 	bucket.SetHash(nil)
@@ -402,7 +417,7 @@ func (s *Shard) verifyBucket(bucket *ArchiveBucketNode) (bool, int64) {
 	bucket.cacheMu.RUnlock()
 
 	if items == nil {
-		bucketData, err := s.getBucketData(bucket.Hash())
+		bucketData, err := s.getBucketData(s.ensureBucketHash(bucket))
 		if err != nil {
 			return false, time.Since(start).Nanoseconds()
 		}

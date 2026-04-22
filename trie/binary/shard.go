@@ -49,6 +49,11 @@ type Shard struct {
 	// Pending deletes from existing buckets. Key is the NEW bucket metadata hash.
 	pendingDeletes map[string]deleteTask
 
+	// Value writes are staged until commit so they can share the same LevelDB
+	// batch and async write pipeline as node updates.
+	pendingValues map[string][]byte
+	stagedValues  []map[string][]byte
+
 	// Node pool for reusing internal and leaf nodes
 	pool *NodePool
 }
@@ -90,6 +95,7 @@ func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte
 		pendingArchives: make(map[string][]byte),
 		pendingAppends:  make(map[string]appendTask),
 		pendingDeletes:  make(map[string]deleteTask),
+		pendingValues:   make(map[string][]byte),
 		pool:            NewNodePool(),
 	}
 	if len(rootHash) > 0 {
@@ -122,6 +128,8 @@ func (s *Shard) Reset(shardRoot []byte) {
 	}
 	s.rootHash = shardRoot
 	s.root = nil
+	s.pendingValues = make(map[string][]byte)
+	s.stagedValues = nil
 }
 
 // loadNode 根据哈希从 DB 读取并反序列化节点。
@@ -201,6 +209,52 @@ func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
 	return data, err
 }
 
+func (s *Shard) stageValue(value []byte) []byte {
+	valueHash := crypto.Keccak256Hash(value).Bytes()
+	if s.pendingValues == nil {
+		s.pendingValues = make(map[string][]byte)
+	}
+	key := string(valueHash)
+	if _, ok := s.pendingValues[key]; !ok {
+		s.pendingValues[key] = common.CopyBytes(value)
+	}
+	return valueHash
+}
+
+func (s *Shard) getValue(valueHash []byte) ([]byte, error) {
+	if len(valueHash) == 0 {
+		return nil, ErrNodeNotFound
+	}
+	key := string(valueHash)
+	if val, ok := s.pendingValues[key]; ok {
+		return val, nil
+	}
+	for i := len(s.stagedValues) - 1; i >= 0; i-- {
+		if val, ok := s.stagedValues[i][key]; ok {
+			return val, nil
+		}
+	}
+	return s.db.Get(valueHash)
+}
+
+func (s *Shard) commitPendingValues(batch Batcher) error {
+	if batch == nil || len(s.pendingValues) == 0 {
+		return nil
+	}
+	values := s.pendingValues
+	for h, value := range values {
+		if err := batch.Put([]byte(h), value); err != nil {
+			return err
+		}
+	}
+	s.stagedValues = append(s.stagedValues, values)
+	if len(s.stagedValues) > 2 {
+		s.stagedValues = append([]map[string][]byte(nil), s.stagedValues[len(s.stagedValues)-2:]...)
+	}
+	s.pendingValues = make(map[string][]byte)
+	return nil
+}
+
 func (s *Shard) Get(key []byte) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -241,7 +295,7 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 		matchLen := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
 		if matchLen == n.PathBits && depth+matchLen == len(key)*8 {
 			atomic.AddInt64(&common.BinaryHitCount, 1)
-			val, err := s.db.Get(n.ValueHash)
+			val, err := s.getValue(n.ValueHash)
 			return val, false, err
 		}
 		return nil, false, ErrNodeNotFound
@@ -382,7 +436,7 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]b
 	if items == nil {
 		bucket.cacheMu.Lock()
 		if bucket.cachedItems == nil {
-			bucketData, err := s.getBucketData(bucket.Hash())
+			bucketData, err := s.getBucketData(s.ensureBucketHash(bucket))
 			if err == nil {
 				itms, _ := s.deserializeArchivedKV(bucketData)
 				if s.shouldCacheArchivedItems(len(itms)) {
@@ -405,7 +459,7 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]b
 				match := s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits)
 				if match {
 					atomic.AddInt64(&common.BinaryMissExistentCount, 1)
-					val, err := s.db.Get(item.Value)
+					val, err := s.getValue(item.Value)
 					return val, true, err
 				}
 			}
@@ -431,10 +485,7 @@ func (s *Shard) Put(key []byte, value []byte) error {
 			return err
 		}
 	}
-	valHash := crypto.Keccak256Hash(value).Bytes()
-	if err := s.db.Put(valHash, value); err != nil {
-		return err
-	}
+	valHash := s.stageValue(value)
 
 	// Shard start depth
 	newRoot, err := s.insert(s.root, key, s.config.ShardDepth, valHash)
@@ -465,8 +516,7 @@ func (s *Shard) Activate(key []byte, value []byte) error {
 	}
 
 	// 2. 执行常规插入
-	valHash := crypto.Keccak256Hash(value).Bytes()
-	s.db.Put(valHash, value)
+	valHash := s.stageValue(value)
 
 	var err error
 	s.root, err = s.insert(s.root, key, s.config.ShardDepth, valHash)
@@ -490,7 +540,7 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 				bucket.cacheMu.RUnlock()
 
 				if items == nil {
-					bucketData, err := s.getBucketData(bucket.Hash())
+					bucketData, err := s.getBucketData(s.ensureBucketHash(bucket))
 					if err != nil {
 						continue
 					}
@@ -506,7 +556,7 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 
 						if bucket.Count == 0 {
 							if s.config.ArchiveDB != nil {
-								s.config.ArchiveDB.DeleteBucket(archiveDataKey(bucket.Hash()))
+								s.config.ArchiveDB.DeleteBucket(archiveDataKey(s.ensureBucketHash(bucket)))
 							}
 							n.StubList = append(n.StubList[:i], n.StubList[i+1:]...)
 						}
@@ -938,6 +988,9 @@ func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.root == nil {
+		if err := s.commitPendingValues(batch); err != nil {
+			return nil, err
+		}
 		return s.rootHash, nil
 	}
 
@@ -955,6 +1008,10 @@ func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 			}
 		}
 		s.staleSet = make(map[string]struct{})
+	}
+
+	if err := s.commitPendingValues(batch); err != nil {
+		return nil, err
 	}
 
 	if destructive {
@@ -979,7 +1036,7 @@ func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value [
 	switch n := node.(type) {
 	case *LeafNode:
 		fullKey, _ := s.prependPath(n.Path, n.PathBits, prefix, bits)
-		val, _ := s.db.Get(n.ValueHash)
+		val, _ := s.getValue(n.ValueHash)
 		return fn(fullKey, val)
 	case *InternalNode:
 		newPrefix := prefix
@@ -1018,7 +1075,7 @@ func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value [
 		}
 		// Iterate over archived buckets
 		for _, bucket := range n.StubList {
-			data, err := s.getBucketData(bucket.Hash())
+			data, err := s.getBucketData(s.ensureBucketHash(bucket))
 			if err == nil {
 				kvs, _ := s.deserializeArchivedKV(data)
 				for _, kv := range kvs {

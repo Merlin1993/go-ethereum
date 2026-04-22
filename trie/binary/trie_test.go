@@ -153,7 +153,7 @@ func TestTrieStressBinary(t *testing.T) {
 	header := []string{
 		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Avg_LoopWall_ms", "Prune_ms", "Commit_ms", "Flush_ms", "Write_ms", "Raw_Flush_ms", "Raw_Write_ms", "Max_Root_ms",
 		"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
-		"State_MB", "Archive_MB", "RSS_MB", "Heap_MB",
+		"State_MB", "Archive_MB", "Leaf_Count", "Archive_Items", "Bucket_Count", "RSS_MB", "Heap_MB",
 	}
 	writer.Write(header)
 
@@ -352,12 +352,12 @@ func TestTrieStressBinary(t *testing.T) {
 		proc.MemoryInfo() // 刷新
 		memInfo, _ := proc.MemoryInfo()
 		runtime.ReadMemStats(&mem)
+		stats := trie.Stats()
 
 		// 归档增长强校验 (Panic Check)
 		// 只有在完成两个完整裁剪周期后，归档数据才应该有规模性增长。
 		cycleItems := (1 << config.ShardDepth) * BatchSize
 		if totalInjected > 2*cycleItems {
-			stats := trie.Stats()
 			// 在 50% 的更新率下，理论归档期望约为 0.5 * cycleItems。
 			// 这里设定 10% 为硬性红线，若低于此值则判定归档逻辑失效。
 			minExpected := int64(float64(cycleItems) * 0.1)
@@ -397,16 +397,27 @@ func TestTrieStressBinary(t *testing.T) {
 			fmt.Sprintf("%.2f", q3),
 			fmt.Sprintf("%d", stateSize/(1024*1024)),
 			fmt.Sprintf("%d", archiveSize/(1024*1024)),
+			fmt.Sprintf("%d", stats.LeafCount),
+			fmt.Sprintf("%d", stats.ArchivedDataSize),
+			fmt.Sprintf("%d", stats.BucketCount),
 			fmt.Sprintf("%d", memInfo.RSS/(1024*1024)),
 			fmt.Sprintf("%d", mem.HeapAlloc/(1024*1024)),
 		}
 		writer.Write(record)
 		writer.Flush()
 
-		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Injected: %.2fM, Pool: %d, Avg: %.2fms, Wall: %.2fms (Prune: %.2fms, Commit: %.2fms, FlushWait: %.2fms, WriteWait: %.2fms, RawFlush: %.2fms, RawWrite: %.2fms), P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
+		fmt.Printf("TrieStats: LeafCount=%d, ArchiveItems=%d, BucketCount=%d\n",
+			stats.LeafCount,
+			stats.ArchivedDataSize,
+			stats.BucketCount,
+		)
+		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Leaves: %d, ArchiveItems: %d, Buckets: %d, Injected: %.2fM, Pool: %d, Avg: %.2fms, Wall: %.2fms (Prune: %.2fms, Commit: %.2fms, FlushWait: %.2fms, WriteWait: %.2fms, RawFlush: %.2fms, RawWrite: %.2fms), P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
 			startItem, endItem,
 			bytesToReadable(uint64(stateSize)),
 			bytesToReadable(uint64(archiveSize)),
+			stats.LeafCount,
+			stats.ArchivedDataSize,
+			stats.BucketCount,
 			float64(totalInjected)/1000000.0,
 			len(keyPool),
 			avgCalc, avgWall, avgPrune, avgCommit, avgFlush, avgWrite, avgRawFlush, avgRawWrite,

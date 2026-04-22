@@ -55,6 +55,7 @@ func (c *Config) ResolveArchiveBucketSize() int {
 // TrieStats holds statistics about the Trie.
 type TrieStats struct {
 	BucketCount      int   // Total number of archive buckets
+	LeafCount        int64 // Total number of reachable leaf nodes
 	ArchivedDataSize int64 // Total number of archived KV pairs
 	MaxBucketsPath   int   // Max number of buckets on a single path
 
@@ -141,12 +142,12 @@ func (s *Shard) nodeStats(node Node, currentPathBuckets int, stats *TrieStats) {
 			}
 		}
 	case *LeafNode:
-		// Leaf nodes don't have buckets in this implementation
+		stats.LeafCount++
 	case *ArchiveBucketNode:
 		stats.BucketCount++
 		stats.ArchivedDataSize += int64(n.Count)
 		// [NEW] 统计归档数据的字节大小
-		if data, err := s.getBucketData(n.Hash()); err == nil {
+		if data, err := s.getBucketData(s.ensureBucketHash(n)); err == nil {
 			stats.ArchiveStorageSize += int64(len(data))
 		}
 		if currentPathBuckets+1 > stats.MaxBucketsPath {

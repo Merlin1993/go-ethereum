@@ -2,6 +2,14 @@
 
 本文档总结了 `trie/binary` 包中归档（Archival）的核心实现逻辑，旨在为测试用例排查和系统调试提供参考。
 
+## 0. 近期性能优化说明（2026-04-22）
+
+*   **ECMH 映射快路径**：`hashToPoint` 保持原始 try-and-increment 语义，但通过 Decred secp256k1 压缩公钥解析（`0x02 || x`）验证候选点；旧 big.Int 映射保留为测试参考。
+*   **ECMH 批量累加**：大批量 `Add/Delete` 使用 worker-local Jacobian partial sum 后再合并，避免重复 affine 转换；空 commitment 下 1~3 个 hash 的新归档桶走直接 Jacobian 编码路径。
+*   **Value 写入批处理**：`Shard.Put/Activate` 先把 value blob 暂存在内存，`Shard.CommitToBatch` 再与节点元数据写入同一个 batch，使压力测试里的异步 batch write 可以被下一轮 prune/commit 覆盖。读路径会先查 pending/staged value，再查 LevelDB，保证异步窗口内的 read-your-write。
+*   **归档桶 hash 懒恢复**：反序列化后的 `ArchiveBucketNode` 不持久化内存态 `hash` 字段，读取归档数据前会根据桶元数据懒重建 hash，确保 reload 后仍可使用 `BucketHash + 0x01` 定位 archive data。
+*   **Prune 优化边界**：归档后立即断开热子树指针不是安全的局部优化，必须配合 StubList 可达性和路径压缩规则整体重构；否则部分侧挂桶可能在 shrink 后不可达。本轮保持正确性优先，不启用该优化。
+
 ## 1. 核心架构与术语
 
 ### 分片 (Sharding)

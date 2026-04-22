@@ -67,7 +67,7 @@ func (t *Trie) CommitShardToBatch(id int, batch Batcher, destructive bool) ([]by
 	if err != nil {
 		return nil, err
 	}
-	return shard.commit(shard.root, batch, nil, destructive)
+	return shard.CommitToBatch(batch, destructive)
 }
 
 func (t *Trie) GetShardID(key []byte) int {
