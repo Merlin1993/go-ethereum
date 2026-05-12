@@ -1,5 +1,7 @@
 package binary
 
+import "sort"
+
 // MaxPathBits is the maximum number of bits a key path can have in the binary trie.
 // Storage keys use compositeKey = address(20 bytes) + slot(32 bytes) = 52 bytes = 416 bits.
 // This must be the ceiling for all path-related overflow checks.
@@ -20,7 +22,6 @@ type Config struct {
 	ArchiveDB             ArchiveStore // Separate store for archive data
 	CuckooBuckets         int          // Number of buckets in cuckoo filter (default 32)
 	CuckooSlots           int          // Slots per bucket in cuckoo filter (default 4)
-	ShardCacheLimit       int          // [NEW] Maximum number of shards to keep in memory
 }
 
 // DefaultConfig returns a Config with default values.
@@ -31,7 +32,6 @@ func DefaultConfig() *Config {
 		ArchiveItemCacheLimit: -1,
 		CuckooBuckets:         32,
 		CuckooSlots:           4,
-		ShardCacheLimit:       1024, // [NEW] Default 1024 shards
 	}
 }
 
@@ -54,22 +54,29 @@ func (c *Config) ResolveArchiveBucketSize() int {
 
 // TrieStats holds statistics about the Trie.
 type TrieStats struct {
-	BucketCount      int   // Total number of archive buckets
-	LeafCount        int64 // Total number of reachable leaf nodes
-	ArchivedDataSize int64 // Total number of archived KV pairs
-	MaxBucketsPath   int   // Max number of buckets on a single path
+	BucketCount      int     // Total number of archive buckets
+	LeafCount        int64   // Total number of reachable leaf nodes
+	ArchivedDataSize int64   // Total number of archived KV pairs
+	MaxBucketsPath   int     // Max number of buckets on a single path
+	BucketItemsAvg   float64 // Average number of archived KV pairs per bucket
+	BucketItemsP50   int     // P50 archived KV pairs per bucket
+	BucketItemsP95   int     // P95 archived KV pairs per bucket
+	BucketItemsP99   int     // P99 archived KV pairs per bucket
+	BucketItemsMax   int     // Max archived KV pairs in a bucket
+
+	bucketItemHist map[int]int
 
 	ArchiveReadCount   int64 // Number of times archive store was accessed
 	FalsePositiveCount int64 // Number of false positives from Cuckoo Filter
 	TotalProofSize     int64 // Total size of generated proofs
 	ExistProofCount    int64 // Count of existence proofs
 	NonExistProofCount int64 // Count of non-existence proofs
-	ArchiveStorageSize int64 // [NEW] Total size of archived data in bytes
+	ArchiveStorageSize int64 // Total size of archived data persisted in archive storage
 }
 
 // Stats returns the statistics for the entire Trie.
 func (t *Trie) Stats() *TrieStats {
-	stats := &TrieStats{}
+	stats := &TrieStats{bucketItemHist: make(map[int]int)}
 	numShards := 1 << t.config.ShardDepth
 	for i := 0; i < numShards; i++ {
 		shard, err := t.getOrCreateShard(i)
@@ -77,7 +84,64 @@ func (t *Trie) Stats() *TrieStats {
 			shard.accumulateStats(stats)
 		}
 	}
+	stats.finalizeBucketItemStats()
 	return stats
+}
+
+func (s *TrieStats) addBucketItemCount(count uint64) {
+	if count > uint64(^uint(0)>>1) {
+		count = uint64(^uint(0) >> 1)
+	}
+	c := int(count)
+	s.bucketItemHist[c]++
+	if c > s.BucketItemsMax {
+		s.BucketItemsMax = c
+	}
+}
+
+func (s *TrieStats) finalizeBucketItemStats() {
+	if s.BucketCount == 0 {
+		return
+	}
+	s.BucketItemsAvg = float64(s.ArchivedDataSize) / float64(s.BucketCount)
+	if len(s.bucketItemHist) == 0 {
+		return
+	}
+
+	keys := make([]int, 0, len(s.bucketItemHist))
+	for count := range s.bucketItemHist {
+		keys = append(keys, count)
+	}
+	sort.Ints(keys)
+
+	p50Rank := percentileRank(s.BucketCount, 0.50)
+	p95Rank := percentileRank(s.BucketCount, 0.95)
+	p99Rank := percentileRank(s.BucketCount, 0.99)
+	seen := 0
+	for _, count := range keys {
+		seen += s.bucketItemHist[count]
+		if s.BucketItemsP50 == 0 && seen >= p50Rank {
+			s.BucketItemsP50 = count
+		}
+		if s.BucketItemsP95 == 0 && seen >= p95Rank {
+			s.BucketItemsP95 = count
+		}
+		if s.BucketItemsP99 == 0 && seen >= p99Rank {
+			s.BucketItemsP99 = count
+			break
+		}
+	}
+}
+
+func percentileRank(total int, p float64) int {
+	rank := int(float64(total) * p)
+	if rank < 1 {
+		return 1
+	}
+	if rank > total {
+		return total
+	}
+	return rank
 }
 
 func (s *Shard) accumulateStats(stats *TrieStats) {
@@ -94,6 +158,12 @@ func (s *Shard) accumulateStats(stats *TrieStats) {
 	}
 	root := s.root
 	s.mu.RUnlock()
+
+	s.statsMut.Lock()
+	stats.ArchiveReadCount += s.stats.ArchiveReadCount
+	stats.FalsePositiveCount += s.stats.FalsePositiveCount
+	stats.ArchiveStorageSize += s.stats.ArchiveStorageSize
+	s.statsMut.Unlock()
 
 	if root == nil {
 		return
@@ -113,6 +183,7 @@ func (s *Shard) nodeStats(node Node, currentPathBuckets int, stats *TrieStats) {
 		stats.BucketCount += numBuckets
 		for _, bucket := range n.StubList {
 			stats.ArchivedDataSize += int64(bucket.Count)
+			stats.addBucketItemCount(bucket.Count)
 		}
 
 		newPathBuckets := currentPathBuckets + numBuckets
@@ -146,10 +217,7 @@ func (s *Shard) nodeStats(node Node, currentPathBuckets int, stats *TrieStats) {
 	case *ArchiveBucketNode:
 		stats.BucketCount++
 		stats.ArchivedDataSize += int64(n.Count)
-		// [NEW] 统计归档数据的字节大小
-		if data, err := s.getBucketData(s.ensureBucketHash(n)); err == nil {
-			stats.ArchiveStorageSize += int64(len(data))
-		}
+		stats.addBucketItemCount(n.Count)
 		if currentPathBuckets+1 > stats.MaxBucketsPath {
 			stats.MaxBucketsPath = currentPathBuckets + 1
 		}

@@ -150,46 +150,57 @@ func (n *InternalNode) SetOriginalHash(h []byte) {
 }
 
 func (n *InternalNode) Serialize() ([]byte, error) {
-	var buf bytes.Buffer
-
-	// InternalNode Type=0, so just Epoch & 0x7F
-	buf.WriteByte(n.epoch & 0x7F)
-
-	// PathBits: Uvarint
 	var scratch [binary.MaxVarintLen64]byte
-	nBits := binary.PutUvarint(scratch[:], uint64(n.PathBits))
-	buf.Write(scratch[:nBits])
-
-	// Path: Raw bytes
-	buf.Write(n.Path)
-
-	// Children hashes & epochs
-	buf.WriteByte(byte(len(n.LeftHash)))
-	buf.Write(n.LeftHash)
-	buf.WriteByte(n.LeftEpoch)
-
-	buf.WriteByte(byte(len(n.RightHash)))
-	buf.Write(n.RightHash)
-	buf.WriteByte(n.RightEpoch)
-
-	// [NEW] StubList 序列化
-	// 写入桶的数量
-	nBits = binary.PutUvarint(scratch[:], uint64(len(n.StubList)))
-	buf.Write(scratch[:nBits])
-
-	// 依次写入每个桶的数据（桶内包含了路径和 ArchivedData）
-	for _, bucket := range n.StubList {
+	stubData := make([][]byte, len(n.StubList))
+	stubBytes := 0
+	for i, bucket := range n.StubList {
 		bData, err := bucket.Serialize()
 		if err != nil {
 			return nil, err
 		}
-		// 写入桶数据的长度
-		nBits = binary.PutUvarint(scratch[:], uint64(len(bData)))
-		buf.Write(scratch[:nBits])
-		buf.Write(bData)
+		stubData[i] = bData
+		stubBytes += uvarintLen(uint64(len(bData))) + len(bData)
 	}
 
-	return buf.Bytes(), nil
+	size := 1 + uvarintLen(uint64(n.PathBits)) + len(n.Path) +
+		1 + len(n.LeftHash) + 1 +
+		1 + len(n.RightHash) + 1 +
+		uvarintLen(uint64(len(n.StubList))) + stubBytes
+	buf := make([]byte, 0, size)
+
+	// InternalNode Type=0, so just Epoch & 0x7F
+	buf = append(buf, n.epoch&0x7F)
+
+	// PathBits: Uvarint
+	nBits := binary.PutUvarint(scratch[:], uint64(n.PathBits))
+	buf = append(buf, scratch[:nBits]...)
+
+	// Path: Raw bytes
+	buf = append(buf, n.Path...)
+
+	// Children hashes & epochs
+	buf = append(buf, byte(len(n.LeftHash)))
+	buf = append(buf, n.LeftHash...)
+	buf = append(buf, n.LeftEpoch)
+
+	buf = append(buf, byte(len(n.RightHash)))
+	buf = append(buf, n.RightHash...)
+	buf = append(buf, n.RightEpoch)
+
+	// [NEW] StubList 序列化
+	// 写入桶的数量
+	nBits = binary.PutUvarint(scratch[:], uint64(len(n.StubList)))
+	buf = append(buf, scratch[:nBits]...)
+
+	// 依次写入每个桶的数据（桶内包含了路径和 ArchivedData）
+	for _, bData := range stubData {
+		// 写入桶数据的长度
+		nBits = binary.PutUvarint(scratch[:], uint64(len(bData)))
+		buf = append(buf, scratch[:nBits]...)
+		buf = append(buf, bData...)
+	}
+
+	return buf, nil
 }
 
 // ClearCaches 清除侧挂桶的缓存。
@@ -319,7 +330,7 @@ func (n *LeafNode) Serialize() ([]byte, error) {
 // ArchiveBucketNode 归档桶节点，聚合存储历史数据。
 // 它不再参与 Epoch 演进，是 Trie 的“冷”数据固化结果。
 type ArchiveBucketNode struct {
-	Path     []byte // 桶相对于挂载节点的相对路径
+	Path     []byte // 桶的绝对入口路径；桶上浮时保持不变，不向下迁移
 	PathBits int    // 路径位数
 
 	Filter     []byte // 布谷鸟过滤器序列化数据
@@ -335,7 +346,9 @@ type ArchiveBucketNode struct {
 	// 这些字段不序列化到磁盘。
 	cachedFilter *cuckoo.Filter
 	cachedItems  []ArchivedKV
+	cachedMeta   []byte
 	cacheMu      sync.RWMutex
+	metaMu       sync.RWMutex
 }
 
 func NewArchiveBucketNode(path []byte, bits int, filter []byte, commitment []byte, count uint64) *ArchiveBucketNode {
@@ -377,6 +390,12 @@ func (n *ArchiveBucketNode) SetDirty(d bool) {
 	n.dirty = d
 }
 
+func (n *ArchiveBucketNode) invalidateMetaCache() {
+	n.metaMu.Lock()
+	n.cachedMeta = nil
+	n.metaMu.Unlock()
+}
+
 func (n *ArchiveBucketNode) OriginalHash() []byte {
 	return n.originalHash
 }
@@ -386,42 +405,52 @@ func (n *ArchiveBucketNode) SetOriginalHash(h []byte) {
 }
 
 func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
-	var buf bytes.Buffer
+	n.metaMu.RLock()
+	if n.cachedMeta != nil {
+		data := append([]byte(nil), n.cachedMeta...)
+		n.metaMu.RUnlock()
+		return data, nil
+	}
+	n.metaMu.RUnlock()
 
-	// Header: bit7=1, bit6=1: ArchiveBucket
-	header := byte(0xC0)
-	buf.WriteByte(header)
+	var scratch [binary.MaxVarintLen64]byte
+	pathBitsLen := uvarintLen(uint64(n.PathBits))
+	countLen := uvarintLen(n.Count)
+	filterLen := uvarintLen(uint64(len(n.Filter)))
+	size := 1 + pathBitsLen + len(n.Path) + countLen + 1 + len(n.Commitment) + filterLen + len(n.Filter)
+	buf := make([]byte, 0, size)
 
-	// PathBits
-	scratch := make([]byte, binary.MaxVarintLen64)
-	nBits := binary.PutUvarint(scratch, uint64(n.PathBits))
-	buf.Write(scratch[:nBits])
+	buf = append(buf, 0xC0)
 
-	// Path
-	buf.Write(n.Path)
+	nBits := binary.PutUvarint(scratch[:], uint64(n.PathBits))
+	buf = append(buf, scratch[:nBits]...)
 
-	// Count
-	nBits = binary.PutUvarint(scratch, n.Count)
-	buf.Write(scratch[:nBits])
+	buf = append(buf, n.Path...)
 
-	// Commitment Length + Commitment
-	buf.WriteByte(byte(len(n.Commitment)))
-	buf.Write(n.Commitment)
+	nBits = binary.PutUvarint(scratch[:], n.Count)
+	buf = append(buf, scratch[:nBits]...)
 
-	// Filter Length + Filter
-	nBits = binary.PutUvarint(scratch, uint64(len(n.Filter)))
-	buf.Write(scratch[:nBits])
-	buf.Write(n.Filter)
+	buf = append(buf, byte(len(n.Commitment)))
+	buf = append(buf, n.Commitment...)
 
-	return buf.Bytes(), nil
+	nBits = binary.PutUvarint(scratch[:], uint64(len(n.Filter)))
+	buf = append(buf, scratch[:nBits]...)
+	buf = append(buf, n.Filter...)
+
+	n.metaMu.Lock()
+	n.cachedMeta = append(n.cachedMeta[:0], buf...)
+	n.metaMu.Unlock()
+
+	return buf, nil
 }
 
 // ClearCaches 清除桶内部缓存的过滤器和数据项。
 func (n *ArchiveBucketNode) ClearCaches() {
 	n.cacheMu.Lock()
-	defer n.cacheMu.Unlock()
 	n.cachedFilter = nil
 	n.cachedItems = nil
+	n.cacheMu.Unlock()
+	n.invalidateMetaCache()
 }
 
 // DeserializeNode 将字节序列解码为节点实例。

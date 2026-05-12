@@ -144,6 +144,9 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	defer bucket.cacheMu.Unlock()
 
 	oldHash := s.ensureBucketHash(bucket)
+	if s.pruning && len(oldHash) > 0 {
+		s.staleSet[string(oldHash)] = struct{}{}
+	}
 
 	var keyBuf []byte
 	var hashBuf []byte
@@ -200,6 +203,8 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	// 5. 记录追加任务
 	// 清除旧哈希以重新计算元数据哈希
 	bucket.SetHash(nil)
+	bucket.SetDirty(true)
+	bucket.invalidateMetaCache()
 	meta, _ := bucket.Serialize()
 	newHash := append([]byte{}, s.hasher.Hash(meta)...)
 	bucket.SetHash(newHash)
@@ -232,6 +237,9 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 	defer bucket.cacheMu.Unlock()
 
 	oldHash := s.ensureBucketHash(bucket)
+	if s.pruning && len(oldHash) > 0 {
+		s.staleSet[string(oldHash)] = struct{}{}
+	}
 
 	// 1. 增量更新布谷鸟过滤器
 	var keyBuf []byte
@@ -299,6 +307,8 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 
 	// 清除旧哈希以重新计算元数据哈希
 	bucket.SetHash(nil)
+	bucket.SetDirty(true)
+	bucket.invalidateMetaCache()
 	meta, _ := bucket.Serialize()
 	newHash := append([]byte{}, s.hasher.Hash(meta)...)
 	bucket.SetHash(newHash)
@@ -398,6 +408,7 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	// 提前计算桶在 Commit 后的哈希，用于 pendingArchives 索引
 	// 注意：哈希前必须清除老的 hash 字段，确保哈希只针对元数据内容
 	bucket.SetHash(nil)
+	bucket.invalidateMetaCache()
 	meta, _ := bucket.Serialize()
 	h := append([]byte{}, s.hasher.Hash(meta)...)
 	bucket.SetHash(h)

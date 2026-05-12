@@ -9,7 +9,7 @@ var (
 	UseCacheTrie     = true
 	VerkleLayerCount = 1
 	DebugFlag        = false
-	Parallelism      = 5
+	Parallelism      = 12
 	ReadSet          = true
 
 	// CacheTrie statistics

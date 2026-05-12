@@ -25,16 +25,20 @@ func (s *Shard) Prune(global byte) error {
 	prefix, prefixBits := s.getShardPrefix()
 
 	// 2. 递归剪枝并收集 MaxPathBits 范围内的绝对全路径项
-	newRoot, items, err := s.pruneAndArchive(s.root, prefix, prefixBits, global)
+	newRoot, items, promotedStubs, err := s.pruneAndArchive(s.root, prefix, prefixBits, global)
 	if err != nil {
 		return err
 	}
 
 	// 3. 处理结果合并到分片根节点
+	promotedAttached := false
 	if newRoot == nil {
 		if len(items) > 0 {
 			// 全量归档：构建归档子树并更新 root
 			s.root = s.buildArchiveSubtree(items, prefix, prefixBits)
+		} else if len(promotedStubs) > 0 {
+			s.root = s.newStubContainer(promotedStubs)
+			promotedAttached = true
 		} else {
 			s.root = nil
 		}
@@ -47,6 +51,9 @@ func (s *Shard) Prune(global byte) error {
 				s.collectAndAttachToStubList(in, items, prefix, prefixBits)
 			}
 		}
+	}
+	if len(promotedStubs) > 0 && !promotedAttached && s.root != nil {
+		s.root = s.attachPromotedStubsToRoot(s.root, promotedStubs)
 	}
 	return nil
 }
@@ -65,10 +72,85 @@ func (s *Shard) getShardPrefix() ([]byte, int) {
 	return res, depth
 }
 
+func (s *Shard) newStubContainer(stubs []*ArchiveBucketNode) Node {
+	n := s.pool.GetInternal()
+	s.attachStubs(n, stubs)
+	return n
+}
+
+func (s *Shard) attachPromotedStubsToRoot(root Node, stubs []*ArchiveBucketNode) Node {
+	if len(stubs) == 0 {
+		return root
+	}
+	if root == nil {
+		return s.newStubContainer(stubs)
+	}
+	if in, ok := root.(*InternalNode); ok {
+		if s.pruning && len(in.OriginalHash()) > 0 {
+			s.staleSet[string(in.OriginalHash())] = struct{}{}
+		}
+		s.attachStubs(in, stubs)
+		in.SetDirty(true)
+		return in
+	}
+
+	container := s.newStubContainer(stubs).(*InternalNode)
+	if bucket, ok := root.(*ArchiveBucketNode); ok {
+		s.attachStubs(container, []*ArchiveBucketNode{bucket})
+		return container
+	}
+	bit, ok := s.detachLeadingPathBit(root)
+	if !ok {
+		// Root is the only place without a parent to receive promoted buckets.
+		// Keep a minimal container rather than dropping either side.
+		container.Left = root
+		s.refreshInternalEpochMask(container)
+		return container
+	}
+	if bit == 0 {
+		container.Left = root
+	} else {
+		container.Right = root
+	}
+	s.refreshInternalEpochMask(container)
+	return container
+}
+
+func (s *Shard) detachLeadingPathBit(node Node) (byte, bool) {
+	switch n := node.(type) {
+	case *InternalNode:
+		if n.PathBits <= 0 {
+			return 0, false
+		}
+		bit := s.getBitFromBytes(n.Path, 0)
+		n.Path = s.shiftBits(n.Path, n.PathBits, 1, nil)
+		n.PathBits--
+		n.SetDirty(true)
+		if s.pruning && len(n.OriginalHash()) > 0 {
+			s.staleSet[string(n.OriginalHash())] = struct{}{}
+		}
+		return bit, true
+	case *LeafNode:
+		if n.PathBits <= 0 {
+			return 0, false
+		}
+		bit := s.getBitFromBytes(n.Path, 0)
+		n.Path = s.shiftBits(n.Path, n.PathBits, 1, nil)
+		n.PathBits--
+		n.SetDirty(true)
+		if s.pruning && len(n.OriginalHash()) > 0 {
+			s.staleSet[string(n.OriginalHash())] = struct{}{}
+		}
+		return bit, true
+	default:
+		return 0, false
+	}
+}
+
 // pruneAndArchive 递归处理节点，items 返回值始终是 MaxPathBits 范围内的绝对路径。
-func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global byte) (Node, []ArchivedKV, error) {
+func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global byte) (Node, []ArchivedKV, []*ArchiveBucketNode, error) {
 	if node == nil {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	switch n := node.(type) {
@@ -81,9 +163,9 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 				SuffixBits: absB,
 				Value:      n.ValueHash,
 			}
-			return nil, []ArchivedKV{item}, nil
+			return nil, []ArchivedKV{item}, nil, nil
 		}
-		return n, nil, nil
+		return n, nil, nil, nil
 
 	case *InternalNode:
 		var err error
@@ -95,17 +177,17 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		if mask, ok := s.subtreeEpochMask(n); ok {
 			hotMask := leafEpochMask(global)
 			if mask&^hotMask == 0 {
-				return n, nil, nil
+				return n, nil, nil, nil
 			}
 			if len(n.StubList) == 0 && mask&hotMask == 0 {
 				items, err := s.collectLeavesRecursive(n, prefix, prefixBits)
 				if err != nil {
-					return nil, nil, err
+					return nil, nil, nil, err
 				}
 				if s.pruning && len(n.OriginalHash()) > 0 {
 					s.staleSet[string(n.OriginalHash())] = struct{}{}
 				}
-				return nil, items, nil
+				return nil, items, nil, nil
 			}
 		}
 
@@ -122,20 +204,25 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		if n.Left == nil && len(n.LeftHash) > 0 {
 			n.Left, err = s.loadNode(n.LeftHash)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 		lp, lb := s.appendBit(currentP, currentB, 0)
-		newLeft, leftItems, err := s.pruneAndArchive(n.Left, lp, lb, global)
+		newLeft, leftItems, leftStubs, err := s.pruneAndArchive(n.Left, lp, lb, global)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
+		}
+		if len(leftStubs) > 0 {
+			s.attachStubs(n, leftStubs)
 		}
 
-		if newLeft == nil && len(leftItems) > 0 {
-			// items are already absolute paths; pass lp/lb as the absolute bucket entry path
-			s.collectAndAttachToStubList(n, leftItems, lp, lb)
+		if newLeft == nil {
 			n.Left, n.LeftHash = nil, nil
 			n.LeftEpoch = 0
+			if len(leftItems) > 0 {
+				// items are already absolute paths; pass lp/lb as the absolute bucket entry path
+				s.collectAndAttachToStubList(n, leftItems, lp, lb)
+			}
 		} else {
 			n.Left = newLeft
 			allItems = append(allItems, leftItems...)
@@ -145,19 +232,24 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		if n.Right == nil && len(n.RightHash) > 0 {
 			n.Right, err = s.loadNode(n.RightHash)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 		rp, rb := s.appendBit(currentP, currentB, 1)
-		newRight, rightItems, err := s.pruneAndArchive(n.Right, rp, rb, global)
+		newRight, rightItems, rightStubs, err := s.pruneAndArchive(n.Right, rp, rb, global)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
+		}
+		if len(rightStubs) > 0 {
+			s.attachStubs(n, rightStubs)
 		}
 
-		if newRight == nil && len(rightItems) > 0 {
-			s.collectAndAttachToStubList(n, rightItems, rp, rb)
+		if newRight == nil {
 			n.Right, n.RightHash = nil, nil
 			n.RightEpoch = 0
+			if len(rightItems) > 0 {
+				s.collectAndAttachToStubList(n, rightItems, rp, rb)
+			}
 		} else {
 			n.Right = newRight
 			allItems = append(allItems, rightItems...)
@@ -170,15 +262,15 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 			n.SetDirty(true)
 		}
 
-		resNode := s.shrink(n)
-		return resNode, allItems, nil
+		resNode, promoted := s.shrinkPromote(n)
+		return resNode, allItems, promoted, nil
 
 	case *ArchiveBucketNode:
 		// 已归档桶保持原样
-		return n, nil, nil
+		return n, nil, nil, nil
 
 	default:
-		return node, nil, nil
+		return node, nil, nil, nil
 	}
 }
 
@@ -271,7 +363,8 @@ func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) N
 	}
 
 	// 达到桶大小限制，或者达到 MaxPathBits 极限，停止分裂。
-	if len(items) <= s.config.ArchiveBucketSize || s.config.ArchiveBucketSize <= 0 || bits >= MaxPathBits {
+	bucketSize := s.config.ResolveArchiveBucketSize()
+	if len(items) <= bucketSize || bucketSize <= 0 || bits >= MaxPathBits {
 		// 重要：存入桶之前，剥离物理前缀路径，确保桶内仅存储相对 Suffix。
 		localItems := make([]ArchivedKV, len(items))
 		for i := range items {
@@ -340,7 +433,7 @@ func (s *Shard) collectAndAttachToStubList(parent *InternalNode, items []Archive
 
 	archNode := s.buildArchiveSubtree(items, absPath, absBits)
 	if bucket, ok := archNode.(*ArchiveBucketNode); ok {
-		parent.StubList = append(parent.StubList, bucket)
+		s.attachStubs(parent, []*ArchiveBucketNode{bucket})
 	} else if in, ok := archNode.(*InternalNode); ok {
 		s.flattenToStubList(parent, in)
 	}
@@ -362,7 +455,7 @@ func (s *Shard) flattenRecursive(parent *InternalNode, node Node) {
 	}
 	switch n := node.(type) {
 	case *ArchiveBucketNode:
-		parent.StubList = append(parent.StubList, n)
+		s.attachStubs(parent, []*ArchiveBucketNode{n})
 	case *InternalNode:
 		if n.Left != nil {
 			s.flattenRecursive(parent, n.Left)
@@ -379,8 +472,7 @@ func (s *Shard) mergeArchiveSubtree(hot *InternalNode, cold Node) {
 	}
 	switch c := cold.(type) {
 	case *ArchiveBucketNode:
-		hot.StubList = append(hot.StubList, c)
-		hot.SetDirty(true)
+		s.attachStubs(hot, []*ArchiveBucketNode{c})
 	case *InternalNode:
 		// 展平所有归档桶
 		s.flattenToStubList(hot, c)
@@ -391,5 +483,5 @@ func (s *Shard) mergeArchiveSubtree(hot *InternalNode, cold Node) {
 func (s *Shard) mountBucket(node *InternalNode, items []ArchivedKV) {
 	bucket := &ArchiveBucketNode{}
 	s.recomputeBucket(bucket, items)
-	node.StubList = append(node.StubList, bucket)
+	s.attachStubs(node, []*ArchiveBucketNode{bucket})
 }

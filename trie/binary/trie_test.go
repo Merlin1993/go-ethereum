@@ -153,7 +153,7 @@ func TestTrieStressBinary(t *testing.T) {
 	header := []string{
 		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Avg_LoopWall_ms", "Prune_ms", "Commit_ms", "Flush_ms", "Write_ms", "Raw_Flush_ms", "Raw_Write_ms", "Max_Root_ms",
 		"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
-		"State_MB", "Archive_MB", "Leaf_Count", "Archive_Items", "Bucket_Count", "RSS_MB", "Heap_MB",
+		"State_MB", "Archive_MB", "Leaf_Count", "Archive_Items", "Bucket_Count", "Max_Buckets_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max", "RSS_MB", "Heap_MB",
 	}
 	writer.Write(header)
 
@@ -400,24 +400,42 @@ func TestTrieStressBinary(t *testing.T) {
 			fmt.Sprintf("%d", stats.LeafCount),
 			fmt.Sprintf("%d", stats.ArchivedDataSize),
 			fmt.Sprintf("%d", stats.BucketCount),
+			fmt.Sprintf("%d", stats.MaxBucketsPath),
+			fmt.Sprintf("%.2f", stats.BucketItemsAvg),
+			fmt.Sprintf("%d", stats.BucketItemsP50),
+			fmt.Sprintf("%d", stats.BucketItemsP95),
+			fmt.Sprintf("%d", stats.BucketItemsP99),
+			fmt.Sprintf("%d", stats.BucketItemsMax),
 			fmt.Sprintf("%d", memInfo.RSS/(1024*1024)),
 			fmt.Sprintf("%d", mem.HeapAlloc/(1024*1024)),
 		}
 		writer.Write(record)
 		writer.Flush()
 
-		fmt.Printf("TrieStats: LeafCount=%d, ArchiveItems=%d, BucketCount=%d\n",
+		fmt.Printf("TrieStats: LeafCount=%d, ArchiveItems=%d, BucketCount=%d, MaxBucketsPath=%d, BucketItemsAvg=%.2f, BucketItemsP50=%d, BucketItemsP95=%d, BucketItemsP99=%d, BucketItemsMax=%d\n",
 			stats.LeafCount,
 			stats.ArchivedDataSize,
 			stats.BucketCount,
+			stats.MaxBucketsPath,
+			stats.BucketItemsAvg,
+			stats.BucketItemsP50,
+			stats.BucketItemsP95,
+			stats.BucketItemsP99,
+			stats.BucketItemsMax,
 		)
-		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Leaves: %d, ArchiveItems: %d, Buckets: %d, Injected: %.2fM, Pool: %d, Avg: %.2fms, Wall: %.2fms (Prune: %.2fms, Commit: %.2fms, FlushWait: %.2fms, WriteWait: %.2fms, RawFlush: %.2fms, RawWrite: %.2fms), P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
+		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Leaves: %d, ArchiveItems: %d, Buckets: %d, MaxBucketsPath: %d, BucketItems[Avg: %.2f, P50: %d, P95: %d, P99: %d, Max: %d], Injected: %.2fM, Pool: %d, Avg: %.2fms, Wall: %.2fms (Prune: %.2fms, Commit: %.2fms, FlushWait: %.2fms, WriteWait: %.2fms, RawFlush: %.2fms, RawWrite: %.2fms), P95: %.2fms, P99: %.2fms, Box[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
 			startItem, endItem,
 			bytesToReadable(uint64(stateSize)),
 			bytesToReadable(uint64(archiveSize)),
 			stats.LeafCount,
 			stats.ArchivedDataSize,
 			stats.BucketCount,
+			stats.MaxBucketsPath,
+			stats.BucketItemsAvg,
+			stats.BucketItemsP50,
+			stats.BucketItemsP95,
+			stats.BucketItemsP99,
+			stats.BucketItemsMax,
 			float64(totalInjected)/1000000.0,
 			len(keyPool),
 			avgCalc, avgWall, avgPrune, avgCommit, avgFlush, avgWrite, avgRawFlush, avgRawWrite,

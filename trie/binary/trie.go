@@ -22,7 +22,8 @@ type Trie struct {
 	globalEpochBit byte
 	pruning        bool
 
-	dirtyShards map[int]struct{}
+	dirtyShards        map[int]struct{}
+	archiveDirtyShards map[int]struct{}
 }
 
 // NewTrie creates a new Binary Trie with the given database and configuration.
@@ -31,13 +32,14 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 		config = DefaultConfig()
 	}
 	t := &Trie{
-		db:             db,
-		hasher:         hasher,
-		config:         config,
-		shards:         make([]*Shard, 1<<config.ShardDepth),
-		globalEpochBit: 0,
-		pruning:        pruning,
-		dirtyShards:    make(map[int]struct{}),
+		db:                 db,
+		hasher:             hasher,
+		config:             config,
+		shards:             make([]*Shard, 1<<config.ShardDepth),
+		globalEpochBit:     0,
+		pruning:            pruning,
+		dirtyShards:        make(map[int]struct{}),
+		archiveDirtyShards: make(map[int]struct{}),
 	}
 	t.topTree = NewTopTree(hasher, nil, config.ShardDepth)
 
@@ -86,6 +88,18 @@ func (t *Trie) GetShardID(key []byte) int {
 		}
 	}
 	return id
+}
+
+func (t *Trie) markDirtyShard(id int) {
+	t.shardsMu.Lock()
+	t.dirtyShards[id] = struct{}{}
+	t.shardsMu.Unlock()
+}
+
+func (t *Trie) markArchiveDirtyShard(id int) {
+	t.shardsMu.Lock()
+	t.archiveDirtyShards[id] = struct{}{}
+	t.shardsMu.Unlock()
 }
 
 // Load loads the Trie state from the database using a given root hash.
@@ -158,7 +172,12 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return shard.Get(key)
+	val, err := shard.Get(key)
+	if err == nil && shard.HasPendingArchiveWrites() {
+		t.markDirtyShard(shardID)
+		t.markArchiveDirtyShard(shardID)
+	}
+	return val, err
 }
 
 // Put updates or inserts a value for a given key.
@@ -168,10 +187,14 @@ func (t *Trie) Put(key []byte, value []byte) error {
 	if err != nil {
 		return err
 	}
-	t.shardsMu.Lock()
-	t.dirtyShards[shardID] = struct{}{}
-	t.shardsMu.Unlock()
-	return shard.Put(key, value)
+	t.markDirtyShard(shardID)
+	if err := shard.Put(key, value); err != nil {
+		return err
+	}
+	if shard.HasPendingArchiveWrites() {
+		t.markArchiveDirtyShard(shardID)
+	}
+	return nil
 }
 
 // Delete removes a key and its value from the Trie.
@@ -181,9 +204,8 @@ func (t *Trie) Delete(key []byte) error {
 	if err != nil {
 		return err
 	}
-	t.shardsMu.Lock()
-	t.dirtyShards[shardID] = struct{}{}
-	t.shardsMu.Unlock()
+	t.markDirtyShard(shardID)
+	t.markArchiveDirtyShard(shardID)
 	return shard.Delete(key)
 }
 
@@ -280,9 +302,8 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		go func() {
 			defer wg.Done()
 
-			// Worker local state
-			// Mock batcher to collect puts
-			workerBatch := &memBatcher{puts: make([]memKV, 0, 5000)}
+			// Worker-local batch captures operation order, including stale deletes.
+			workerBatch := &memBatcher{ops: make([]memBatchOp, 0, 5000)}
 
 			for i := range shardChan {
 				s := t.shards[i]
@@ -312,8 +333,20 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 
 			// Merge back to global state
 			mu.Lock()
-			for _, item := range workerBatch.puts {
-				batch.Put(item.k, item.v)
+			for _, item := range workerBatch.ops {
+				var err error
+				if item.delete {
+					err = batch.Delete(item.k)
+				} else {
+					err = batch.Put(item.k, item.v)
+				}
+				if err != nil {
+					mu.Unlock()
+					errMu.Lock()
+					errs = append(errs, err)
+					errMu.Unlock()
+					return
+				}
 			}
 			mu.Unlock()
 		}()
@@ -324,13 +357,16 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		return nil, errs[0]
 	}
 
-	if destructive {
-		t.shardsMu.Lock()
-		t.dirtyShards = make(map[int]struct{})
-		t.shardsMu.Unlock()
+	rootHash, err := t.topTree.Compute(shardRoots, dirtyShards, batch)
+	if err != nil {
+		return nil, err
 	}
 
-	return t.topTree.Compute(shardRoots, dirtyShards, batch)
+	t.shardsMu.Lock()
+	t.dirtyShards = make(map[int]struct{})
+	t.shardsMu.Unlock()
+
+	return rootHash, nil
 }
 
 // PruneNextShard prunes the next shard in cycle.
@@ -347,6 +383,7 @@ func (t *Trie) PruneNextShard() error {
 
 	t.shardsMu.Lock()
 	t.dirtyShards[idx] = struct{}{}
+	t.archiveDirtyShards[idx] = struct{}{}
 	t.shardsMu.Unlock()
 
 	err = shard.Prune(t.globalEpochBit)
@@ -403,8 +440,15 @@ func (t *Trie) getShardPrefix(shardID int) []byte {
 // FlushArchives persists all pending archive data to ArchiveDB.
 func (t *Trie) FlushArchives() error {
 	t.shardsMu.RLock()
-	dirtyShardsList := make([]int, 0, len(t.dirtyShards))
+	archiveShards := make(map[int]struct{}, len(t.archiveDirtyShards)+len(t.dirtyShards))
+	for i := range t.archiveDirtyShards {
+		archiveShards[i] = struct{}{}
+	}
 	for i := range t.dirtyShards {
+		archiveShards[i] = struct{}{}
+	}
+	dirtyShardsList := make([]int, 0, len(archiveShards))
+	for i := range archiveShards {
 		dirtyShardsList = append(dirtyShardsList, i)
 	}
 	t.shardsMu.RUnlock()
@@ -430,6 +474,12 @@ func (t *Trie) FlushArchives() error {
 	if len(errChan) > 0 {
 		return <-errChan
 	}
+
+	t.shardsMu.Lock()
+	for _, i := range dirtyShardsList {
+		delete(t.archiveDirtyShards, i)
+	}
+	t.shardsMu.Unlock()
 	return nil
 }
 
@@ -442,6 +492,7 @@ func (t *Trie) Activate(key []byte, value []byte) error {
 	}
 	t.shardsMu.Lock()
 	t.dirtyShards[shardID] = struct{}{}
+	t.archiveDirtyShards[shardID] = struct{}{}
 	t.shardsMu.Unlock()
 	return shard.Activate(key, value)
 }
@@ -474,23 +525,30 @@ func (t *Trie) Config() *Config {
 	return t.config
 }
 
-type memKV struct {
-	k, v []byte
+type memBatchOp struct {
+	k, v   []byte
+	delete bool
 }
 
 type memBatcher struct {
-	puts []memKV
+	ops       []memBatchOp
+	valueSize int
 }
 
 func (m *memBatcher) Put(key []byte, value []byte) error {
-	m.puts = append(m.puts, memKV{k: key, v: value})
+	m.ops = append(m.ops, memBatchOp{k: key, v: value})
+	m.valueSize += len(key) + len(value)
 	return nil
 }
 
-func (m *memBatcher) Delete(key []byte) error { return nil }
-func (m *memBatcher) Write() error            { return nil }
-func (m *memBatcher) Reset()                  { m.puts = nil }
-func (m *memBatcher) ValueSize() int          { return 0 }
+func (m *memBatcher) Delete(key []byte) error {
+	m.ops = append(m.ops, memBatchOp{k: key, delete: true})
+	m.valueSize += len(key)
+	return nil
+}
+func (m *memBatcher) Write() error   { return nil }
+func (m *memBatcher) Reset()         { m.ops = nil; m.valueSize = 0 }
+func (m *memBatcher) ValueSize() int { return m.valueSize }
 
 // GetGlobalEpochBit returns the current global epoch bit.
 func (t *Trie) GetGlobalEpochBit() byte {

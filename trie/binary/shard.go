@@ -49,6 +49,9 @@ type Shard struct {
 	// Pending deletes from existing buckets. Key is the NEW bucket metadata hash.
 	pendingDeletes map[string]deleteTask
 
+	// Pending whole archive data deletes. Key is the obsolete bucket hash.
+	pendingArchiveDeletes map[string]int
+
 	// Value writes are staged until commit so they can share the same LevelDB
 	// batch and async write pipeline as node updates.
 	pendingValues map[string][]byte
@@ -81,22 +84,23 @@ func archiveDataKey(hash []byte) []byte {
 // NewShard 创建一个新的 Shard（若提供 rootHash 则从 DB 加载根节点）。
 func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte, pruning bool, globalEpochBit func() byte) (*Shard, error) {
 	s := &Shard{
-		id:              id,
-		db:              db,
-		hasher:          hasher,
-		pruning:         pruning,
-		staleSet:        make(map[string]struct{}),
-		config:          config,
-		globalEpochBit:  globalEpochBit,
-		isPruned:        false,
-		scratch:         make([]byte, 128),
-		ecmh:            ecmh.New(),
-		stats:           &TrieStats{},
-		pendingArchives: make(map[string][]byte),
-		pendingAppends:  make(map[string]appendTask),
-		pendingDeletes:  make(map[string]deleteTask),
-		pendingValues:   make(map[string][]byte),
-		pool:            NewNodePool(),
+		id:                    id,
+		db:                    db,
+		hasher:                hasher,
+		pruning:               pruning,
+		staleSet:              make(map[string]struct{}),
+		config:                config,
+		globalEpochBit:        globalEpochBit,
+		isPruned:              false,
+		scratch:               make([]byte, 128),
+		ecmh:                  ecmh.New(),
+		stats:                 &TrieStats{},
+		pendingArchives:       make(map[string][]byte),
+		pendingAppends:        make(map[string]appendTask),
+		pendingDeletes:        make(map[string]deleteTask),
+		pendingArchiveDeletes: make(map[string]int),
+		pendingValues:         make(map[string][]byte),
+		pool:                  NewNodePool(),
 	}
 	if len(rootHash) > 0 {
 		node, err := s.loadNode(rootHash)
@@ -202,11 +206,164 @@ func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
 		}
 		return s.serializeArchivedKV(newItems)
 	}
-	if s.config.ArchiveDB == nil {
-		return s.db.Get(archiveDataKey(hash))
+	data, err := s.getStoredBucketData(hash)
+	if err == nil {
+		s.statsMut.Lock()
+		s.stats.ArchiveReadCount++
+		s.statsMut.Unlock()
 	}
-	data, err := s.config.ArchiveDB.GetBucket(archiveDataKey(hash))
 	return data, err
+}
+
+func (s *Shard) getStoredBucketData(hash []byte) ([]byte, error) {
+	if s.config.ArchiveDB != nil {
+		return s.config.ArchiveDB.GetBucket(archiveDataKey(hash))
+	}
+	return s.db.Get(archiveDataKey(hash))
+}
+
+func (s *Shard) HasPendingArchiveWrites() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.pendingArchives) > 0 || len(s.pendingAppends) > 0 || len(s.pendingDeletes) > 0 || len(s.pendingArchiveDeletes) > 0
+}
+
+func (s *Shard) markArchiveDataDelete(hash []byte, oldSize int) {
+	if len(hash) == 0 {
+		return
+	}
+	key := string(hash)
+	if _, ok := s.pendingArchives[key]; ok {
+		delete(s.pendingArchives, key)
+		return
+	}
+	if task, ok := s.pendingAppends[key]; ok {
+		delete(s.pendingAppends, key)
+		if !bytes.Equal(task.oldHash, hash) {
+			s.markArchiveDataDelete(task.oldHash, -1)
+		}
+		return
+	}
+	if task, ok := s.pendingDeletes[key]; ok {
+		delete(s.pendingDeletes, key)
+		if !bytes.Equal(task.oldHash, hash) {
+			s.markArchiveDataDelete(task.oldHash, -1)
+		}
+		return
+	}
+	if s.pendingArchiveDeletes == nil {
+		s.pendingArchiveDeletes = make(map[string]int)
+	}
+	if prev, ok := s.pendingArchiveDeletes[key]; !ok || (prev < 0 && oldSize >= 0) {
+		s.pendingArchiveDeletes[key] = oldSize
+	}
+}
+
+func (s *Shard) attachStubs(parent *InternalNode, stubs []*ArchiveBucketNode) {
+	if parent == nil || len(stubs) == 0 {
+		return
+	}
+	parent.StubList = append(parent.StubList, stubs...)
+	s.compactStubList(parent)
+	parent.SetDirty(true)
+}
+
+func (s *Shard) compactStubList(parent *InternalNode) {
+	if parent == nil || len(parent.StubList) < 2 {
+		return
+	}
+	limit := s.config.ResolveArchiveBucketSize()
+	if limit <= 0 {
+		limit = int(^uint(0) >> 1)
+	}
+
+	groups := make(map[string][]int)
+	for i, bucket := range parent.StubList {
+		if bucket == nil {
+			continue
+		}
+		path := s.prefixBits(bucket.Path, bucket.PathBits, nil)
+		key := fmt.Sprintf("%d:%s", bucket.PathBits, string(path))
+		groups[key] = append(groups[key], i)
+	}
+
+	consumed := make([]bool, len(parent.StubList))
+	newList := make([]*ArchiveBucketNode, 0, len(parent.StubList))
+	changed := false
+	for i, bucket := range parent.StubList {
+		if consumed[i] {
+			continue
+		}
+		if bucket == nil {
+			changed = true
+			continue
+		}
+		path := s.prefixBits(bucket.Path, bucket.PathBits, nil)
+		key := fmt.Sprintf("%d:%s", bucket.PathBits, string(path))
+		idxs := groups[key]
+		if len(idxs) < 2 {
+			consumed[i] = true
+			newList = append(newList, bucket)
+			continue
+		}
+
+		total := uint64(0)
+		for _, idx := range idxs {
+			total += parent.StubList[idx].Count
+		}
+		if total > uint64(limit) {
+			consumed[i] = true
+			newList = append(newList, bucket)
+			continue
+		}
+
+		items := make([]ArchivedKV, 0, total)
+		oldHashes := make([][]byte, 0, len(idxs))
+		oldSizes := make([]int, 0, len(idxs))
+		ok := true
+		for _, idx := range idxs {
+			oldBucket := parent.StubList[idx]
+			hash := s.ensureBucketHash(oldBucket)
+			data, err := s.getBucketData(hash)
+			if err != nil {
+				ok = false
+				break
+			}
+			bucketItems, err := s.deserializeArchivedKV(data)
+			if err != nil {
+				ok = false
+				break
+			}
+			items = append(items, bucketItems...)
+			oldHashes = append(oldHashes, common.CopyBytes(hash))
+			oldSizes = append(oldSizes, len(data))
+		}
+		if !ok {
+			consumed[i] = true
+			newList = append(newList, bucket)
+			continue
+		}
+
+		merged := &ArchiveBucketNode{
+			Path:     common.CopyBytes(bucket.Path),
+			PathBits: bucket.PathBits,
+			dirty:    true,
+		}
+		s.recomputeBucket(merged, items)
+		for j, idx := range idxs {
+			consumed[idx] = true
+			if s.pruning && len(oldHashes[j]) > 0 {
+				s.staleSet[string(oldHashes[j])] = struct{}{}
+			}
+			s.markArchiveDataDelete(oldHashes[j], oldSizes[j])
+		}
+		newList = append(newList, merged)
+		changed = true
+	}
+	if changed {
+		parent.StubList = newList
+		parent.SetDirty(true)
+	}
 }
 
 func (s *Shard) stageValue(value []byte) []byte {
@@ -464,6 +621,9 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]b
 				}
 			}
 		}
+		s.statsMut.Lock()
+		s.stats.FalsePositiveCount++
+		s.statsMut.Unlock()
 		atomic.AddInt64(&common.BinaryCycleFPCount, 1)
 		atomic.AddInt64(&common.BinaryTrieFPInBlock, 1)
 		common.BinaryStatsMu.Lock()
@@ -485,6 +645,7 @@ func (s *Shard) Put(key []byte, value []byte) error {
 			return err
 		}
 	}
+	s.removeArchivedVersionForWrite(key)
 	valHash := s.stageValue(value)
 
 	// Shard start depth
@@ -494,6 +655,48 @@ func (s *Shard) Put(key []byte, value []byte) error {
 	}
 	s.root = newRoot
 	return nil
+}
+
+func (s *Shard) removeArchivedVersionForWrite(key []byte) bool {
+	if s.root == nil {
+		return false
+	}
+	removed := s.removeFromStubList(s.root, key, s.config.ShardDepth)
+	if removed {
+		s.cleanupRootAfterArchiveDelete()
+	}
+	return removed
+}
+
+func (s *Shard) cleanupRootAfterArchiveDelete() {
+	if s.root == nil {
+		return
+	}
+	switch n := s.root.(type) {
+	case *ArchiveBucketNode:
+		if n.Count == 0 {
+			s.markNodeStale(n)
+			s.root = nil
+		}
+	case *InternalNode:
+		if len(n.StubList) == 0 && n.Left == nil && n.Right == nil && len(n.LeftHash) == 0 && len(n.RightHash) == 0 {
+			s.markNodeStale(n)
+			s.root = nil
+		}
+	}
+}
+
+func (s *Shard) markNodeStale(node Node) {
+	if !s.pruning || node == nil {
+		return
+	}
+	if h := node.OriginalHash(); len(h) > 0 {
+		s.staleSet[string(h)] = struct{}{}
+		return
+	}
+	if h := node.Hash(); len(h) > 0 {
+		s.staleSet[string(h)] = struct{}{}
+	}
 }
 
 // Activate 实现显式激活：从 StubList 查找并移除匹配项，然后执行常规插入
@@ -507,13 +710,7 @@ func (s *Shard) Activate(key []byte, value []byte) error {
 	}
 
 	// 1. 深度搜索并从现有 StubList 中移除该 key
-	if s.root != nil {
-		// 已知 key，只需按路径下探并在沿途 Node 的 StubList 中定点查找
-		ok := s.removeFromStubList(s.root, key, s.config.ShardDepth)
-		if !ok {
-			// Failed to remove, but we continue to insert
-		}
-	}
+	s.removeArchivedVersionForWrite(key)
 
 	// 2. 执行常规插入
 	valHash := s.stageValue(value)
@@ -552,12 +749,16 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 				for _, item := range items {
 					if innerDepth+item.SuffixBits == keyBits && s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits) {
 						// 命中：执行盲删除
+						oldHash := s.ensureBucketHash(bucket)
+						oldSize := -1
+						if bucketData, err := s.getBucketData(oldHash); err == nil {
+							oldSize = len(bucketData)
+						}
+
 						s.blindDeleteFromBucket(bucket, []ArchivedKV{item})
 
 						if bucket.Count == 0 {
-							if s.config.ArchiveDB != nil {
-								s.config.ArchiveDB.DeleteBucket(archiveDataKey(s.ensureBucketHash(bucket)))
-							}
+							s.markArchiveDataDelete(oldHash, oldSize)
 							n.StubList = append(n.StubList[:i], n.StubList[i+1:]...)
 						}
 						n.SetDirty(true)
@@ -622,11 +823,15 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) bool {
 			keyBits := len(key) * 8
 			for _, item := range items {
 				if innerDepth+item.SuffixBits == keyBits && s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits) {
+					oldHash := s.ensureBucketHash(n)
+					oldSize := -1
+					if bucketData, err := s.getBucketData(oldHash); err == nil {
+						oldSize = len(bucketData)
+					}
+
 					s.blindDeleteFromBucket(n, []ArchivedKV{item})
 					if n.Count == 0 {
-						if s.config.ArchiveDB != nil {
-							s.config.ArchiveDB.DeleteBucket(archiveDataKey(n.Hash()))
-						}
+						s.markArchiveDataDelete(oldHash, oldSize)
 						// 此处无法直接移除 node，需由调用者处理 s.root = nil
 					}
 					return true
@@ -795,7 +1000,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 
 		s.updateEpoch(n)
 		s.refreshInternalEpochMask(n)
-		return s.shrink(n), nil
+		return s.shrinkLocal(n), nil
 
 	case *ArchiveBucketNode:
 		// 如果插入一个已归档的桶，直接把它当成一个“冷”节点处理：
@@ -803,7 +1008,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		parent := s.pool.GetInternal()
 		parent.Path = n.Path
 		parent.PathBits = n.PathBits
-		parent.StubList = append(parent.StubList, n)
+		s.attachStubs(parent, []*ArchiveBucketNode{n})
 		parent.SetDirty(true)
 		return s.insert(parent, key, depth, valueHash)
 
@@ -1182,18 +1387,8 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 			n.RightEpoch = 0
 		}
 
-		// [NEW] 也需提交 StubList 中的 bucket
-		for _, bucket := range n.StubList {
-			if bucket.IsDirty() {
-				_, err := s.commit(bucket, batch, nodeCount, destructive)
-				if err != nil {
-					return nil, err
-				}
-			}
-		}
-
-		// [FIX] Do NOT updateEpoch during commit — epoch reflects access pattern, not persistence.
-		// Updating epoch here would cause Prune to skip nodes that haven't been accessed.
+		// Do not update epoch during commit; epoch reflects access pattern, not persistence.
+		// Updating it here would cause Prune to skip nodes that have not been accessed.
 		s.refreshInternalEpochMask(n)
 
 		data, err := n.Serialize()
@@ -1302,7 +1497,7 @@ func (s *Shard) refreshInternalEpochMask(n *InternalNode) {
 	n.epoch = setStoredSubtreeEpochMask(n.epoch, mask)
 }
 
-func (s *Shard) shrink(n *InternalNode) Node {
+func (s *Shard) shrinkLocal(n *InternalNode) Node {
 	var remaining Node
 	var remainingBit byte
 	var remainingHash []byte
@@ -1400,11 +1595,87 @@ func (s *Shard) shrink(n *InternalNode) Node {
 }
 
 // moveStubs 将 n 上的桶移动到其子节点 child 上。
+func (s *Shard) shrinkPromote(n *InternalNode) (Node, []*ArchiveBucketNode) {
+	var remaining Node
+	var remainingBit byte
+	var remainingHash []byte
+
+	childCount := 0
+	if n.Left != nil || len(n.LeftHash) > 0 {
+		childCount++
+		remaining = n.Left
+		remainingHash = n.LeftHash
+		remainingBit = 0
+	}
+	if n.Right != nil || len(n.RightHash) > 0 {
+		childCount++
+		remaining = n.Right
+		remainingHash = n.RightHash
+		remainingBit = 1
+	}
+
+	if childCount > 1 {
+		return n, nil
+	}
+	if childCount == 0 {
+		if len(n.StubList) == 0 {
+			return n, nil
+		}
+		promoted := n.StubList
+		n.StubList = nil
+		if s.pruning && len(n.OriginalHash()) > 0 {
+			s.staleSet[string(n.OriginalHash())] = struct{}{}
+		}
+		return nil, promoted
+	}
+
+	if remaining == nil && len(remainingHash) > 0 {
+		var err error
+		remaining, err = s.loadNode(remainingHash)
+		if err != nil {
+			return n, nil
+		}
+	}
+
+	promoted := n.StubList
+	if len(promoted) > 0 {
+		n.StubList = nil
+		if s.pruning && len(n.OriginalHash()) > 0 {
+			s.staleSet[string(n.OriginalHash())] = struct{}{}
+		}
+	}
+
+	if inChild, ok := remaining.(*InternalNode); ok {
+		newCP, newCB := s.concatPath(n.Path, n.PathBits, remainingBit, inChild.Path, inChild.PathBits)
+		inChild.Path, inChild.PathBits = newCP, newCB
+		inChild.SetDirty(true)
+		if s.pruning && len(inChild.OriginalHash()) > 0 {
+			s.staleSet[string(inChild.OriginalHash())] = struct{}{}
+		}
+		s.refreshInternalEpochMask(inChild)
+		return inChild, promoted
+	}
+
+	if leaf, ok := remaining.(*LeafNode); ok {
+		newLP, newLB := s.concatPath(n.Path, n.PathBits, remainingBit, leaf.Path, leaf.PathBits)
+		leaf.Path, leaf.PathBits = newLP, newLB
+		leaf.SetDirty(true)
+		if s.pruning && len(leaf.OriginalHash()) > 0 {
+			s.staleSet[string(leaf.OriginalHash())] = struct{}{}
+		}
+		return leaf, promoted
+	}
+
+	if len(promoted) > 0 {
+		n.StubList = promoted
+	}
+	return n, nil
+}
+
 func (s *Shard) moveStubs(n *InternalNode, child *InternalNode, bit byte) {
 	if len(n.StubList) > 0 {
-		child.StubList = append(child.StubList, n.StubList...)
+		s.attachStubs(child, n.StubList)
 		n.StubList = nil // 清空
-		child.SetDirty(true)
 	}
 }
 
@@ -1419,9 +1690,8 @@ func (s *Shard) stripPrefix(path []byte, bits int, ignoreBit byte, prefix []byte
 
 func (s *Shard) distributeStubs(n *InternalNode, parent *InternalNode, prefix []byte, prefixBits int, bit byte) {
 	if len(n.StubList) > 0 {
-		parent.StubList = append(parent.StubList, n.StubList...)
+		s.attachStubs(parent, n.StubList)
 		n.StubList = nil
-		parent.SetDirty(true)
 	}
 }
 
@@ -1429,18 +1699,136 @@ func (s *Shard) FlushArchives() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for h, data := range s.pendingArchives {
-		// [FIX] 使用独立的归档库存储，防止混入状态库
-		dataKey := archiveDataKey([]byte(h))
-		if s.config.ArchiveDB != nil {
-			if err := s.config.ArchiveDB.PutBucket(dataKey, data); err != nil {
+		if err := s.putBucketDataWithOldSize([]byte(h), data, 0); err != nil {
+			return err
+		}
+	}
+	for h, task := range s.pendingAppends {
+		oldData, err := s.getBucketData(task.oldHash)
+		if err != nil {
+			return err
+		}
+		items, err := s.deserializeArchivedKV(oldData)
+		if err != nil {
+			return err
+		}
+		items = append(items, task.newItems...)
+		data, err := s.serializeArchivedKV(items)
+		if err != nil {
+			return err
+		}
+		if err := s.putBucketDataWithOldSize([]byte(h), data, 0); err != nil {
+			return err
+		}
+		if err := s.deleteBucketDataWithOldSize(task.oldHash, len(oldData)); err != nil {
+			return err
+		}
+	}
+	for h, task := range s.pendingDeletes {
+		hash := []byte(h)
+		oldData, err := s.getBucketData(task.oldHash)
+		if err != nil {
+			return err
+		}
+		items, err := s.deserializeArchivedKV(oldData)
+		if err != nil {
+			return err
+		}
+		newItems := make([]ArchivedKV, 0, len(items))
+		for _, it := range items {
+			found := false
+			for _, del := range task.deleteItems {
+				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newItems = append(newItems, it)
+			}
+		}
+		if len(newItems) > 0 {
+			data, err := s.serializeArchivedKV(newItems)
+			if err != nil {
 				return err
 			}
-		} else {
-			if err := s.db.Put(dataKey, data); err != nil {
+			if err := s.putBucketDataWithOldSize(hash, data, 0); err != nil {
 				return err
 			}
+		} else if err := s.deleteBucketDataWithOldSize(hash, 0); err != nil {
+			return err
+		}
+		if err := s.deleteBucketDataWithOldSize(task.oldHash, len(oldData)); err != nil {
+			return err
+		}
+	}
+	for h, oldSize := range s.pendingArchiveDeletes {
+		if err := s.deleteBucketDataWithOldSize([]byte(h), oldSize); err != nil {
+			return err
 		}
 	}
 	s.pendingArchives = make(map[string][]byte)
+	s.pendingAppends = make(map[string]appendTask)
+	s.pendingDeletes = make(map[string]deleteTask)
+	s.pendingArchiveDeletes = make(map[string]int)
+	return nil
+}
+
+func (s *Shard) putBucketData(hash []byte, data []byte) error {
+	return s.putBucketDataWithOldSize(hash, data, -1)
+}
+
+func (s *Shard) putBucketDataWithOldSize(hash []byte, data []byte, oldSize int) error {
+	dataKey := archiveDataKey(hash)
+	if oldSize < 0 {
+		oldSize = 0
+		if oldData, err := s.getStoredBucketData(hash); err == nil {
+			oldSize = len(oldData)
+		}
+	}
+	if s.config.ArchiveDB != nil {
+		if err := s.config.ArchiveDB.PutBucket(dataKey, data); err != nil {
+			return err
+		}
+	} else {
+		if err := s.db.Put(dataKey, data); err != nil {
+			return err
+		}
+	}
+	s.statsMut.Lock()
+	s.stats.ArchiveStorageSize += int64(len(data) - oldSize)
+	s.statsMut.Unlock()
+	return nil
+}
+
+func (s *Shard) deleteBucketData(hash []byte) error {
+	return s.deleteBucketDataWithOldSize(hash, -1)
+}
+
+func (s *Shard) deleteBucketDataWithOldSize(hash []byte, oldSize int) error {
+	if len(hash) == 0 {
+		return nil
+	}
+	dataKey := archiveDataKey(hash)
+	if oldSize < 0 {
+		oldSize = 0
+		if oldData, err := s.getStoredBucketData(hash); err == nil {
+			oldSize = len(oldData)
+		}
+	}
+	if s.config.ArchiveDB != nil {
+		if err := s.config.ArchiveDB.DeleteBucket(dataKey); err != nil {
+			return err
+		}
+	} else {
+		if err := s.db.Delete(dataKey); err != nil {
+			return err
+		}
+	}
+	if oldSize > 0 {
+		s.statsMut.Lock()
+		s.stats.ArchiveStorageSize -= int64(oldSize)
+		s.statsMut.Unlock()
+	}
 	return nil
 }

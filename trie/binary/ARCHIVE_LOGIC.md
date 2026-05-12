@@ -8,7 +8,7 @@
 *   **ECMH 批量累加**：大批量 `Add/Delete` 使用 worker-local Jacobian partial sum 后再合并，避免重复 affine 转换；空 commitment 下 1~3 个 hash 的新归档桶走直接 Jacobian 编码路径。
 *   **Value 写入批处理**：`Shard.Put/Activate` 先把 value blob 暂存在内存，`Shard.CommitToBatch` 再与节点元数据写入同一个 batch，使压力测试里的异步 batch write 可以被下一轮 prune/commit 覆盖。读路径会先查 pending/staged value，再查 LevelDB，保证异步窗口内的 read-your-write。
 *   **归档桶 hash 懒恢复**：反序列化后的 `ArchiveBucketNode` 不持久化内存态 `hash` 字段，读取归档数据前会根据桶元数据懒重建 hash，确保 reload 后仍可使用 `BucketHash + 0x01` 定位 archive data。
-*   **Prune 优化边界**：归档后立即断开热子树指针不是安全的局部优化，必须配合 StubList 可达性和路径压缩规则整体重构；否则部分侧挂桶可能在 shrink 后不可达。本轮保持正确性优先，不启用该优化。
+*   **Prune/Shrink 可达性边界**：归档后断开热子树指针必须配合 StubList 上浮。当前归档剪枝路径使用 `shrinkPromote`，中间节点被压缩时会把侧挂桶返回给递归父节点，而不是保留该中间节点或把桶下沉到唯一热子节点。
 
 ## 1. 核心架构与术语
 
@@ -41,7 +41,8 @@
     *   **InternalNode**: 
         *   如果整个子树变冷，递归收集所有叶子位 `ArchivedKV`。
         *   如果部分变冷，热的分支保留，冷的分支转换为 **ArchiveBucketNode** 挂载到该节点的 `StubList`。
-3.  **路径更新**: 在归档项上抛过程中，使用 `prependBit` 和 `prependPath` 动态维护其相对于分片根部的完整路径。
+3.  **路径更新**: 当前实现统一使用**绝对路径**表示归档桶入口路径。递归下探时从分片前缀累积绝对路径，子方向使用 `appendBit` 向前扩展；桶内 `ArchivedKV.Suffix` 仅保存相对于桶入口路径的后缀。
+4.  **迁移边界**: 归档桶允许在 Shrink 过程中向上提升到递归父节点，但不会向下迁移到唯一热子树；上浮时 `ArchiveBucketNode.Path` 保持绝对路径不变，不做重写。
 
 ### 路径位数上限 (`MaxPathBits`)
 *   **统一边界**: 路径相关操作以 `MaxPathBits` 为硬上限，当前配置为 416 位。
@@ -62,10 +63,13 @@
 *   **查找顺序**: 按“后进先出”（栈）顺序遍历。
 
 ### ArchiveBucketNode (归档桶)
+*   **绝对入口路径**: `ArchiveBucketNode.Path` 表示桶在分片中的绝对入口路径，而不是相对于当前挂载节点的相对路径。
 *   **增量更新**: 系统支持增量修改（`pendingAppends/pendingDeletes`），避免每次微小变动都触发全量桶重建。
 *   **Filter**: 包含 Cuckoo Filter，Key 采用 `[uvarint(后缀位数)] + [后缀内容]` 编码以防碰撞，并支持 `MaxPathBits` 范围内的路径长度。
     *   **Fingerprint Hash Cache**: `alternateIndex` 仍使用原 Keccak(fp) 算法以兼容既有过滤器编码，但 16-bit fingerprint 的 65536 个哈希前缀会被全局缓存，避免归档桶重算时重复对 2 字节输入执行 Keccak。
-*   **盲删除**: 在 `Activate` 过程中，通过元数据更新而非全量加载来实现桶内项的移除。
+*   **盲删除**: 当前“盲删除”指不重建整桶并通过 pending delete / 元数据更新完成落库；匹配具体删除项时仍可能读取桶数据或使用缓存项来定位目标。
+*   **同入口前缀合并**: StubList 挂载新桶或提升旧桶时，会按 `Path + PathBits` 分组；同一绝对入口前缀下的多个小桶若合计不超过 `Config.ResolveArchiveBucketSize()`，会重建为一个桶。该合并不跨前缀、不把桶向下迁移，旧 archive data key 通过 pending 删除在 `FlushArchives` 阶段清理。
+*   **桶大小配置**: 归档桶分裂阈值由 `Config.ResolveArchiveBucketSize()` 生效，实际限制会结合 Cuckoo 参数收敛，而不是仅取原始 `ArchiveBucketSize` 字段。
 
 ---
 
@@ -99,19 +103,46 @@
 ### 自动激活 (`Activate`)
 *   **命中即激活**: `Shard.Get` 如果从归档桶中找到数据，会自动调用 `Activate`。
 *   **移除与重插**: `Activate` 执行“盲删除”从桶中移除项，并将其作为热 `LeafNode` 插入。
+*   **并发边界**: 当前实现不承诺并发读安全。`Get` 命中归档后会触发写路径，因此该 Trie 不能按“多 reader + 自动激活”模型使用；这里的锁主要用于保护分片内部状态，而不是提供通用并发读语义。
 
 ---
 
-## 5. 底层设计细节
+## 6. 底层设计细节
 
 ### 全状态完整性保证 (ECMH)
-每个 Shard 维护一个基于椭圆曲线的多集哈希（ECMH）。它对“热路径节点数据 + 冷路径归档数据”统一生成累加承诺，确保存储引擎在不遍历树的情况下也能验证冷热混合状态的正确性。
+每个归档桶维护一个基于椭圆曲线的多集哈希（ECMH）承诺，用于覆盖该桶内归档项集合，并在桶元数据变化时参与父节点哈希计算。
 *   **并行映射**: 批量 `Add/Delete/Verify` 时，`hashToPoint` 映射可并行计算，最终仍按确定顺序累加点，保持 ECMH 的顺序无关语义不变。
 *   **内存取舍**: 当前不启用全局 point cache，避免数百万唯一归档项把内存再次顶高。
 *   **低分配输入**: 归档项的 filter key、ECMH hash 输入和 `ArchivedKV` 序列化采用可复用缓冲/精确预分配，减少桶重算和 pending archive 写入时的短命切片。
+*   **当前边界**: 已落地的是 archive-bucket 级承诺；本文不再把它表述为统一覆盖热路径节点与冷路径数据的 shard-level 全状态承诺。
 
 ### 并发模型
-*   **分片并行**: `Trie.shardsMu` 仅控制分片容器，各分片拥有独立读写锁 `Shard.mu`，支持多线程并行 Commit 或 Prune。
+*   **分片并行**: `Trie.shardsMu` 仅控制分片容器，各分片拥有独立锁 `Shard.mu`。当前实现支持多线程并行 Commit，不存在“每轮同时裁剪多个分片”的顶层调度。
+*   **裁剪粒度**: `PruneNextShard()` 每次只处理一个 shard；是否在单个 shard 内继续并行化，属于实现优化空间，不是当前外部语义保证。
+*   **读取语义**: 由于 `Get` 可能触发 `Activate`，读路径并不保证无副作用，也不应按通用并发读接口理解。
+
+### Commit / Flush 边界
+*   **承诺计算边界**: 影响 root / commitment 的逻辑必须留在 `Commit` / `CommitToBatch` 主路径中完成，`FlushArchives` 只负责把已决定的 archive 数据落库。
+*   **合并边界**: 同入口前缀小桶合并会改变 bucket metadata 与父节点 hash，因此必须在内存树挂载/剪枝路径中完成；合并后的新 archive data 写入、旧 archive data 删除仍通过 pending 队列交给 `FlushArchives`。
+*   **非破坏持久化路径**: `CommitToBatch -> Write -> FlushArchives -> Reload` 的设计目标，是避免 archive flush 时间影响主 commit 的承诺计算速度，同时保证 archive 数据最终可恢复。
+*   **实现备注**: `Trie.Commit()` 是 destructive 的便捷路径，其调度顺序可与外部 batch 的 non-destructive 流程不同；理解 durability 时应优先区分这两条路径。
+
+### 统计口径
+*   **`ArchivedDataSize` / `ArchiveItems`**: 表示逻辑归档项数量，可在生成、删除归档项时增减。
+*   **`ArchiveStorageSize` / `Archive_MB`**: 表示 archive store 中已落库的物理数据量，应以 `FlushArchives` 实际 `Put/Delete` 为准，而不是仅依据 pending delta 推导。
+*   **`FalsePositiveCount`**: 统一按 `TrieStats.FalsePositiveCount` 口径统计 Cuckoo Filter 假阳性；历史压测里若同时打印全局计数器，应视为兼容性输出而非新的统计定义。
+
+### 配置口径
+*   当前有效配置包括 `ShardDepth`、`ArchiveBucketSize`、`ArchiveItemCacheLimit`、`ArchiveDB`、`CuckooBuckets`、`CuckooSlots`。
+*   `ShardCacheLimit` 不属于当前实现语义，若旧分支/旧文档出现该字段，应视为过期配置。
+
+### 内存管理 (Node Pool)
+*   通过 `NodePool` 复用 `InternalNode` 和 `LeafNode` 对象，在高频剪枝和数据注入期间显著降低 Golang GC 压力。
+
+### 空分片状态 (Empty Shard)
+*   若分片内所有热数据均被裁剪，分片根节点 `s.root` 将动态转换为单个 `ArchiveBucketNode` 或一颗纯归档子树。
+
+---
 
 ### 内存管理 (Node Pool)
 *   通过 `NodePool` 复用 `InternalNode` 和 `LeafNode` 对象，在高频剪枝和数据注入期间显著降低 Golang GC 压力。
@@ -143,10 +174,23 @@
 
 #### 数据变化趋势
 随着实验进入第二个周期及以后，统计数据会出现以下显著变化：
-1.  **数据库容量**: State DB 增长曲线变缓；Archive DB 从 0 开始快速增长。
+1.  **数据库容量**: State DB 增长曲线变缓；Archive DB 从 0 开始快速增长。这里的 `Archive_MB` 应按已落库的物理 archive 数据量理解。
 2.  **内存占用**: RSS 和 Heap 因为节点被清理而趋于平稳（或随状态总量缓慢爬升）。
-3.  **读指标**: "Miss (Existent/Archived)" 从 0 变为正值，伴随 Cuckoo Filter 的查询记录。
+3.  **读指标**: "Miss (Existent/Archived)" 从 0 变为正值，伴随 Cuckoo Filter 的查询记录；假阳性统一看 `TrieStats.FalsePositiveCount`。
 4.  **通信指标**: 出现“证明生成耗时”和“证明大小”统计，反映了由于自动赎回（Activation）带来的额外开销。
+
+#### Flush 与 Commit 的性能边界
+*   `FlushArchives` 的职责是 archive 数据落库，不应承担影响 root / commitment 的逻辑。
+*   如果某项工作会改变承诺结果，就必须在 `Commit` / `CommitToBatch` 中完成，而不是推迟到 flush 阶段。
+*   这样做的目标是把 archive IO 延迟与主 commit 的承诺计算解耦，避免 flush 时间直接拖慢 commit。
+
+#### 裁剪并行性边界
+*   顶层调度每次只裁剪一个 shard；不存在一次同时裁剪多个分片的外部语义。
+*   “裁剪可并行”如果成立，也只应理解为单个 shard 内部实现可继续优化，而不是多 shard 并行 prune。
+
+#### 历史压力数字的解释
+*   文中的固定 MB / 延迟数字是历史观测样本，用于识别趋势，不应被理解为当前实现必须精确复现的常量。
+*   当前更重要的判断标准是：热树规模是否稳定、逻辑归档项是否按预期增长、以及 archive store 的物理大小是否在 flush 后持续增长。
 
 #### A. 主网回放压测 (`TestExpireStateProcessor`)
 *   **逻辑**: 使用真实主网数据文件（Transaction Streamer）进行长时间回放。
@@ -179,6 +223,10 @@
         *   **预期比例**：归档量应与注入量成正比。例如在 50% 更新率下，每注入 100 万项，理论上应有约 **40~50 万项** 进入归档。如果 `Archive_MB` 仅增长几 KB 或项数极少（如仅几百项），通常意味着裁剪判定逻辑存在漏洞（漏判）或 Epoch 翻转未生效。
     3.  **现象**：`ArchivedDataSize` 统计指标应与预期的冷数据量大致匹配。
 *   **核心观测点**：确认进入第二个周期后，归档库文件物理生成并被成功索引。
+*   **分阶段 ShardDepth 验证**：
+    1.  先使用较小的 `ShardDepth`（例如 8）快速压测，用较短周期触发 epoch 翻转与归档，判断裁剪、归档落库、`ArchivedDataSize` / `Archive_MB` 增长链路是否成功。
+    2.  再使用较大的 `ShardDepth`（例如 `log2(65536*16)=20`）压测分片数量变多后的行为，重点观察 `Commit` 是否随 shard 数量或 dirty shard 分布明显退化、bucket 是否过度分散、`BucketItemsAvg/P50/P95/P99/Max` 是否异常偏小，以及 `MaxBucketsPath` 是否过大导致单次查询需要轮询过多桶。
+    3.  大 `ShardDepth` 压测不能只跑满一个 shard 轮询周期：第一轮主要完成分片覆盖，第二轮才开始形成可裁剪旧数据，至少跑到第三轮后再判断归档量、bucket 分布和单路径桶数，否则容易把“尚未过期”误判为“bucket 过度分散”或“归档不足”。
 
 ---
 
@@ -186,14 +234,14 @@
 
 在代码提交或逻辑重大变更后，建议通过以下自测流程进行归档系统验证：
 
-### 8.1 一致性实验 (`TestBinaryTrieConsistency`)
+### 9.1 一致性实验 (`TestBinaryTrieConsistency`)
 *   **通过标准 (Pass Criteria)**:
     1.  **WriteCount 零偏差**: 处理主网任意区块区间后，Binary Trie 记录的状态写入次数必须与标准 MPT 完全一致。
     2.  **WriteHash 校验**: `consistencyTracer` 记录的所有账户、存储变更的哈希指纹必须与 MPT 线路 100% 匹配。State Root 仅作为各自引擎的持久化锚点记录，不要求跨结构相等。
     3.  **零异常报错**: 运行过程中不允许出现任何 "Node Not Found" 或持久化层面的加载/序列化错误。
 *   **观测细节**: 异常发生时，通过 `consistencyTracer` 输出的交易索引（Tx Index）快速定位状态分歧点。
 
-### 8.2 压测实验 (`TestTrieStressBinary` / `TestExpireStateProcessor`)
+### 9.2 压测实验 (`TestTrieStressBinary` / `TestExpireStateProcessor`)
 *   **通过标准 (Pass Criteria)**:
     1.  **系统稳定性**: 持续注入 1B+ KV 或回放 1M+ 主网区块期间，系统内存（RSS/Heap）必须趋于平稳，严禁出现内存泄露（OOM）或 Panic。
     2.  **数据可访问性**: 即使在数据被大规模归档（Cold items > 90%）的情况下，所有 `Get` 请求及后续的 `Activate` 动作必须 100% 成功。
@@ -221,10 +269,11 @@ RSS/Heap, and latency continued to grow through millions of injected items.
   an accumulated absolute prefix must use `appendBit`, not `prependBit`.
   `prependBit` reverses the child direction relative to the absolute key and
   can make archived buckets unreachable once the hot child is detached.
-* **Nodes with side-mounted buckets are not shrinkable**: an `InternalNode` with
-  a non-empty `StubList` is an addressable anchor for archived sibling data.
-  Collapsing it into the only remaining hot child can bypass those buckets
-  during lookup.
+* **Nodes with side-mounted buckets promote those buckets during archive
+  shrink**: an `InternalNode` with a non-empty `StubList` may still collapse
+  into its only hot child, but the buckets must be returned to the recursive
+  parent and attached there. Moving the buckets down into the hot child would
+  make archived sibling paths unreachable.
 * **Stale node deletes are required for async/non-destructive commits too**:
   stress mode can commit through a batch while `destructive=false`; stale node
   hashes still have to be deleted from LevelDB, otherwise the physical state DB
@@ -251,3 +300,88 @@ Observed verification after the fix:
 
 * 300k items: `LeafCount=130657`, `ArchiveItems=171578`, `Avg=24.55ms`.
 * 1M items: `LeafCount=131830`, `ArchiveItems=877807`, `Avg=25.62ms`.
+
+## 11. State DB Write Amplification Fix (2026-04-22)
+
+The long stress run later showed a different bottleneck: `LeafCount` and heap
+were stable, but `State` kept growing and `WriteWait` reached second-level
+latency. The root cause was in the write pipeline rather than the prune logic.
+
+* **Worker batch deletes must be replayed**: `Trie.CommitToBatch` commits shards
+  in parallel through a worker-local `memBatcher`. The old `memBatcher.Delete`
+  was a no-op, so stale trie node deletes produced by shards were silently
+  dropped before reaching the real LevelDB batch.
+* **Dirty shard tracking is not archive flush tracking**: non-destructive
+  commits now clear `dirtyShards` after the top tree is computed, but archive
+  flush uses a separate `archiveDirtyShards` set so `CommitToBatch -> Write ->
+  FlushArchives -> Reload` remains durable.
+* **Side-mounted archive buckets are embedded metadata**: buckets in
+  `InternalNode.StubList` are already serialized into their parent node. They
+  should not be written again as standalone state nodes on every commit.
+* **Changed bucket metadata invalidates the old bucket hash**:
+  `blindAppendToBucket` and `blindDeleteFromBucket` mark the previous bucket
+  metadata hash stale and mark the bucket dirty before recomputing its new hash.
+* **Pending archive deltas are flushed durably**: `pendingAppends` and
+  `pendingDeletes` are materialized to the archive store and old archive data
+  keys are deleted, instead of only keeping the delta chain in memory.
+
+### 11.1 Updated Stress Signal
+
+With real stale deletes enabled, the benchmark includes LevelDB deletion and
+compaction cost that was previously being skipped. The expected result is lower
+State DB growth and stable memory, but not the earlier artificially low 20-30ms
+average when deletes were not actually replayed.
+
+Observed verification after the write-pipeline fix:
+
+* 1M items: `State=838.37 MB`, `Archive=72.63 MB`, `LeafCount=131960`,
+  `ArchiveItems=877432`, `Avg=57.33ms`, `WriteWait=31.85ms`.
+* 2M items: `State=1.61 GB`, `Archive=163.75 MB`, `LeafCount=132192`,
+  `ArchiveItems=1888341`, `Avg=84.28ms` with one 2.8s LevelDB outlier;
+  most windows stayed around `Avg=54-59ms`.
+
+## 12. StubList Promotion During Shrink (2026-04-22)
+
+Archive-prune shrink uses a parent-return channel for side-mounted buckets:
+
+* `shrinkPromote` collapses an `InternalNode` with zero or one hot child.
+* If the collapsed node owns `StubList` buckets, those buckets are removed from
+  the node and returned to the recursive caller.
+* The caller attaches promoted buckets to its own `StubList`, so the bucket
+  moves upward and remains searchable before descending into the hot branch.
+* The promoted bucket keeps its absolute `ArchiveBucketNode.Path`; no suffix
+  rewrite is needed during the move.
+* The shard root is the only no-parent edge case. If root-level buckets are
+  promoted, a minimal root container is created only to hold the promoted
+  buckets and the remaining hot child.
+
+This replaces the earlier conservative rule that blocked shrink whenever a
+node had side-mounted buckets. That conservative rule preserved reachability but
+kept unnecessary middle nodes and increased hot-tree depth.
+
+## 13. Put Rewrite Must Evict Old Archive Entry (2026-04-24)
+
+Rewriting an already-archived key through `Trie.Put` must not leave the old
+archive version behind.
+
+* **`Put` and `Activate` share the same archive-eviction rule**: before the hot
+  insert runs, the shard removes any matching archived item from the reachable
+  `StubList` / root bucket path.
+* **Archive deletion can empty the shard root**: if that removal clears the last
+  root-level bucket, the shard drops the empty root container instead of
+  keeping an empty `ArchiveBucketNode` or `InternalNode`.
+* **Root-node eviction still needs stale delete propagation**: when the old root
+  container disappears, its prior node hash is pushed into the stale-delete set
+  so the State DB does not keep the orphaned serialized node forever.
+* **Archive flush tracking must follow `Put` as well**: `Trie.Put` now marks the
+  shard in `archiveDirtyShards` whenever the rewrite produced pending archive
+  appends/deletes. This keeps the non-destructive durability sequence correct:
+  `CommitToBatch -> Write -> FlushArchives -> Reload`.
+
+Expected correctness signal after this fix:
+
+* Rewriting an archived key through `Trie.Put` keeps `ArchivedDataSize` flat or
+  decreases it; it must not create `ArchiveItems + Leaves > Injected` drift for
+  that key.
+* Reloading after a non-destructive commit must show only the new hot value, and
+  the old archive bucket entry must be gone.

@@ -96,6 +96,141 @@ func setupTrie() (*Trie, Hasher) {
 	return NewTrie(nil, db, hasher, config, true), hasher
 }
 
+func TestCommitToBatchPropagatesStaleDeletesNonDestructive(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 4
+	config.ArchiveDB = db
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	key := bytes.Repeat([]byte{0x42}, 32)
+	batch := &MemoryBatchAdapter{db: db}
+
+	if err := trie.Put(key, []byte("value-1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trie.CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	batch.Reset()
+
+	if err := trie.Put(key, []byte("value-2")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trie.CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+
+	deletes := 0
+	for _, op := range batch.ops {
+		if op.isDel {
+			deletes++
+		}
+	}
+	if deletes == 0 {
+		t.Fatalf("expected non-destructive Trie.CommitToBatch to forward stale deletes")
+	}
+}
+
+func TestFlushArchivesAfterNonDestructiveCommitReload(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.ArchiveDB = db
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	key := make([]byte, 32)
+	key[0] = 0x11
+	val := []byte("archived-after-commit")
+
+	if err := trie.Put(key, val); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := trie.CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	trie.SetGlobalEpoch(0)
+	if err := archiveShardForTest(trie, trie.GetShardID(key)); err != nil {
+		t.Fatal(err)
+	}
+	batch = db.NewBatch()
+	root, err := trie.CommitToBatch(batch, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if err := trie.FlushArchives(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewTrie(root, db, hasher, config, true)
+	got, err := reloaded.Get(key)
+	if err != nil {
+		t.Fatalf("archived key missing after reload: %v", err)
+	}
+	if !bytes.Equal(got, val) {
+		t.Fatalf("value mismatch after reload: got %x, want %x", got, val)
+	}
+}
+
+func TestShrinkPromotesStubList(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ArchiveDB = db
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bucket := &ArchiveBucketNode{
+		Path:     []byte{0x00},
+		PathBits: 8,
+		Count:    1,
+		dirty:    true,
+	}
+	leaf := &LeafNode{
+		Path:      []byte{0x80},
+		PathBits:  1,
+		ValueHash: bytes.Repeat([]byte{0x01}, 32),
+		dirty:     true,
+	}
+	parent := &InternalNode{
+		Path:     []byte{0x40}, // high bits 01
+		PathBits: 2,
+		Left:     leaf,
+		StubList: []*ArchiveBucketNode{bucket},
+		dirty:    true,
+	}
+
+	node, promoted := shard.shrinkPromote(parent)
+	if len(promoted) != 1 || promoted[0] != bucket {
+		t.Fatalf("expected bucket to be promoted, got %d", len(promoted))
+	}
+	if len(parent.StubList) != 0 {
+		t.Fatalf("expected source StubList to be cleared")
+	}
+	shrunkLeaf, ok := node.(*LeafNode)
+	if !ok {
+		t.Fatalf("expected middle node to shrink away, got %T", node)
+	}
+	if shrunkLeaf.PathBits != 4 {
+		t.Fatalf("expected leaf path to absorb parent path and branch bit, got %d bits", shrunkLeaf.PathBits)
+	}
+}
+
 func archiveShardForTest(trie *Trie, shardID int) error {
 	// Fresh writes start on epoch bit 1 under the rolling-epoch policy. Pruning
 	// shard 0 flips the global bit inside PruneNextShard; other shards do not.
@@ -601,6 +736,85 @@ func TestDataActivation(t *testing.T) {
 	got, _ := trie.Get(key)
 	if !bytes.Equal(got, newVal) {
 		t.Errorf("Value mismatch after activation: got %x, want %x", got, newVal)
+	}
+}
+
+func TestPutRemovesArchivedVersion(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.ArchiveDB = db
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	key := make([]byte, 32)
+	key[0] = 0x00
+	key[1] = 0x11
+	oldVal := []byte("archived-value")
+	newVal := []byte("rewritten-hot")
+
+	if err := trie.Put(key, oldVal); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := trie.CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := archiveShardForTest(trie, trie.GetShardID(key)); err != nil {
+		t.Fatal(err)
+	}
+	batch = db.NewBatch()
+	root, err := trie.CommitToBatch(batch, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if err := trie.FlushArchives(); err != nil {
+		t.Fatal(err)
+	}
+
+	archived := NewTrie(root, db, hasher, config, true)
+	stats := archived.Stats()
+	if stats.ArchivedDataSize != 1 {
+		t.Fatalf("expected archived item before rewrite, got %d", stats.ArchivedDataSize)
+	}
+
+	if err := trie.Put(key, newVal); err != nil {
+		t.Fatal(err)
+	}
+	batch = db.NewBatch()
+	root, err = trie.CommitToBatch(batch, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if err := trie.FlushArchives(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewTrie(root, db, hasher, config, true)
+	stats = reloaded.Stats()
+	if stats.ArchivedDataSize != 0 {
+		t.Fatalf("expected archived item to be removed after Put, got %d", stats.ArchivedDataSize)
+	}
+	if stats.BucketCount != 0 {
+		t.Fatalf("expected no archive buckets after Put rewrite, got %d", stats.BucketCount)
+	}
+
+	got, err := reloaded.Get(key)
+	if err != nil {
+		t.Fatalf("reloaded get failed: %v", err)
+	}
+	if !bytes.Equal(got, newVal) {
+		t.Fatalf("value mismatch after rewrite: got %x, want %x", got, newVal)
 	}
 }
 
