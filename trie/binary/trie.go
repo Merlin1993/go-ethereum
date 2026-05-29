@@ -3,6 +3,7 @@ package binary
 import (
 	"bytes"
 	"sync"
+	"time"
 )
 
 // Trie represents a Binary Merkle Patricia Trie that shards its key space.
@@ -70,6 +71,19 @@ func (t *Trie) CommitShardToBatch(id int, batch Batcher, destructive bool) ([]by
 		return nil, err
 	}
 	return shard.CommitToBatch(batch, destructive)
+}
+
+func (t *Trie) CommitTopTreeToBatch(shardRoots map[int][]byte, dirtyShards []int, batch Batcher) ([]byte, error) {
+	rootHash, err := t.topTree.Compute(shardRoots, dirtyShards, batch)
+	if err != nil {
+		return nil, err
+	}
+	t.shardsMu.Lock()
+	for _, id := range dirtyShards {
+		delete(t.dirtyShards, id)
+	}
+	t.shardsMu.Unlock()
+	return rootHash, nil
 }
 
 func (t *Trie) GetShardID(key []byte) int {
@@ -251,29 +265,58 @@ func (t *Trie) Hash() ([]byte, error) {
 
 // Commit persists any dirty shards to the database.
 func (t *Trie) Commit() ([]byte, error) {
+	totalStart := time.Now()
+	dirtyShards, archiveDirtyShards, flushShards := t.diagnosticCommitShardCounts()
 	batch := t.db.NewBatch()
 	defer batch.Reset()
 
 	// Flush archives FIRST before committing shards (which might clear dirty set)
+	flushStart := time.Now()
 	if err := t.FlushArchives(); err != nil {
+		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), time.Since(flushStart).Nanoseconds(), 0, 0, dirtyShards, archiveDirtyShards, flushShards)
 		return nil, err
 	}
+	flushDuration := time.Since(flushStart)
+
+	commitToBatchStart := time.Now()
 	rootHash, err := t.CommitToBatch(batch, true)
 	if err != nil {
+		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), flushDuration.Nanoseconds(), time.Since(commitToBatchStart).Nanoseconds(), 0, dirtyShards, archiveDirtyShards, flushShards)
 		return nil, err
 	}
+	commitToBatchDuration := time.Since(commitToBatchStart)
 
+	batchWriteStart := time.Now()
 	if err := batch.Write(); err != nil {
+		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), flushDuration.Nanoseconds(), commitToBatchDuration.Nanoseconds(), time.Since(batchWriteStart).Nanoseconds(), dirtyShards, archiveDirtyShards, flushShards)
 		return nil, err
 	}
+	batchWriteDuration := time.Since(batchWriteStart)
+	recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), flushDuration.Nanoseconds(), commitToBatchDuration.Nanoseconds(), batchWriteDuration.Nanoseconds(), dirtyShards, archiveDirtyShards, flushShards)
 
 	return rootHash, nil
+}
+
+func (t *Trie) diagnosticCommitShardCounts() (dirtyShards, archiveDirtyShards, flushShards int) {
+	t.shardsMu.RLock()
+	defer t.shardsMu.RUnlock()
+	flushSet := make(map[int]struct{}, len(t.dirtyShards)+len(t.archiveDirtyShards))
+	for i := range t.dirtyShards {
+		dirtyShards++
+		flushSet[i] = struct{}{}
+	}
+	for i := range t.archiveDirtyShards {
+		archiveDirtyShards++
+		flushSet[i] = struct{}{}
+	}
+	return dirtyShards, archiveDirtyShards, len(flushSet)
 }
 
 // CommitToBatch commits the trie state to a given batcher.
 func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	shardRoots := make(map[int][]byte)
 	dirtyShards := make([]int, 0)
+	shardCommitStart := time.Now()
 
 	var (
 		mu         sync.Mutex
@@ -354,13 +397,19 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	wg.Wait()
 
 	if len(errs) > 0 {
+		recordCommitToBatchDiagnostics(time.Since(shardCommitStart).Nanoseconds(), 0)
 		return nil, errs[0]
 	}
+	shardCommitDuration := time.Since(shardCommitStart)
 
+	topTreeStart := time.Now()
 	rootHash, err := t.topTree.Compute(shardRoots, dirtyShards, batch)
 	if err != nil {
+		recordCommitToBatchDiagnostics(shardCommitDuration.Nanoseconds(), time.Since(topTreeStart).Nanoseconds())
 		return nil, err
 	}
+	topTreeDuration := time.Since(topTreeStart)
+	recordCommitToBatchDiagnostics(shardCommitDuration.Nanoseconds(), topTreeDuration.Nanoseconds())
 
 	t.shardsMu.Lock()
 	t.dirtyShards = make(map[int]struct{})

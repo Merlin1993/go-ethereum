@@ -1,8 +1,9 @@
 package tree
 
 import (
-	"encoding/binary"
+	stdbinary "encoding/binary"
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"hash"
@@ -28,12 +29,15 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/params"
+	binarytrie "github.com/ethereum/go-ethereum/trie/binary"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/database"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
 )
+
+var globalFPDistribution = make(map[string]int64)
 
 // ProcessorHost encapsulates the environment for state processing experiments.
 type ProcessorHost struct {
@@ -53,6 +57,7 @@ var (
 	useBinaryTrie    = flag.Bool("useBinaryTrie2", true, "Enable Binary trie")
 	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
 	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
+	metricsDir       = flag.String("metricsDir2", ".", "Directory for mainnet metrics CSV/JSON output")
 	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
 	pruneInterval    = flag.Int("pruneInterval", 1, "Blocks between Trie.PruneNextShard() calls")
 	maxBlocks        = flag.Int("blocks", 0, "Maximum number of blocks to process during processor or consistency tests (0 = all)")
@@ -63,6 +68,8 @@ var (
 	archiveItemCacheLimit = flag.Int("archiveItemCacheLimit", 0, "Binary trie decoded archive item cache limit; 0 disables item caching, negative keeps all")
 	cuckooBuckets         = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
 	cuckooSlots           = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
+	binaryNodeCacheLimit  = flag.Int("binaryNodeCacheLimit", 262144, "Binary trie process node cache limit; 0 uses default, negative disables cache")
+	binaryPhysicalDelete  = flag.Bool("binaryPhysicalDelete", false, "Physically delete obsolete binary trie state nodes from stateDB")
 )
 
 func TestMain(m *testing.M) {
@@ -82,6 +89,7 @@ type ProcessorConfig struct {
 	UseBinaryTrie    bool
 	UseMemory        bool
 	BinaryArchiveDir string
+	MetricsDir       string
 	StartNum         uint64
 	PruneInterval    int
 	MaxBlocks        int
@@ -92,6 +100,8 @@ type ProcessorConfig struct {
 	ArchiveItemCacheLimit int
 	CuckooBuckets         int
 	CuckooSlots           int
+	BinaryNodeCacheLimit  int
+	BinaryPhysicalDelete  bool
 }
 
 func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
@@ -130,6 +140,8 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 			ArchiveItemCacheLimit: cfg.ArchiveItemCacheLimit,
 			CuckooBuckets:         cfg.CuckooBuckets,
 			CuckooSlots:           cfg.CuckooSlots,
+			NodeCacheLimit:        cfg.BinaryNodeCacheLimit,
+			PhysicalDelete:        cfg.BinaryPhysicalDelete,
 		},
 		PathDB: pdb,
 		HashDB: hdb,
@@ -182,6 +194,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		UseBinaryTrie:         *useBinaryTrie,
 		UseMemory:             *useMemory,
 		BinaryArchiveDir:      *binaryArchiveDir,
+		MetricsDir:            *metricsDir,
 		StartNum:              46147,
 		PruneInterval:         *pruneInterval,
 		MaxBlocks:             *maxBlocks,
@@ -190,6 +203,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		ArchiveItemCacheLimit: *archiveItemCacheLimit,
 		CuckooBuckets:         *cuckooBuckets,
 		CuckooSlots:           *cuckooSlots,
+		BinaryNodeCacheLimit:  *binaryNodeCacheLimit,
+		BinaryPhysicalDelete:  *binaryPhysicalDelete,
 	}
 
 	common.UseVerkle = cfg.UseVerkle
@@ -228,10 +243,21 @@ func TestExpireStateProcessor(t *testing.T) {
 		epochID                uint64
 		totalTxTime            time.Duration
 		maxTxTime              time.Duration
-		totalRootTime          time.Duration
-		maxRootTime            time.Duration
+		totalFinaliseTime      time.Duration
+		maxFinaliseTime        time.Duration
+		totalCommitTime        time.Duration
+		maxCommitTime          time.Duration
+		maxCommitBlock         uint64
+		totalRootPipelineTime  time.Duration
+		maxRootPipelineTime    time.Duration
+		maxRootPipelineBlock   uint64
+		totalHandleDestruct    time.Duration
+		maxHandleDestruct      time.Duration
+		maxHandleDestructBlock uint64
 		totalPruneTime         time.Duration
 		maxPruneTime           time.Duration
+		maxPruneBlock          uint64
+		maxProofSizeBlockBlock uint64
 		pruneCount             uint64
 		totalStorageSize       int64 // Cumulative storage size
 		intervalTxCount        uint64
@@ -239,9 +265,18 @@ func TestExpireStateProcessor(t *testing.T) {
 		globalTxCount          uint64
 		globalSuccessTxCount   uint64
 	)
+	slowCommitDiagThreshold := 400 * time.Millisecond
+
+	outputDir := cfg.MetricsDir
+	if outputDir == "" {
+		outputDir = "."
+	}
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		t.Fatalf("failed to create metrics directory %s: %v", outputDir, err)
+	}
 
 	// CSV file setup
-	csvFile, err := os.Create("asct_mainnet_metrics.csv")
+	csvFile, err := os.Create(filepath.Join(outputDir, "asct_mainnet_metrics.csv"))
 	if err != nil {
 		t.Fatalf("failed to create csv file: %v", err)
 	}
@@ -251,11 +286,21 @@ func TestExpireStateProcessor(t *testing.T) {
 
 	// Write CSV Header
 	writer.Write([]string{
-		"Epoch_ID", "Cumulative_Storage_Bytes", "Avg_Root_Calc_Time_ms", "Max_Root_Calc_Time_ms",
+		"Epoch_ID", "Tree_Type", "Cumulative_Storage_Bytes",
+		"State_Storage_Bytes", "Archived_Storage_Bytes",
+		"Trie_Child_Node_Count", "Total_Archived_Items", "Total_Bucket_Count",
+		"Max_Buckets_On_Single_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max",
+		"Avg_Finalise_Time_ms", "Max_Finalise_Time_ms",
+		"Avg_State_Commit_Time_ms", "Max_State_Commit_Time_ms",
+		"Avg_Root_Pipeline_Time_ms", "Max_Root_Pipeline_Time_ms",
+		"Max_State_Commit_Block", "Max_Root_Pipeline_Block",
+		"Avg_Handle_Destruction_Time_ms", "Max_Handle_Destruction_Time_ms", "Max_Handle_Destruction_Block",
 		"Avg_Pruning_Time_us", "Max_Pruning_Time_us",
 		"Hit_Count", "Miss_NonExistent_Count", "Miss_Existent_Count",
 		"Avg_Proof_Gen_Time_ms", "Max_Proof_Gen_Time_ms", "Avg_Proof_Verify_Time_ms", "Max_Proof_Verify_Time_ms",
 		"Avg_Proof_Size_Byte", "Max_Proof_Size_Byte",
+		"Max_Pruning_Block", "Max_Proof_Size_Block",
+		"Block_Start", "Block_End",
 		"Item_Proof_Min", "Item_Proof_P25", "Item_Proof_Med", "Item_Proof_P75", "Item_Proof_Max",
 		"Cycle_FP_Count", "Max_FP_In_Single_Block",
 	})
@@ -265,17 +310,60 @@ func TestExpireStateProcessor(t *testing.T) {
 			return
 		}
 		epochID++
-		storageSize, _ := getDirSize(cfg.DbDir)
-		totalStorageSize = storageSize // Update cumulative storage size
+		treeType := "MPT"
+		if cfg.UseBinaryTrie {
+			treeType = "ASCT"
+		} else if cfg.UseVerkle {
+			treeType = "Verkle"
+		}
+		stateStorageSize, _ := getDirSize(cfg.DbDir)
+		archiveStorageSize := int64(0)
+		if cfg.UseBinaryTrie && cfg.BinaryArchiveDir != "" {
+			archiveStorageSize, _ = getDirSize(cfg.BinaryArchiveDir)
+		}
+		totalStorageSize = stateStorageSize + archiveStorageSize
+
+		var (
+			trieChildNodeCount int64
+			totalArchivedItems int64
+			totalBucketCount   int
+			maxBucketsPath     int
+			bucketItemsAvg     float64
+			bucketItemsP50     int
+			bucketItemsP95     int
+			bucketItemsP99     int
+			bucketItemsMax     int
+		)
+		if cfg.UseBinaryTrie {
+			if active := host.trieDB.GetBinaryTrie(); active != nil {
+				if bt, ok := active.(*binarytrie.Trie); ok {
+					stats := bt.Stats()
+					trieChildNodeCount = stats.LeafCount
+					totalArchivedItems = stats.ArchivedDataSize
+					totalBucketCount = stats.BucketCount
+					maxBucketsPath = stats.MaxBucketsPath
+					bucketItemsAvg = stats.BucketItemsAvg
+					bucketItemsP50 = stats.BucketItemsP50
+					bucketItemsP95 = stats.BucketItemsP95
+					bucketItemsP99 = stats.BucketItemsP99
+					bucketItemsMax = stats.BucketItemsMax
+				}
+			}
+		}
 
 		fmt.Printf("  Blocks: %d - %d (Processed Blocks Count)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
 		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
 		if intervalTxCount > 0 {
 			fmt.Printf("  Tx Success Rate - %.2f%% (%d/%d)\n", float64(intervalSuccessTxCount)*100/float64(intervalTxCount), intervalSuccessTxCount, intervalTxCount)
 		}
-		fmt.Printf("  平均根计算耗时: %.2f ms\n", float64(totalRootTime.Milliseconds())/float64(intervalBlocks))
-		fmt.Printf("  最大根计算耗时: %v\n", maxRootTime)
-		fmt.Printf("  累计存储占用: %d 字节\n", totalStorageSize)
+		fmt.Printf("  Finalise - Avg: %.2f ms, Max: %v\n", float64(totalFinaliseTime.Milliseconds())/float64(intervalBlocks), maxFinaliseTime)
+		fmt.Printf("  State Commit - Avg: %.2f ms, Max: %v\n", float64(totalCommitTime.Milliseconds())/float64(intervalBlocks), maxCommitTime)
+		fmt.Printf("  Root Pipeline - Avg: %.2f ms, Max: %v\n", float64(totalRootPipelineTime.Milliseconds())/float64(intervalBlocks), maxRootPipelineTime)
+		fmt.Printf("  Storage bytes: total=%d, state=%d, archive=%d\n", totalStorageSize, stateStorageSize, archiveStorageSize)
+		if cfg.UseBinaryTrie {
+			fmt.Printf("  ASCT Struct - Leaves=%d, ArchiveItems=%d, Buckets=%d, MaxBucketsPath=%d\n",
+				trieChildNodeCount, totalArchivedItems, totalBucketCount, maxBucketsPath)
+		}
 
 		avgBinaryPruneTime := 0.0
 		if pruneCount > 0 {
@@ -287,16 +375,16 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  未命中且数据不存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissNonExistentCount))
 		fmt.Printf("  未命中但数据存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissExistentCount))
 
-		totalReads := atomic.LoadInt64(&common.BinaryHitCount) + atomic.LoadInt64(&common.BinaryMissNonExistentCount) + atomic.LoadInt64(&common.BinaryMissExistentCount)
+		missExistent := atomic.LoadInt64(&common.BinaryMissExistentCount)
 		avgGenTime := 0.0
-		if totalReads > 0 {
-			avgGenTime = (float64(atomic.LoadInt64(&common.BinaryProofGenTime)) / float64(totalReads)) / 1_000_000.0 // us -> ms
+		if missExistent > 0 {
+			avgGenTime = (float64(atomic.LoadInt64(&common.BinaryProofGenTime)) / float64(missExistent)) / 1_000_000.0 // ns -> ms
 		}
 		maxGenTime := float64(atomic.LoadInt64(&common.BinaryProofGenTimeMax)) / 1_000_000.0
 
 		avgVerifTime := 0.0
-		if atomic.LoadInt64(&common.BinaryMissExistentCount) > 0 {
-			avgVerifTime = (float64(atomic.LoadInt64(&common.BinaryProofVerifTime)) / float64(atomic.LoadInt64(&common.BinaryMissExistentCount))) / 1_000_000.0 // us -> ms
+		if missExistent > 0 {
+			avgVerifTime = (float64(atomic.LoadInt64(&common.BinaryProofVerifTime)) / float64(missExistent)) / 1_000_000.0 // ns -> ms
 		}
 		maxVerifTime := float64(atomic.LoadInt64(&common.BinaryProofVerifTimeMax)) / 1_000_000.0
 
@@ -306,9 +394,12 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  最大复活验证耗时: %.4f ms\n", maxVerifTime)
 
 		// Proof size metrics
-		avgProofSizeBlock := float64(atomic.LoadInt64(&common.BinaryTotalProofSize)) / float64(intervalBlocks)
+		avgProofSizeBlock := 0.0
+		if missExistent > 0 {
+			avgProofSizeBlock = float64(atomic.LoadInt64(&common.BinaryTotalProofSize)) / float64(missExistent)
+		}
 		maxProofSizeBlock := atomic.LoadInt64(&common.BinaryBlockProofSizeMax)
-		fmt.Printf("  平均每区块证明大小: %.2f bytes\n", avgProofSizeBlock)
+		fmt.Printf("  平均归档命中证明大小: %.2f bytes\n", avgProofSizeBlock)
 		fmt.Printf("  单区块证明最大大小: %d bytes\n", maxProofSizeBlock)
 
 		// Five-number summary for item proof sizes
@@ -347,9 +438,30 @@ func TestExpireStateProcessor(t *testing.T) {
 		// 写入 CSV
 		record := []string{
 			strconv.FormatUint(epochID, 10),
-			strconv.FormatInt(storageSize, 10),
-			fmt.Sprintf("%.2f", float64(totalRootTime.Milliseconds())/float64(intervalBlocks)),
-			strconv.FormatInt(maxRootTime.Milliseconds(), 10),
+			treeType,
+			strconv.FormatInt(totalStorageSize, 10),
+			strconv.FormatInt(stateStorageSize, 10),
+			strconv.FormatInt(archiveStorageSize, 10),
+			strconv.FormatInt(trieChildNodeCount, 10),
+			strconv.FormatInt(totalArchivedItems, 10),
+			strconv.Itoa(totalBucketCount),
+			strconv.Itoa(maxBucketsPath),
+			fmt.Sprintf("%.2f", bucketItemsAvg),
+			strconv.Itoa(bucketItemsP50),
+			strconv.Itoa(bucketItemsP95),
+			strconv.Itoa(bucketItemsP99),
+			strconv.Itoa(bucketItemsMax),
+			fmt.Sprintf("%.2f", float64(totalFinaliseTime.Milliseconds())/float64(intervalBlocks)),
+			strconv.FormatInt(maxFinaliseTime.Milliseconds(), 10),
+			fmt.Sprintf("%.2f", float64(totalCommitTime.Milliseconds())/float64(intervalBlocks)),
+			strconv.FormatInt(maxCommitTime.Milliseconds(), 10),
+			fmt.Sprintf("%.2f", float64(totalRootPipelineTime.Milliseconds())/float64(intervalBlocks)),
+			strconv.FormatInt(maxRootPipelineTime.Milliseconds(), 10),
+			strconv.FormatUint(maxCommitBlock, 10),
+			strconv.FormatUint(maxRootPipelineBlock, 10),
+			fmt.Sprintf("%.2f", float64(totalHandleDestruct.Milliseconds())/float64(intervalBlocks)),
+			strconv.FormatInt(maxHandleDestruct.Milliseconds(), 10),
+			strconv.FormatUint(maxHandleDestructBlock, 10),
 			fmt.Sprintf("%.2f", avgBinaryPruneTime),
 			strconv.FormatInt(maxPruneTime.Microseconds(), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
@@ -361,6 +473,8 @@ func TestExpireStateProcessor(t *testing.T) {
 			fmt.Sprintf("%.4f", maxVerifTime),
 			fmt.Sprintf("%.2f", avgProofSizeBlock),
 			strconv.FormatInt(maxProofSizeBlock, 10),
+			strconv.FormatUint(maxPruneBlock, 10),
+			strconv.FormatUint(maxProofSizeBlockBlock, 10),
 			strconv.FormatUint(totalProcessedBlocks-intervalBlocks, 10),
 			strconv.FormatUint(totalProcessedBlocks-1, 10),
 			strconv.FormatInt(minS, 10),
@@ -376,10 +490,21 @@ func TestExpireStateProcessor(t *testing.T) {
 
 		// 重置统计变量
 		intervalBlocks = 0
-		totalRootTime = 0
-		maxRootTime = 0
+		totalFinaliseTime = 0
+		maxFinaliseTime = 0
+		totalCommitTime = 0
+		maxCommitTime = 0
+		maxCommitBlock = 0
+		totalRootPipelineTime = 0
+		maxRootPipelineTime = 0
+		maxRootPipelineBlock = 0
+		totalHandleDestruct = 0
+		maxHandleDestruct = 0
+		maxHandleDestructBlock = 0
 		totalPruneTime = 0
 		maxPruneTime = 0
+		maxPruneBlock = 0
+		maxProofSizeBlockBlock = 0
 		pruneCount = 0
 		totalTxTime = 0 // Reset Tx Execution stats
 		maxTxTime = 0   // Reset Tx Execution stats
@@ -461,12 +586,72 @@ processFiles:
 					AddBalanceSilent(statedb, miner, reward)
 				}
 
-				if (cfg.UseBinaryTrie || !cfg.UseVerkle) && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
+				if cfg.UseBinaryTrie && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
+					pruneStart := time.Now()
 					statedb.PruneNextShard()
+					pruneDuration := time.Since(pruneStart)
+					totalPruneTime += pruneDuration
+					if pruneDuration > maxPruneTime {
+						maxPruneTime = pruneDuration
+						maxPruneBlock = b
+					}
+					pruneCount++
 				}
+				rootStart := time.Now()
+				finaliseStart := time.Now()
 				statedb.Finalise(false)
-				h, _ := statedb.Commit(b, false, false)
+				finaliseDuration := time.Since(finaliseStart)
+
+				commitStart := time.Now()
+				if cfg.UseBinaryTrie {
+					binarytrie.ResetCommitDiagnostics()
+				}
+				preCommitStart := time.Now()
+				if _, _, err := statedb.PreCommit(false); err != nil {
+					t.Fatalf("pre-commit failed at empty block %d: %v", b, err)
+				}
+				preCommitDuration := time.Since(preCommitStart)
+				postCommitStart := time.Now()
+				h, err := statedb.PostCommit(b, false, false)
+				if err != nil {
+					t.Fatalf("post-commit failed at empty block %d: %v", b, err)
+				}
+				postCommitDuration := time.Since(postCommitStart)
+				commitDuration := time.Since(commitStart)
+				rootDuration := time.Since(rootStart)
+				if commitDuration >= slowCommitDiagThreshold || statedb.CommitHandleDestruction >= slowCommitDiagThreshold {
+					treeLabel := "MPT"
+					extra := ""
+					if cfg.UseBinaryTrie {
+						treeLabel = "ASCT"
+						extra = " " + binarytrie.LastCommitDiagnostics().String()
+					} else if cfg.UseVerkle {
+						treeLabel = "Verkle"
+					}
+					fmt.Printf("[%s_COMMIT_DIAG] block=%d empty=true commit=%v pre=%v post=%v commitInternal=%v handleDestruction=%v deleteMerge=%v workers=%v afterWorkers=%v buildUpdate=%v codeWrite=%v accountCommit=%v storageCommit=%v snapshotCommit=%v trieDBCommit=%v readerReset=%v root_pipeline=%v%s\n",
+						treeLabel, b, commitDuration, preCommitDuration, postCommitDuration, statedb.CommitInternal, statedb.CommitHandleDestruction, statedb.CommitDeleteMerge, statedb.CommitWorkers, statedb.CommitAfterWorkers, statedb.CommitBuildUpdate, statedb.CommitCodeWrite, statedb.AccountCommits, statedb.StorageCommits, statedb.SnapshotCommits, statedb.TrieDBCommits, statedb.CommitReaderReset, rootDuration, extra)
+				}
 				lastStateRoot = h
+
+				totalFinaliseTime += finaliseDuration
+				if finaliseDuration > maxFinaliseTime {
+					maxFinaliseTime = finaliseDuration
+				}
+				totalCommitTime += commitDuration
+				if commitDuration > maxCommitTime {
+					maxCommitTime = commitDuration
+					maxCommitBlock = b
+				}
+				totalHandleDestruct += statedb.CommitHandleDestruction
+				if statedb.CommitHandleDestruction > maxHandleDestruct {
+					maxHandleDestruct = statedb.CommitHandleDestruction
+					maxHandleDestructBlock = b
+				}
+				totalRootPipelineTime += rootDuration
+				if rootDuration > maxRootPipelineTime {
+					maxRootPipelineTime = rootDuration
+					maxRootPipelineBlock = b
+				}
 				if b%1000 == 0 {
 					host.trieDB.Commit(h, false)
 					if !cfg.UseBinaryTrie && !cfg.UseVerkle {
@@ -558,31 +743,58 @@ processFiles:
 				maxTxTime = txDuration
 			}
 
-			if (cfg.UseBinaryTrie || !cfg.UseVerkle) && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
+			if cfg.UseBinaryTrie && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
 				pruneStart := time.Now()
 				statedb.PruneNextShard()
 				pruneDuration := time.Since(pruneStart)
 				totalPruneTime += pruneDuration
 				if pruneDuration > maxPruneTime {
 					maxPruneTime = pruneDuration
+					maxPruneBlock = b
 				}
 				pruneCount++
 			}
 
 			// 2. State root calculation time statistics
 			rootStart := time.Now()
+			finaliseStart := time.Now()
 			statedb.Finalise(false)
-			finaliseDuration := time.Since(rootStart)
+			finaliseDuration := time.Since(finaliseStart)
 
 			commitStart := time.Now()
-			h, _ := statedb.Commit(b, false, false)
+			if cfg.UseBinaryTrie {
+				binarytrie.ResetCommitDiagnostics()
+			}
+			preCommitStart := time.Now()
+			if _, _, err := statedb.PreCommit(false); err != nil {
+				t.Fatalf("pre-commit failed at block %d: %v", b, err)
+			}
+			preCommitDuration := time.Since(preCommitStart)
+			postCommitStart := time.Now()
+			h, err := statedb.PostCommit(b, false, false)
+			if err != nil {
+				t.Fatalf("post-commit failed at block %d: %v", b, err)
+			}
+			postCommitDuration := time.Since(postCommitStart)
 			commitDuration := time.Since(commitStart)
 
 			rootDuration := time.Since(rootStart)
+			if commitDuration >= slowCommitDiagThreshold || statedb.CommitHandleDestruction >= slowCommitDiagThreshold {
+				treeLabel := "MPT"
+				extra := ""
+				if cfg.UseBinaryTrie {
+					treeLabel = "ASCT"
+					extra = " " + binarytrie.LastCommitDiagnostics().String()
+				} else if cfg.UseVerkle {
+					treeLabel = "Verkle"
+				}
+				fmt.Printf("[%s_COMMIT_DIAG] block=%d empty=false commit=%v pre=%v post=%v commitInternal=%v handleDestruction=%v deleteMerge=%v workers=%v afterWorkers=%v buildUpdate=%v codeWrite=%v accountCommit=%v storageCommit=%v snapshotCommit=%v trieDBCommit=%v readerReset=%v root_pipeline=%v%s\n",
+					treeLabel, b, commitDuration, preCommitDuration, postCommitDuration, statedb.CommitInternal, statedb.CommitHandleDestruction, statedb.CommitDeleteMerge, statedb.CommitWorkers, statedb.CommitAfterWorkers, statedb.CommitBuildUpdate, statedb.CommitCodeWrite, statedb.AccountCommits, statedb.StorageCommits, statedb.SnapshotCommits, statedb.TrieDBCommits, statedb.CommitReaderReset, rootDuration, extra)
+			}
 
 			if b%100000 == 0 {
-				fmt.Printf("[测试] 区块 %d: 最终处理周期: %v, 树根计算: %v, 提交耗时: %v, 总计: %v\n",
-					b, finaliseDuration, commitDuration, rootDuration, rootDuration+finaliseDuration+commitDuration)
+				fmt.Printf("[测试] block %d: finalise=%v, commit=%v, root_pipeline=%v\n",
+					b, finaliseDuration, commitDuration, rootDuration)
 			}
 			lastStateRoot = h
 
@@ -598,7 +810,11 @@ processFiles:
 			blockProofSize := atomic.SwapInt64(&common.BinaryBlockProofSize, 0)
 			for {
 				maxBlockSize := atomic.LoadInt64(&common.BinaryBlockProofSizeMax)
-				if blockProofSize <= maxBlockSize || atomic.CompareAndSwapInt64(&common.BinaryBlockProofSizeMax, maxBlockSize, blockProofSize) {
+				if blockProofSize <= maxBlockSize {
+					break
+				}
+				if atomic.CompareAndSwapInt64(&common.BinaryBlockProofSizeMax, maxBlockSize, blockProofSize) {
+					maxProofSizeBlockBlock = b
 					break
 				}
 			}
@@ -612,9 +828,24 @@ processFiles:
 				}
 			}
 
-			totalRootTime += rootDuration
-			if rootDuration > maxRootTime {
-				maxRootTime = rootDuration
+			totalFinaliseTime += finaliseDuration
+			if finaliseDuration > maxFinaliseTime {
+				maxFinaliseTime = finaliseDuration
+			}
+			totalCommitTime += commitDuration
+			if commitDuration > maxCommitTime {
+				maxCommitTime = commitDuration
+				maxCommitBlock = b
+			}
+			totalHandleDestruct += statedb.CommitHandleDestruction
+			if statedb.CommitHandleDestruction > maxHandleDestruct {
+				maxHandleDestruct = statedb.CommitHandleDestruction
+				maxHandleDestructBlock = b
+			}
+			totalRootPipelineTime += rootDuration
+			if rootDuration > maxRootPipelineTime {
+				maxRootPipelineTime = rootDuration
+				maxRootPipelineBlock = b
 			}
 
 			intervalBlocks++
@@ -625,7 +856,7 @@ processFiles:
 			}
 			// 每 10w 区块刷新一次假阳性分布
 			if (b+1)%100000 == 0 {
-				flushGlobalFPDistribution()
+				flushGlobalFPDistribution(outputDir)
 			}
 		}
 	}
@@ -649,37 +880,38 @@ processFiles:
 	fmt.Printf(">>> END SUMMARY <<<\n\n")
 
 	t.Logf("最终状态根: %s", lastStateRoot.String())
-	flushGlobalFPDistribution() // 结束后强制刷新一次
+	flushGlobalFPDistribution(outputDir) // 结束后强制刷新一次
 }
 
-func flushGlobalFPDistribution() {
+func flushGlobalFPDistribution(outputDir string) {
 	common.BinaryStatsMu.Lock()
-	if len(common.BinaryFPDistribution) == 0 {
-		common.BinaryStatsMu.Unlock()
-		return
-	}
 	dist := make([]int64, len(common.BinaryFPDistribution))
 	copy(dist, common.BinaryFPDistribution)
 	common.BinaryFPDistribution = nil
 	common.BinaryStatsMu.Unlock()
 
-	f, err := os.OpenFile("global_fp_distribution.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	for _, d := range dist {
+		label := "100+"
+		if d < 100 {
+			if d < 0 {
+				d = 0
+			}
+			label = strconv.FormatInt(d, 10)
+		}
+		globalFPDistribution[label]++
+	}
+
+	if len(globalFPDistribution) == 0 {
+		return
+	}
+	data, err := json.MarshalIndent(globalFPDistribution, "", "  ")
 	if err != nil {
 		return
 	}
-	defer f.Close()
-
-	writer := csv.NewWriter(f)
-	defer writer.Flush()
-
-	// 检查文件是否为空，写入表头
-	if info, err := f.Stat(); err == nil && info.Size() == 0 {
-		writer.Write([]string{"Bucket_Size"})
+	if outputDir == "" {
+		outputDir = "."
 	}
-
-	for _, d := range dist {
-		writer.Write([]string{strconv.FormatInt(d, 10)})
-	}
+	_ = os.WriteFile(filepath.Join(outputDir, "global_fp_distribution.json"), data, 0644)
 }
 
 // BlockSummary aggregates state changes for a block.
@@ -725,7 +957,7 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 			t.count++
 			t.hasher.Write(addr[:])
 			var b [8]byte
-			binary.BigEndian.PutUint64(b[:], new)
+			stdbinary.BigEndian.PutUint64(b[:], new)
 			t.hasher.Write(b[:])
 
 			if t.blockNum == 50107 || t.blockNum == 46170 {

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	gethcrypto "github.com/ethereum/go-ethereum/crypto"
 )
 
 // MemoryDBAdapter adapts a simple map to KVStore interface for testing
@@ -88,6 +89,49 @@ func (b *MemoryBatchAdapter) Write() error {
 func (b *MemoryBatchAdapter) Reset()         { b.ops = nil }
 func (b *MemoryBatchAdapter) ValueSize() int { return 0 }
 
+func TestShardHashDoesNotClearDirtyBeforeCommit(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 4
+	config.InlineValueThreshold = 0
+	config.DeleteOldValues = true
+
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatalf("new shard: %v", err)
+	}
+	key := bytes.Repeat([]byte{0x11}, 32)
+	value := bytes.Repeat([]byte{0x22}, 64)
+	if err := shard.Put(key, value); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	rootHash, err := shard.Hash()
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	batch := &MemoryBatchAdapter{db: db}
+	committedRoot, err := shard.CommitToBatch(batch, false)
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if !bytes.Equal(committedRoot, rootHash) {
+		t.Fatalf("commit root mismatch: got %x want %x", committedRoot, rootHash)
+	}
+
+	foundRootPut := false
+	for _, op := range batch.ops {
+		if !op.isDel && bytes.Equal(op.key, rootHash) {
+			foundRootPut = true
+			break
+		}
+	}
+	if !foundRootPut {
+		t.Fatalf("Hash cleared dirty state before commit; root node %x was not written", rootHash)
+	}
+}
+
 func setupTrie() (*Trie, Hasher) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
@@ -133,6 +177,81 @@ func TestCommitToBatchPropagatesStaleDeletesNonDestructive(t *testing.T) {
 	}
 	if deletes == 0 {
 		t.Fatalf("expected non-destructive Trie.CommitToBatch to forward stale deletes")
+	}
+}
+
+func TestPruneMarksArchivedSubtreeNodesStale(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 4
+	config.ArchiveDB = db
+
+	global := byte(1)
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return global })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key0 := make([]byte, 32)
+	key1 := make([]byte, 32)
+	key1[0] = 0x08
+	if err := shard.Put(key0, []byte("value-0")); err != nil {
+		t.Fatal(err)
+	}
+	if err := shard.Put(key1, []byte("value-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	batch := &MemoryBatchAdapter{db: db}
+	if _, err := shard.CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	oldHashes := make(map[string]struct{})
+	collectPersistedNodeHashesForTest(shard.root, oldHashes)
+	if len(oldHashes) < 3 {
+		t.Fatalf("expected root and leaf hashes before prune, got %d", len(oldHashes))
+	}
+
+	global = 0
+	if err := shard.Prune(global); err != nil {
+		t.Fatal(err)
+	}
+	batch = &MemoryBatchAdapter{db: db}
+	if _, err := shard.CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+
+	deletes := make(map[string]struct{})
+	for _, op := range batch.ops {
+		if op.isDel {
+			deletes[string(op.key)] = struct{}{}
+		}
+	}
+	for hash := range oldHashes {
+		if _, ok := deletes[hash]; !ok {
+			t.Fatalf("expected stale delete for archived subtree node %x", []byte(hash))
+		}
+	}
+}
+
+func collectPersistedNodeHashesForTest(node Node, hashes map[string]struct{}) {
+	if node == nil {
+		return
+	}
+	if h := node.OriginalHash(); len(h) > 0 {
+		hashes[string(h)] = struct{}{}
+	}
+	if n, ok := node.(*InternalNode); ok {
+		collectPersistedNodeHashesForTest(n.Left, hashes)
+		collectPersistedNodeHashesForTest(n.Right, hashes)
+		for _, bucket := range n.StubList {
+			collectPersistedNodeHashesForTest(bucket, hashes)
+		}
 	}
 }
 
@@ -231,6 +350,343 @@ func TestShrinkPromotesStubList(t *testing.T) {
 	}
 }
 
+func TestCompactStubListMergesCommonPrefixBuckets(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ArchiveBucketSize = 4
+	config.ArchiveDB = db
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key0 := make([]byte, 32)
+	key1 := make([]byte, 32)
+	key1[0] = 0x01
+	key0[31] = 0x10
+	key1[31] = 0x20
+	val0 := []byte("value-0")
+	val1 := []byte("value-1")
+
+	newBucket := func(key, value []byte) *ArchiveBucketNode {
+		path := shard.prefixBits(key, 8, nil)
+		suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, path, 8)
+		bucket := &ArchiveBucketNode{Path: path, PathBits: 8, dirty: true}
+		shard.recomputeBucket(bucket, []ArchivedKV{{
+			Suffix:     suffix,
+			SuffixBits: suffixBits,
+			Value:      shard.stageValue(value),
+		}})
+		return bucket
+	}
+
+	parent := &InternalNode{}
+	shard.attachStubs(parent, []*ArchiveBucketNode{newBucket(key0, val0)})
+	shard.attachStubs(parent, []*ArchiveBucketNode{newBucket(key1, val1)})
+
+	if len(parent.StubList) != 1 {
+		t.Fatalf("expected common-prefix compaction to merge buckets, got %d", len(parent.StubList))
+	}
+	merged := parent.StubList[0]
+	if merged.PathBits != 7 {
+		t.Fatalf("expected merged bucket to use 7-bit common prefix, got %d", merged.PathBits)
+	}
+	got0, fromArchive, err := shard.getFromBucket(merged, key0, 0)
+	if err != nil || !fromArchive || !bytes.Equal(got0, val0) {
+		t.Fatalf("merged bucket lost key0: value=%q fromArchive=%v err=%v", got0, fromArchive, err)
+	}
+	got1, fromArchive, err := shard.getFromBucket(merged, key1, 0)
+	if err != nil || !fromArchive || !bytes.Equal(got1, val1) {
+		t.Fatalf("merged bucket lost key1: value=%q fromArchive=%v err=%v", got1, fromArchive, err)
+	}
+}
+
+func TestArchiveSubtreeKeepsBucketSizeLimitOnDegeneratePrefix(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 4
+	config.ArchiveBucketSize = 4
+	config.CuckooBuckets = 64
+	config.CuckooSlots = 4
+	config.ArchiveDB = db
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	keys := make([][]byte, 20)
+	values := make([][]byte, len(keys))
+	for i := range keys {
+		key := make([]byte, 32)
+		key[31] = byte(i)
+		value := []byte{byte(i), byte(i + 1)}
+		keys[i] = key
+		values[i] = value
+		if err := trie.Put(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := trie.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveShardForTest(trie, 0); err != nil {
+		t.Fatal(err)
+	}
+	root, err := trie.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewTrie(root, db, hasher, config, true)
+	stats := reloaded.Stats()
+	if stats.BucketItemsMax > config.ResolveArchiveBucketSize() {
+		t.Fatalf("archive bucket exceeded limit: max=%d limit=%d", stats.BucketItemsMax, config.ResolveArchiveBucketSize())
+	}
+	if stats.ArchivedDataSize != int64(len(keys)) {
+		t.Fatalf("archived item count mismatch: got %d want %d", stats.ArchivedDataSize, len(keys))
+	}
+	for i, key := range keys {
+		got, err := reloaded.Get(key)
+		if err != nil {
+			t.Fatalf("get archived key %d failed: %v", i, err)
+		}
+		if !bytes.Equal(got, values[i]) {
+			t.Fatalf("value mismatch for key %d: got %x want %x", i, got, values[i])
+		}
+	}
+}
+
+func TestInlineSmallValueSkipsValueBlobAndReloads(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 4
+	config.InlineValueThreshold = 32
+	config.ArchiveDB = db
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	key := bytes.Repeat([]byte{0x23}, 32)
+	value := bytes.Repeat([]byte{0x42}, 32)
+	if err := trie.Put(key, value); err != nil {
+		t.Fatal(err)
+	}
+	root, err := trie.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := db.Has(gethcrypto.Keccak256Hash(value).Bytes()); ok {
+		t.Fatalf("expected inline value to skip value blob write")
+	}
+
+	reloaded := NewTrie(root, db, hasher, config, true)
+	got, err := reloaded.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("inline value mismatch after reload: got %x want %x", got, value)
+	}
+
+	if err := archiveShardForTest(reloaded, reloaded.GetShardID(key)); err != nil {
+		t.Fatal(err)
+	}
+	if err := reloaded.FlushArchives(); err != nil {
+		t.Fatal(err)
+	}
+	got, err = reloaded.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("inline archive value mismatch: got %x want %x", got, value)
+	}
+}
+
+func TestDeleteOldValueBlobOnUpdate(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 4
+	config.DeleteOldValues = true
+	config.ArchiveDB = db
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	key := bytes.Repeat([]byte{0x35}, 32)
+	oldValue := []byte("old-value")
+	newValue := []byte("new-value")
+	oldRef := gethcrypto.Keccak256Hash(key, oldValue).Bytes()
+	newRef := gethcrypto.Keccak256Hash(key, newValue).Bytes()
+
+	if err := trie.Put(key, oldValue); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trie.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := db.Has(valueDataKey(oldRef)); !ok {
+		t.Fatalf("expected old value blob to be written")
+	}
+
+	if err := trie.Put(key, newValue); err != nil {
+		t.Fatal(err)
+	}
+	root, err := trie.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := db.Has(valueDataKey(oldRef)); ok {
+		t.Fatalf("expected superseded value blob to be deleted")
+	}
+	if ok, _ := db.Has(valueDataKey(newRef)); !ok {
+		t.Fatalf("expected new value blob to be written")
+	}
+
+	reloaded := NewTrie(root, db, hasher, config, true)
+	got, err := reloaded.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newValue) {
+		t.Fatalf("value mismatch after update: got %x want %x", got, newValue)
+	}
+}
+
+func TestExternalValuesStoredOutsideStateDB(t *testing.T) {
+	stateDB := NewMemoryDBAdapter()
+	valueDB := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 4
+	config.DeleteOldValues = true
+	config.ArchiveDB = valueDB
+	trie := NewTrie(nil, stateDB, hasher, config, true)
+
+	key := bytes.Repeat([]byte{0x44}, 32)
+	oldValue := []byte("old-external-value")
+	newValue := []byte("new-external-value")
+	oldRef := gethcrypto.Keccak256Hash(key, oldValue).Bytes()
+	newRef := gethcrypto.Keccak256Hash(key, newValue).Bytes()
+
+	if err := trie.Put(key, oldValue); err != nil {
+		t.Fatal(err)
+	}
+	root, err := trie.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := stateDB.Has(valueDataKey(oldRef)); ok {
+		t.Fatalf("stateDB should not contain external value blob")
+	}
+	if ok, _ := stateDB.Has(oldRef); ok {
+		t.Fatalf("stateDB should not contain legacy raw value blob")
+	}
+	if ok, _ := valueDB.Has(valueDataKey(oldRef)); !ok {
+		t.Fatalf("archive/value DB should contain external value blob")
+	}
+
+	reloaded := NewTrie(root, stateDB, hasher, config, true)
+	got, err := reloaded.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, oldValue) {
+		t.Fatalf("external value mismatch after reload: got %x want %x", got, oldValue)
+	}
+
+	if err := archiveShardForTest(reloaded, reloaded.GetShardID(key)); err != nil {
+		t.Fatal(err)
+	}
+	root, err = reloaded.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded = NewTrie(root, stateDB, hasher, config, true)
+	got, err = reloaded.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, oldValue) {
+		t.Fatalf("external archived value mismatch: got %x want %x", got, oldValue)
+	}
+
+	if err := reloaded.Put(key, newValue); err != nil {
+		t.Fatal(err)
+	}
+	root, err = reloaded.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := valueDB.Has(valueDataKey(oldRef)); ok {
+		t.Fatalf("expected superseded external value blob to be deleted")
+	}
+	if ok, _ := valueDB.Has(valueDataKey(newRef)); !ok {
+		t.Fatalf("expected new external value blob to be written")
+	}
+
+	reloaded = NewTrie(root, stateDB, hasher, config, true)
+	got, err = reloaded.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newValue) {
+		t.Fatalf("external value mismatch after update: got %x want %x", got, newValue)
+	}
+}
+
+func TestTopTreeDeletesSupersededRootNode(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 4
+	config.ArchiveDB = db
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	key1 := bytes.Repeat([]byte{0x11}, 32)
+	key2 := bytes.Repeat([]byte{0x22}, 32)
+	if err := trie.Put(key1, []byte("value-1")); err != nil {
+		t.Fatal(err)
+	}
+	root1, err := trie.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := db.Has(root1); !ok {
+		t.Fatalf("expected first top root node to be persisted")
+	}
+
+	if err := trie.Put(key2, []byte("value-2")); err != nil {
+		t.Fatal(err)
+	}
+	root2, err := trie.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(root1, root2) {
+		t.Fatalf("expected top root to change")
+	}
+	if ok, _ := db.Has(root1); ok {
+		t.Fatalf("expected superseded top root node to be deleted")
+	}
+	if ok, _ := db.Has(root2); !ok {
+		t.Fatalf("expected current top root node to be persisted")
+	}
+
+	reloaded := NewTrie(root2, db, hasher, config, true)
+	got, err := reloaded.Get(key1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("value-1")) {
+		t.Fatalf("key1 mismatch after reload: got %q", got)
+	}
+	got, err = reloaded.Get(key2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("value-2")) {
+		t.Fatalf("key2 mismatch after reload: got %q", got)
+	}
+}
+
 func archiveShardForTest(trie *Trie, shardID int) error {
 	// Fresh writes start on epoch bit 1 under the rolling-epoch policy. Pruning
 	// shard 0 flips the global bit inside PruneNextShard; other shards do not.
@@ -281,6 +737,69 @@ func TestBasicOperations(t *testing.T) {
 	_, err = trie.Get(key)
 	if err != ErrNodeNotFound {
 		t.Errorf("Get after delete returned error %v, want ErrNodeNotFound", err)
+	}
+}
+
+func TestDeleteArchivedBucketEntry(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 4
+	config.ArchiveDB = db
+	config.InlineValueThreshold = 0
+	config.DeleteOldValues = true
+
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key1 := bytes.Repeat([]byte{0x10}, 32)
+	key2 := bytes.Repeat([]byte{0x10}, 32)
+	key2[31] = 0x20
+	val1 := []byte("archived-value-1")
+	val2 := []byte("archived-value-2")
+
+	path := shard.prefixBits(key1, 8, nil)
+	makeItem := func(key, value []byte) ArchivedKV {
+		suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, path, 8)
+		return ArchivedKV{
+			Suffix:     suffix,
+			SuffixBits: suffixBits,
+			Value:      shard.stageValueForKey(key, value),
+		}
+	}
+	items := []ArchivedKV{
+		makeItem(key1, val1),
+		makeItem(key2, val2),
+	}
+	bucket := &ArchiveBucketNode{Path: path, PathBits: 8, dirty: true}
+	shard.recomputeBucket(bucket, items)
+	data, err := shard.serializeArchivedKV(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := shard.ensureBucketHash(bucket)
+	if err := db.PutBucket(archiveDataKey(hash), data); err != nil {
+		t.Fatal(err)
+	}
+	shard.root = bucket
+
+	if err := shard.Delete(key1); err != nil {
+		t.Fatalf("delete archived key failed: %v", err)
+	}
+	if bucket.Count != 1 {
+		t.Fatalf("expected one archived item to remain, got %d", bucket.Count)
+	}
+	if _, _, err := shard.getFromBucket(bucket, key1, 0); err != ErrNodeNotFound {
+		t.Fatalf("deleted archived key still resolves, err=%v", err)
+	}
+	got, fromArchive, err := shard.getFromBucket(bucket, key2, 0)
+	if err != nil {
+		t.Fatalf("remaining archived key missing: %v", err)
+	}
+	if !fromArchive || !bytes.Equal(got, val2) {
+		t.Fatalf("remaining archived value mismatch: value=%q fromArchive=%v", got, fromArchive)
 	}
 }
 
@@ -408,7 +927,7 @@ func TestPersistence(t *testing.T) {
 	// If I can't load roots, I can't test persistence across instances easily without modifying Trie.
 	// But I can test if Commit actually writes to DB.
 	valHash := hasher.Hash(val)
-	if data, _ := db.Get(valHash); !bytes.Equal(data, val) {
+	if data, _ := db.Get(valueDataKey(valHash)); !bytes.Equal(data, val) {
 		t.Errorf("Value not written to DB")
 	}
 
@@ -432,7 +951,7 @@ func TestPruningBasic(t *testing.T) {
 
 	// Verify it exists in DB
 	valHash := hasher.Hash(val)
-	if data, _ := db.Get(valHash); len(data) == 0 {
+	if data, _ := db.Get(valueDataKey(valHash)); len(data) == 0 {
 		t.Fatalf("Data missing before prune")
 	}
 

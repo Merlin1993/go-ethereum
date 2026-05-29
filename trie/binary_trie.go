@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
@@ -45,12 +46,63 @@ var (
 	// globalNodeCache stores nodes that are not yet committed to triedb's disk.
 	// This is needed because NewBinaryTrie creates new adapters that wouldn't see
 	// the previous blocks' uncommitted nodes otherwise.
-	globalNodeCache   = make(map[common.Hash][]byte)
-	globalNodeCacheMu sync.RWMutex
+	globalNodeCache      *lru.Cache[common.Hash, []byte]
+	globalNodeCacheLimit int
+	globalNodeCacheMu    sync.RWMutex
 
 	globalTrieRegistry   = make(map[database.NodeDatabase]*binary.Trie)
 	globalTrieRegistryMu sync.Mutex
 )
+
+const defaultBinaryNodeCacheLimit = 262144
+
+func configureBinaryNodeCache(limit int) {
+	globalNodeCacheMu.Lock()
+	defer globalNodeCacheMu.Unlock()
+
+	if limit == globalNodeCacheLimit {
+		return
+	}
+	globalNodeCacheLimit = limit
+	if limit <= 0 {
+		globalNodeCache = nil
+		return
+	}
+	globalNodeCache = lru.NewCache[common.Hash, []byte](limit)
+}
+
+func binaryNodeCacheAdd(hash common.Hash, value []byte) {
+	globalNodeCacheMu.RLock()
+	cache := globalNodeCache
+	globalNodeCacheMu.RUnlock()
+	if cache == nil {
+		return
+	}
+	cache.Add(hash, common.CopyBytes(value))
+}
+
+func binaryNodeCacheGet(hash common.Hash) ([]byte, bool) {
+	globalNodeCacheMu.RLock()
+	cache := globalNodeCache
+	globalNodeCacheMu.RUnlock()
+	if cache == nil {
+		return nil, false
+	}
+	val, ok := cache.Get(hash)
+	if !ok {
+		return nil, false
+	}
+	return common.CopyBytes(val), true
+}
+
+func binaryNodeCacheRemove(hash common.Hash) {
+	globalNodeCacheMu.RLock()
+	cache := globalNodeCache
+	globalNodeCacheMu.RUnlock()
+	if cache != nil {
+		cache.Remove(hash)
+	}
+}
 
 // NewBinaryTrie creates a new binary trie.
 func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Database) (*BinaryTrie, error) {
@@ -87,9 +139,9 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 		}
 	}
 
-	// For now, we use a simple adapter for the KVStore and ArchiveDB
-	kvAdapter := &binaryDBAdapter{db: db, root: root, archive: archive}
 	config := binary.DefaultConfig()
+	nodeCacheLimit := defaultBinaryNodeCacheLimit
+	physicalDelete := false
 
 	// Try to get config from DB
 	type configDB interface {
@@ -111,8 +163,17 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 			if dbConf.CuckooSlots > 0 {
 				config.CuckooSlots = dbConf.CuckooSlots
 			}
+			if dbConf.NodeCacheLimit != 0 {
+				nodeCacheLimit = dbConf.NodeCacheLimit
+			}
+			physicalDelete = dbConf.PhysicalDelete
 		}
 	}
+
+	configureBinaryNodeCache(nodeCacheLimit)
+
+	// For now, we use a simple adapter for the KVStore and ArchiveDB
+	kvAdapter := &binaryDBAdapter{db: db, root: root, archive: archive, physicalDelete: physicalDelete}
 
 	if archive != nil {
 		config.ArchiveDB = &binaryDBAdapterArchive{db: archive}
@@ -138,14 +199,15 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 }
 
 type binaryDBAdapter struct {
-	db           database.NodeDatabase
-	root         common.Hash
-	reader       database.NodeReader
-	disk         ethdb.Database
-	archive      ethdb.Database
-	values       map[common.Hash][]byte
-	pendingNodes *trienode.NodeSet // [FIX] Tracks all nodes written between commits
-	mu           sync.RWMutex
+	db             database.NodeDatabase
+	root           common.Hash
+	reader         database.NodeReader
+	disk           ethdb.Database
+	archive        ethdb.Database
+	values         map[common.Hash][]byte
+	pendingNodes   *trienode.NodeSet // [FIX] Tracks all nodes written between commits
+	physicalDelete bool
+	mu             sync.RWMutex
 }
 
 func (a *binaryDBAdapter) archiveDB() ethdb.Database {
@@ -168,9 +230,7 @@ func (a *binaryDBAdapter) diskDB() ethdb.Database {
 func (a *binaryDBAdapter) Put(key, value []byte) error {
 	h := common.BytesToHash(key)
 	if len(key) == 32 {
-		globalNodeCacheMu.Lock()
-		globalNodeCache[h] = common.CopyBytes(value)
-		globalNodeCacheMu.Unlock()
+		binaryNodeCacheAdd(h, value)
 
 		// [FIX] Record for current NodeSet in Commit
 		a.mu.Lock()
@@ -189,12 +249,9 @@ func (a *binaryDBAdapter) Put(key, value []byte) error {
 func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
 	if len(key) == 32 {
 		h := common.BytesToHash(key)
-		globalNodeCacheMu.RLock()
-		if val, ok := globalNodeCache[h]; ok {
-			globalNodeCacheMu.RUnlock()
-			return common.CopyBytes(val), nil
+		if val, ok := binaryNodeCacheGet(h); ok {
+			return val, nil
 		}
-		globalNodeCacheMu.RUnlock()
 	}
 	// ... rest of the code
 
@@ -233,25 +290,28 @@ func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
 	if err == nil && data != nil {
 		// [FIX] Warm the cache! Once a node is found, keep it in globalNodeCache
 		// to ensure cross-block and cross-reset visibility.
-		globalNodeCacheMu.Lock()
-		globalNodeCache[h] = common.CopyBytes(data)
-		globalNodeCacheMu.Unlock()
+		binaryNodeCacheAdd(h, data)
 		return data, nil
 	}
 	return data, err
 }
 func (a *binaryDBAdapter) Delete(key []byte) error {
-	// [FIX] Zero-Deletion Strategy for consistency debugging.
-	// We do NOT physically delete nodes until we 100% guarantee no
-	// logical view (current or next block) still refers to them.
-	// fmt.Printf("[DEBUG] adapter.Delete intercepted for %x\n", key)
+	if len(key) == common.HashLength {
+		binaryNodeCacheRemove(common.BytesToHash(key))
+	}
+	if !a.physicalDelete {
+		return nil
+	}
+	if db := a.diskDB(); db != nil {
+		return db.Delete(key)
+	}
 	return nil
 }
 func (a *binaryDBAdapter) NewBatch() binary.Batcher {
 	if db := a.diskDB(); db != nil {
-		return &binaryBatchAdapter{db: a.db, batch: db.NewBatch()}
+		return &binaryBatchAdapter{db: a.db, batch: db.NewBatch(), physicalDelete: a.physicalDelete}
 	}
-	return &binaryBatchAdapter{db: a.db}
+	return &binaryBatchAdapter{db: a.db, physicalDelete: a.physicalDelete}
 }
 
 // ArchiveStore implementation for binaryDBAdapter
@@ -274,8 +334,9 @@ func (a *binaryDBAdapterArchive) GetBucket(hash []byte) ([]byte, error) { return
 func (a *binaryDBAdapterArchive) DeleteBucket(hash []byte) error        { return a.db.Delete(hash) }
 
 type binaryBatchAdapter struct {
-	db    database.NodeDatabase
-	batch ethdb.Batch
+	db             database.NodeDatabase
+	batch          ethdb.Batch
+	physicalDelete bool
 }
 
 func (a *binaryBatchAdapter) Put(key, value []byte) error {
@@ -285,6 +346,12 @@ func (a *binaryBatchAdapter) Put(key, value []byte) error {
 	return nil
 }
 func (a *binaryBatchAdapter) Delete(key []byte) error {
+	if len(key) == common.HashLength {
+		binaryNodeCacheRemove(common.BytesToHash(key))
+	}
+	if !a.physicalDelete {
+		return nil
+	}
 	if a.batch != nil {
 		return a.batch.Delete(key)
 	}
@@ -329,18 +396,7 @@ func (b *nodeSetBatcher) Put(key, value []byte) error {
 	b.nodes.AddNode(key, trienode.New(h, value))
 
 	// [FIX] Update global cache for immediate visibility in subsequent adapter.Get across blocks
-	globalNodeCacheMu.Lock()
-	globalNodeCache[h] = common.CopyBytes(value)
-	globalNodeCacheMu.Unlock()
-
-	// [FIX] Record for current NodeSet in adapter as well for cross-block persistence
-	if b.adapter != nil {
-		b.adapter.mu.Lock()
-		if b.adapter.pendingNodes != nil {
-			b.adapter.pendingNodes.AddNode(key, trienode.New(h, value))
-		}
-		b.adapter.mu.Unlock()
-	}
+	binaryNodeCacheAdd(h, value)
 
 	return nil
 }
@@ -435,58 +491,99 @@ func (t *BinaryTrie) Hash() common.Hash {
 }
 
 func (t *BinaryTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
+	commitStart := time.Now()
 	// [SHARD-AWARE COMMIT via Anonymous Interface to break Import Cycle]
 	if adapter, ok := t.trie.Database().(*binaryDBAdapter); ok {
-		h, err := t.trie.Hash()
-		if err != nil {
-			return common.Hash{}, nil
-		}
-		root := common.BytesToHash(h)
-
 		// 1. Prepare MergedNodeSet for atomic update across owners
 		merged := trienode.NewMergedNodeSet()
+		dirtyShards := t.trie.GetDirtyShards()
+		shardRoots := make(map[int][]byte, len(dirtyShards))
 
 		// 2. Iterate through dirty shards and populate MergedNodeSet
-		for _, id := range t.trie.GetDirtyShards() {
-			shardRootBytes := t.trie.GetShardRoot(id)
-			shardRoot := common.BytesToHash(shardRootBytes)
+		shardCommitStart := time.Now()
+		for _, id := range dirtyShards {
+			nodes := trienode.NewNodeSet(common.Hash{})
+			batch := &nodeSetBatcher{adapter: adapter, nodes: nodes}
+			shardRootBytes, err := t.trie.CommitShardToBatch(id, batch, false)
+			if err != nil {
+				fmt.Printf("[DEBUG] BinaryTrie.Commit shard %d error: %v\n", id, err)
+				return common.Hash{}, nil
+			}
+			if len(shardRootBytes) > 0 {
+				shardRoots[id] = shardRootBytes
+			} else {
+				shardRoots[id] = make([]byte, common.HashLength)
+			}
 
-			nodes := trienode.NewNodeSet(shardRoot)
-			batch := &nodeSetBatcher{adapter: adapter, nodes: nodes, owner: shardRoot}
-			t.trie.CommitShardToBatch(id, batch, false)
-
+			shardRoot := common.BytesToHash(shardRoots[id])
+			nodes.Owner = shardRoot
 			if len(nodes.Nodes) > 0 {
-				merged.Sets[shardRoot] = nodes
+				if err := merged.Merge(nodes); err != nil {
+					fmt.Printf("[DEBUG] BinaryTrie.Commit merge shard %d error: %v\n", id, err)
+					return common.Hash{}, nil
+				}
+			}
+		}
+		shardCommitDuration := time.Since(shardCommitStart)
+
+		// 3. Commit the top tree container nodes under the zero owner.
+		topNodes := trienode.NewNodeSet(common.Hash{})
+		topBatch := &nodeSetBatcher{adapter: adapter, nodes: topNodes}
+		topTreeStart := time.Now()
+		h, err := t.trie.CommitTopTreeToBatch(shardRoots, dirtyShards, topBatch)
+		if err != nil {
+			fmt.Printf("[DEBUG] BinaryTrie.Commit top tree error: %v\n", err)
+			return common.Hash{}, nil
+		}
+		topTreeDuration := time.Since(topTreeStart)
+		root := common.BytesToHash(h)
+		if len(topNodes.Nodes) > 0 {
+			if err := merged.Merge(topNodes); err != nil {
+				fmt.Printf("[DEBUG] BinaryTrie.Commit merge top tree error: %v\n", err)
+				return common.Hash{}, nil
 			}
 		}
 
-		// 3. Add pending nodes and manual values to MergedNodeSet under zero owner
+		// 4. Add pending nodes and manual values to MergedNodeSet under zero owner
+		adapterMergeStart := time.Now()
 		adapter.mu.Lock()
 		if adapter.pendingNodes != nil && len(adapter.pendingNodes.Nodes) > 0 {
-			merged.Sets[common.Hash{}] = adapter.pendingNodes
-			adapter.pendingNodes = trienode.NewNodeSet(common.Hash{})
+			if err := merged.Merge(adapter.pendingNodes); err != nil {
+				adapter.mu.Unlock()
+				fmt.Printf("[DEBUG] BinaryTrie.Commit merge pending nodes error: %v\n", err)
+				return common.Hash{}, nil
+			}
+			adapter.pendingNodes = nil
 		}
 		if len(adapter.values) > 0 {
 			vNodes := trienode.NewNodeSet(common.Hash{})
 			for hash, blob := range adapter.values {
 				vNodes.AddNode(hash.Bytes(), trienode.New(hash, blob))
 			}
-			merged.Sets[common.Hash{}] = vNodes
+			if err := merged.Merge(vNodes); err != nil {
+				adapter.mu.Unlock()
+				fmt.Printf("[DEBUG] BinaryTrie.Commit merge values error: %v\n", err)
+				return common.Hash{}, nil
+			}
 			adapter.values = nil
 		}
 		adapter.mu.Unlock()
+		adapterMergeDuration := time.Since(adapterMergeStart)
 
-		// 4. Update triedb atomically via anonymous interface assertion
+		// 5. Update triedb atomically via anonymous interface assertion
+		var updateDuration time.Duration
 		type updater interface {
 			Update(common.Hash, common.Hash, uint64, *trienode.MergedNodeSet, interface{}) error
 		}
 		if u, ok := t.db.(updater); ok {
+			updateStart := time.Now()
 			if err := u.Update(root, t.originRoot, t.block, merged, nil); err != nil {
 				fmt.Printf("[DEBUG] BinaryTrie.Commit Update error: %v\n", err)
 			}
+			updateDuration = time.Since(updateStart)
 		}
 
-		// 5. Native persistence for reuse
+		// 6. Native persistence for reuse
 		type trieSetter interface {
 			SetBinaryTrie(interface{})
 		}
@@ -495,11 +592,14 @@ func (t *BinaryTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 		}
 
 		t.originRoot = root
+		binary.RecordWrapperCommitDiagnostics(time.Since(commitStart), shardCommitDuration, topTreeDuration, adapterMergeDuration, updateDuration, len(dirtyShards))
 		// Return nil NodeSet because the internal logic already handled the atomic update
 		return root, nil
 	}
 
+	fallbackStart := time.Now()
 	h, _ := t.trie.CommitToBatch(nil, true)
+	binary.RecordWrapperCommitDiagnostics(time.Since(commitStart), time.Since(fallbackStart), 0, 0, 0, 0)
 	return common.BytesToHash(h), nil
 }
 

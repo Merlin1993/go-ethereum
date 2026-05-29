@@ -24,11 +24,13 @@ import (
 
 // BinaryConfig holds the configuration parameters for binary trie ablation.
 type BinaryConfig struct {
-	ShardDepth            int // Shard depth for binary trie
-	ArchiveBucketSize     int // Archive bucket size for binary trie
-	ArchiveItemCacheLimit int // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
-	CuckooBuckets         int // Cuckoo filter buckets for binary trie
-	CuckooSlots           int // Cuckoo filter slots for binary trie
+	ShardDepth            int  // Shard depth for binary trie
+	ArchiveBucketSize     int  // Archive bucket size for binary trie
+	ArchiveItemCacheLimit int  // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
+	CuckooBuckets         int  // Cuckoo filter buckets for binary trie
+	CuckooSlots           int  // Cuckoo filter slots for binary trie
+	NodeCacheLimit        int  // Max binary trie node blobs cached in process; 0 uses default, negative disables cache
+	PhysicalDelete        bool // Physically delete obsolete binary trie state nodes when requested
 }
 
 // NodeReader wraps the Node method of a backing trie reader.

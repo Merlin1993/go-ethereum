@@ -17,13 +17,17 @@ import (
 )
 
 var (
-	stressItems                 = flag.Int("stressItems", 1000000000, "Total items to inject in TestTrieStressBinary")
-	stressEpochItems            = flag.Int("stressEpochItems", 100000, "Items per metrics window in TestTrieStressBinary")
+	stressItems                 = flag.Int("stressItems", 5242880000, "Total items to inject in TestTrieStressBinary")
+	stressEpochItems            = flag.Int("stressEpochItems", 1000000, "Items per metrics window in TestTrieStressBinary")
 	stressBatchSize             = flag.Int("stressBatchSize", 1000, "Items per commit batch in TestTrieStressBinary")
-	stressBaseDir               = flag.String("stressBaseDir", "F:\\trie_stress_data_final_v3", "Base directory for TestTrieStressBinary")
+	stressGetsPerBatch          = flag.Int("stressGetsPerBatch", 1000, "Random Get operations per commit batch in TestTrieStressBinary")
+	stressGetMissPercent        = flag.Int("stressGetMissPercent", 50, "Percent of random Get operations targeting likely non-existent keys")
+	stressBaseDir               = flag.String("stressBaseDir", "F:\\trie_stress_depth16_batch1000_delete_values", "Base directory for TestTrieStressBinary")
 	stressMaxPool               = flag.Int("stressMaxPool", 10000000, "Maximum sliding key pool size in TestTrieStressBinary")
-	stressShardDepth            = flag.Int("stressShardDepth", 8, "Shard depth for TestTrieStressBinary")
+	stressShardDepth            = flag.Int("stressShardDepth", 16, "Shard depth for TestTrieStressBinary; 20 means 1,048,576 shards")
 	stressArchiveItemCacheLimit = flag.Int("stressArchiveItemCacheLimit", 0, "Decoded archive item cache limit for TestTrieStressBinary; 0 disables item caching, negative keeps all")
+	stressInlineValueThreshold  = flag.Int("stressInlineValueThreshold", 0, "Inline values up to this many bytes into trie/archive nodes during TestTrieStressBinary; 0 disables")
+	stressDeleteOldValues       = flag.Bool("stressDeleteOldValues", true, "Delete superseded external value blobs during TestTrieStressBinary")
 	stressDestructiveCommit     = flag.Bool("stressDestructiveCommit", false, "Unload committed shard nodes during TestTrieStressBinary commits")
 	stressAsyncIO               = flag.Bool("stressAsyncIO", false, "Pipeline archive flush and LevelDB batch writes behind the next foreground cycle")
 )
@@ -70,7 +74,7 @@ func (db *LevelDBAdapter) DeleteBucket(hash []byte) error {
 func TestTrieStressBinary(t *testing.T) {
 	// 1. 测试参数
 	TargetItems := 1000000000 // 总目标量 (5亿)
-	EpochItems := 100000      // 一个统计周期 (100万条)
+	EpochItems := 100000      // 一个统计周期 (10万条)
 	BatchSize := 1000         // 每个 Commit 的数据量
 
 	TargetItems = *stressItems
@@ -78,6 +82,15 @@ func TestTrieStressBinary(t *testing.T) {
 	BatchSize = *stressBatchSize
 	if TargetItems <= 0 || EpochItems <= 0 || BatchSize <= 0 {
 		t.Fatalf("stressItems, stressEpochItems and stressBatchSize must all be positive")
+	}
+	if *stressShardDepth < 0 || *stressShardDepth > 30 {
+		t.Fatalf("stressShardDepth is a bit depth, not a shard count; use 20 for 1,048,576 shards, got %d", *stressShardDepth)
+	}
+	if *stressInlineValueThreshold < 0 {
+		t.Fatalf("stressInlineValueThreshold must be non-negative")
+	}
+	if *stressGetsPerBatch < 0 || *stressGetMissPercent < 0 || *stressGetMissPercent > 100 {
+		t.Fatalf("stressGetsPerBatch must be non-negative and stressGetMissPercent must be in [0,100]")
 	}
 	if *stressAsyncIO && *stressDestructiveCommit {
 		t.Fatalf("stressAsyncIO requires in-memory shards; do not combine it with stressDestructiveCommit")
@@ -124,7 +137,8 @@ func TestTrieStressBinary(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ArchiveItemCacheLimit = *stressArchiveItemCacheLimit
-	config.ShardDepth = 8 // 降低分片深度以加速裁剪周期触发 (2^8 = 256)
+	config.InlineValueThreshold = *stressInlineValueThreshold
+	config.DeleteOldValues = *stressDeleteOldValues
 	config.ShardDepth = *stressShardDepth
 	config.ArchiveDB = &LevelDBAdapter{adb}
 	trie := NewTrie(nil, &LevelDBAdapter{sdb}, hasher, config, true)
@@ -141,7 +155,7 @@ func TestTrieStressBinary(t *testing.T) {
 	// 4. CSV 设置
 	resultsDir := filepath.Join(baseDir, "results")
 	os.MkdirAll(resultsDir, 0755)
-	csvPath := filepath.Join(resultsDir, "binary_stress.csv")
+	csvPath := filepath.Join(resultsDir, "asct_stress_test.csv")
 	csvFile, err := os.Create(csvPath)
 	if err != nil {
 		t.Fatal(err)
@@ -240,9 +254,21 @@ func TestTrieStressBinary(t *testing.T) {
 				}
 			}
 
+			for j := 0; j < *stressGetsPerBatch; j++ {
+				key := make([]byte, 32)
+				if len(keyPool) > 0 && rand.Intn(100) >= *stressGetMissPercent {
+					key = keyPool[rand.Intn(len(keyPool))]
+				} else {
+					rand.Read(key)
+				}
+				_, _ = trie.Get(key)
+			}
+
 			// 计算根耗时统计
 			startCommit := time.Now()
-			trie.CommitToBatch(batch, *stressDestructiveCommit)
+			if _, err := trie.CommitToBatch(batch, *stressDestructiveCommit); err != nil {
+				t.Fatalf("Failed to commit trie: %v", err)
+			}
 			commitDur := time.Since(startCommit)
 
 			if flushCh != nil {

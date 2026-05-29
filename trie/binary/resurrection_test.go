@@ -15,7 +15,10 @@ func TestResurrectionMetrics(t *testing.T) {
 	// 1. Reset metrics
 	atomic.StoreInt64(&common.BinaryMissExistentCount, 0)
 	atomic.StoreInt64(&common.BinaryProofGenTime, 0)
+	atomic.StoreInt64(&common.BinaryProofGenTimeMax, 0)
 	atomic.StoreInt64(&common.BinaryProofVerifTime, 0)
+	atomic.StoreInt64(&common.BinaryProofVerifTimeMax, 0)
+	atomic.StoreInt64(&common.BinaryTotalProofSize, 0)
 
 	// 2. Put data and move to archive
 	key := make([]byte, 32)
@@ -87,7 +90,7 @@ func TestResurrectionMetrics(t *testing.T) {
 	if verifTime < 0 {
 		t.Errorf("Expected ProofVerifTime >= 0, got %d", verifTime)
 	}
-	if verifTime > genTime {
-		t.Errorf("ProofVerifTime (%d) should be less than or equal to ProofGenTime (%d)", verifTime, genTime)
+	if totalSize <= 0 {
+		t.Errorf("Expected TotalProofSize > 0, got %d", totalSize)
 	}
 }

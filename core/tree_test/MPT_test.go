@@ -2,6 +2,7 @@ package tree
 
 import (
 	"crypto/sha256"
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
@@ -31,6 +32,14 @@ const (
 	method2Iterations = 20000 // Number of iterations
 
 	mptDir = "/home/ASCT/mpt_stress/cachedata" // "F:\\trie_stress_data\\mpt"
+)
+
+var (
+	mptStressItems      = flag.Int("mptStressItems", method1TotalData, "Total items to inject in TestTrieStressMPT")
+	mptStressBatchSize  = flag.Int("mptStressBatchSize", method1BatchSize, "Items per commit batch in TestTrieStressMPT")
+	mptStressEpochItems = flag.Int("mptStressEpochItems", 1000000, "Items per metrics window in TestTrieStressMPT")
+	mptStressBaseDir    = flag.String("mptStressBaseDir", mptDir, "Base directory for TestTrieStressMPT")
+	mptStressScheme     = flag.String("mptStressScheme", rawdb.PathScheme, "Trie DB scheme for TestTrieStressMPT: path or hash")
 )
 
 // Database keys
@@ -102,12 +111,24 @@ func BenchmarkMPT_Update(b *testing.B) {
 
 // TestTrieStressMPT: Batch write and commit with sliding window updates
 func TestTrieStressMPT(t *testing.T) {
+	totalData := *mptStressItems
+	batchPerCommit := *mptStressBatchSize
+	epochItems := *mptStressEpochItems
+	baseDir := *mptStressBaseDir
+	scheme := *mptStressScheme
+	if totalData <= 0 || batchPerCommit <= 0 || epochItems <= 0 {
+		t.Fatalf("mptStressItems, mptStressBatchSize and mptStressEpochItems must all be positive")
+	}
+	if scheme != rawdb.PathScheme && scheme != rawdb.HashScheme {
+		t.Fatalf("mptStressScheme must be %q or %q, got %q", rawdb.PathScheme, rawdb.HashScheme, scheme)
+	}
+
 	// Create temporary directory
-	os.RemoveAll(mptDir)
-	os.MkdirAll(mptDir, os.ModePerm)
+	os.RemoveAll(baseDir)
+	os.MkdirAll(baseDir, os.ModePerm)
 
 	// Create database
-	ldb, err := leveldb.New(mptDir, 128, 128, "sliding-test", false)
+	ldb, err := leveldb.New(baseDir, 128, 128, "sliding-test", false)
 	if err != nil {
 		t.Fatalf("Failed to create database: %v", err)
 	}
@@ -117,10 +138,10 @@ func TestTrieStressMPT(t *testing.T) {
 
 	mdb := ethdb.WrapWithStats(ldb)
 	diskDB := rawdb.NewDatabase(mdb)
-	// Use PathScheme for pruning support
-	cacheConfig := core.DefaultCacheConfigWithScheme(rawdb.PathScheme)
+	cacheConfig := core.DefaultCacheConfigWithScheme(scheme)
 	cacheConfig.SnapshotLimit = 0
 	trieDB := triedb.NewDatabase(diskDB, cacheConfig.TriedbConfig(false))
+	defer trieDB.Close()
 
 	// Load the last root hash
 	lastRoot, err := loadLastRoot(diskDB)
@@ -140,14 +161,14 @@ func TestTrieStressMPT(t *testing.T) {
 	var finalRoot common.Hash = lastRoot
 	totalStart := time.Now()
 
-	collector := NewMetricsCollector(100000, mptDir, "mpt_stress.csv")
+	collector := NewMetricsCollector(epochItems, baseDir, "mpt_stress.csv")
 	defer collector.Close()
 
 	// Batch write data
-	for i := 0; i < method1TotalData; i += method1BatchSize {
-		batchSize := method1BatchSize
-		if i+method1BatchSize > method1TotalData {
-			batchSize = method1TotalData - i
+	for i := 0; i < totalData; i += batchPerCommit {
+		batchSize := batchPerCommit
+		if i+batchPerCommit > totalData {
+			batchSize = totalData - i
 		}
 
 		// 1. Insert new keys (1000 items)
@@ -178,15 +199,18 @@ func TestTrieStressMPT(t *testing.T) {
 		finalRoot = root
 
 		// Update database
-		if err := trieDB.Update(root, lastRoot, uint64(i/method1BatchSize), trienode.NewWithNodeSet(nodes), triedb.NewStateSet()); err != nil {
+		if err := trieDB.Update(root, lastRoot, uint64(i/batchPerCommit), trienode.NewWithNodeSet(nodes), triedb.NewStateSet()); err != nil {
 			t.Fatalf("Failed to update database: %v", err)
 		}
 		if err := trieDB.Commit(root, false); err != nil {
 			t.Fatalf("Failed to commit database: %v", err)
 		}
 
-		// Prune historical state to keep only current data
-		trieDB.Cap(0)
+		if scheme == rawdb.HashScheme {
+			if err := trieDB.Cap(0); err != nil {
+				t.Fatalf("Failed to cap trie database: %v", err)
+			}
+		}
 
 		// Save the last root hash
 		if err := saveLastRoot(diskDB, root); err != nil {
@@ -202,7 +226,13 @@ func TestTrieStressMPT(t *testing.T) {
 		}
 
 		if collector.ShouldReport() {
-			t.Logf("Period Summary (Total Items: %d), metrics: %s", collector.totalInjected, collector.GetMetricsString())
+			diffs, nodes, preimages := trieDB.Size()
+			t.Logf("Period Summary (Total Items: %d), metrics: %s, TrieDBCache[Diffs: %s, Nodes: %s, Preimages: %s]",
+				collector.totalInjected,
+				collector.GetMetricsString(),
+				bytesToReadable(uint64(diffs)),
+				bytesToReadable(uint64(nodes)),
+				bytesToReadable(uint64(preimages)))
 			collector.ResetWindow()
 		}
 	}

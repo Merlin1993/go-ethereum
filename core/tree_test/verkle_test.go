@@ -1,6 +1,7 @@
 package tree
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -24,14 +25,29 @@ const (
 	verkleDir = "F:\\trie_stress_data\\verkle"
 )
 
+var (
+	verkleStressItems      = flag.Int("verkleStressItems", method1TotalData, "Total items to inject in TestTrieStressVerkle")
+	verkleStressBatchSize  = flag.Int("verkleStressBatchSize", method1BatchSize, "Items per commit batch in TestTrieStressVerkle")
+	verkleStressEpochItems = flag.Int("verkleStressEpochItems", 1000000, "Items per metrics window in TestTrieStressVerkle")
+	verkleStressBaseDir    = flag.String("verkleStressBaseDir", verkleDir, "Base directory for TestTrieStressVerkle")
+)
+
 // TestTrieStressVerkle: batch writes and commit with sliding window updates
 func TestTrieStressVerkle(t *testing.T) {
+	totalData := *verkleStressItems
+	batchPerCommit := *verkleStressBatchSize
+	epochItems := *verkleStressEpochItems
+	baseDir := *verkleStressBaseDir
+	if totalData <= 0 || batchPerCommit <= 0 || epochItems <= 0 {
+		t.Fatalf("verkleStressItems, verkleStressBatchSize and verkleStressEpochItems must all be positive")
+	}
+
 	// Create temporary directory
-	os.RemoveAll(verkleDir)
-	os.MkdirAll(verkleDir, os.ModePerm)
+	os.RemoveAll(baseDir)
+	os.MkdirAll(baseDir, os.ModePerm)
 
 	// Create database
-	ldb, err := leveldb.New(verkleDir, 128, 128, "verkle-test", false)
+	ldb, err := leveldb.New(baseDir, 128, 128, "verkle-test", false)
 	if err != nil {
 		t.Fatalf("failed to create database: %v", err)
 	}
@@ -63,17 +79,17 @@ func TestTrieStressVerkle(t *testing.T) {
 	var finalRoot common.Hash = lastRoot
 	totalStart := time.Now()
 
-	collector := NewMetricsCollector(100000, verkleDir, "verkle_stress.csv")
+	collector := NewMetricsCollector(epochItems, baseDir, "verkle_stress.csv")
 	defer collector.Close()
 
 	// Use a fixed address for testing
 	testAddr := common.Address{}
 
 	// Batch write data
-	for i := 0; i < method1TotalData; i += method1BatchSize {
-		batchSize := method1BatchSize
-		if i+method1BatchSize > method1TotalData {
-			batchSize = method1TotalData - i
+	for i := 0; i < totalData; i += batchPerCommit {
+		batchSize := batchPerCommit
+		if i+batchPerCommit > totalData {
+			batchSize = totalData - i
 		}
 
 		// 1. Insert new keys (1000 items)

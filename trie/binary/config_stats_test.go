@@ -53,3 +53,50 @@ func TestConfigAndStats(t *testing.T) {
 	// 4. Test ArchiveBucketSize
 	// Data size 20, BucketSize 5. Individual buckets should split if many items hit the same path.
 }
+
+func TestStatsDoesNotCreateEmptyShards(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := &Config{
+		ShardDepth:        8,
+		ArchiveBucketSize: 5,
+		ArchiveDB:         db,
+	}
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	key := make([]byte, 32)
+	key[0] = 0x42
+	if err := trie.Put(key, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := trie.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewTrie(root, db, hasher, config, true)
+	if loaded := countLoadedShardsForTest(reloaded); loaded != 0 {
+		t.Fatalf("expected reload to keep shards lazy, got %d loaded shards", loaded)
+	}
+
+	stats := reloaded.Stats()
+	if stats.LeafCount != 1 {
+		t.Fatalf("expected Stats to count one persisted leaf, got %d", stats.LeafCount)
+	}
+	if loaded := countLoadedShardsForTest(reloaded); loaded != 0 {
+		t.Fatalf("Stats should not install shard objects, got %d loaded shards", loaded)
+	}
+}
+
+func countLoadedShardsForTest(trie *Trie) int {
+	trie.shardsMu.RLock()
+	defer trie.shardsMu.RUnlock()
+
+	count := 0
+	for _, shard := range trie.shards {
+		if shard != nil {
+			count++
+		}
+	}
+	return count
+}

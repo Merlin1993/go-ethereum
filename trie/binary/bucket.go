@@ -139,7 +139,12 @@ func (s *Shard) ensureBucketHash(bucket *ArchiveBucketNode) []byte {
 }
 
 // blindAppendToBucket 实现“盲追加”：只更新元数据（过滤器、ECMH、Count），无需加载原始数据。
-func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []ArchivedKV) {
+func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []ArchivedKV) bool {
+	limit := s.config.ResolveArchiveBucketSize()
+	if limit > 0 && bucket.Count+uint64(len(newItems)) > uint64(limit) {
+		return false
+	}
+
 	bucket.cacheMu.Lock()
 	defer bucket.cacheMu.Unlock()
 
@@ -229,6 +234,7 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 			newItems: newItems,
 		}
 	}
+	return true
 }
 
 // blindDeleteFromBucket 实现“盲删除”：增量更新元数据（过滤器、ECMH、Count），无需加载原始数据。

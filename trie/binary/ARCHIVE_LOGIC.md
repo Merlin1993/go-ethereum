@@ -8,7 +8,7 @@
 *   **ECMH 批量累加**：大批量 `Add/Delete` 使用 worker-local Jacobian partial sum 后再合并，避免重复 affine 转换；空 commitment 下 1~3 个 hash 的新归档桶走直接 Jacobian 编码路径。
 *   **Value 写入批处理**：`Shard.Put/Activate` 先把 value blob 暂存在内存，`Shard.CommitToBatch` 再与节点元数据写入同一个 batch，使压力测试里的异步 batch write 可以被下一轮 prune/commit 覆盖。读路径会先查 pending/staged value，再查 LevelDB，保证异步窗口内的 read-your-write。
 *   **归档桶 hash 懒恢复**：反序列化后的 `ArchiveBucketNode` 不持久化内存态 `hash` 字段，读取归档数据前会根据桶元数据懒重建 hash，确保 reload 后仍可使用 `BucketHash + 0x01` 定位 archive data。
-*   **Prune/Shrink 可达性边界**：归档后断开热子树指针必须配合 StubList 上浮。当前归档剪枝路径使用 `shrinkPromote`，中间节点被压缩时会把侧挂桶返回给递归父节点，而不是保留该中间节点或把桶下沉到唯一热子节点。
+*   **Prune/Shrink 可达性边界**：归档后断开热子树指针必须保留冷路径可达性。当前归档剪枝优先把冷分支替换为 archive subtree，`StubList` 仅作为同路径或 shrink 上浮的兜底承载。
 
 ## 1. 核心架构与术语
 
@@ -40,7 +40,7 @@
     *   **LeafNode**: 转换为 `ArchivedKV` 记录（包含后缀路径和位长度）。
     *   **InternalNode**: 
         *   如果整个子树变冷，递归收集所有叶子位 `ArchivedKV`。
-        *   如果部分变冷，热的分支保留，冷的分支转换为 **ArchiveBucketNode** 挂载到该节点的 `StubList`。
+        *   如果部分变冷，热的分支保留，冷的分支转换为以 **ArchiveBucketNode** 为叶子的 archive subtree，并挂回原来的 child 边；只有入口路径已经等于当前节点位置、无法再通过 child bit 区分时，才挂入 `StubList`。
 3.  **路径更新**: 当前实现统一使用**绝对路径**表示归档桶入口路径。递归下探时从分片前缀累积绝对路径，子方向使用 `appendBit` 向前扩展；桶内 `ArchivedKV.Suffix` 仅保存相对于桶入口路径的后缀。
 4.  **迁移边界**: 归档桶允许在 Shrink 过程中向上提升到递归父节点，但不会向下迁移到唯一热子树；上浮时 `ArchiveBucketNode.Path` 保持绝对路径不变，不做重写。
 
@@ -51,7 +51,7 @@
 
 ### 节点收缩 (`tryShrink`) 与 StubList 上浮
 *   **路径压缩**: 当一个内部节点只有一个热分支时，触发路径压缩（Collapse）。
-*   **StubList 上浮**: 如果被压缩或删除的节点携带有归档桶（`StubList`），这些桶的内容不会被丢弃，而是被重新打散并“上浮”返回给递归上层。最终，这些内容会根据补全后的路径重新挂载到更高层的归档桶中，确保树结构的极致紧凑。
+*   **StubList 上浮**: 如果被压缩或删除的节点携带有归档桶（`StubList`），这些桶的内容不会被丢弃，而是上浮返回给递归上层。新生成的冷分支不应为了压缩而主动 flatten 到 `StubList`；它应优先作为 archive subtree 留在 child 边上。
 
 ---
 
@@ -61,14 +61,15 @@
 `InternalNode` 维护一个 `StubList []*ArchiveBucketNode`。
 *   **哈希依赖**: 在 `InternalNode.Serialize()` 中，所有侧挂桶的哈希按顺序参与序列化。这意味着归档数据的变动会递归反映到 Shard 的 Root Hash 上。
 *   **查找顺序**: 按“后进先出”（栈）顺序遍历。
+*   **使用边界**: `StubList` 不是冷分支的默认承载结构；默认承载结构是普通 child 指针下的 archive subtree。`StubList` 只用于同入口路径、root 容器或 shrink promotion 这类无法用 child bit 表达的情况。
 
 ### ArchiveBucketNode (归档桶)
 *   **绝对入口路径**: `ArchiveBucketNode.Path` 表示桶在分片中的绝对入口路径，而不是相对于当前挂载节点的相对路径。
-*   **增量更新**: 系统支持增量修改（`pendingAppends/pendingDeletes`），避免每次微小变动都触发全量桶重建。
+*   **增量更新**: 系统支持受限的增量修改（`pendingAppends/pendingDeletes`）。增量追加不得突破 `Config.ResolveArchiveBucketSize()`；一旦追加会超限，必须回退为加载原 bucket 并重建 archive subtree。
 *   **Filter**: 包含 Cuckoo Filter，Key 采用 `[uvarint(后缀位数)] + [后缀内容]` 编码以防碰撞，并支持 `MaxPathBits` 范围内的路径长度。
     *   **Fingerprint Hash Cache**: `alternateIndex` 仍使用原 Keccak(fp) 算法以兼容既有过滤器编码，但 16-bit fingerprint 的 65536 个哈希前缀会被全局缓存，避免归档桶重算时重复对 2 字节输入执行 Keccak。
 *   **盲删除**: 当前“盲删除”指不重建整桶并通过 pending delete / 元数据更新完成落库；匹配具体删除项时仍可能读取桶数据或使用缓存项来定位目标。
-*   **同入口前缀合并**: StubList 挂载新桶或提升旧桶时，会按 `Path + PathBits` 分组；同一绝对入口前缀下的多个小桶若合计不超过 `Config.ResolveArchiveBucketSize()`，会重建为一个桶。该合并不跨前缀、不把桶向下迁移，旧 archive data key 通过 pending 删除在 `FlushArchives` 阶段清理。
+*   **同入口前缀合并**: StubList 挂载新桶或提升旧桶时，会按 `Path + PathBits` 分组；同一绝对入口前缀下的多个小桶若合计不超过 `Config.ResolveArchiveBucketSize()`，会重建为一个桶。该合并不跨前缀，旧 archive data key 通过 pending 删除在 `FlushArchives` 阶段清理。
 *   **桶大小配置**: 归档桶分裂阈值由 `Config.ResolveArchiveBucketSize()` 生效，实际限制会结合 Cuckoo 参数收敛，而不是仅取原始 `ArchiveBucketSize` 字段。
 
 ---
@@ -97,8 +98,9 @@
 
 ### 查找序列
 1.  **热路径检索**: 优先走标准的 Trie 查找逻辑。
-2.  **冷路径回溯**: 如果热路径查找失败（例如遇到 `nil` 或路径不匹配），则检查当前所在 `InternalNode` 的 `StubList`。
-3.  **桶内搜索**: 遍历 `StubList`，先过过滤器，再反序列化匹配具体后缀。
+2.  **Archive child 检索**: 如果当前 child 是 `ArchiveBucketNode` 或 archive subtree，按普通 child 边继续下探；bucket 自身使用绝对入口路径确认命中。
+3.  **冷路径回溯**: 如果热路径查找失败（例如遇到 `nil` 或路径不匹配），再检查当前所在 `InternalNode` 的 `StubList`。
+4.  **桶内搜索**: 对候选 bucket 先过过滤器，再反序列化匹配具体后缀。
 
 ### 自动激活 (`Activate`)
 *   **命中即激活**: `Shard.Get` 如果从归档桶中找到数据，会自动调用 `Activate`。
@@ -260,20 +262,19 @@
 This section records the invariants added after the stress run where `State`,
 RSS/Heap, and latency continued to grow through millions of injected items.
 
-* **Archived child subtrees must be detached from the hot tree**: after a cold
-  left/right subtree is converted into an `ArchiveBucketNode` and side-mounted
-  in `StubList`, the corresponding child pointer, child hash, and child epoch
-  must be cleared. Keeping the child alive makes `LeafCount`, state nodes,
-  prune traversal cost, and heap usage grow linearly with total injected items.
+* **Archived child subtrees must replace stale hot nodes**: after a cold
+  left/right subtree is converted into an archive subtree, the old hot child
+  pointer/hash must be removed and replaced by the archive subtree. Keeping the
+  original hot child alive makes `LeafCount`, state nodes, prune traversal cost,
+  and heap usage grow linearly with total injected items.
 * **Archive bucket paths are absolute and extend forward**: child traversal from
   an accumulated absolute prefix must use `appendBit`, not `prependBit`.
   `prependBit` reverses the child direction relative to the absolute key and
   can make archived buckets unreachable once the hot child is detached.
 * **Nodes with side-mounted buckets promote those buckets during archive
-  shrink**: an `InternalNode` with a non-empty `StubList` may still collapse
-  into its only hot child, but the buckets must be returned to the recursive
-  parent and attached there. Moving the buckets down into the hot child would
-  make archived sibling paths unreachable.
+  shrink**: an `InternalNode` with a non-empty `StubList` may still collapse,
+  but the buckets must be returned to the recursive parent and attached only if
+  no child edge can preserve their entry path.
 * **Stale node deletes are required for async/non-destructive commits too**:
   stress mode can commit through a batch while `destructive=false`; stale node
   hashes still have to be deleted from LevelDB, otherwise the physical state DB
@@ -366,7 +367,7 @@ archive version behind.
 
 * **`Put` and `Activate` share the same archive-eviction rule**: before the hot
   insert runs, the shard removes any matching archived item from the reachable
-  `StubList` / root bucket path.
+  archive child, `StubList`, or root bucket path.
 * **Archive deletion can empty the shard root**: if that removal clears the last
   root-level bucket, the shard drops the empty root container instead of
   keeping an empty `ArchiveBucketNode` or `InternalNode`.
@@ -385,3 +386,41 @@ Expected correctness signal after this fix:
   that key.
 * Reloading after a non-destructive commit must show only the new hot value, and
   the old archive bucket entry must be gone.
+
+## 14. Archive Bucket Size Bound and Placement (2026-05-28)
+
+Long stress runs showed that `Bucket_Items_Max` could grow far beyond
+`Config.ResolveArchiveBucketSize()` while P99 stayed near the expected bound.
+That means the bug is not a general distribution shift; it is a small number of
+paths where bucket construction or append logic bypassed the hard cap.
+
+The updated invariant is:
+
+* **Bucket size is a hard cap**: no normal archive bucket may exceed
+  `Config.ResolveArchiveBucketSize()`. With `cuckooBuckets=32` and
+  `cuckooSlots=4`, the effective cap is 100.
+* **Append is not allowed to grow a bucket past the cap**:
+  `blindAppendToBucket` must refuse an append that would exceed the resolved
+  limit. A caller that needs to add more items must load the source items and
+  rebuild the affected archive subtree so the split is reflected in trie
+  metadata before commit.
+* **Flush must not silently persist an oversized append**: pending append
+  materialization is only an IO step. If it would serialize more than the
+  resolved limit into one bucket, it is a logic error and must fail instead of
+  writing the oversized bucket.
+* **Degenerate splits continue walking the path**: when all items fall on the
+  same side at a split bit, `buildArchiveSubtree` must advance one bit and try
+  again instead of returning a large fallback bucket. Only `MaxPathBits` is a
+  true unsplittable boundary.
+* **Archive buckets are leaf nodes by default**: a cold child branch should be
+  replaced by an archive subtree whose leaves are `ArchiveBucketNode`s. It
+  should not be flattened into the hot parent node's `StubList` merely because
+  the sibling branch is hot.
+* **StubList is the same-path escape hatch**: side-mounted buckets remain valid
+  only when the archive bucket's entry path is exactly the current trie
+  position and there is no child edge that can distinguish it from the hot
+  branch.
+
+This placement rule keeps `MaxBucketsPath` from growing just because many cold
+branches share a hot ancestor, and it keeps proof generation bounded by the
+configured bucket cap instead of by the full history on one path.

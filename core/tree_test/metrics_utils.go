@@ -42,7 +42,7 @@ func NewMetricsCollector(windowSize int, baseDir string, csvName string) *Metric
 	}
 
 	if csvName != "" {
-		resultsDir := "results"
+		resultsDir := filepath.Join(baseDir, "results")
 		os.MkdirAll(resultsDir, 0755)
 		c.csvFilePath = filepath.Join(resultsDir, csvName)
 		f, err := os.Create(c.csvFilePath)

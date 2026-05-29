@@ -22,37 +22,106 @@ import (
 	"github.com/holiman/uint256"
 )
 
+type silentReadStatsSnapshot struct {
+	totalReads                 int64
+	totalAccountReads          int64
+	cacheAccountHit            int64
+	cacheAccountMissNotExists  int64
+	cacheAccountMissExists     int64
+	binaryHitCount             int64
+	binaryMissNonExistentCount int64
+	binaryMissExistentCount    int64
+	binaryCycleFPCount         int64
+	binaryMaxFPInSingleBlock   int64
+	binaryTrieFPInBlock        int64
+	binaryProofVerifTime       int64
+	binaryProofVerifTimeMax    int64
+	binaryProofGenTime         int64
+	binaryProofGenTimeMax      int64
+	binaryBlockProofSize       int64
+	binaryBlockProofSizeMax    int64
+	binaryTotalProofSize       int64
+	binaryItemProofSizeMin     int64
+	binaryItemProofSizeMax     int64
+	binaryItemProofSizesLen    int
+	binaryFPDistributionLen    int
+}
+
+func captureSilentReadStats() silentReadStatsSnapshot {
+	common.BinaryStatsMu.Lock()
+	itemProofSizesLen := len(common.BinaryItemProofSizes)
+	fpDistributionLen := len(common.BinaryFPDistribution)
+	itemProofSizeMin := common.BinaryItemProofSizeMin
+	itemProofSizeMax := common.BinaryItemProofSizeMax
+	common.BinaryStatsMu.Unlock()
+
+	return silentReadStatsSnapshot{
+		totalReads:                 atomic.LoadInt64(&common.TotalReads),
+		totalAccountReads:          atomic.LoadInt64(&common.TotalAccountReads),
+		cacheAccountHit:            atomic.LoadInt64(&common.CacheAccountHit),
+		cacheAccountMissNotExists:  atomic.LoadInt64(&common.CacheAccountMissNotExists),
+		cacheAccountMissExists:     atomic.LoadInt64(&common.CacheAccountMissExists),
+		binaryHitCount:             atomic.LoadInt64(&common.BinaryHitCount),
+		binaryMissNonExistentCount: atomic.LoadInt64(&common.BinaryMissNonExistentCount),
+		binaryMissExistentCount:    atomic.LoadInt64(&common.BinaryMissExistentCount),
+		binaryCycleFPCount:         atomic.LoadInt64(&common.BinaryCycleFPCount),
+		binaryMaxFPInSingleBlock:   atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock),
+		binaryTrieFPInBlock:        atomic.LoadInt64(&common.BinaryTrieFPInBlock),
+		binaryProofVerifTime:       atomic.LoadInt64(&common.BinaryProofVerifTime),
+		binaryProofVerifTimeMax:    atomic.LoadInt64(&common.BinaryProofVerifTimeMax),
+		binaryProofGenTime:         atomic.LoadInt64(&common.BinaryProofGenTime),
+		binaryProofGenTimeMax:      atomic.LoadInt64(&common.BinaryProofGenTimeMax),
+		binaryBlockProofSize:       atomic.LoadInt64(&common.BinaryBlockProofSize),
+		binaryBlockProofSizeMax:    atomic.LoadInt64(&common.BinaryBlockProofSizeMax),
+		binaryTotalProofSize:       atomic.LoadInt64(&common.BinaryTotalProofSize),
+		binaryItemProofSizeMin:     itemProofSizeMin,
+		binaryItemProofSizeMax:     itemProofSizeMax,
+		binaryItemProofSizesLen:    itemProofSizesLen,
+		binaryFPDistributionLen:    fpDistributionLen,
+	}
+}
+
+func (s silentReadStatsSnapshot) restore() {
+	atomic.StoreInt64(&common.TotalReads, s.totalReads)
+	atomic.StoreInt64(&common.TotalAccountReads, s.totalAccountReads)
+	atomic.StoreInt64(&common.CacheAccountHit, s.cacheAccountHit)
+	atomic.StoreInt64(&common.CacheAccountMissNotExists, s.cacheAccountMissNotExists)
+	atomic.StoreInt64(&common.CacheAccountMissExists, s.cacheAccountMissExists)
+	atomic.StoreInt64(&common.BinaryHitCount, s.binaryHitCount)
+	atomic.StoreInt64(&common.BinaryMissNonExistentCount, s.binaryMissNonExistentCount)
+	atomic.StoreInt64(&common.BinaryMissExistentCount, s.binaryMissExistentCount)
+	atomic.StoreInt64(&common.BinaryCycleFPCount, s.binaryCycleFPCount)
+	atomic.StoreInt64(&common.BinaryMaxFPInSingleBlock, s.binaryMaxFPInSingleBlock)
+	atomic.StoreInt64(&common.BinaryTrieFPInBlock, s.binaryTrieFPInBlock)
+	atomic.StoreInt64(&common.BinaryProofVerifTime, s.binaryProofVerifTime)
+	atomic.StoreInt64(&common.BinaryProofVerifTimeMax, s.binaryProofVerifTimeMax)
+	atomic.StoreInt64(&common.BinaryProofGenTime, s.binaryProofGenTime)
+	atomic.StoreInt64(&common.BinaryProofGenTimeMax, s.binaryProofGenTimeMax)
+	atomic.StoreInt64(&common.BinaryBlockProofSize, s.binaryBlockProofSize)
+	atomic.StoreInt64(&common.BinaryBlockProofSizeMax, s.binaryBlockProofSizeMax)
+	atomic.StoreInt64(&common.BinaryTotalProofSize, s.binaryTotalProofSize)
+
+	common.BinaryStatsMu.Lock()
+	if len(common.BinaryItemProofSizes) > s.binaryItemProofSizesLen {
+		common.BinaryItemProofSizes = common.BinaryItemProofSizes[:s.binaryItemProofSizesLen]
+	}
+	if len(common.BinaryFPDistribution) > s.binaryFPDistributionLen {
+		common.BinaryFPDistribution = common.BinaryFPDistribution[:s.binaryFPDistributionLen]
+	}
+	common.BinaryItemProofSizeMin = s.binaryItemProofSizeMin
+	common.BinaryItemProofSizeMax = s.binaryItemProofSizeMax
+	common.BinaryStatsMu.Unlock()
+}
+
 // AddBalanceSilent performs a balance change on a StateDB without affecting the accumulated reading statistics.
 func AddBalanceSilent(sdb *state.StateDB, addr common.Address, amount *uint256.Int) {
 	if amount == nil || amount.IsZero() {
 		return
 	}
 
-	// Capture baseline statistics
-	beforeReads := atomic.LoadInt64(&common.TotalReads)
-	beforeAccReads := atomic.LoadInt64(&common.TotalAccountReads)
-	beforeCAccHit := atomic.LoadInt64(&common.CacheAccountHit)
-	beforeCAccMissNo := atomic.LoadInt64(&common.CacheAccountMissNotExists)
-	beforeCAccMissEx := atomic.LoadInt64(&common.CacheAccountMissExists)
-	beforeBHit := atomic.LoadInt64(&common.BinaryHitCount)
-	beforeBMissNo := atomic.LoadInt64(&common.BinaryMissNonExistentCount)
-	beforeBMissEx := atomic.LoadInt64(&common.BinaryMissExistentCount)
-
-	// Perform the balance change
+	stats := captureSilentReadStats()
 	sdb.AddBalance(addr, amount, tracing.BalanceChangeUnspecified)
-
-	// Calculate and undo the delta in reading statistics
-	afterReads := atomic.LoadInt64(&common.TotalReads)
-	if afterReads > beforeReads {
-		atomic.AddInt64(&common.TotalReads, beforeReads-afterReads)
-		atomic.AddInt64(&common.TotalAccountReads, beforeAccReads-atomic.LoadInt64(&common.TotalAccountReads))
-		atomic.AddInt64(&common.CacheAccountHit, beforeCAccHit-atomic.LoadInt64(&common.CacheAccountHit))
-		atomic.AddInt64(&common.CacheAccountMissNotExists, beforeCAccMissNo-atomic.LoadInt64(&common.CacheAccountMissNotExists))
-		atomic.AddInt64(&common.CacheAccountMissExists, beforeCAccMissEx-atomic.LoadInt64(&common.CacheAccountMissExists))
-		atomic.AddInt64(&common.BinaryHitCount, beforeBHit-atomic.LoadInt64(&common.BinaryHitCount))
-		atomic.AddInt64(&common.BinaryMissNonExistentCount, beforeBMissNo-atomic.LoadInt64(&common.BinaryMissNonExistentCount))
-		atomic.AddInt64(&common.BinaryMissExistentCount, beforeBMissEx-atomic.LoadInt64(&common.BinaryMissExistentCount))
-	}
+	stats.restore()
 }
 
 // SetCodeSilent performs a code update on a StateDB without affecting the accumulated reading statistics.
@@ -61,31 +130,9 @@ func SetCodeSilent(sdb *state.StateDB, addr common.Address, code []byte) {
 		return
 	}
 
-	// Capture baseline statistics
-	beforeReads := atomic.LoadInt64(&common.TotalReads)
-	beforeAccReads := atomic.LoadInt64(&common.TotalAccountReads)
-	beforeCAccHit := atomic.LoadInt64(&common.CacheAccountHit)
-	beforeCAccMissNo := atomic.LoadInt64(&common.CacheAccountMissNotExists)
-	beforeCAccMissEx := atomic.LoadInt64(&common.CacheAccountHit) // Use Hit for simplicity or specific miss count
-	beforeBHit := atomic.LoadInt64(&common.BinaryHitCount)
-	beforeBMissNo := atomic.LoadInt64(&common.BinaryMissNonExistentCount)
-	beforeBMissEx := atomic.LoadInt64(&common.BinaryMissExistentCount)
-
-	// Perform the code update
+	stats := captureSilentReadStats()
 	sdb.SetCode(addr, code)
-
-	// Calculate and undo the delta in reading statistics
-	afterReads := atomic.LoadInt64(&common.TotalReads)
-	if afterReads > beforeReads {
-		atomic.AddInt64(&common.TotalReads, beforeReads-afterReads)
-		atomic.AddInt64(&common.TotalAccountReads, beforeAccReads-atomic.LoadInt64(&common.TotalAccountReads))
-		atomic.AddInt64(&common.CacheAccountHit, beforeCAccHit-atomic.LoadInt64(&common.CacheAccountHit))
-		atomic.AddInt64(&common.CacheAccountMissNotExists, beforeCAccMissNo-atomic.LoadInt64(&common.CacheAccountMissNotExists))
-		atomic.AddInt64(&common.CacheAccountMissExists, beforeCAccMissEx-atomic.LoadInt64(&common.CacheAccountMissExists))
-		atomic.AddInt64(&common.BinaryHitCount, beforeBHit-atomic.LoadInt64(&common.BinaryHitCount))
-		atomic.AddInt64(&common.BinaryMissNonExistentCount, beforeBMissNo-atomic.LoadInt64(&common.BinaryMissNonExistentCount))
-		atomic.AddInt64(&common.BinaryMissExistentCount, beforeBMissEx-atomic.LoadInt64(&common.BinaryMissExistentCount))
-	}
+	stats.restore()
 }
 
 type txIndex struct {

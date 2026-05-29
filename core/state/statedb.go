@@ -153,6 +153,15 @@ type StateDB struct {
 	SnapshotCommits time.Duration
 	TrieDBCommits   time.Duration
 
+	CommitInternal          time.Duration
+	CommitHandleDestruction time.Duration
+	CommitDeleteMerge       time.Duration
+	CommitWorkers           time.Duration
+	CommitAfterWorkers      time.Duration
+	CommitBuildUpdate       time.Duration
+	CommitCodeWrite         time.Duration
+	CommitReaderReset       time.Duration
+
 	AccountLoaded  int          // Number of accounts retrieved from the database during the state transition
 	AccountUpdated int          // Number of accounts updated during the state transition
 	AccountDeleted int          // Number of accounts deleted during the state transition
@@ -1205,15 +1214,19 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool) (*stateU
 	// the same block, account deletions must be processed first. This ensures
 	// that the storage trie nodes deleted during destruction and recreated
 	// during subsequent resurrection can be combined correctly.
+	handleDestructionStart := time.Now()
 	deletes, delNodes, err := s.handleDestruction(noStorageWiping)
+	s.CommitHandleDestruction = time.Since(handleDestructionStart)
 	if err != nil {
 		return nil, err
 	}
+	deleteMergeStart := time.Now()
 	for _, set := range delNodes {
 		if err := merge(set); err != nil {
 			return nil, err
 		}
 	}
+	s.CommitDeleteMerge = time.Since(deleteMergeStart)
 	// Handle all state updates afterwards, concurrently to one another to shave
 	// off some milliseconds from the commit operation. Also accumulate the code
 	// writes to run in parallel with the computations.
@@ -1279,6 +1292,8 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool) (*stateU
 	if err := workers.Wait(); err != nil {
 		return nil, err
 	}
+	s.CommitWorkers = time.Since(start)
+	afterWorkersStart := time.Now()
 	accountReadMeters.Mark(int64(s.AccountLoaded))
 	storageReadMeters.Mark(int64(s.StorageLoaded))
 	accountUpdatedMeter.Mark(int64(s.AccountUpdated))
@@ -1306,18 +1321,25 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool) (*stateU
 	//if origin != root {
 	//	s.originalRoot = root
 	//}
-	return newStateUpdate(noStorageWiping, origin, root, deletes, updates, nodes), nil
+	buildUpdateStart := time.Now()
+	ret := newStateUpdate(noStorageWiping, origin, root, deletes, updates, nodes)
+	s.CommitBuildUpdate = time.Since(buildUpdateStart)
+	s.CommitAfterWorkers = time.Since(afterWorkersStart)
+	return ret, nil
 }
 
 // commitAndFlush is a wrapper of commit which also commits the state mutations
 // to the configured data stores.
 func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorageWiping bool) (*stateUpdate, error) {
+	commitStart := time.Now()
 	ret, err := s.commit(deleteEmptyObjects, noStorageWiping)
+	s.CommitInternal = time.Since(commitStart)
 	if err != nil {
 		return nil, err
 	}
 	// Commit dirty contract code if any exists
 	if db := s.db.TrieDB().Disk(); db != nil && len(ret.codes) > 0 {
+		codeWriteStart := time.Now()
 		batch := db.NewBatch()
 		for _, code := range ret.codes {
 			rawdb.WriteCode(batch, code.hash, code.blob)
@@ -1325,6 +1347,7 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 		if err := batch.Write(); err != nil {
 			return nil, err
 		}
+		s.CommitCodeWrite = time.Since(codeWriteStart)
 	}
 	if !ret.empty() {
 		// If snapshotting is enabled, update the snapshot tree with this new version
@@ -1351,7 +1374,9 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 			s.TrieDBCommits += time.Since(start)
 		}
 	}
+	readerStart := time.Now()
 	s.reader, _ = s.db.Reader(s.originalRoot)
+	s.CommitReaderReset = time.Since(readerStart)
 	return ret, err
 }
 

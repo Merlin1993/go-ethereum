@@ -156,6 +156,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 	switch n := node.(type) {
 	case *LeafNode:
 		if (n.Epoch() & 1) != global {
+			s.markPersistedNodeStale(n)
 			// 组装绝对路径
 			absP, absB := s.prependPath(n.Path, n.PathBits, prefix, prefixBits)
 			item := ArchivedKV{
@@ -184,8 +185,8 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 				if err != nil {
 					return nil, nil, nil, err
 				}
-				if s.pruning && len(n.OriginalHash()) > 0 {
-					s.staleSet[string(n.OriginalHash())] = struct{}{}
+				if err := s.markSubtreeStaleRecursive(n); err != nil {
+					return nil, nil, nil, err
 				}
 				return nil, items, nil, nil
 			}
@@ -199,6 +200,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		}
 
 		var allItems []ArchivedKV
+		parentChanged := false
 
 		// 处理左子树
 		if n.Left == nil && len(n.LeftHash) > 0 {
@@ -207,6 +209,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 				return nil, nil, nil, err
 			}
 		}
+		leftHadChild := n.Left != nil || len(n.LeftHash) > 0
 		lp, lb := s.appendBit(currentP, currentB, 0)
 		newLeft, leftItems, leftStubs, err := s.pruneAndArchive(n.Left, lp, lb, global)
 		if err != nil {
@@ -214,16 +217,26 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		}
 		if len(leftStubs) > 0 {
 			s.attachStubs(n, leftStubs)
+			parentChanged = true
 		}
 
 		if newLeft == nil {
-			n.Left, n.LeftHash = nil, nil
-			n.LeftEpoch = 0
+			if leftHadChild {
+				parentChanged = true
+			}
 			if len(leftItems) > 0 {
-				// items are already absolute paths; pass lp/lb as the absolute bucket entry path
-				s.collectAndAttachToStubList(n, leftItems, lp, lb)
+				n.Left = s.buildArchiveSubtree(leftItems, lp, lb)
+				n.LeftHash = nil
+				n.LeftEpoch = n.Left.Epoch()
+				parentChanged = true
+			} else {
+				n.Left, n.LeftHash = nil, nil
+				n.LeftEpoch = 0
 			}
 		} else {
+			if n.Left != newLeft {
+				parentChanged = true
+			}
 			n.Left = newLeft
 			allItems = append(allItems, leftItems...)
 		}
@@ -235,6 +248,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 				return nil, nil, nil, err
 			}
 		}
+		rightHadChild := n.Right != nil || len(n.RightHash) > 0
 		rp, rb := s.appendBit(currentP, currentB, 1)
 		newRight, rightItems, rightStubs, err := s.pruneAndArchive(n.Right, rp, rb, global)
 		if err != nil {
@@ -242,21 +256,33 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		}
 		if len(rightStubs) > 0 {
 			s.attachStubs(n, rightStubs)
+			parentChanged = true
 		}
 
 		if newRight == nil {
-			n.Right, n.RightHash = nil, nil
-			n.RightEpoch = 0
+			if rightHadChild {
+				parentChanged = true
+			}
 			if len(rightItems) > 0 {
-				s.collectAndAttachToStubList(n, rightItems, rp, rb)
+				n.Right = s.buildArchiveSubtree(rightItems, rp, rb)
+				n.RightHash = nil
+				n.RightEpoch = n.Right.Epoch()
+				parentChanged = true
+			} else {
+				n.Right, n.RightHash = nil, nil
+				n.RightEpoch = 0
 			}
 		} else {
+			if n.Right != newRight {
+				parentChanged = true
+			}
 			n.Right = newRight
 			allItems = append(allItems, rightItems...)
 		}
 
-		if n.Left != newLeft || n.Right != newRight || len(n.StubList) != origStubCount ||
+		if parentChanged || len(n.StubList) != origStubCount ||
 			(newLeft != nil && newLeft.IsDirty()) || (newRight != nil && newRight.IsDirty()) {
+			s.markPersistedNodeStale(n)
 			n.LeftHash, n.RightHash = nil, nil
 			s.refreshInternalEpochMask(n)
 			n.SetDirty(true)
@@ -331,7 +357,7 @@ func (s *Shard) collectLeavesRecursive(node Node, prefix []byte, prefixBits int)
 		return allItems, nil
 
 	case *ArchiveBucketNode:
-		bucketData, err := s.getBucketData(n.Hash())
+		bucketData, err := s.getBucketData(s.ensureBucketHash(n))
 		if err != nil {
 			return nil, err
 		}
@@ -357,9 +383,93 @@ func (s *Shard) collectLeavesRecursive(node Node, prefix []byte, prefixBits int)
 	}
 }
 
+func (s *Shard) markPersistedNodeStale(node Node) {
+	if !s.pruning || node == nil {
+		return
+	}
+	if h := node.OriginalHash(); len(h) > 0 {
+		s.staleSet[string(h)] = struct{}{}
+	}
+}
+
+func (s *Shard) markSubtreeStaleRecursive(node Node) error {
+	if !s.pruning || node == nil {
+		return nil
+	}
+	s.markPersistedNodeStale(node)
+
+	switch n := node.(type) {
+	case *InternalNode:
+		var err error
+		if n.Left == nil && len(n.LeftHash) > 0 {
+			n.Left, err = s.loadNode(n.LeftHash)
+			if err != nil {
+				return err
+			}
+		}
+		if err := s.markSubtreeStaleRecursive(n.Left); err != nil {
+			return err
+		}
+
+		if n.Right == nil && len(n.RightHash) > 0 {
+			n.Right, err = s.loadNode(n.RightHash)
+			if err != nil {
+				return err
+			}
+		}
+		if err := s.markSubtreeStaleRecursive(n.Right); err != nil {
+			return err
+		}
+
+		for _, bucket := range n.StubList {
+			if err := s.markSubtreeStaleRecursive(bucket); err != nil {
+				return err
+			}
+		}
+	case *ArchiveBucketNode:
+		hash := s.ensureBucketHash(n)
+		if len(hash) > 0 {
+			s.staleSet[string(hash)] = struct{}{}
+			s.markArchiveDataDelete(hash, -1)
+		}
+	}
+	return nil
+}
+
 func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) Node {
 	if len(items) == 0 {
 		return nil
+	}
+
+	limit := s.config.ResolveArchiveBucketSize()
+	if len(items) > limit && limit > 0 && bits < MaxPathBits {
+		var leftItems, rightItems []ArchivedKV
+		for _, it := range items {
+			if bits >= it.SuffixBits || s.getBitFromBytes(it.Suffix, bits) == 0 {
+				leftItems = append(leftItems, it)
+			} else {
+				rightItems = append(rightItems, it)
+			}
+		}
+
+		n := s.pool.GetInternal()
+		n.SetDirty(true)
+		if len(leftItems) > 0 {
+			lp, lb := s.appendBit(path, bits, 0)
+			n.Left = s.buildArchiveSubtree(leftItems, lp, lb)
+			if n.Left != nil {
+				n.LeftEpoch = n.Left.Epoch()
+			}
+		}
+		if len(rightItems) > 0 {
+			rp, rb := s.appendBit(path, bits, 1)
+			n.Right = s.buildArchiveSubtree(rightItems, rp, rb)
+			if n.Right != nil {
+				n.RightEpoch = n.Right.Epoch()
+			}
+		}
+		s.refreshInternalEpochMask(n)
+		return n
 	}
 
 	// 达到桶大小限制，或者达到 MaxPathBits 极限，停止分裂。
@@ -384,44 +494,7 @@ func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) N
 		s.recomputeBucket(bucket, localItems)
 		return bucket
 	}
-
-	var leftItems, rightItems []ArchivedKV
-	for _, it := range items {
-		if bits >= it.SuffixBits {
-			leftItems = append(leftItems, it)
-			continue
-		}
-		if s.getBitFromBytes(it.Suffix, bits) == 0 {
-			leftItems = append(leftItems, it)
-		} else {
-			rightItems = append(rightItems, it)
-		}
-	}
-
-	if len(leftItems) == 0 || len(rightItems) == 0 {
-		localItems := make([]ArchivedKV, len(items))
-		for i := range items {
-			p, b := s.stripPrefix(items[i].Suffix, items[i].SuffixBits, 0, path, bits)
-			localItems[i] = ArchivedKV{Suffix: p, SuffixBits: b, Value: items[i].Value}
-		}
-		bucket := &ArchiveBucketNode{Path: path, PathBits: bits, dirty: true}
-		s.recomputeBucket(bucket, localItems)
-		return bucket
-	}
-
-	lp, lb := s.appendBit(path, bits, 0)
-	leftNode := s.buildArchiveSubtree(leftItems, lp, lb)
-
-	rp, rb := s.appendBit(path, bits, 1)
-	rightNode := s.buildArchiveSubtree(rightItems, rp, rb)
-
-	n := s.pool.GetInternal()
-	n.Path = path
-	n.PathBits = bits
-	n.Left = leftNode
-	n.Right = rightNode
-	n.SetDirty(true)
-	return n
+	return nil
 }
 
 func (s *Shard) collectAndAttachToStubList(parent *InternalNode, items []ArchivedKV, absPath []byte, absBits int) {

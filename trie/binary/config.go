@@ -22,6 +22,8 @@ type Config struct {
 	ArchiveDB             ArchiveStore // Separate store for archive data
 	CuckooBuckets         int          // Number of buckets in cuckoo filter (default 32)
 	CuckooSlots           int          // Slots per bucket in cuckoo filter (default 4)
+	InlineValueThreshold  int          // Inline values up to this size into leaf/archive refs; 0 disables
+	DeleteOldValues       bool         // Use key-bound value refs and delete superseded external value blobs
 }
 
 // DefaultConfig returns a Config with default values.
@@ -77,13 +79,47 @@ type TrieStats struct {
 // Stats returns the statistics for the entire Trie.
 func (t *Trie) Stats() *TrieStats {
 	stats := &TrieStats{bucketItemHist: make(map[int]int)}
-	numShards := 1 << t.config.ShardDepth
-	for i := 0; i < numShards; i++ {
-		shard, err := t.getOrCreateShard(i)
-		if err == nil && shard != nil {
-			shard.accumulateStats(stats)
+
+	t.shardsMu.RLock()
+	shards := make([]*Shard, len(t.shards))
+	copy(shards, t.shards)
+	t.shardsMu.RUnlock()
+
+	seen := make(map[int]struct{}, len(shards))
+	for i, shard := range shards {
+		if shard == nil {
+			continue
+		}
+		seen[i] = struct{}{}
+		shard.accumulateStats(stats)
+	}
+
+	if t.topTree != nil {
+		roots := make(map[int][]byte)
+		t.topTree.ForEachShardRoot(func(id int, hash []byte) {
+			if id < 0 || id >= len(shards) {
+				return
+			}
+			if _, ok := seen[id]; ok {
+				return
+			}
+			roots[id] = hash
+		})
+
+		for id, root := range roots {
+			shardID := id
+			shard, err := NewShard(shardID, t.db, t.hasher, t.config, root, t.pruning, func() byte {
+				if shardID < t.pruneShardIdx {
+					return t.globalEpochBit
+				}
+				return t.globalEpochBit ^ 1
+			})
+			if err == nil && shard != nil {
+				shard.accumulateStats(stats)
+			}
 		}
 	}
+
 	stats.finalizeBucketItemStats()
 	return stats
 }
