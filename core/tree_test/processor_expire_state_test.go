@@ -70,6 +70,9 @@ var (
 	cuckooSlots           = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
 	binaryNodeCacheLimit  = flag.Int("binaryNodeCacheLimit", 262144, "Binary trie process node cache limit; 0 uses default, negative disables cache")
 	binaryPhysicalDelete  = flag.Bool("binaryPhysicalDelete", false, "Physically delete obsolete binary trie state nodes from stateDB")
+	maxRootPipelineMs     = flag.Int("maxRootPipelineMs", 0, "Abort if any block root pipeline exceeds this many milliseconds; 0 disables")
+	maxHandleDestructMs   = flag.Int("maxHandleDestructionMs", 0, "Abort if any block handleDestruction exceeds this many milliseconds; 0 disables")
+	maxPruningMs          = flag.Int("maxPruningMs", 0, "Abort if any binary pruning step exceeds this many milliseconds; 0 disables")
 )
 
 func TestMain(m *testing.M) {
@@ -102,6 +105,9 @@ type ProcessorConfig struct {
 	CuckooSlots           int
 	BinaryNodeCacheLimit  int
 	BinaryPhysicalDelete  bool
+	MaxRootPipelineMs     int
+	MaxHandleDestructMs   int
+	MaxPruningMs          int
 }
 
 func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
@@ -176,6 +182,17 @@ func (h *ProcessorHost) Close() {
 	}
 }
 
+func checkDurationLimit(t *testing.T, label string, block uint64, got time.Duration, limitMs int) {
+	t.Helper()
+	if limitMs <= 0 {
+		return
+	}
+	limit := time.Duration(limitMs) * time.Millisecond
+	if got > limit {
+		t.Fatalf("%s exceeded configured limit at block %d: got %v > %v", label, block, got, limit)
+	}
+}
+
 // Transaction loading is now handled by TransactionStreamer in processor_utils.go
 
 // 增加配置 -- binary-trie的分片数 binary-trie stub桶的大小上限.
@@ -205,6 +222,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		CuckooSlots:           *cuckooSlots,
 		BinaryNodeCacheLimit:  *binaryNodeCacheLimit,
 		BinaryPhysicalDelete:  *binaryPhysicalDelete,
+		MaxRootPipelineMs:     *maxRootPipelineMs,
+		MaxHandleDestructMs:   *maxHandleDestructMs,
+		MaxPruningMs:          *maxPruningMs,
 	}
 
 	common.UseVerkle = cfg.UseVerkle
@@ -288,6 +308,8 @@ func TestExpireStateProcessor(t *testing.T) {
 	writer.Write([]string{
 		"Epoch_ID", "Tree_Type", "Cumulative_Storage_Bytes",
 		"State_Storage_Bytes", "Archived_Storage_Bytes",
+		"State_Storage_Share_Pct", "Archive_Storage_Share_Pct",
+		"Archive_Bytes_Per_Item", "State_Bytes_Per_Active_Leaf",
 		"Trie_Child_Node_Count", "Total_Archived_Items", "Total_Bucket_Count",
 		"Max_Buckets_On_Single_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max",
 		"Avg_Finalise_Time_ms", "Max_Finalise_Time_ms",
@@ -350,6 +372,20 @@ func TestExpireStateProcessor(t *testing.T) {
 				}
 			}
 		}
+		stateStorageSharePct := 0.0
+		archiveStorageSharePct := 0.0
+		if totalStorageSize > 0 {
+			stateStorageSharePct = float64(stateStorageSize) * 100 / float64(totalStorageSize)
+			archiveStorageSharePct = float64(archiveStorageSize) * 100 / float64(totalStorageSize)
+		}
+		archiveBytesPerItem := 0.0
+		if totalArchivedItems > 0 {
+			archiveBytesPerItem = float64(archiveStorageSize) / float64(totalArchivedItems)
+		}
+		stateBytesPerActiveLeaf := 0.0
+		if trieChildNodeCount > 0 {
+			stateBytesPerActiveLeaf = float64(stateStorageSize) / float64(trieChildNodeCount)
+		}
 
 		fmt.Printf("  Blocks: %d - %d (Processed Blocks Count)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
 		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
@@ -360,6 +396,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  State Commit - Avg: %.2f ms, Max: %v\n", float64(totalCommitTime.Milliseconds())/float64(intervalBlocks), maxCommitTime)
 		fmt.Printf("  Root Pipeline - Avg: %.2f ms, Max: %v\n", float64(totalRootPipelineTime.Milliseconds())/float64(intervalBlocks), maxRootPipelineTime)
 		fmt.Printf("  Storage bytes: total=%d, state=%d, archive=%d\n", totalStorageSize, stateStorageSize, archiveStorageSize)
+		fmt.Printf("  Storage shares: state=%.2f%%, archive=%.2f%%, archiveBytesPerItem=%.2f, stateBytesPerActiveLeaf=%.2f\n",
+			stateStorageSharePct, archiveStorageSharePct, archiveBytesPerItem, stateBytesPerActiveLeaf)
 		if cfg.UseBinaryTrie {
 			fmt.Printf("  ASCT Struct - Leaves=%d, ArchiveItems=%d, Buckets=%d, MaxBucketsPath=%d\n",
 				trieChildNodeCount, totalArchivedItems, totalBucketCount, maxBucketsPath)
@@ -442,6 +480,10 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(totalStorageSize, 10),
 			strconv.FormatInt(stateStorageSize, 10),
 			strconv.FormatInt(archiveStorageSize, 10),
+			fmt.Sprintf("%.2f", stateStorageSharePct),
+			fmt.Sprintf("%.2f", archiveStorageSharePct),
+			fmt.Sprintf("%.2f", archiveBytesPerItem),
+			fmt.Sprintf("%.2f", stateBytesPerActiveLeaf),
 			strconv.FormatInt(trieChildNodeCount, 10),
 			strconv.FormatInt(totalArchivedItems, 10),
 			strconv.Itoa(totalBucketCount),
@@ -596,6 +638,7 @@ processFiles:
 						maxPruneBlock = b
 					}
 					pruneCount++
+					checkDurationLimit(t, "binary pruning", b, pruneDuration, cfg.MaxPruningMs)
 				}
 				rootStart := time.Now()
 				finaliseStart := time.Now()
@@ -631,6 +674,8 @@ processFiles:
 					fmt.Printf("[%s_COMMIT_DIAG] block=%d empty=true commit=%v pre=%v post=%v commitInternal=%v handleDestruction=%v deleteMerge=%v workers=%v afterWorkers=%v buildUpdate=%v codeWrite=%v accountCommit=%v storageCommit=%v snapshotCommit=%v trieDBCommit=%v readerReset=%v root_pipeline=%v%s\n",
 						treeLabel, b, commitDuration, preCommitDuration, postCommitDuration, statedb.CommitInternal, statedb.CommitHandleDestruction, statedb.CommitDeleteMerge, statedb.CommitWorkers, statedb.CommitAfterWorkers, statedb.CommitBuildUpdate, statedb.CommitCodeWrite, statedb.AccountCommits, statedb.StorageCommits, statedb.SnapshotCommits, statedb.TrieDBCommits, statedb.CommitReaderReset, rootDuration, extra)
 				}
+				checkDurationLimit(t, "root pipeline", b, rootDuration, cfg.MaxRootPipelineMs)
+				checkDurationLimit(t, "handleDestruction", b, statedb.CommitHandleDestruction, cfg.MaxHandleDestructMs)
 				lastStateRoot = h
 
 				totalFinaliseTime += finaliseDuration
@@ -753,6 +798,7 @@ processFiles:
 					maxPruneBlock = b
 				}
 				pruneCount++
+				checkDurationLimit(t, "binary pruning", b, pruneDuration, cfg.MaxPruningMs)
 			}
 
 			// 2. State root calculation time statistics
@@ -791,6 +837,8 @@ processFiles:
 				fmt.Printf("[%s_COMMIT_DIAG] block=%d empty=false commit=%v pre=%v post=%v commitInternal=%v handleDestruction=%v deleteMerge=%v workers=%v afterWorkers=%v buildUpdate=%v codeWrite=%v accountCommit=%v storageCommit=%v snapshotCommit=%v trieDBCommit=%v readerReset=%v root_pipeline=%v%s\n",
 					treeLabel, b, commitDuration, preCommitDuration, postCommitDuration, statedb.CommitInternal, statedb.CommitHandleDestruction, statedb.CommitDeleteMerge, statedb.CommitWorkers, statedb.CommitAfterWorkers, statedb.CommitBuildUpdate, statedb.CommitCodeWrite, statedb.AccountCommits, statedb.StorageCommits, statedb.SnapshotCommits, statedb.TrieDBCommits, statedb.CommitReaderReset, rootDuration, extra)
 			}
+			checkDurationLimit(t, "root pipeline", b, rootDuration, cfg.MaxRootPipelineMs)
+			checkDurationLimit(t, "handleDestruction", b, statedb.CommitHandleDestruction, cfg.MaxHandleDestructMs)
 
 			if b%100000 == 0 {
 				fmt.Printf("[测试] block %d: finalise=%v, commit=%v, root_pipeline=%v\n",

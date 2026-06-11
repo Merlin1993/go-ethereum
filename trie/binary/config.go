@@ -19,6 +19,7 @@ type Config struct {
 	ShardDepth            int          // Number of bits for shard routing (default 16)
 	ArchiveBucketSize     int          // Max number of items in an archive bucket before splitting (default 100)
 	ArchiveItemCacheLimit int          // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
+	CompactArchiveStubs   bool         // Merge adjacent archive stubs synchronously; expensive on hot pruning paths
 	ArchiveDB             ArchiveStore // Separate store for archive data
 	CuckooBuckets         int          // Number of buckets in cuckoo filter (default 32)
 	CuckooSlots           int          // Slots per bucket in cuckoo filter (default 4)

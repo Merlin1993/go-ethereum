@@ -31,6 +31,34 @@ func getBit(key []byte, depth int) byte {
 	return 0
 }
 
+func bitPrefixesOverlap(a []byte, aBits int, b []byte, bBits int) bool {
+	limit := aBits
+	if bBits < limit {
+		limit = bBits
+	}
+	for i := 0; i < limit; i++ {
+		if getBit(a, i) != getBit(b, i) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasBitPrefix(path []byte, pathBits int, prefix []byte, prefixBits int) bool {
+	if prefixBits <= 0 {
+		return true
+	}
+	if pathBits < prefixBits {
+		return false
+	}
+	for i := 0; i < prefixBits; i++ {
+		if getBit(path, i) != getBit(prefix, i) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Shard) getBit(key []byte, depth int) byte {
 	return getBit(key, depth)
 }

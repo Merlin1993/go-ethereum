@@ -473,6 +473,39 @@ func (t *Trie) ForEach(fn func(key, value []byte) bool) {
 	}
 }
 
+// ForEachPrefix iterates over keys matching the given bit prefix. It avoids
+// touching unrelated shards, which is important for storage wiping.
+func (t *Trie) ForEachPrefix(prefix []byte, prefixBits int, fn func(key, value []byte) bool) {
+	if prefixBits <= 0 {
+		t.ForEach(fn)
+		return
+	}
+	shardDepth := t.config.ShardDepth
+	if prefixBits >= shardDepth {
+		shardID := t.GetShardID(prefix)
+		shard, err := t.getOrCreateShard(shardID)
+		if err != nil || shard == nil {
+			return
+		}
+		shardPrefix := t.getShardPrefix(shardID)
+		shard.ForEachPrefix(shardPrefix, shardDepth, prefix, prefixBits, fn)
+		return
+	}
+
+	shardCount := 1 << shardDepth
+	for id := 0; id < shardCount; id++ {
+		shardPrefix := t.getShardPrefix(id)
+		if !bitPrefixesOverlap(shardPrefix, shardDepth, prefix, prefixBits) {
+			continue
+		}
+		shard, err := t.getOrCreateShard(id)
+		if err != nil || shard == nil {
+			continue
+		}
+		shard.ForEachPrefix(shardPrefix, shardDepth, prefix, prefixBits, fn)
+	}
+}
+
 func (t *Trie) getShardPrefix(shardID int) []byte {
 	prefix := make([]byte, (t.config.ShardDepth+7)/8)
 	for i := 0; i < t.config.ShardDepth; i++ {

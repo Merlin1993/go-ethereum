@@ -89,6 +89,30 @@ func (b *MemoryBatchAdapter) Write() error {
 func (b *MemoryBatchAdapter) Reset()         { b.ops = nil }
 func (b *MemoryBatchAdapter) ValueSize() int { return 0 }
 
+type CountingMemoryDBAdapter struct {
+	*MemoryDBAdapter
+	archiveDataGets int64
+}
+
+func NewCountingMemoryDBAdapter() *CountingMemoryDBAdapter {
+	return &CountingMemoryDBAdapter{MemoryDBAdapter: NewMemoryDBAdapter()}
+}
+
+func (db *CountingMemoryDBAdapter) GetBucket(hash []byte) ([]byte, error) {
+	if len(hash) > 0 && hash[len(hash)-1] == 0x01 {
+		atomic.AddInt64(&db.archiveDataGets, 1)
+	}
+	return db.MemoryDBAdapter.GetBucket(hash)
+}
+
+func (db *CountingMemoryDBAdapter) ResetArchiveDataGets() {
+	atomic.StoreInt64(&db.archiveDataGets, 0)
+}
+
+func (db *CountingMemoryDBAdapter) ArchiveDataGets() int64 {
+	return atomic.LoadInt64(&db.archiveDataGets)
+}
+
 func TestShardHashDoesNotClearDirtyBeforeCommit(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
@@ -304,6 +328,74 @@ func TestFlushArchivesAfterNonDestructiveCommitReload(t *testing.T) {
 	}
 }
 
+func TestForEachPrefixDoesNotScanUnrelatedArchivedShard(t *testing.T) {
+	db := NewCountingMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.ArchiveDB = db
+	config.InlineValueThreshold = 0
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	keyA := []byte{0x10, 0xaa, 0x01, 0x02}
+	keyB := []byte{0x20, 0xbb, 0x03, 0x04}
+	valA := bytes.Repeat([]byte{0xa1}, 64)
+	valB := bytes.Repeat([]byte{0xb2}, 64)
+	if err := trie.Put(keyA, valA); err != nil {
+		t.Fatal(err)
+	}
+	if err := trie.Put(keyB, valB); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := trie.CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := archiveShardForTest(trie, trie.GetShardID(keyA)); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveShardForTest(trie, trie.GetShardID(keyB)); err != nil {
+		t.Fatal(err)
+	}
+	batch = db.NewBatch()
+	root, err := trie.CommitToBatch(batch, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if err := trie.FlushArchives(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewTrie(root, db, hasher, config, true)
+	db.ResetArchiveDataGets()
+	var gotKeys [][]byte
+	var gotVals [][]byte
+	reloaded.ForEachPrefix(keyA[:1], 8, func(key, value []byte) bool {
+		gotKeys = append(gotKeys, common.CopyBytes(key))
+		gotVals = append(gotVals, common.CopyBytes(value))
+		return true
+	})
+	if len(gotKeys) != 1 {
+		t.Fatalf("expected one prefixed key, got %d: %x", len(gotKeys), gotKeys)
+	}
+	if !bytes.Equal(gotKeys[0], keyA) {
+		t.Fatalf("unexpected key: got %x want %x", gotKeys[0], keyA)
+	}
+	if !bytes.Equal(gotVals[0], valA) {
+		t.Fatalf("unexpected value: got %x want %x", gotVals[0], valA)
+	}
+	if gets := db.ArchiveDataGets(); gets != 1 {
+		t.Fatalf("expected to read only the matching shard archive bucket, got %d archive data reads", gets)
+	}
+}
+
 func TestShrinkPromotesStubList(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
@@ -355,6 +447,7 @@ func TestCompactStubListMergesCommonPrefixBuckets(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ArchiveBucketSize = 4
+	config.CompactArchiveStubs = true
 	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
@@ -399,6 +492,113 @@ func TestCompactStubListMergesCommonPrefixBuckets(t *testing.T) {
 	got1, fromArchive, err := shard.getFromBucket(merged, key1, 0)
 	if err != nil || !fromArchive || !bytes.Equal(got1, val1) {
 		t.Fatalf("merged bucket lost key1: value=%q fromArchive=%v err=%v", got1, fromArchive, err)
+	}
+}
+
+func TestAttachStubsDoesNotReadArchiveDataByDefault(t *testing.T) {
+	db := NewCountingMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ArchiveBucketSize = 4
+	config.ArchiveDB = db
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	makeBucket := func(keyByte byte, value []byte) *ArchiveBucketNode {
+		key := make([]byte, 32)
+		key[0] = keyByte
+		path := shard.prefixBits(key, 8, nil)
+		suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, path, 8)
+		bucket := &ArchiveBucketNode{Path: path, PathBits: 8, dirty: true}
+		shard.recomputeBucket(bucket, []ArchivedKV{{
+			Suffix:     suffix,
+			SuffixBits: suffixBits,
+			Value:      shard.stageValue(value),
+		}})
+		return bucket
+	}
+
+	persisted := makeBucket(0x10, []byte("persisted-value"))
+	persistedItems := shard.pendingArchiveItems[string(shard.ensureBucketHash(persisted))]
+	if len(persistedItems) == 0 {
+		t.Fatalf("expected pending archive items for persisted bucket")
+	}
+	persistedData, err := shard.serializeArchivedKV(persistedItems)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutBucket(archiveDataKey(shard.ensureBucketHash(persisted)), persistedData); err != nil {
+		t.Fatal(err)
+	}
+	persisted.SetDirty(false)
+	persisted.SetOriginalHash(shard.ensureBucketHash(persisted))
+	delete(shard.pendingArchiveItems, string(shard.ensureBucketHash(persisted)))
+
+	parent := &InternalNode{StubList: []*ArchiveBucketNode{persisted}}
+	db.ResetArchiveDataGets()
+	shard.attachStubs(parent, []*ArchiveBucketNode{makeBucket(0x11, []byte("new-value"))})
+
+	if gets := db.ArchiveDataGets(); gets != 0 {
+		t.Fatalf("default attachStubs should not read archive data, got %d reads", gets)
+	}
+	if len(parent.StubList) != 2 {
+		t.Fatalf("expected both stubs to remain unmerged, got %d", len(parent.StubList))
+	}
+}
+
+func TestPruneCollectKeepsExistingArchiveBucketOpaque(t *testing.T) {
+	db := NewCountingMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ArchiveBucketSize = 4
+	config.ArchiveDB = db
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := make([]byte, 32)
+	key[0] = 0x22
+	path := shard.prefixBits(key, 8, nil)
+	suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, path, 8)
+	bucket := &ArchiveBucketNode{Path: path, PathBits: 8, dirty: true}
+	shard.recomputeBucket(bucket, []ArchivedKV{{
+		Suffix:     suffix,
+		SuffixBits: suffixBits,
+		Value:      shard.stageValue([]byte("archived-value")),
+	}})
+
+	hash := shard.ensureBucketHash(bucket)
+	items := shard.pendingArchiveItems[string(hash)]
+	if len(items) == 0 {
+		t.Fatalf("expected pending archive items")
+	}
+	data, err := shard.serializeArchivedKV(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PutBucket(archiveDataKey(hash), data); err != nil {
+		t.Fatal(err)
+	}
+	delete(shard.pendingArchiveItems, string(hash))
+	bucket.SetDirty(false)
+	bucket.SetOriginalHash(hash)
+
+	db.ResetArchiveDataGets()
+	collected, stubs, err := shard.collectLeavesAndMarkStaleRecursive(bucket, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(collected) != 0 {
+		t.Fatalf("expected existing archive bucket to stay opaque, got %d collected items", len(collected))
+	}
+	if len(stubs) != 1 || stubs[0] != bucket {
+		t.Fatalf("expected existing archive bucket to be returned as a stub")
+	}
+	if gets := db.ArchiveDataGets(); gets != 0 {
+		t.Fatalf("prune collection should not read archive data, got %d reads", gets)
 	}
 }
 

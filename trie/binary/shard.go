@@ -61,6 +61,10 @@ type Shard struct {
 	// Key is the bucket hash
 	pendingArchives map[string][]byte
 
+	// Pending archive items for newly-created buckets. These are serialized by
+	// the archive flush path so pruning only pays for proof metadata updates.
+	pendingArchiveItems map[string][]ArchivedKV
+
 	// Pending appends to existing buckets. Key is the NEW bucket metadata hash.
 	pendingAppends map[string]appendTask
 
@@ -125,6 +129,7 @@ func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte
 		ecmh:                  ecmh.New(),
 		stats:                 &TrieStats{},
 		pendingArchives:       make(map[string][]byte),
+		pendingArchiveItems:   make(map[string][]ArchivedKV),
 		pendingAppends:        make(map[string]appendTask),
 		pendingDeletes:        make(map[string]deleteTask),
 		pendingArchiveDeletes: make(map[string]int),
@@ -189,6 +194,9 @@ func (s *Shard) loadNode(hash []byte) (Node, error) {
 }
 
 func (s *Shard) getBucketData(hash []byte) ([]byte, error) {
+	if items, ok := s.pendingArchiveItems[string(hash)]; ok {
+		return s.serializeArchivedKV(items)
+	}
 	if data, ok := s.pendingArchives[string(hash)]; ok {
 		// fmt.Printf("Shard %d: Found %x in pendingArchives\n", s.id, hash)
 		return data, nil
@@ -256,7 +264,7 @@ func (s *Shard) getStoredBucketData(hash []byte) ([]byte, error) {
 func (s *Shard) HasPendingArchiveWrites() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return len(s.pendingArchives) > 0 || len(s.pendingAppends) > 0 || len(s.pendingDeletes) > 0 || len(s.pendingArchiveDeletes) > 0
+	return len(s.pendingArchives) > 0 || len(s.pendingArchiveItems) > 0 || len(s.pendingAppends) > 0 || len(s.pendingDeletes) > 0 || len(s.pendingArchiveDeletes) > 0
 }
 
 func (s *Shard) markArchiveDataDelete(hash []byte, oldSize int) {
@@ -266,6 +274,10 @@ func (s *Shard) markArchiveDataDelete(hash []byte, oldSize int) {
 	key := string(hash)
 	if _, ok := s.pendingArchives[key]; ok {
 		delete(s.pendingArchives, key)
+		return
+	}
+	if _, ok := s.pendingArchiveItems[key]; ok {
+		delete(s.pendingArchiveItems, key)
 		return
 	}
 	if task, ok := s.pendingAppends[key]; ok {
@@ -295,8 +307,14 @@ func (s *Shard) attachStubs(parent *InternalNode, stubs []*ArchiveBucketNode) {
 		return
 	}
 	s.markPersistedNodeStale(parent)
-	parent.StubList = append(parent.StubList, stubs...)
-	s.compactStubList(parent)
+	for _, stub := range stubs {
+		if stub != nil {
+			parent.StubList = append(parent.StubList, stub)
+		}
+	}
+	if s.config != nil && s.config.CompactArchiveStubs {
+		s.compactStubList(parent)
+	}
 	parent.SetDirty(true)
 }
 
@@ -1512,6 +1530,13 @@ func (s *Shard) ForEach(prefix []byte, bits int, fn func(key, value []byte) bool
 	s.forEach(s.root, prefix, bits, fn)
 }
 
+func (s *Shard) ForEachPrefix(prefix []byte, bits int, matchPrefix []byte, matchBits int, fn func(key, value []byte) bool) {
+	if s.root == nil {
+		return
+	}
+	s.forEachPrefix(s.root, prefix, bits, matchPrefix, matchBits, fn)
+}
+
 func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value []byte) bool) bool {
 	if node == nil {
 		return true
@@ -1602,6 +1627,95 @@ func (s *Shard) Commit() ([]byte, error) {
 	}
 
 	return rootHash, nil
+}
+
+func (s *Shard) forEachPrefix(node Node, prefix []byte, bits int, matchPrefix []byte, matchBits int, fn func(key, value []byte) bool) bool {
+	if node == nil {
+		return true
+	}
+	if matchBits <= 0 {
+		return s.forEach(node, prefix, bits, fn)
+	}
+	switch n := node.(type) {
+	case *LeafNode:
+		fullKey, fullBits := s.prependPath(n.Path, n.PathBits, prefix, bits)
+		if !hasBitPrefix(fullKey, fullBits, matchPrefix, matchBits) {
+			return true
+		}
+		val, _ := s.getValue(n.ValueHash)
+		return fn(fullKey, val)
+	case *ArchiveBucketNode:
+		return s.forEachArchiveBucketPrefix(n, matchPrefix, matchBits, fn)
+	case *InternalNode:
+		newPrefix := prefix
+		newBits := bits
+		if n.PathBits > 0 {
+			newPrefix, newBits = s.prependPath(n.Path, n.PathBits, prefix, bits)
+		}
+		if !bitPrefixesOverlap(newPrefix, newBits, matchPrefix, matchBits) {
+			return true
+		}
+
+		leftPrefix, leftBits := s.appendBit(newPrefix, newBits, 0)
+		if bitPrefixesOverlap(leftPrefix, leftBits, matchPrefix, matchBits) {
+			if n.Left != nil {
+				if !s.forEachPrefix(n.Left, leftPrefix, leftBits, matchPrefix, matchBits, fn) {
+					return false
+				}
+			} else if len(n.LeftHash) > 0 {
+				loaded, _ := s.loadNode(n.LeftHash)
+				if loaded != nil && !s.forEachPrefix(loaded, leftPrefix, leftBits, matchPrefix, matchBits, fn) {
+					return false
+				}
+			}
+		}
+
+		rightPrefix, rightBits := s.appendBit(newPrefix, newBits, 1)
+		if bitPrefixesOverlap(rightPrefix, rightBits, matchPrefix, matchBits) {
+			if n.Right != nil {
+				if !s.forEachPrefix(n.Right, rightPrefix, rightBits, matchPrefix, matchBits, fn) {
+					return false
+				}
+			} else if len(n.RightHash) > 0 {
+				loaded, _ := s.loadNode(n.RightHash)
+				if loaded != nil && !s.forEachPrefix(loaded, rightPrefix, rightBits, matchPrefix, matchBits, fn) {
+					return false
+				}
+			}
+		}
+
+		for _, bucket := range n.StubList {
+			if !s.forEachArchiveBucketPrefix(bucket, matchPrefix, matchBits, fn) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *Shard) forEachArchiveBucketPrefix(bucket *ArchiveBucketNode, matchPrefix []byte, matchBits int, fn func(key, value []byte) bool) bool {
+	if bucket == nil || !bitPrefixesOverlap(bucket.Path, bucket.PathBits, matchPrefix, matchBits) {
+		return true
+	}
+	data, err := s.getBucketData(s.ensureBucketHash(bucket))
+	if err != nil {
+		return true
+	}
+	kvs, _ := s.deserializeArchivedKV(data)
+	for _, kv := range kvs {
+		fullK, fullBits := s.prependPath(kv.Suffix, kv.SuffixBits, bucket.Path, bucket.PathBits)
+		if !hasBitPrefix(fullK, fullBits, matchPrefix, matchBits) {
+			continue
+		}
+		val, err := s.getValue(kv.Value)
+		if err != nil {
+			val = kv.Value
+		}
+		if !fn(fullK, val) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive bool) ([]byte, error) {
@@ -1981,13 +2095,23 @@ func (s *Shard) FlushArchives() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pendingArchives := len(s.pendingArchives)
+	pendingArchiveItems := len(s.pendingArchiveItems)
 	pendingAppends := len(s.pendingAppends)
 	pendingDeletes := len(s.pendingDeletes)
 	pendingArchiveDeletes := len(s.pendingArchiveDeletes)
 	defer func() {
-		recordShardFlushDiagnostics(time.Since(flushStart).Nanoseconds(), pendingArchives, pendingAppends, pendingDeletes, pendingArchiveDeletes)
+		recordShardFlushDiagnostics(time.Since(flushStart).Nanoseconds(), pendingArchives+pendingArchiveItems, pendingAppends, pendingDeletes, pendingArchiveDeletes)
 	}()
 	for h, data := range s.pendingArchives {
+		if err := s.putBucketDataWithOldSize([]byte(h), data, 0); err != nil {
+			return err
+		}
+	}
+	for h, items := range s.pendingArchiveItems {
+		data, err := s.serializeArchivedKV(items)
+		if err != nil {
+			return err
+		}
 		if err := s.putBucketDataWithOldSize([]byte(h), data, 0); err != nil {
 			return err
 		}
@@ -2060,6 +2184,7 @@ func (s *Shard) FlushArchives() error {
 		}
 	}
 	s.pendingArchives = make(map[string][]byte)
+	s.pendingArchiveItems = make(map[string][]ArchivedKV)
 	s.pendingAppends = make(map[string]appendTask)
 	s.pendingDeletes = make(map[string]deleteTask)
 	s.pendingArchiveDeletes = make(map[string]int)

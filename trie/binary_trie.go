@@ -722,7 +722,7 @@ func newBinaryStorageIterator(address common.Address, bt *binary.Trie, isGlobal 
 		prefix: prefix,
 		index:  -1,
 	}
-	bt.ForEach(func(key, val []byte) bool {
+	visit := func(key, val []byte) bool {
 		if len(it.prefix) == 0 || bytes.HasPrefix(key, it.prefix) {
 			it.leaves = append(it.leaves, leafKV{
 				key:   key[len(it.prefix):],
@@ -730,7 +730,12 @@ func newBinaryStorageIterator(address common.Address, bt *binary.Trie, isGlobal 
 			})
 		}
 		return true
-	})
+	}
+	if len(it.prefix) == 0 {
+		bt.ForEach(visit)
+	} else {
+		bt.ForEachPrefix(it.prefix, len(it.prefix)*8, visit)
+	}
 	return it
 }
 

@@ -215,7 +215,11 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	bucket.SetHash(newHash)
 
 	// [优化]：如果 oldHash 已经在 pending 队列中，直接在内存中合并，保持 pending 状态扁平
-	if data, ok := s.pendingArchives[string(oldHash)]; ok {
+	if items, ok := s.pendingArchiveItems[string(oldHash)]; ok {
+		items = append(items, newItems...)
+		s.pendingArchiveItems[string(newHash)] = items
+		delete(s.pendingArchiveItems, string(oldHash))
+	} else if data, ok := s.pendingArchives[string(oldHash)]; ok {
 		// 已经在全量缓存中
 		items, _ := s.deserializeArchivedKV(data)
 		items = append(items, newItems...)
@@ -320,7 +324,23 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 	bucket.SetHash(newHash)
 
 	// [优化]：如果 oldHash 已经在 pendingArchives 队列中 (说明是本批次新创建的桶)，直接处理
-	if data, ok := s.pendingArchives[string(oldHash)]; ok {
+	if items, ok := s.pendingArchiveItems[string(oldHash)]; ok {
+		newItems := make([]ArchivedKV, 0, len(items))
+		for _, it := range items {
+			found := false
+			for _, del := range deleteItems {
+				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newItems = append(newItems, it)
+			}
+		}
+		s.pendingArchiveItems[string(newHash)] = newItems
+		delete(s.pendingArchiveItems, string(oldHash))
+	} else if data, ok := s.pendingArchives[string(oldHash)]; ok {
 		items, _ := s.deserializeArchivedKV(data)
 		// 简单过滤掉要删除的项
 		newItems := make([]ArchivedKV, 0, len(items))
@@ -419,11 +439,10 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	h := append([]byte{}, s.hasher.Hash(meta)...)
 	bucket.SetHash(h)
 
-	bucketData, _ := s.serializeArchivedKV(items)
-	if s.pendingArchives == nil {
-		s.pendingArchives = make(map[string][]byte)
+	if s.pendingArchiveItems == nil {
+		s.pendingArchiveItems = make(map[string][]ArchivedKV)
 	}
-	s.pendingArchives[string(h)] = bucketData
+	s.pendingArchiveItems[string(h)] = items
 }
 
 // verifyBucket 验证桶的 ECMH 承诺是否正确。返回布尔值及验证耗时（纳秒）。
