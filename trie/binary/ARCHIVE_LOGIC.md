@@ -424,3 +424,55 @@ The updated invariant is:
 This placement rule keeps `MaxBucketsPath` from growing just because many cold
 branches share a hot ancestor, and it keeps proof generation bounded by the
 configured bucket cap instead of by the full history on one path.
+
+## 15. Sparse Archive Bucket Compaction (2026-06-11)
+
+The next long run exposed the opposite failure mode after enforcing the hard
+bucket cap: with `ShardDepth=20` (about 1M shards), early pruning often archives
+only one or two items per shard. If each tiny cold branch immediately becomes a
+deep archive leaf, later adjacent items cannot find a shallow merge window and
+the system degenerates into one bucket per few items.
+
+Observed bad signal:
+
+* `ArchiveItems=22,076,815`
+* `BucketCount=14,219,598`
+* `BucketItemsAvg=1.55`, `P50=1`, `P95=3`, `P99=5`
+* `BucketItemsMax=100`
+
+This means the hard cap works, but bucket utilization collapses.
+
+The updated rule is a hybrid placement policy:
+
+* **Small cold branches are side-mounted first**: if a newly pruned cold branch
+  has no more than `Config.ResolveArchiveBucketSize()` items, it is converted to
+  a sparse bucket and attached to the current ancestor's `StubList` instead of
+  being pushed down as a standalone archive child.
+* **StubList compaction is enabled by default**: `CompactArchiveStubs` defaults
+  to true. Adjacent sparse buckets are sorted by absolute path and greedily
+  rebuilt into groups up to the resolved bucket cap.
+* **Large cold branches still become archive subtrees**: branches larger than
+  the cap keep using archive subtree construction, so proof size stays bounded
+  by `BucketItemsMax <= ResolveArchiveBucketSize()`.
+* **Existing tiny archive children are folded upward opportunistically**: when
+  prune revisits an archive-only child subtree whose total item count fits in
+  one bucket, the subtree is replaced by one ancestor-side sparse bucket. This
+  gradually repairs small buckets created before the compaction rule was added.
+* **Hard cap remains non-negotiable**: neither sparse compaction nor pending
+  append materialization may write a bucket over the resolved cap.
+
+Expected stress signal after this change:
+
+* `BucketItemsMax` remains exactly at or below the cap (100 for
+  `cuckooBuckets=32,cuckooSlots=4`).
+* `BucketItemsAvg/P50` should move toward tens of items per bucket rather than
+  staying near 1.
+* `MaxBucketsPath` may rise because sparse buckets are intentionally held at
+  ancestors, so long runs must monitor it together with proof latency.
+
+Local 1M-item verification with `ShardDepth=8`, `BatchSize=1000`:
+
+* `ArchiveItems=868,215`
+* `BucketCount=12,872`
+* `BucketItemsAvg=67.45`, `P50=67`, `P95=97`, `P99=99`
+* `BucketItemsMax=100`, `MaxBucketsPath=54`

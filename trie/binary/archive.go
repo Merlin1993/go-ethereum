@@ -226,9 +226,15 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 				parentChanged = true
 			}
 			if len(leftItems) > 0 {
-				n.Left = s.buildArchiveSubtreeFast(leftItems, lp, lb)
-				n.LeftHash = nil
-				n.LeftEpoch = n.Left.Epoch()
+				if s.shouldSideMountArchiveItems(len(leftItems)) {
+					s.collectAndAttachToStubList(n, leftItems, lp, lb)
+					n.Left, n.LeftHash = nil, nil
+					n.LeftEpoch = 0
+				} else {
+					n.Left = s.buildArchiveSubtreeFast(leftItems, lp, lb)
+					n.LeftHash = nil
+					n.LeftEpoch = n.Left.Epoch()
+				}
 				parentChanged = true
 			} else {
 				n.Left, n.LeftHash = nil, nil
@@ -240,6 +246,18 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 			}
 			n.Left = newLeft
 			allItems = append(allItems, leftItems...)
+		}
+		if n.Left != nil {
+			collapsed, err := s.collapseSmallArchiveChildToStub(n.Left, lp, lb)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if collapsed != nil {
+				s.attachStubs(n, []*ArchiveBucketNode{collapsed})
+				n.Left, n.LeftHash = nil, nil
+				n.LeftEpoch = 0
+				parentChanged = true
+			}
 		}
 
 		// 处理右子树
@@ -265,9 +283,15 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 				parentChanged = true
 			}
 			if len(rightItems) > 0 {
-				n.Right = s.buildArchiveSubtreeFast(rightItems, rp, rb)
-				n.RightHash = nil
-				n.RightEpoch = n.Right.Epoch()
+				if s.shouldSideMountArchiveItems(len(rightItems)) {
+					s.collectAndAttachToStubList(n, rightItems, rp, rb)
+					n.Right, n.RightHash = nil, nil
+					n.RightEpoch = 0
+				} else {
+					n.Right = s.buildArchiveSubtreeFast(rightItems, rp, rb)
+					n.RightHash = nil
+					n.RightEpoch = n.Right.Epoch()
+				}
 				parentChanged = true
 			} else {
 				n.Right, n.RightHash = nil, nil
@@ -279,6 +303,18 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 			}
 			n.Right = newRight
 			allItems = append(allItems, rightItems...)
+		}
+		if n.Right != nil {
+			collapsed, err := s.collapseSmallArchiveChildToStub(n.Right, rp, rb)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			if collapsed != nil {
+				s.attachStubs(n, []*ArchiveBucketNode{collapsed})
+				n.Right, n.RightHash = nil, nil
+				n.RightEpoch = 0
+				parentChanged = true
+			}
 		}
 
 		if parentChanged || len(n.StubList) != origStubCount ||
@@ -535,6 +571,83 @@ func (s *Shard) markSubtreeStaleRecursive(node Node) error {
 		}
 	}
 	return nil
+}
+
+func (s *Shard) shouldSideMountArchiveItems(count int) bool {
+	limit := s.config.ResolveArchiveBucketSize()
+	return limit <= 0 || count <= limit
+}
+
+func (s *Shard) collapseSmallArchiveChildToStub(node Node, entryPath []byte, entryBits int) (*ArchiveBucketNode, error) {
+	limit := s.config.ResolveArchiveBucketSize()
+	if limit <= 0 || node == nil {
+		return nil, nil
+	}
+	count, archiveOnly, err := s.archiveOnlyItemCount(node)
+	if err != nil || !archiveOnly || count == 0 || count > uint64(limit) {
+		return nil, err
+	}
+	items, err := s.collectLeavesRecursive(node, entryPath, entryBits)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 || len(items) > limit {
+		return nil, nil
+	}
+	if err := s.markSubtreeStaleRecursive(node); err != nil {
+		return nil, err
+	}
+	bucket, ok := s.buildArchiveBucket(items, entryPath, entryBits).(*ArchiveBucketNode)
+	if !ok {
+		return nil, nil
+	}
+	return bucket, nil
+}
+
+func (s *Shard) archiveOnlyItemCount(node Node) (uint64, bool, error) {
+	switch n := node.(type) {
+	case nil:
+		return 0, true, nil
+	case *LeafNode:
+		return 0, false, nil
+	case *ArchiveBucketNode:
+		return n.Count, true, nil
+	case *InternalNode:
+		var err error
+		var total uint64
+		if n.Left == nil && len(n.LeftHash) > 0 {
+			n.Left, err = s.loadNode(n.LeftHash)
+			if err != nil {
+				return 0, false, err
+			}
+		}
+		leftCount, leftArchiveOnly, err := s.archiveOnlyItemCount(n.Left)
+		if err != nil || !leftArchiveOnly {
+			return 0, leftArchiveOnly, err
+		}
+		total += leftCount
+
+		if n.Right == nil && len(n.RightHash) > 0 {
+			n.Right, err = s.loadNode(n.RightHash)
+			if err != nil {
+				return 0, false, err
+			}
+		}
+		rightCount, rightArchiveOnly, err := s.archiveOnlyItemCount(n.Right)
+		if err != nil || !rightArchiveOnly {
+			return 0, rightArchiveOnly, err
+		}
+		total += rightCount
+
+		for _, bucket := range n.StubList {
+			if bucket != nil {
+				total += bucket.Count
+			}
+		}
+		return total, true, nil
+	default:
+		return 0, false, nil
+	}
 }
 
 func (s *Shard) buildArchiveSubtree(items []ArchivedKV, path []byte, bits int) Node {

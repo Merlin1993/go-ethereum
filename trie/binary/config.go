@@ -33,6 +33,7 @@ func DefaultConfig() *Config {
 		ShardDepth:            16,
 		ArchiveBucketSize:     100,
 		ArchiveItemCacheLimit: -1,
+		CompactArchiveStubs:   true,
 		CuckooBuckets:         32,
 		CuckooSlots:           4,
 	}

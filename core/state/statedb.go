@@ -330,6 +330,7 @@ func (s *StateDB) Empty(addr common.Address) bool {
 
 // GetBalance retrieves the balance from the given address or 0 if object not found
 func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
+	s.recordKVAccountRead(addr)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.Balance()
@@ -339,6 +340,7 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 
 // GetNonce retrieves the nonce from the given address or 0 if object not found
 func (s *StateDB) GetNonce(addr common.Address) uint64 {
+	s.recordKVAccountRead(addr)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.Nonce()
@@ -350,6 +352,7 @@ func (s *StateDB) GetNonce(addr common.Address) uint64 {
 // GetStorageRoot retrieves the storage root from the given address or empty
 // if object not found.
 func (s *StateDB) GetStorageRoot(addr common.Address) common.Hash {
+	s.recordKVAccountRead(addr)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.Root()
@@ -363,6 +366,7 @@ func (s *StateDB) TxIndex() int {
 }
 
 func (s *StateDB) GetCode(addr common.Address) []byte {
+	s.recordKVAccountRead(addr)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		if s.witness != nil {
@@ -374,6 +378,7 @@ func (s *StateDB) GetCode(addr common.Address) []byte {
 }
 
 func (s *StateDB) GetCodeSize(addr common.Address) int {
+	s.recordKVAccountRead(addr)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		if s.witness != nil {
@@ -385,6 +390,7 @@ func (s *StateDB) GetCodeSize(addr common.Address) int {
 }
 
 func (s *StateDB) GetCodeHash(addr common.Address) common.Hash {
+	s.recordKVAccountRead(addr)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return common.BytesToHash(stateObject.CodeHash())
@@ -394,6 +400,7 @@ func (s *StateDB) GetCodeHash(addr common.Address) common.Hash {
 
 // GetState retrieves the value associated with the specific key.
 func (s *StateDB) GetState(addr common.Address, hash common.Hash) common.Hash {
+	s.recordKVStorageRead(addr, hash)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.GetState(hash)
@@ -404,6 +411,7 @@ func (s *StateDB) GetState(addr common.Address, hash common.Hash) common.Hash {
 // GetCommittedState retrieves the value associated with the specific key
 // without any mutations caused in the current execution.
 func (s *StateDB) GetCommittedState(addr common.Address, hash common.Hash) common.Hash {
+	s.recordKVStorageRead(addr, hash)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.GetCommittedState(hash)
@@ -414,6 +422,30 @@ func (s *StateDB) GetCommittedState(addr common.Address, hash common.Hash) commo
 // Database retrieves the low level database supporting the lower level trie ops.
 func (s *StateDB) Database() Database {
 	return s.db
+}
+
+func (s *StateDB) recordKVAccountRead(addr common.Address) {
+	if recorder, ok := s.db.(kvAccessRecorder); ok {
+		recorder.RecordAccountRead(addr)
+	}
+}
+
+func (s *StateDB) recordKVAccountWrite(addr common.Address) {
+	if recorder, ok := s.db.(kvAccessRecorder); ok {
+		recorder.RecordAccountWrite(addr)
+	}
+}
+
+func (s *StateDB) recordKVStorageRead(addr common.Address, slot common.Hash) {
+	if recorder, ok := s.db.(kvAccessRecorder); ok {
+		recorder.RecordStorageRead(addr, slot)
+	}
+}
+
+func (s *StateDB) recordKVStorageWrite(addr common.Address, slot common.Hash) {
+	if recorder, ok := s.db.(kvAccessRecorder); ok {
+		recorder.RecordStorageWrite(addr, slot)
+	}
 }
 
 func (s *StateDB) HasSelfDestructed(addr common.Address) bool {
@@ -431,6 +463,7 @@ func (s *StateDB) HasSelfDestructed(addr common.Address) bool {
 // AddBalance adds amount to the account associated with addr.
 func (s *StateDB) SetAccount(addr common.Address, data []byte, reason tracing.BalanceChangeReason) {
 
+	s.recordKVAccountWrite(addr)
 	stateObject := s.getOrNewStateObject(addr)
 	if len(data) == 0 {
 		s.journal.destruct(addr)
@@ -447,6 +480,7 @@ func (s *StateDB) SetAccount(addr common.Address, data []byte, reason tracing.Ba
 
 // AddBalance adds amount to the account associated with addr.
 func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
+	s.recordKVAccountWrite(addr)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject == nil {
 		return uint256.Int{}
@@ -456,6 +490,7 @@ func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tr
 
 // SubBalance subtracts amount from the account associated with addr.
 func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
+	s.recordKVAccountWrite(addr)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject == nil {
 		return uint256.Int{}
@@ -467,6 +502,7 @@ func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tr
 }
 
 func (s *StateDB) SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) {
+	s.recordKVAccountWrite(addr)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
 		stateObject.SetBalance(amount)
@@ -474,6 +510,7 @@ func (s *StateDB) SetBalance(addr common.Address, amount *uint256.Int, reason tr
 }
 
 func (s *StateDB) SetNonce(addr common.Address, nonce uint64, reason tracing.NonceChangeReason) {
+	s.recordKVAccountWrite(addr)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
 		stateObject.SetNonce(nonce)
@@ -481,6 +518,7 @@ func (s *StateDB) SetNonce(addr common.Address, nonce uint64, reason tracing.Non
 }
 
 func (s *StateDB) SetCode(addr common.Address, code []byte) (prev []byte) {
+	s.recordKVAccountWrite(addr)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
 		return stateObject.SetCode(crypto.Keccak256Hash(code), code)
@@ -489,8 +527,13 @@ func (s *StateDB) SetCode(addr common.Address, code []byte) (prev []byte) {
 }
 
 func (s *StateDB) SetState(addr common.Address, key, value common.Hash) common.Hash {
+	s.recordKVStorageRead(addr, key)
 	if stateObject := s.getOrNewStateObject(addr); stateObject != nil {
-		return stateObject.SetState(key, value)
+		prev := stateObject.SetState(key, value)
+		if prev != value {
+			s.recordKVStorageWrite(addr, key)
+		}
+		return prev
 	}
 	return common.Hash{}
 }
@@ -499,6 +542,7 @@ func (s *StateDB) SetState(addr common.Address, key, value common.Hash) common.H
 // storage. This function should only be used for debugging and the mutations
 // must be discarded afterwards.
 func (s *StateDB) SetStorage(addr common.Address, storage map[common.Hash]common.Hash) {
+	s.recordKVAccountWrite(addr)
 	// SetStorage needs to wipe the existing storage. We achieve this by marking
 	// the account as self-destructed in this block. The effect is that storage
 	// lookups will not hit the disk, as it is assumed that the disk data belongs
@@ -514,6 +558,7 @@ func (s *StateDB) SetStorage(addr common.Address, storage map[common.Hash]common
 	}
 	newObj := s.createObject(addr)
 	for k, v := range storage {
+		s.recordKVStorageWrite(addr, k)
 		newObj.SetState(k, v)
 	}
 	// Inherit the metadata of original object if it was existent
@@ -530,6 +575,7 @@ func (s *StateDB) SetStorage(addr common.Address, storage map[common.Hash]common
 // The account's state object is still available until the state is committed,
 // getStateObject will return a non-nil account after SelfDestruct.
 func (s *StateDB) SelfDestruct(addr common.Address) uint256.Int {
+	s.recordKVAccountWrite(addr)
 	stateObject := s.getStateObject(addr)
 	var prevBalance uint256.Int
 	if stateObject == nil {
@@ -674,6 +720,7 @@ func (s *StateDB) createObject(addr common.Address) *stateObject {
 // exists, this function will silently overwrite it which might lead to a
 // consensus bug eventually.
 func (s *StateDB) CreateAccount(addr common.Address) {
+	s.recordKVAccountWrite(addr)
 	s.createObject(addr)
 }
 
@@ -683,6 +730,7 @@ func (s *StateDB) CreateAccount(addr common.Address) {
 // This operation sets the 'newContract'-flag, which is required in order to
 // correctly handle EIP-6780 'delete-in-same-transaction' logic.
 func (s *StateDB) CreateContract(addr common.Address) {
+	s.recordKVAccountWrite(addr)
 	obj := s.getStateObject(addr)
 	if !obj.newContract {
 		obj.newContract = true
@@ -1337,6 +1385,15 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 	if err != nil {
 		return nil, err
 	}
+	if kv, ok := s.db.(kvStateBackend); ok {
+		if err := kv.CommitKV(block, ret); err != nil {
+			return nil, err
+		}
+		readerStart := time.Now()
+		s.reader, _ = s.db.Reader(s.originalRoot)
+		s.CommitReaderReset = time.Since(readerStart)
+		return ret, nil
+	}
 	// Commit dirty contract code if any exists
 	if db := s.db.TrieDB().Disk(); db != nil && len(ret.codes) > 0 {
 		codeWriteStart := time.Now()
@@ -1535,6 +1592,8 @@ func mustCopyTrie(t Trie) Trie {
 	case *trie.StateTrie:
 		return t.Copy()
 	case *trie.VerkleTrie:
+		return t.Copy()
+	case *kvTrie:
 		return t.Copy()
 	default:
 		panic(fmt.Errorf("unknown trie type %T", t))

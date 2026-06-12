@@ -602,6 +602,50 @@ func TestPruneCollectKeepsExistingArchiveBucketOpaque(t *testing.T) {
 	}
 }
 
+func TestSparseArchiveStubsCompactTowardBucketLimit(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ArchiveBucketSize = 10
+	config.CuckooBuckets = 64
+	config.CuckooSlots = 4
+	config.CompactArchiveStubs = true
+	config.ArchiveDB = db
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parent := &InternalNode{}
+	const itemCount = 25
+	for i := 0; i < itemCount; i++ {
+		key := make([]byte, 32)
+		key[31] = byte(i)
+		prefix := shard.prefixBits(key, 4, nil)
+		item := ArchivedKV{
+			Suffix:     key,
+			SuffixBits: len(key) * 8,
+			Value:      shard.stageValue([]byte{byte(i)}),
+		}
+		shard.collectAndAttachToStubList(parent, []ArchivedKV{item}, prefix, 4)
+	}
+
+	limit := config.ResolveArchiveBucketSize()
+	if len(parent.StubList) > (itemCount+limit-1)/limit {
+		t.Fatalf("sparse stubs were not compacted: buckets=%d limit=%d items=%d", len(parent.StubList), limit, itemCount)
+	}
+	var total uint64
+	for _, bucket := range parent.StubList {
+		if bucket.Count > uint64(limit) {
+			t.Fatalf("bucket exceeded limit: count=%d limit=%d", bucket.Count, limit)
+		}
+		total += bucket.Count
+	}
+	if total != itemCount {
+		t.Fatalf("compacted bucket item total mismatch: got %d want %d", total, itemCount)
+	}
+}
+
 func TestArchiveSubtreeKeepsBucketSizeLimitOnDegeneratePrefix(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()

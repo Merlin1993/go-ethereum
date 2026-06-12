@@ -27,6 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -64,6 +65,7 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		allLogs     []*types.Log
 		gp          = new(GasPool).AddGas(block.GasLimit())
 	)
+	statedb.Database().SetBlockNum(block.NumberU64())
 
 	// Mutate the block and state according to any hard-fork specs
 	if p.config.DAOForkSupport && p.config.DAOForkBlock != nil && p.config.DAOForkBlock.Cmp(block.Number()) == 0 {
@@ -120,6 +122,15 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
 	p.chain.engine.Finalize(p.chain, header, tracingStateDB, block.Body())
+	if kvdb, ok := statedb.Database().(interface{ KVBlockStats() state.KVAccessStats }); ok {
+		stats := kvdb.KVBlockStats()
+		ctx := []interface{}{
+			"block", stats.Block,
+			"reads", stats.Reads, "read3m", stats.Read3M, "read6m", stats.Read6M, "read1y", stats.Read1Y, "readNonExistent", stats.ReadNonExistent,
+			"writes", stats.Writes, "write3m", stats.Write3M, "write6m", stats.Write6M, "write1y", stats.Write1Y, "writeNonExistent", stats.WriteNonExistent,
+		}
+		log.Info("KV state access stats", ctx...)
+	}
 
 	return &ProcessResult{
 		Receipts: receipts,

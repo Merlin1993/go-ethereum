@@ -43,7 +43,7 @@ var globalFPDistribution = make(map[string]int64)
 type ProcessorHost struct {
 	db     ethdb.Database
 	trieDB *triedb.Database
-	sdb    *state.CachingDB
+	sdb    state.Database
 	snaps  *snapshot.Tree
 	config *ProcessorConfig
 }
@@ -55,6 +55,7 @@ var (
 	endIdx           = flag.Int("endFileIdx2", 21, "End file index")
 	useVerkle        = flag.Bool("useVerkle2", false, "Enable Verkle trie")
 	useBinaryTrie    = flag.Bool("useBinaryTrie2", true, "Enable Binary trie")
+	useKV            = flag.Bool("useKV2", false, "Enable no-hash KV state backend")
 	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
 	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
 	metricsDir       = flag.String("metricsDir2", ".", "Directory for mainnet metrics CSV/JSON output")
@@ -90,6 +91,7 @@ type ProcessorConfig struct {
 	EndFileIdx       int
 	UseVerkle        bool
 	UseBinaryTrie    bool
+	UseKV            bool
 	UseMemory        bool
 	BinaryArchiveDir string
 	MetricsDir       string
@@ -124,6 +126,15 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 	}
 
 	db := rawdb.NewDatabase(ldb)
+	if cfg.UseKV {
+		sdb := state.NewKVDatabase(db)
+		return &ProcessorHost{
+			db:     db,
+			trieDB: sdb.TrieDB(),
+			sdb:    sdb,
+			config: cfg,
+		}, nil
+	}
 	hdb := hashdb.Defaults
 	pdb := pathdb.Defaults
 	if cfg.UseVerkle || !cfg.UseBinaryTrie && !cfg.UseVerkle {
@@ -208,7 +219,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		StartFileIdx:          *startIdx,
 		EndFileIdx:            *endIdx,
 		UseVerkle:             *useVerkle,
-		UseBinaryTrie:         *useBinaryTrie,
+		UseBinaryTrie:         *useBinaryTrie && !*useKV,
+		UseKV:                 *useKV,
 		UseMemory:             *useMemory,
 		BinaryArchiveDir:      *binaryArchiveDir,
 		MetricsDir:            *metricsDir,
@@ -304,6 +316,14 @@ func TestExpireStateProcessor(t *testing.T) {
 	writer := csv.NewWriter(csvFile)
 	defer writer.Flush()
 
+	kvStatsFile, err := os.Create(filepath.Join(outputDir, "kv_block_access_stats.csv"))
+	if err != nil {
+		t.Fatalf("failed to create kv stats csv file: %v", err)
+	}
+	defer kvStatsFile.Close()
+	kvStatsWriter := csv.NewWriter(kvStatsFile)
+	defer kvStatsWriter.Flush()
+
 	// Write CSV Header
 	writer.Write([]string{
 		"Epoch_ID", "Tree_Type", "Cumulative_Storage_Bytes",
@@ -326,6 +346,11 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Item_Proof_Min", "Item_Proof_P25", "Item_Proof_Med", "Item_Proof_P75", "Item_Proof_Max",
 		"Cycle_FP_Count", "Max_FP_In_Single_Block",
 	})
+	kvStatsWriter.Write([]string{
+		"Block",
+		"Reads", "Read_3M", "Read_6M", "Read_1Y", "Read_NonExistent",
+		"Writes", "Write_3M", "Write_6M", "Write_1Y", "Write_NonExistent",
+	})
 
 	reportStats := func() {
 		if intervalBlocks == 0 {
@@ -337,6 +362,8 @@ func TestExpireStateProcessor(t *testing.T) {
 			treeType = "ASCT"
 		} else if cfg.UseVerkle {
 			treeType = "Verkle"
+		} else if cfg.UseKV {
+			treeType = "KV"
 		}
 		stateStorageSize, _ := getDirSize(cfg.DbDir)
 		archiveStorageSize := int64(0)
@@ -573,6 +600,40 @@ func TestExpireStateProcessor(t *testing.T) {
 		common.BinaryStatsMu.Unlock()
 	}
 
+	recordKVBlockStats := func(block uint64) {
+		if !cfg.UseKV {
+			return
+		}
+		kvdb, ok := host.sdb.(interface{ KVBlockStats() state.KVAccessStats })
+		if !ok {
+			return
+		}
+		stats := kvdb.KVBlockStats()
+		kvStatsWriter.Write([]string{
+			strconv.FormatUint(stats.Block, 10),
+			strconv.FormatUint(stats.Reads, 10),
+			strconv.FormatUint(stats.Read3M, 10),
+			strconv.FormatUint(stats.Read6M, 10),
+			strconv.FormatUint(stats.Read1Y, 10),
+			strconv.FormatUint(stats.ReadNonExistent, 10),
+			strconv.FormatUint(stats.Writes, 10),
+			strconv.FormatUint(stats.Write3M, 10),
+			strconv.FormatUint(stats.Write6M, 10),
+			strconv.FormatUint(stats.Write1Y, 10),
+			strconv.FormatUint(stats.WriteNonExistent, 10),
+		})
+		if block%100000 == 0 {
+			kvStatsWriter.Flush()
+		}
+	}
+
+	var (
+		currentBlock           uint64
+		currentBlockInit       bool
+		duplicateBlocksSkipped uint64
+		duplicateTxsSkipped    uint64
+	)
+
 processFiles:
 	for _, file := range selectedFiles {
 		t.Logf("Processing file: %s", file)
@@ -588,16 +649,31 @@ processFiles:
 		compareLoadBlockTimestampsFromFile(cfg.DataDir, fileIdx)
 
 		start10k := time.Now()
-		// Process blocks sequentially from the streamer
-		currentBlock, ok := ts.PeekBlockNum()
+		// Process blocks sequentially from the streamer. CSV shards may overlap at
+		// file boundaries, so keep currentBlock global across files.
+		firstBlock, ok := ts.PeekBlockNum()
 		if !ok {
 			continue // skip empty file
+		}
+		if !currentBlockInit {
+			currentBlock = firstBlock
+			currentBlockInit = true
 		}
 
 		for {
 			targetBlock, ok := ts.PeekBlockNum()
 			if !ok {
 				break
+			}
+			if targetBlock < currentBlock {
+				msgs, _ := ts.PopBlock(targetBlock)
+				duplicateBlocksSkipped++
+				duplicateTxsSkipped += uint64(len(msgs))
+				if duplicateBlocksSkipped <= 10 || duplicateBlocksSkipped%1000 == 0 {
+					fmt.Printf("[dedup] skipped duplicate/out-of-order block %d txs=%d nextExpected=%d totalSkippedBlocks=%d totalSkippedTxs=%d\n",
+						targetBlock, len(msgs), currentBlock, duplicateBlocksSkipped, duplicateTxsSkipped)
+				}
+				continue
 			}
 
 			// Process empty blocks between transactions
@@ -615,6 +691,9 @@ processFiles:
 				host.trieDB.UpdateBlockNum(b)
 				if host.trieDB.CacheTrie() != nil {
 					host.trieDB.CacheTrie().SetBlockNum(b)
+				}
+				if cfg.UseKV {
+					host.sdb.SetBlockNum(b)
 				}
 				statedb, err := state.New(lastStateRoot, host.sdb)
 				if err != nil {
@@ -662,6 +741,7 @@ processFiles:
 				postCommitDuration := time.Since(postCommitStart)
 				commitDuration := time.Since(commitStart)
 				rootDuration := time.Since(rootStart)
+				recordKVBlockStats(b)
 				if commitDuration >= slowCommitDiagThreshold || statedb.CommitHandleDestruction >= slowCommitDiagThreshold {
 					treeLabel := "MPT"
 					extra := ""
@@ -727,6 +807,9 @@ processFiles:
 			host.trieDB.UpdateBlockNum(b)
 			if host.trieDB.CacheTrie() != nil {
 				host.trieDB.CacheTrie().SetBlockNum(b)
+			}
+			if cfg.UseKV {
+				host.sdb.SetBlockNum(b)
 			}
 			statedb, err := state.New(lastStateRoot, host.sdb)
 			if err != nil {
@@ -825,6 +908,7 @@ processFiles:
 			commitDuration := time.Since(commitStart)
 
 			rootDuration := time.Since(rootStart)
+			recordKVBlockStats(b)
 			if commitDuration >= slowCommitDiagThreshold || statedb.CommitHandleDestruction >= slowCommitDiagThreshold {
 				treeLabel := "MPT"
 				extra := ""
