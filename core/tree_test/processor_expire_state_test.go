@@ -71,6 +71,7 @@ var (
 	cuckooSlots           = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
 	binaryNodeCacheLimit  = flag.Int("binaryNodeCacheLimit", 262144, "Binary trie process node cache limit; 0 uses default, negative disables cache")
 	binaryPhysicalDelete  = flag.Bool("binaryPhysicalDelete", false, "Physically delete obsolete binary trie state nodes from stateDB")
+	binaryNodeStorage     = flag.String("binaryNodeStorage", "path", "Binary trie node storage scheme: hash or path")
 	maxRootPipelineMs     = flag.Int("maxRootPipelineMs", 0, "Abort if any block root pipeline exceeds this many milliseconds; 0 disables")
 	maxHandleDestructMs   = flag.Int("maxHandleDestructionMs", 0, "Abort if any block handleDestruction exceeds this many milliseconds; 0 disables")
 	maxPruningMs          = flag.Int("maxPruningMs", 0, "Abort if any binary pruning step exceeds this many milliseconds; 0 disables")
@@ -107,6 +108,7 @@ type ProcessorConfig struct {
 	CuckooSlots           int
 	BinaryNodeCacheLimit  int
 	BinaryPhysicalDelete  bool
+	BinaryNodeStorage     string
 	MaxRootPipelineMs     int
 	MaxHandleDestructMs   int
 	MaxPruningMs          int
@@ -159,6 +161,7 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 			CuckooSlots:           cfg.CuckooSlots,
 			NodeCacheLimit:        cfg.BinaryNodeCacheLimit,
 			PhysicalDelete:        cfg.BinaryPhysicalDelete,
+			NodeStorageScheme:     cfg.BinaryNodeStorage,
 		},
 		PathDB: pdb,
 		HashDB: hdb,
@@ -168,11 +171,10 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 	if cfg.UseVerkle || cfg.UseBinaryTrie {
 		firstRootHash = common.Hash{}
 	}
-	// --- 硬编码开关：当使用 Binary Trie 时是否禁用快照 (用于精准调试 Binary Trie 指标) ---
-	disableSnapForBinary := true
 	var activeSnaps *snapshot.Tree
-	if !(cfg.UseBinaryTrie && disableSnapForBinary) {
-		activeSnaps, _ = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, firstRootHash)
+	activeSnaps, err = snapshot.New(snapshot.Config{CacheSize: 100}, db, trieDB, firstRootHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create state snapshot: %v", err)
 	}
 	sdb := state.NewDatabase(trieDB, activeSnaps)
 
@@ -234,6 +236,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		CuckooSlots:           *cuckooSlots,
 		BinaryNodeCacheLimit:  *binaryNodeCacheLimit,
 		BinaryPhysicalDelete:  *binaryPhysicalDelete,
+		BinaryNodeStorage:     *binaryNodeStorage,
 		MaxRootPipelineMs:     *maxRootPipelineMs,
 		MaxHandleDestructMs:   *maxHandleDestructMs,
 		MaxPruningMs:          *maxPruningMs,
@@ -1179,9 +1182,16 @@ func TestBinaryTrieConsistency(t *testing.T) {
 		UseMemory:             false,
 		BinaryArchiveDir:      filepath.Join(os.TempDir(), "bin_consistency_archive"),
 		StartNum:              46147,
-		PruneInterval:         0,
+		PruneInterval:         *pruneInterval,
 		MaxBlocks:             *maxBlocks,
-		ArchiveItemCacheLimit: 0,
+		ShardDepth:            *shardDepth,
+		ArchiveBucketSize:     *archiveBucketSize,
+		ArchiveItemCacheLimit: *archiveItemCacheLimit,
+		CuckooBuckets:         *cuckooBuckets,
+		CuckooSlots:           *cuckooSlots,
+		BinaryNodeCacheLimit:  *binaryNodeCacheLimit,
+		BinaryPhysicalDelete:  *binaryPhysicalDelete,
+		BinaryNodeStorage:     *binaryNodeStorage,
 	}
 	os.RemoveAll(binCfg.DbDir)
 	os.RemoveAll(binCfg.BinaryArchiveDir)

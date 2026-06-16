@@ -156,6 +156,44 @@ func TestShardHashDoesNotClearDirtyBeforeCommit(t *testing.T) {
 	}
 }
 
+func TestArchivedWritePromotionUsesBucketValueRef(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 0
+	shard, err := NewShard(0, db, NewPooledKeccakHasher(), config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatalf("new shard: %v", err)
+	}
+
+	key := bytes.Repeat([]byte{0x3f}, 32)
+	oldValue := []byte("old-value")
+	oldValueRef := valueRefForKeyValue(key, oldValue)
+	bucket := &ArchiveBucketNode{dirty: true}
+	shard.recomputeBucket(bucket, []ArchivedKV{{
+		Suffix:     common.CopyBytes(key),
+		SuffixBits: len(key) * 8,
+		Value:      oldValueRef,
+	}})
+	shard.root = bucket
+
+	if err := shard.Put(key, []byte("new-value")); err != nil {
+		t.Fatalf("promotion should use bucket valueRef without reading old flat value: %v", err)
+	}
+	if bucket.Count != 0 || len(bucket.Keys) != 0 {
+		t.Fatalf("promotion did not remove archived membership: count=%d keys=%d", bucket.Count, len(bucket.Keys))
+	}
+	if _, ok := shard.root.(*LeafNode); !ok {
+		t.Fatalf("promotion did not insert a hot leaf, got %T", shard.root)
+	}
+	newValue, err := shard.getFlatValue(key)
+	if err != nil {
+		t.Fatalf("new flat value missing after promotion: %v", err)
+	}
+	if !bytes.Equal(newValue, []byte("new-value")) {
+		t.Fatalf("flat value mismatch: got %q", newValue)
+	}
+}
+
 func setupTrie() (*Trie, Hasher) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
@@ -391,8 +429,8 @@ func TestForEachPrefixDoesNotScanUnrelatedArchivedShard(t *testing.T) {
 	if !bytes.Equal(gotVals[0], valA) {
 		t.Fatalf("unexpected value: got %x want %x", gotVals[0], valA)
 	}
-	if gets := db.ArchiveDataGets(); gets != 1 {
-		t.Fatalf("expected to read only the matching shard archive bucket, got %d archive data reads", gets)
+	if gets := db.ArchiveDataGets(); gets != 0 {
+		t.Fatalf("minimalist archive prefix iteration should read flat values without archive payload reads, got %d archive data reads", gets)
 	}
 }
 
@@ -465,11 +503,12 @@ func TestCompactStubListMergesCommonPrefixBuckets(t *testing.T) {
 	newBucket := func(key, value []byte) *ArchiveBucketNode {
 		path := shard.prefixBits(key, 8, nil)
 		suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, path, 8)
+		shard.stageFlatValueForKey(key, value)
 		bucket := &ArchiveBucketNode{Path: path, PathBits: 8, dirty: true}
 		shard.recomputeBucket(bucket, []ArchivedKV{{
 			Suffix:     suffix,
 			SuffixBits: suffixBits,
-			Value:      shard.stageValue(value),
+			Value:      value,
 		}})
 		return bucket
 	}
@@ -511,30 +550,19 @@ func TestAttachStubsDoesNotReadArchiveDataByDefault(t *testing.T) {
 		key[0] = keyByte
 		path := shard.prefixBits(key, 8, nil)
 		suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, path, 8)
+		shard.stageFlatValueForKey(key, value)
 		bucket := &ArchiveBucketNode{Path: path, PathBits: 8, dirty: true}
 		shard.recomputeBucket(bucket, []ArchivedKV{{
 			Suffix:     suffix,
 			SuffixBits: suffixBits,
-			Value:      shard.stageValue(value),
+			Value:      value,
 		}})
 		return bucket
 	}
 
 	persisted := makeBucket(0x10, []byte("persisted-value"))
-	persistedItems := shard.pendingArchiveItems[string(shard.ensureBucketHash(persisted))]
-	if len(persistedItems) == 0 {
-		t.Fatalf("expected pending archive items for persisted bucket")
-	}
-	persistedData, err := shard.serializeArchivedKV(persistedItems)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.PutBucket(archiveDataKey(shard.ensureBucketHash(persisted)), persistedData); err != nil {
-		t.Fatal(err)
-	}
 	persisted.SetDirty(false)
 	persisted.SetOriginalHash(shard.ensureBucketHash(persisted))
-	delete(shard.pendingArchiveItems, string(shard.ensureBucketHash(persisted)))
 
 	parent := &InternalNode{StubList: []*ArchiveBucketNode{persisted}}
 	db.ResetArchiveDataGets()
@@ -543,8 +571,8 @@ func TestAttachStubsDoesNotReadArchiveDataByDefault(t *testing.T) {
 	if gets := db.ArchiveDataGets(); gets != 0 {
 		t.Fatalf("default attachStubs should not read archive data, got %d reads", gets)
 	}
-	if len(parent.StubList) != 2 {
-		t.Fatalf("expected both stubs to remain unmerged, got %d", len(parent.StubList))
+	if len(parent.StubList) != 1 {
+		t.Fatalf("expected key-list stubs to merge without archive payload reads, got %d", len(parent.StubList))
 	}
 }
 
@@ -563,26 +591,15 @@ func TestPruneCollectKeepsExistingArchiveBucketOpaque(t *testing.T) {
 	key[0] = 0x22
 	path := shard.prefixBits(key, 8, nil)
 	suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, path, 8)
+	shard.stageFlatValueForKey(key, []byte("archived-value"))
 	bucket := &ArchiveBucketNode{Path: path, PathBits: 8, dirty: true}
 	shard.recomputeBucket(bucket, []ArchivedKV{{
 		Suffix:     suffix,
 		SuffixBits: suffixBits,
-		Value:      shard.stageValue([]byte("archived-value")),
+		Value:      []byte("archived-value"),
 	}})
 
 	hash := shard.ensureBucketHash(bucket)
-	items := shard.pendingArchiveItems[string(hash)]
-	if len(items) == 0 {
-		t.Fatalf("expected pending archive items")
-	}
-	data, err := shard.serializeArchivedKV(items)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.PutBucket(archiveDataKey(hash), data); err != nil {
-		t.Fatal(err)
-	}
-	delete(shard.pendingArchiveItems, string(hash))
 	bucket.SetDirty(false)
 	bucket.SetOriginalHash(hash)
 
@@ -745,7 +762,7 @@ func TestInlineSmallValueSkipsValueBlobAndReloads(t *testing.T) {
 	}
 }
 
-func TestDeleteOldValueBlobOnUpdate(t *testing.T) {
+func TestFlatValueOverwrittenOnUpdate(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
@@ -757,8 +774,8 @@ func TestDeleteOldValueBlobOnUpdate(t *testing.T) {
 	key := bytes.Repeat([]byte{0x35}, 32)
 	oldValue := []byte("old-value")
 	newValue := []byte("new-value")
-	oldRef := gethcrypto.Keccak256Hash(key, oldValue).Bytes()
-	newRef := gethcrypto.Keccak256Hash(key, newValue).Bytes()
+	oldRef := valueRefForKeyValue(key, oldValue)
+	newRef := valueRefForKeyValue(key, newValue)
 
 	if err := trie.Put(key, oldValue); err != nil {
 		t.Fatal(err)
@@ -766,8 +783,11 @@ func TestDeleteOldValueBlobOnUpdate(t *testing.T) {
 	if _, err := trie.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := db.Has(valueDataKey(oldRef)); !ok {
-		t.Fatalf("expected old value blob to be written")
+	if ok, _ := db.Has(valueDataKey(oldRef)); ok {
+		t.Fatalf("plus mode should not copy old value into value store")
+	}
+	if got, _ := db.Get(flatValueDataKey(key)); !bytes.Equal(got, oldValue) {
+		t.Fatalf("expected old value in flat store, got %x", got)
 	}
 
 	if err := trie.Put(key, newValue); err != nil {
@@ -778,10 +798,13 @@ func TestDeleteOldValueBlobOnUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ok, _ := db.Has(valueDataKey(oldRef)); ok {
-		t.Fatalf("expected superseded value blob to be deleted")
+		t.Fatalf("plus mode should not keep superseded value blob")
 	}
-	if ok, _ := db.Has(valueDataKey(newRef)); !ok {
-		t.Fatalf("expected new value blob to be written")
+	if ok, _ := db.Has(valueDataKey(newRef)); ok {
+		t.Fatalf("plus mode should not copy new value into value store")
+	}
+	if got, _ := db.Get(flatValueDataKey(key)); !bytes.Equal(got, newValue) {
+		t.Fatalf("expected new value in flat store, got %x", got)
 	}
 
 	reloaded := NewTrie(root, db, hasher, config, true)
@@ -794,7 +817,7 @@ func TestDeleteOldValueBlobOnUpdate(t *testing.T) {
 	}
 }
 
-func TestExternalValuesStoredOutsideStateDB(t *testing.T) {
+func TestArchiveDBDoesNotStoreExecutionValues(t *testing.T) {
 	stateDB := NewMemoryDBAdapter()
 	valueDB := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
@@ -807,8 +830,8 @@ func TestExternalValuesStoredOutsideStateDB(t *testing.T) {
 	key := bytes.Repeat([]byte{0x44}, 32)
 	oldValue := []byte("old-external-value")
 	newValue := []byte("new-external-value")
-	oldRef := gethcrypto.Keccak256Hash(key, oldValue).Bytes()
-	newRef := gethcrypto.Keccak256Hash(key, newValue).Bytes()
+	oldRef := valueRefForKeyValue(key, oldValue)
+	newRef := valueRefForKeyValue(key, newValue)
 
 	if err := trie.Put(key, oldValue); err != nil {
 		t.Fatal(err)
@@ -823,8 +846,11 @@ func TestExternalValuesStoredOutsideStateDB(t *testing.T) {
 	if ok, _ := stateDB.Has(oldRef); ok {
 		t.Fatalf("stateDB should not contain legacy raw value blob")
 	}
-	if ok, _ := valueDB.Has(valueDataKey(oldRef)); !ok {
-		t.Fatalf("archive/value DB should contain external value blob")
+	if ok, _ := valueDB.Has(valueDataKey(oldRef)); ok {
+		t.Fatalf("archive/value DB should not contain execution value blob in plus mode")
+	}
+	if got, _ := stateDB.Get(flatValueDataKey(key)); !bytes.Equal(got, oldValue) {
+		t.Fatalf("stateDB flat store mismatch: got %x want %x", got, oldValue)
 	}
 
 	reloaded := NewTrie(root, stateDB, hasher, config, true)
@@ -860,10 +886,13 @@ func TestExternalValuesStoredOutsideStateDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	if ok, _ := valueDB.Has(valueDataKey(oldRef)); ok {
-		t.Fatalf("expected superseded external value blob to be deleted")
+		t.Fatalf("archive/value DB should not contain superseded execution value blob")
 	}
-	if ok, _ := valueDB.Has(valueDataKey(newRef)); !ok {
-		t.Fatalf("expected new external value blob to be written")
+	if ok, _ := valueDB.Has(valueDataKey(newRef)); ok {
+		t.Fatalf("archive/value DB should not contain new execution value blob")
+	}
+	if got, _ := stateDB.Get(flatValueDataKey(key)); !bytes.Equal(got, newValue) {
+		t.Fatalf("stateDB flat store mismatch after update: got %x want %x", got, newValue)
 	}
 
 	reloaded = NewTrie(root, stateDB, hasher, config, true)
@@ -1170,9 +1199,8 @@ func TestPersistence(t *testing.T) {
 
 	// If I can't load roots, I can't test persistence across instances easily without modifying Trie.
 	// But I can test if Commit actually writes to DB.
-	valHash := hasher.Hash(val)
-	if data, _ := db.Get(valueDataKey(valHash)); !bytes.Equal(data, val) {
-		t.Errorf("Value not written to DB")
+	if data, _ := db.Get(flatValueDataKey(key)); !bytes.Equal(data, val) {
+		t.Errorf("Value not written to flat DB")
 	}
 
 	// We can't easily test reloading the trie without a Way to set the root hash for shards.
@@ -1194,8 +1222,7 @@ func TestPruningBasic(t *testing.T) {
 	trie.Commit()
 
 	// Verify it exists in DB
-	valHash := hasher.Hash(val)
-	if data, _ := db.Get(valueDataKey(valHash)); len(data) == 0 {
+	if data, _ := db.Get(flatValueDataKey(key)); len(data) == 0 {
 		t.Fatalf("Data missing before prune")
 	}
 
@@ -1649,7 +1676,235 @@ func TestFullTrieReload(t *testing.T) {
 	}
 }
 
-func TestAutomaticRedemption(t *testing.T) {
+func TestPathStorageReloadAfterSplitsUpdatesAndDeletes(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.NodeStorageScheme = NodeStoragePath
+
+	trie := NewTrie(nil, db, hasher, config, true)
+	keys := make([][]byte, 96)
+	values := make(map[string][]byte, len(keys))
+	for i := range keys {
+		key := make([]byte, 32)
+		key[0] = 0x42
+		key[1] = byte(i)
+		key[2] = byte(i * 17)
+		value := []byte{0xa0, byte(i), byte(i >> 1)}
+		keys[i] = key
+		values[string(key)] = value
+		if err := trie.Put(key, value); err != nil {
+			t.Fatalf("initial put %d: %v", i, err)
+		}
+	}
+	root, err := trie.Commit()
+	if err != nil {
+		t.Fatalf("initial commit: %v", err)
+	}
+	if blob, _ := db.Get(root); len(blob) != 0 {
+		t.Fatalf("path storage unexpectedly persisted top root by hash")
+	}
+
+	trie = NewTrie(root, db, hasher, config, true)
+	for i, key := range keys {
+		got, err := trie.Get(key)
+		if err != nil || !bytes.Equal(got, values[string(key)]) {
+			t.Fatalf("initial reload key %d: got %x err %v", i, got, err)
+		}
+	}
+
+	deleted := make(map[string]struct{})
+	for i, key := range keys {
+		if i%3 == 0 {
+			if err := trie.Delete(key); err != nil {
+				t.Fatalf("delete %d: %v", i, err)
+			}
+			deleted[string(key)] = struct{}{}
+			continue
+		}
+		if i%2 == 0 {
+			value := []byte{0xb0, byte(i), byte(i * 3)}
+			values[string(key)] = value
+			if err := trie.Put(key, value); err != nil {
+				t.Fatalf("update %d: %v", i, err)
+			}
+		}
+	}
+	root, err = trie.Commit()
+	if err != nil {
+		t.Fatalf("second commit: %v", err)
+	}
+
+	reloaded := NewTrie(root, db, hasher, config, true)
+	for i, key := range keys {
+		got, err := reloaded.Get(key)
+		if _, ok := deleted[string(key)]; ok {
+			if err == nil || got != nil {
+				t.Fatalf("deleted key %d survived reload: %x", i, got)
+			}
+			continue
+		}
+		if err != nil || !bytes.Equal(got, values[string(key)]) {
+			t.Fatalf("second reload key %d: got %x want %x err %v", i, got, values[string(key)], err)
+		}
+	}
+
+	for _, key := range keys {
+		if _, ok := deleted[string(key)]; ok {
+			continue
+		}
+		if err := reloaded.Delete(key); err != nil {
+			t.Fatalf("final delete %x: %v", key, err)
+		}
+	}
+	root, err = reloaded.Commit()
+	if err != nil {
+		t.Fatalf("empty commit: %v", err)
+	}
+	emptyReload := NewTrie(root, db, hasher, config, true)
+	for i, key := range keys {
+		if got, err := emptyReload.Get(key); err == nil || got != nil {
+			t.Fatalf("key %d survived empty-shard reload: %x", i, got)
+		}
+	}
+}
+
+func TestPathStorageDestructiveCommitBoundsNodePaths(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.NodeStorageScheme = NodeStoragePath
+
+	trie := NewTrie(nil, db, hasher, config, true)
+	for i := 0; i < 256; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x42
+		key[1] = byte(i)
+		key[2] = byte(i * 17)
+		if err := trie.Put(key, []byte{byte(i), byte(i >> 1)}); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if _, err := trie.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	shard := trie.shards[0x42]
+	if shard == nil {
+		t.Fatal("expected path-storage shard")
+	}
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	if shard.root != nil {
+		t.Fatal("destructive commit retained the in-memory shard root")
+	}
+	if len(shard.nodePaths) != 1 {
+		t.Fatalf("destructive commit retained %d node paths, want only the root path", len(shard.nodePaths))
+	}
+	if _, ok := shard.nodePaths[string(shard.rootHash)]; !ok {
+		t.Fatal("destructive commit did not retain the root hash-to-path mapping")
+	}
+}
+
+func TestPutBatchMatchesSequentialWrites(t *testing.T) {
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.NodeStorageScheme = NodeStoragePath
+	hasher := NewPooledKeccakHasher()
+	sequential := NewTrie(nil, NewMemoryDBAdapter(), hasher, config, true)
+	batched := NewTrie(nil, NewMemoryDBAdapter(), hasher, config, true)
+
+	entries := make([]KeyValue, 0, 260)
+	for i := 0; i < 256; i++ {
+		key := make([]byte, 32)
+		key[0] = byte(i)
+		key[1] = byte(i * 17)
+		entries = append(entries, KeyValue{Key: key, Value: []byte{byte(i), 0x01}})
+	}
+	entries = append(entries,
+		KeyValue{Key: entries[7].Key, Value: []byte("seven-first")},
+		KeyValue{Key: entries[200].Key, Value: []byte("two-hundred")},
+		KeyValue{Key: entries[7].Key, Value: []byte("seven-last")},
+	)
+	for _, entry := range entries {
+		if err := sequential.Put(entry.Key, entry.Value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := batched.PutBatch(entries); err != nil {
+		t.Fatal(err)
+	}
+	sequentialRoot, err := sequential.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchedRoot, err := batched.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(sequentialRoot, batchedRoot) {
+		t.Fatalf("batch root mismatch: sequential=%x batched=%x", sequentialRoot, batchedRoot)
+	}
+	got, err := batched.Get(entries[7].Key)
+	if err != nil || !bytes.Equal(got, []byte("seven-last")) {
+		t.Fatalf("same-shard write order changed: got %q err %v", got, err)
+	}
+}
+
+func TestPathStorageArchivePromotionReload(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.NodeStorageScheme = NodeStoragePath
+	config.ArchiveDB = db
+
+	key := make([]byte, 32)
+	key[0] = 0x35
+	key[1] = 0x77
+	oldValue := []byte("path-archive-old")
+
+	trie := NewTrie(nil, db, hasher, config, true)
+	if err := trie.Put(key, oldValue); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trie.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveShardForTest(trie, trie.GetShardID(key)); err != nil {
+		t.Fatal(err)
+	}
+	root, err := trie.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := trie.FlushArchives(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewTrie(root, db, hasher, config, true)
+	got, err := reloaded.Get(key)
+	if err != nil || !bytes.Equal(got, oldValue) {
+		t.Fatalf("archived reload: got %x err %v", got, err)
+	}
+
+	newValue := []byte("path-archive-promoted")
+	if err := reloaded.Put(key, newValue); err != nil {
+		t.Fatal(err)
+	}
+	root, err = reloaded.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded = NewTrie(root, db, hasher, config, true)
+	got, err = reloaded.Get(key)
+	if err != nil || !bytes.Equal(got, newValue) {
+		t.Fatalf("promoted reload: got %x err %v", got, err)
+	}
+}
+
+func TestGetDoesNotPromoteArchivedData(t *testing.T) {
 	// 1. 设置 Trie 并插入数据
 	trie, _ := setupTrie()
 
@@ -1657,7 +1912,7 @@ func TestAutomaticRedemption(t *testing.T) {
 	rand.Read(key)
 	// 强制落在 Shard 0，方便测试 Prune
 	key[0], key[1] = 0x00, 0x00
-	val := []byte("automatic-redemption-test")
+	val := []byte("flat-read-no-promotion-test")
 
 	trie.Put(key, val)
 	trie.SetGlobalEpoch(0)
@@ -1690,18 +1945,17 @@ func TestAutomaticRedemption(t *testing.T) {
 	}
 
 	// 验证第一次 Get 记录为 MissExistent (因为是从归档中找回的)
-	if atomic.LoadInt64(&common.BinaryMissExistentCount) != initialMissExistent+1 {
-		t.Errorf("Expected BinaryMissExistentCount to increment on first Get from archive")
+	if atomic.LoadInt64(&common.BinaryMissExistentCount) < initialMissExistent {
+		t.Errorf("BinaryMissExistentCount moved backwards")
 	}
 
 	// 4. 验证数据已回热路径
 	statsAfter := trie.Stats()
-	if statsAfter.ArchivedDataSize != 0 {
-		t.Errorf("Expected 0 archived items after automatic activation, got %d", statsAfter.ArchivedDataSize)
+	if statsAfter.ArchivedDataSize != 1 {
+		t.Errorf("Expected archived item to remain cold after Get, got %d", statsAfter.ArchivedDataSize)
 	}
 
 	// 5. 验证第二次 Get 是热路径命中 (Hit)
-	atomic.StoreInt64(&common.BinaryHitCount, 0)
 	got2, err := trie.Get(key)
 	if err != nil {
 		t.Fatalf("Second Get failed: %v", err)
@@ -1710,7 +1964,8 @@ func TestAutomaticRedemption(t *testing.T) {
 		t.Errorf("Value mismatch on second Get")
 	}
 
-	if atomic.LoadInt64(&common.BinaryHitCount) != 1 {
-		t.Errorf("Expected BinaryHitCount to be 1 on second Get, got %d", atomic.LoadInt64(&common.BinaryHitCount))
+	statsAfterSecondRead := trie.Stats()
+	if statsAfterSecondRead.ArchivedDataSize != 1 {
+		t.Errorf("Expected archived item to remain cold after repeated Get, got %d", statsAfterSecondRead.ArchivedDataSize)
 	}
 }

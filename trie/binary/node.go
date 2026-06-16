@@ -57,6 +57,8 @@ type Node interface {
 	SetDirty(bool)
 	OriginalHash() []byte
 	SetOriginalHash([]byte)
+	StoragePath() ([]byte, int)
+	SetStoragePath([]byte, int)
 	Epoch() byte
 	SetEpoch(byte)
 	Serialize() ([]byte, error)
@@ -84,6 +86,8 @@ type InternalNode struct {
 	hash         []byte
 	dirty        bool
 	originalHash []byte
+	storagePath  []byte
+	storageBits  int
 	epoch        byte
 }
 
@@ -100,6 +104,8 @@ func (n *InternalNode) Reset() {
 	n.hash = nil
 	n.dirty = true
 	n.originalHash = nil
+	n.storagePath = nil
+	n.storageBits = 0
 	n.epoch = 0
 }
 
@@ -147,6 +153,15 @@ func (n *InternalNode) OriginalHash() []byte {
 
 func (n *InternalNode) SetOriginalHash(h []byte) {
 	n.originalHash = h
+}
+
+func (n *InternalNode) StoragePath() ([]byte, int) {
+	return n.storagePath, n.storageBits
+}
+
+func (n *InternalNode) SetStoragePath(path []byte, bits int) {
+	n.storagePath = append(n.storagePath[:0], path...)
+	n.storageBits = bits
 }
 
 func (n *InternalNode) Serialize() ([]byte, error) {
@@ -236,6 +251,8 @@ type LeafNode struct {
 	hash         []byte
 	dirty        bool
 	originalHash []byte
+	storagePath  []byte
+	storageBits  int
 	epoch        byte
 }
 
@@ -255,6 +272,8 @@ func (n *LeafNode) Reset() {
 	n.hash = nil
 	n.dirty = true
 	n.originalHash = nil
+	n.storagePath = nil
+	n.storageBits = 0
 	n.epoch = 0
 }
 
@@ -292,6 +311,15 @@ func (n *LeafNode) OriginalHash() []byte {
 
 func (n *LeafNode) SetOriginalHash(h []byte) {
 	n.originalHash = h
+}
+
+func (n *LeafNode) StoragePath() ([]byte, int) {
+	return n.storagePath, n.storageBits
+}
+
+func (n *LeafNode) SetStoragePath(path []byte, bits int) {
+	n.storagePath = append(n.storagePath[:0], path...)
+	n.storageBits = bits
 }
 
 // Serialize 将叶子节点编码为字节序列。
@@ -335,11 +363,14 @@ type ArchiveBucketNode struct {
 
 	Filter     []byte // 布谷鸟过滤器序列化数据
 	Commitment []byte // ECMH 承诺 (K + Hash(V))
+	Keys       []ArchivedKey
 	Count      uint64 // 桶内数据项数量
 
 	hash         []byte
 	dirty        bool
 	originalHash []byte
+	storagePath  []byte
+	storageBits  int
 	// 归档桶不再需要 epoch，保持静态
 
 	// [CACHE] 缓存解码后的过滤器和数据项，避免重复解码/反序列化。
@@ -357,6 +388,7 @@ func NewArchiveBucketNode(path []byte, bits int, filter []byte, commitment []byt
 		PathBits:   bits,
 		Filter:     filter,
 		Commitment: commitment,
+		Keys:       nil,
 		Count:      count,
 		dirty:      true,
 	}
@@ -404,6 +436,15 @@ func (n *ArchiveBucketNode) SetOriginalHash(h []byte) {
 	n.originalHash = h
 }
 
+func (n *ArchiveBucketNode) StoragePath() ([]byte, int) {
+	return n.storagePath, n.storageBits
+}
+
+func (n *ArchiveBucketNode) SetStoragePath(path []byte, bits int) {
+	n.storagePath = append(n.storagePath[:0], path...)
+	n.storageBits = bits
+}
+
 func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 	n.metaMu.RLock()
 	if n.cachedMeta != nil {
@@ -417,7 +458,11 @@ func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 	pathBitsLen := uvarintLen(uint64(n.PathBits))
 	countLen := uvarintLen(n.Count)
 	filterLen := uvarintLen(uint64(len(n.Filter)))
-	size := 1 + pathBitsLen + len(n.Path) + countLen + 1 + len(n.Commitment) + filterLen + len(n.Filter)
+	keysLen := uvarintLen(uint64(len(n.Keys)))
+	for _, key := range n.Keys {
+		keysLen += uvarintLen(uint64(key.SuffixBits)) + len(key.Suffix) + uvarintLen(uint64(len(key.ValueRef))) + len(key.ValueRef)
+	}
+	size := 1 + pathBitsLen + len(n.Path) + countLen + 1 + len(n.Commitment) + filterLen + len(n.Filter) + keysLen
 	buf := make([]byte, 0, size)
 
 	buf = append(buf, 0xC0)
@@ -436,6 +481,17 @@ func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 	nBits = binary.PutUvarint(scratch[:], uint64(len(n.Filter)))
 	buf = append(buf, scratch[:nBits]...)
 	buf = append(buf, n.Filter...)
+
+	nBits = binary.PutUvarint(scratch[:], uint64(len(n.Keys)))
+	buf = append(buf, scratch[:nBits]...)
+	for _, key := range n.Keys {
+		nBits = binary.PutUvarint(scratch[:], uint64(key.SuffixBits))
+		buf = append(buf, scratch[:nBits]...)
+		buf = append(buf, key.Suffix...)
+		nBits = binary.PutUvarint(scratch[:], uint64(len(key.ValueRef)))
+		buf = append(buf, scratch[:nBits]...)
+		buf = append(buf, key.ValueRef...)
+	}
 
 	n.metaMu.Lock()
 	n.cachedMeta = append(n.cachedMeta[:0], buf...)
@@ -626,11 +682,53 @@ func DeserializeNode(data []byte) (Node, error) {
 			}
 		}
 
+		var keys []ArchivedKey
+		if reader.Len() > 0 {
+			keyCount, err := binary.ReadUvarint(reader)
+			if err != nil {
+				return nil, fmt.Errorf("read bucket key count: %w", err)
+			}
+			if keyCount > 0 {
+				keys = make([]ArchivedKey, keyCount)
+				for i := uint64(0); i < keyCount; i++ {
+					suffixBits, err := binary.ReadUvarint(reader)
+					if err != nil {
+						return nil, fmt.Errorf("read bucket key %d suffix bits: %w", i, err)
+					}
+					suffixLen := (int(suffixBits) + 7) / 8
+					suffix := make([]byte, suffixLen)
+					if suffixLen > 0 {
+						if _, err := reader.Read(suffix); err != nil {
+							return nil, fmt.Errorf("read bucket key %d suffix: %w", i, err)
+						}
+					}
+					var valueRef []byte
+					if reader.Len() > 0 {
+						valueRefLen, err := binary.ReadUvarint(reader)
+						if err != nil {
+							return nil, fmt.Errorf("read bucket key %d value ref len: %w", i, err)
+						}
+						if valueRefLen > uint64(reader.Len()) {
+							return nil, fmt.Errorf("read bucket key %d value ref: length %d exceeds remaining %d", i, valueRefLen, reader.Len())
+						}
+						valueRef = make([]byte, int(valueRefLen))
+						if valueRefLen > 0 {
+							if _, err := reader.Read(valueRef); err != nil {
+								return nil, fmt.Errorf("read bucket key %d value ref: %w", i, err)
+							}
+						}
+					}
+					keys[i] = ArchivedKey{Suffix: suffix, SuffixBits: int(suffixBits), ValueRef: valueRef}
+				}
+			}
+		}
+
 		return &ArchiveBucketNode{
 			Path:       path,
 			PathBits:   int(pathBits),
 			Filter:     filter,
 			Commitment: commitment,
+			Keys:       keys,
 			Count:      count,
 			dirty:      false,
 		}, nil

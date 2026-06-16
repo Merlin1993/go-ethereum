@@ -86,9 +86,7 @@ func (s *Shard) attachPromotedStubsToRoot(root Node, stubs []*ArchiveBucketNode)
 		return s.newStubContainer(stubs)
 	}
 	if in, ok := root.(*InternalNode); ok {
-		if s.pruning && len(in.OriginalHash()) > 0 {
-			s.staleSet[string(in.OriginalHash())] = struct{}{}
-		}
+		s.markPersistedNodeStale(in)
 		s.attachStubs(in, stubs)
 		in.SetDirty(true)
 		return in
@@ -126,9 +124,7 @@ func (s *Shard) detachLeadingPathBit(node Node) (byte, bool) {
 		n.Path = s.shiftBits(n.Path, n.PathBits, 1, nil)
 		n.PathBits--
 		n.SetDirty(true)
-		if s.pruning && len(n.OriginalHash()) > 0 {
-			s.staleSet[string(n.OriginalHash())] = struct{}{}
-		}
+		s.markPersistedNodeStale(n)
 		return bit, true
 	case *LeafNode:
 		if n.PathBits <= 0 {
@@ -138,9 +134,7 @@ func (s *Shard) detachLeadingPathBit(node Node) (byte, bool) {
 		n.Path = s.shiftBits(n.Path, n.PathBits, 1, nil)
 		n.PathBits--
 		n.SetDirty(true)
-		if s.pruning && len(n.OriginalHash()) > 0 {
-			s.staleSet[string(n.OriginalHash())] = struct{}{}
-		}
+		s.markPersistedNodeStale(n)
 		return bit, true
 	default:
 		return 0, false
@@ -157,6 +151,7 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 	case *LeafNode:
 		if (n.Epoch() & 1) != global {
 			s.markPersistedNodeStale(n)
+			s.releaseValue(n.ValueHash)
 			// 组装绝对路径
 			absP, absB := s.prependPath(n.Path, n.PathBits, prefix, prefixBits)
 			item := ArchivedKV{
@@ -345,6 +340,7 @@ func (s *Shard) collectLeavesAndMarkStaleRecursive(node Node, prefix []byte, pre
 	switch n := node.(type) {
 	case *LeafNode:
 		s.markPersistedNodeStale(n)
+		s.releaseValue(n.ValueHash)
 		absP, absB := s.prependPath(n.Path, n.PathBits, prefix, prefixBits)
 		return []ArchivedKV{{
 			Suffix:     absP,
@@ -494,11 +490,7 @@ func (s *Shard) collectLeavesRecursive(node Node, prefix []byte, prefixBits int)
 		return allItems, nil
 
 	case *ArchiveBucketNode:
-		bucketData, err := s.getBucketData(s.ensureBucketHash(n))
-		if err != nil {
-			return nil, err
-		}
-		items, err := s.deserializeArchivedKV(bucketData)
+		items, err := s.bucketItemsWithValueRefs(n)
 		if err != nil {
 			return nil, err
 		}
@@ -522,6 +514,13 @@ func (s *Shard) collectLeavesRecursive(node Node, prefix []byte, prefixBits int)
 
 func (s *Shard) markPersistedNodeStale(node Node) {
 	if !s.pruning || node == nil {
+		return
+	}
+	if s.config != nil && s.config.UsePathStorage() {
+		path, bits := node.StoragePath()
+		if path != nil || bits == 0 && len(node.OriginalHash()) > 0 {
+			s.staleSet[string(pathNodeKey(s.id, path, bits))] = struct{}{}
+		}
 		return
 	}
 	if h := node.OriginalHash(); len(h) > 0 {
@@ -566,7 +565,9 @@ func (s *Shard) markSubtreeStaleRecursive(node Node) error {
 	case *ArchiveBucketNode:
 		hash := s.ensureBucketHash(n)
 		if len(hash) > 0 {
-			s.staleSet[string(hash)] = struct{}{}
+			if s.config == nil || !s.config.UsePathStorage() {
+				s.staleSet[string(hash)] = struct{}{}
+			}
 			s.markArchiveDataDelete(hash, -1)
 		}
 	}
@@ -735,6 +736,14 @@ func (s *Shard) buildArchiveSubtreeFast(items []ArchivedKV, path []byte, bits in
 
 	split := s.partitionArchiveItemsByBit(items, baseBits)
 	if split == 0 || split == len(items) {
+		if bucketSize > 0 && len(items) > bucketSize && baseBits < MaxPathBits {
+			nextBit := byte(0)
+			if split == 0 {
+				nextBit = 1
+			}
+			nextPath, nextBits := s.appendBit(basePath, baseBits, nextBit)
+			return s.buildArchiveSubtreeFast(items, nextPath, nextBits)
+		}
 		return s.buildArchiveBucket(items, basePath, baseBits)
 	}
 

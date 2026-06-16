@@ -12,11 +12,45 @@ import (
 	"github.com/ethereum/go-ethereum/trie/binary/ecmh"
 )
 
-// ArchivedKV 存储归档在桶内的数据项
+// ArchivedKey stores the proof entry tracked by a minimalist archive bucket.
+// The real value lives in the flat snapshot/value layer; ValueRef is the
+// key-bound value commitment used by ECMH.
+type ArchivedKey struct {
+	Suffix     []byte
+	SuffixBits int
+	ValueRef   []byte
+}
+
+// ArchivedKV is the in-memory construction item used while rebuilding buckets.
+// Value stores the key-bound valueRef used to update ECMH.
 type ArchivedKV struct {
 	Suffix     []byte // 数据的原始后缀（相对于桶前缀）
 	SuffixBits int    // 后缀的位数
 	Value      []byte // 数据的具体值哈希
+}
+
+func archivedKeyFromKV(kv ArchivedKV) ArchivedKey {
+	return ArchivedKey{
+		Suffix:     common.CopyBytes(kv.Suffix),
+		SuffixBits: kv.SuffixBits,
+		ValueRef:   common.CopyBytes(kv.Value),
+	}
+}
+
+func archivedKVFromKey(key ArchivedKey) ArchivedKV {
+	return ArchivedKV{
+		Suffix:     common.CopyBytes(key.Suffix),
+		SuffixBits: key.SuffixBits,
+		Value:      common.CopyBytes(key.ValueRef),
+	}
+}
+
+func archivedKeyEqual(a, b ArchivedKey) bool {
+	return a.SuffixBits == b.SuffixBits && bytes.Equal(a.Suffix, b.Suffix)
+}
+
+func archivedKeyMatchesKV(key ArchivedKey, kv ArchivedKV) bool {
+	return key.SuffixBits == kv.SuffixBits && bytes.Equal(key.Suffix, kv.Suffix)
 }
 
 // serializeArchivedKV 将 ArchivedKV 列表序列化为二进制数据
@@ -122,6 +156,91 @@ func appendArchiveItemHashInput(dst []byte, keyWithLen []byte, value []byte) []b
 	return dst
 }
 
+var valueRefDomain = []byte{'B', 'V', 'R', '1'}
+
+func valueRefForKeyValue(key []byte, value []byte) []byte {
+	var scratch [binary.MaxVarintLen64]byte
+	buf := make([]byte, 0, len(valueRefDomain)+2*binary.MaxVarintLen64+len(key)+len(value))
+	buf = append(buf, valueRefDomain...)
+	n := binary.PutUvarint(scratch[:], uint64(len(key)))
+	buf = append(buf, scratch[:n]...)
+	buf = append(buf, key...)
+	n = binary.PutUvarint(scratch[:], uint64(len(value)))
+	buf = append(buf, scratch[:n]...)
+	buf = append(buf, value...)
+	h := crypto.Keccak256Hash(buf)
+	return h.Bytes()
+}
+
+func (s *Shard) archivePointHash(bucket *ArchiveBucketNode, key ArchivedKey, valueRef []byte, keyBuf []byte, hashBuf []byte) (common.Hash, []byte, []byte) {
+	fullKey, fullBits := s.prependPath(key.Suffix, key.SuffixBits, bucket.Path, bucket.PathBits)
+	keyWithLen := appendArchiveItemKey(keyBuf, fullBits, fullKey)
+	hashInput := appendArchiveItemHashInput(hashBuf, keyWithLen, valueRef)
+	return crypto.Keccak256Hash(hashInput), keyWithLen, hashInput
+}
+
+func (s *Shard) bucketKeys(bucket *ArchiveBucketNode) ([]ArchivedKey, error) {
+	if bucket == nil {
+		return nil, nil
+	}
+	if len(bucket.Keys) > 0 || bucket.Count == 0 {
+		return bucket.Keys, nil
+	}
+	data, err := s.getBucketData(s.ensureBucketHash(bucket))
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.deserializeArchivedKV(data)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]ArchivedKey, len(items))
+	for i, item := range items {
+		keys[i] = archivedKeyFromKV(item)
+	}
+	bucket.Keys = keys
+	return keys, nil
+}
+
+func (s *Shard) ensureBucketKeyList(bucket *ArchiveBucketNode) error {
+	if bucket == nil || len(bucket.Keys) > 0 || bucket.Count == 0 {
+		return nil
+	}
+	_, err := s.bucketKeys(bucket)
+	return err
+}
+
+func (s *Shard) bucketItemsWithValueRefs(bucket *ArchiveBucketNode) ([]ArchivedKV, error) {
+	if bucket == nil {
+		return nil, nil
+	}
+	bucket.cacheMu.RLock()
+	if bucket.cachedItems != nil && len(bucket.cachedItems) == int(bucket.Count) {
+		items := make([]ArchivedKV, len(bucket.cachedItems))
+		copy(items, bucket.cachedItems)
+		bucket.cacheMu.RUnlock()
+		return items, nil
+	}
+	bucket.cacheMu.RUnlock()
+
+	if len(bucket.Keys) > 0 || bucket.Count == 0 {
+		items := make([]ArchivedKV, 0, len(bucket.Keys))
+		for _, key := range bucket.Keys {
+			items = append(items, archivedKVFromKey(key))
+		}
+		return items, nil
+	}
+	data, err := s.getBucketData(s.ensureBucketHash(bucket))
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.deserializeArchivedKV(data)
+	if err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 func (s *Shard) ensureBucketHash(bucket *ArchiveBucketNode) []byte {
 	if bucket == nil {
 		return nil
@@ -147,6 +266,9 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 
 	bucket.cacheMu.Lock()
 	defer bucket.cacheMu.Unlock()
+	if err := s.ensureBucketKeyList(bucket); err != nil {
+		return false
+	}
 
 	oldHash := s.ensureBucketHash(bucket)
 	if s.pruning && len(oldHash) > 0 {
@@ -179,14 +301,18 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 
 	// 2. 增量更新 ECMH 承诺
 	hashes := make([]common.Hash, 0, len(newItems))
+	valuedItems := make([]ArchivedKV, 0, len(newItems))
 	for _, it := range newItems {
-		// [FIX] 一致性：ECMH 必须包含 SuffixBits
-		keyWithLen := appendArchiveItemKey(keyBuf, it.SuffixBits, it.Suffix)
-		hashInput := appendArchiveItemHashInput(hashBuf, keyWithLen, it.Value)
-		h := crypto.Keccak256Hash(hashInput)
+		key := archivedKeyFromKV(it)
+		h, nextKeyBuf, nextHashBuf := s.archivePointHash(bucket, key, it.Value, keyBuf, hashBuf)
 		hashes = append(hashes, h)
-		keyBuf = keyWithLen
-		hashBuf = hashInput
+		valuedItems = append(valuedItems, ArchivedKV{
+			Suffix:     common.CopyBytes(it.Suffix),
+			SuffixBits: it.SuffixBits,
+			Value:      common.CopyBytes(it.Value),
+		})
+		keyBuf = nextKeyBuf
+		hashBuf = nextHashBuf
 	}
 	committer := ecmh.New()
 	newCommitment, _ := committer.Add(bucket.Commitment, hashes)
@@ -194,10 +320,13 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 
 	// 3. 更新计数
 	bucket.Count += uint64(len(newItems))
+	for _, it := range newItems {
+		bucket.Keys = append(bucket.Keys, archivedKeyFromKV(it))
+	}
 
 	// 4. 更新缓存的数据项（如果已加载）
 	if bucket.cachedItems != nil {
-		cachedItems := append(bucket.cachedItems, newItems...)
+		cachedItems := append(bucket.cachedItems, valuedItems...)
 		if s.shouldCacheArchivedItems(len(cachedItems)) {
 			bucket.cachedItems = cachedItems
 		} else {
@@ -214,30 +343,6 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	newHash := append([]byte{}, s.hasher.Hash(meta)...)
 	bucket.SetHash(newHash)
 
-	// [优化]：如果 oldHash 已经在 pending 队列中，直接在内存中合并，保持 pending 状态扁平
-	if items, ok := s.pendingArchiveItems[string(oldHash)]; ok {
-		items = append(items, newItems...)
-		s.pendingArchiveItems[string(newHash)] = items
-		delete(s.pendingArchiveItems, string(oldHash))
-	} else if data, ok := s.pendingArchives[string(oldHash)]; ok {
-		// 已经在全量缓存中
-		items, _ := s.deserializeArchivedKV(data)
-		items = append(items, newItems...)
-		newData, _ := s.serializeArchivedKV(items)
-		s.pendingArchives[string(newHash)] = newData
-		delete(s.pendingArchives, string(oldHash))
-	} else if task, ok := s.pendingAppends[string(oldHash)]; ok {
-		// 已经在追加缓存中，合并到该任务
-		task.newItems = append(task.newItems, newItems...)
-		s.pendingAppends[string(newHash)] = task
-		delete(s.pendingAppends, string(oldHash))
-	} else {
-		// 全新追加任务
-		s.pendingAppends[string(newHash)] = appendTask{
-			oldHash:  oldHash,
-			newItems: newItems,
-		}
-	}
 	return true
 }
 
@@ -245,6 +350,9 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []ArchivedKV) {
 	bucket.cacheMu.Lock()
 	defer bucket.cacheMu.Unlock()
+	if err := s.ensureBucketKeyList(bucket); err != nil {
+		return
+	}
 
 	oldHash := s.ensureBucketHash(bucket)
 	if s.pruning && len(oldHash) > 0 {
@@ -278,13 +386,11 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 	// 2. 增量更新 ECMH 承诺 (减法)
 	hashes := make([]common.Hash, 0, len(deleteItems))
 	for _, it := range deleteItems {
-		// [FIX] 一致性：ECMH 必须包含 SuffixBits
-		keyWithLen := appendArchiveItemKey(keyBuf, it.SuffixBits, it.Suffix)
-		hashInput := appendArchiveItemHashInput(hashBuf, keyWithLen, it.Value)
-		h := crypto.Keccak256Hash(hashInput)
+		key := archivedKeyFromKV(it)
+		h, nextKeyBuf, nextHashBuf := s.archivePointHash(bucket, key, it.Value, keyBuf, hashBuf)
 		hashes = append(hashes, h)
-		keyBuf = keyWithLen
-		hashBuf = hashInput
+		keyBuf = nextKeyBuf
+		hashBuf = nextHashBuf
 	}
 	committer := ecmh.New()
 	newCommitment, _ := committer.Delete(bucket.Commitment, hashes)
@@ -292,6 +398,22 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 
 	// 3. 更新计数
 	bucket.Count -= uint64(len(deleteItems))
+	if len(bucket.Keys) > 0 {
+		newKeys := make([]ArchivedKey, 0, len(bucket.Keys))
+		for _, key := range bucket.Keys {
+			found := false
+			for _, del := range deleteItems {
+				if archivedKeyMatchesKV(key, del) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				newKeys = append(newKeys, key)
+			}
+		}
+		bucket.Keys = newKeys
+	}
 
 	// 4. 更新缓存的数据项（如果已加载）
 	if bucket.cachedItems != nil {
@@ -322,73 +444,6 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 	meta, _ := bucket.Serialize()
 	newHash := append([]byte{}, s.hasher.Hash(meta)...)
 	bucket.SetHash(newHash)
-
-	// [优化]：如果 oldHash 已经在 pendingArchives 队列中 (说明是本批次新创建的桶)，直接处理
-	if items, ok := s.pendingArchiveItems[string(oldHash)]; ok {
-		newItems := make([]ArchivedKV, 0, len(items))
-		for _, it := range items {
-			found := false
-			for _, del := range deleteItems {
-				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				newItems = append(newItems, it)
-			}
-		}
-		s.pendingArchiveItems[string(newHash)] = newItems
-		delete(s.pendingArchiveItems, string(oldHash))
-	} else if data, ok := s.pendingArchives[string(oldHash)]; ok {
-		items, _ := s.deserializeArchivedKV(data)
-		// 简单过滤掉要删除的项
-		newItems := make([]ArchivedKV, 0, len(items))
-		for _, it := range items {
-			found := false
-			for _, del := range deleteItems {
-				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				newItems = append(newItems, it)
-			}
-		}
-		newData, _ := s.serializeArchivedKV(newItems)
-		s.pendingArchives[string(newHash)] = newData
-		delete(s.pendingArchives, string(oldHash))
-	} else if task, ok := s.pendingAppends[string(oldHash)]; ok {
-		// 已经在追加缓存中，尝试从待追加项中移除
-		newItems := make([]ArchivedKV, 0, len(task.newItems))
-		for _, it := range task.newItems {
-			found := false
-			for _, del := range deleteItems {
-				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				newItems = append(newItems, it)
-			}
-		}
-		task.newItems = newItems
-		s.pendingAppends[string(newHash)] = task
-		delete(s.pendingAppends, string(oldHash))
-	} else if task, ok := s.pendingDeletes[string(oldHash)]; ok {
-		// 已经在删除缓存中，累加删除任务
-		task.deleteItems = append(task.deleteItems, deleteItems...)
-		s.pendingDeletes[string(newHash)] = task
-		delete(s.pendingDeletes, string(oldHash))
-	} else {
-		// 全新删除任务
-		s.pendingDeletes[string(newHash)] = deleteTask{
-			oldHash:     oldHash,
-			deleteItems: deleteItems,
-		}
-	}
 }
 
 // recomputeBucket 重新计算桶的承诺部分 (Filter, ECMH, Count)
@@ -399,6 +454,8 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 
 	filter := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
 	hashes := make([]common.Hash, 0, len(items))
+	keys := make([]ArchivedKey, 0, len(items))
+	cachedItems := make([]ArchivedKV, 0, len(items))
 	var keyBuf []byte
 	var hashBuf []byte
 
@@ -407,21 +464,27 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 		keyWithLen := appendArchiveItemKey(keyBuf, item.SuffixBits, item.Suffix)
 		filter.Insert(keyWithLen)
 
-		// ECMH: K + Hash(V)
-		hashInput := appendArchiveItemHashInput(hashBuf, keyWithLen, item.Value)
-		h := crypto.Keccak256Hash(hashInput)
+		key := archivedKeyFromKV(item)
+		h, _, nextHashBuf := s.archivePointHash(bucket, key, item.Value, keyBuf, hashBuf)
 		hashes = append(hashes, h)
+		keys = append(keys, key)
+		cachedItems = append(cachedItems, ArchivedKV{
+			Suffix:     common.CopyBytes(item.Suffix),
+			SuffixBits: item.SuffixBits,
+			Value:      common.CopyBytes(item.Value),
+		})
 		keyBuf = keyWithLen
-		hashBuf = hashInput
+		hashBuf = nextHashBuf
 	}
 
 	bucket.Filter = filter.Encode()
 	bucket.Count = uint64(len(items))
+	bucket.Keys = keys
 
 	// 更新缓存
 	bucket.cachedFilter = filter
-	if s.shouldCacheArchivedItems(len(items)) {
-		bucket.cachedItems = items
+	if s.shouldCacheArchivedItems(len(cachedItems)) {
+		bucket.cachedItems = cachedItems
 	} else {
 		bucket.cachedItems = nil
 	}
@@ -438,11 +501,6 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	meta, _ := bucket.Serialize()
 	h := append([]byte{}, s.hasher.Hash(meta)...)
 	bucket.SetHash(h)
-
-	if s.pendingArchiveItems == nil {
-		s.pendingArchiveItems = make(map[string][]ArchivedKV)
-	}
-	s.pendingArchiveItems[string(h)] = items
 }
 
 // verifyBucket 验证桶的 ECMH 承诺是否正确。返回布尔值及验证耗时（纳秒）。
@@ -453,11 +511,8 @@ func (s *Shard) verifyBucket(bucket *ArchiveBucketNode) (bool, int64) {
 	bucket.cacheMu.RUnlock()
 
 	if items == nil {
-		bucketData, err := s.getBucketData(s.ensureBucketHash(bucket))
-		if err != nil {
-			return false, time.Since(start).Nanoseconds()
-		}
-		items, err = s.deserializeArchivedKV(bucketData)
+		var err error
+		items, err = s.bucketItemsWithValueRefs(bucket)
 		if err != nil {
 			return false, time.Since(start).Nanoseconds()
 		}
@@ -468,13 +523,11 @@ func (s *Shard) verifyBucket(bucket *ArchiveBucketNode) (bool, int64) {
 	var keyBuf []byte
 	var hashBuf []byte
 	for _, it := range items {
-		// [FIX] 一致性：ECMH 必须包含 SuffixBits
-		keyWithLen := appendArchiveItemKey(keyBuf, it.SuffixBits, it.Suffix)
-		hashInput := appendArchiveItemHashInput(hashBuf, keyWithLen, it.Value)
-		h := crypto.Keccak256Hash(hashInput)
+		key := archivedKeyFromKV(it)
+		h, nextKeyBuf, nextHashBuf := s.archivePointHash(bucket, key, it.Value, keyBuf, hashBuf)
 		hashes = append(hashes, h)
-		keyBuf = keyWithLen
-		hashBuf = hashInput
+		keyBuf = nextKeyBuf
+		hashBuf = nextHashBuf
 	}
 
 	committer := ecmh.New()

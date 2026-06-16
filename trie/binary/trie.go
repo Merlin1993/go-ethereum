@@ -2,6 +2,7 @@ package binary
 
 import (
 	"bytes"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -25,6 +26,14 @@ type Trie struct {
 
 	dirtyShards        map[int]struct{}
 	archiveDirtyShards map[int]struct{}
+	dirtyShardList     []int
+	archiveShardList   []int
+}
+
+// KeyValue is one ordered trie write used by PutBatch.
+type KeyValue struct {
+	Key   []byte
+	Value []byte
 }
 
 // NewTrie creates a new Binary Trie with the given database and configuration.
@@ -42,7 +51,7 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 		dirtyShards:        make(map[int]struct{}),
 		archiveDirtyShards: make(map[int]struct{}),
 	}
-	t.topTree = NewTopTree(hasher, nil, config.ShardDepth)
+	t.topTree = NewTopTree(hasher, nil, config.ShardDepth, config.UsePathStorage())
 
 	if len(root) > 0 {
 		t.Load(root)
@@ -50,13 +59,17 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 	return t
 }
 
+func (t *Trie) SetFlatReader(reader FlatValueReader) {
+	if t.config != nil {
+		t.config.FlatReader = reader
+	}
+}
+
 func (t *Trie) GetDirtyShards() []int {
 	t.shardsMu.RLock()
 	defer t.shardsMu.RUnlock()
 	list := make([]int, 0, len(t.dirtyShards))
-	for id := range t.dirtyShards {
-		list = append(list, id)
-	}
+	list = append(list, t.dirtyShardList...)
 	return list
 }
 
@@ -82,6 +95,7 @@ func (t *Trie) CommitTopTreeToBatch(shardRoots map[int][]byte, dirtyShards []int
 	for _, id := range dirtyShards {
 		delete(t.dirtyShards, id)
 	}
+	t.filterDirtyShardListLocked()
 	t.shardsMu.Unlock()
 	return rootHash, nil
 }
@@ -106,14 +120,50 @@ func (t *Trie) GetShardID(key []byte) int {
 
 func (t *Trie) markDirtyShard(id int) {
 	t.shardsMu.Lock()
-	t.dirtyShards[id] = struct{}{}
+	t.markDirtyShardLocked(id)
 	t.shardsMu.Unlock()
 }
 
 func (t *Trie) markArchiveDirtyShard(id int) {
 	t.shardsMu.Lock()
-	t.archiveDirtyShards[id] = struct{}{}
+	t.markArchiveDirtyShardLocked(id)
 	t.shardsMu.Unlock()
+}
+
+func (t *Trie) markDirtyShardLocked(id int) {
+	if _, ok := t.dirtyShards[id]; ok {
+		return
+	}
+	t.dirtyShards[id] = struct{}{}
+	t.dirtyShardList = append(t.dirtyShardList, id)
+}
+
+func (t *Trie) markArchiveDirtyShardLocked(id int) {
+	if _, ok := t.archiveDirtyShards[id]; ok {
+		return
+	}
+	t.archiveDirtyShards[id] = struct{}{}
+	t.archiveShardList = append(t.archiveShardList, id)
+}
+
+func (t *Trie) filterDirtyShardListLocked() {
+	out := t.dirtyShardList[:0]
+	for _, id := range t.dirtyShardList {
+		if _, ok := t.dirtyShards[id]; ok {
+			out = append(out, id)
+		}
+	}
+	t.dirtyShardList = out
+}
+
+func (t *Trie) filterArchiveShardListLocked() {
+	out := t.archiveShardList[:0]
+	for _, id := range t.archiveShardList {
+		if _, ok := t.archiveDirtyShards[id]; ok {
+			out = append(out, id)
+		}
+	}
+	t.archiveShardList = out
 }
 
 // Load loads the Trie state from the database using a given root hash.
@@ -211,6 +261,67 @@ func (t *Trie) Put(key []byte, value []byte) error {
 	return nil
 }
 
+// PutBatch applies ordered writes in parallel across independent shards.
+// Writes targeting the same shard retain their original order.
+func (t *Trie) PutBatch(entries []KeyValue) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	type shardWrites struct {
+		id      int
+		entries []KeyValue
+	}
+	groupIndex := make(map[int]int)
+	groups := make([]shardWrites, 0)
+	for _, entry := range entries {
+		id := t.GetShardID(entry.Key)
+		index, ok := groupIndex[id]
+		if !ok {
+			index = len(groups)
+			groupIndex[id] = index
+			groups = append(groups, shardWrites{id: id})
+		}
+		groups[index].entries = append(groups[index].entries, entry)
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(groups) {
+		workers = len(groups)
+	}
+	jobs := make(chan int, len(groups))
+	errs := make([]error, len(groups))
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				group := groups[index]
+				shard, err := t.getOrCreateShard(group.id)
+				if err == nil {
+					t.markDirtyShard(group.id)
+					err = shard.PutBatch(group.entries)
+					if err == nil && shard.HasPendingArchiveWrites() {
+						t.markArchiveDirtyShard(group.id)
+					}
+				}
+				errs[index] = err
+			}
+		}()
+	}
+	for index := range groups {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Delete removes a key and its value from the Trie.
 func (t *Trie) Delete(key []byte) error {
 	shardID := t.GetShardID(key)
@@ -239,7 +350,7 @@ func (t *Trie) Hash() ([]byte, error) {
 	// or were previously loaded but not committed.
 	// For simplicity, we can use dirtyShards here too, but Hash() doesn't clear them.
 	t.shardsMu.RLock()
-	for i := range t.dirtyShards {
+	for _, i := range t.dirtyShardList {
 		shardRoots[i] = make([]byte, 32) // Default to empty
 		s := t.shards[i]
 		if s != nil {
@@ -300,16 +411,7 @@ func (t *Trie) Commit() ([]byte, error) {
 func (t *Trie) diagnosticCommitShardCounts() (dirtyShards, archiveDirtyShards, flushShards int) {
 	t.shardsMu.RLock()
 	defer t.shardsMu.RUnlock()
-	flushSet := make(map[int]struct{}, len(t.dirtyShards)+len(t.archiveDirtyShards))
-	for i := range t.dirtyShards {
-		dirtyShards++
-		flushSet[i] = struct{}{}
-	}
-	for i := range t.archiveDirtyShards {
-		archiveDirtyShards++
-		flushSet[i] = struct{}{}
-	}
-	return dirtyShards, archiveDirtyShards, len(flushSet)
+	return len(t.dirtyShards), len(t.archiveDirtyShards), len(t.archiveDirtyShards)
 }
 
 // CommitToBatch commits the trie state to a given batcher.
@@ -319,19 +421,23 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	shardCommitStart := time.Now()
 
 	var (
-		mu         sync.Mutex
-		wg         sync.WaitGroup
-		errs       []error
-		errMu      sync.Mutex
-		numWorkers = 8
+		mu    sync.Mutex
+		wg    sync.WaitGroup
+		errs  []error
+		errMu sync.Mutex
 	)
 
 	t.shardsMu.RLock()
-	dirtyShardsList := make([]int, 0, len(t.dirtyShards))
-	for i := range t.dirtyShards {
-		dirtyShardsList = append(dirtyShardsList, i)
-	}
+	dirtyShardsList := append([]int(nil), t.dirtyShardList...)
 	t.shardsMu.RUnlock()
+
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	if numWorkers > len(dirtyShardsList) {
+		numWorkers = len(dirtyShardsList)
+	}
 
 	// Parallel commit shards
 	shardChan := make(chan int, len(dirtyShardsList))
@@ -347,6 +453,8 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 
 			// Worker-local batch captures operation order, including stale deletes.
 			workerBatch := &memBatcher{ops: make([]memBatchOp, 0, 5000)}
+			localRoots := make(map[int][]byte)
+			localDirtyShards := make([]int, 0)
 
 			for i := range shardChan {
 				s := t.shards[i]
@@ -358,24 +466,24 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 						errMu.Unlock()
 						return
 					}
-					mu.Lock()
 					if len(h) > 0 {
-						shardRoots[i] = h
+						localRoots[i] = h
 					} else {
-						shardRoots[i] = make([]byte, 32)
+						localRoots[i] = make([]byte, 32)
 					}
-					dirtyShards = append(dirtyShards, i)
-					mu.Unlock()
+					localDirtyShards = append(localDirtyShards, i)
 				} else {
-					mu.Lock()
-					shardRoots[i] = make([]byte, 32)
-					dirtyShards = append(dirtyShards, i)
-					mu.Unlock()
+					localRoots[i] = make([]byte, 32)
+					localDirtyShards = append(localDirtyShards, i)
 				}
 			}
 
 			// Merge back to global state
 			mu.Lock()
+			for shardID, root := range localRoots {
+				shardRoots[shardID] = root
+			}
+			dirtyShards = append(dirtyShards, localDirtyShards...)
 			for _, item := range workerBatch.ops {
 				var err error
 				if item.delete {
@@ -413,6 +521,7 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 
 	t.shardsMu.Lock()
 	t.dirtyShards = make(map[int]struct{})
+	t.dirtyShardList = nil
 	t.shardsMu.Unlock()
 
 	return rootHash, nil
@@ -431,8 +540,8 @@ func (t *Trie) PruneNextShard() error {
 	}
 
 	t.shardsMu.Lock()
-	t.dirtyShards[idx] = struct{}{}
-	t.archiveDirtyShards[idx] = struct{}{}
+	t.markDirtyShardLocked(idx)
+	t.markArchiveDirtyShardLocked(idx)
 	t.shardsMu.Unlock()
 
 	err = shard.Prune(t.globalEpochBit)
@@ -522,17 +631,7 @@ func (t *Trie) getShardPrefix(shardID int) []byte {
 // FlushArchives persists all pending archive data to ArchiveDB.
 func (t *Trie) FlushArchives() error {
 	t.shardsMu.RLock()
-	archiveShards := make(map[int]struct{}, len(t.archiveDirtyShards)+len(t.dirtyShards))
-	for i := range t.archiveDirtyShards {
-		archiveShards[i] = struct{}{}
-	}
-	for i := range t.dirtyShards {
-		archiveShards[i] = struct{}{}
-	}
-	dirtyShardsList := make([]int, 0, len(archiveShards))
-	for i := range archiveShards {
-		dirtyShardsList = append(dirtyShardsList, i)
-	}
+	dirtyShardsList := append([]int(nil), t.archiveShardList...)
 	t.shardsMu.RUnlock()
 
 	var wg sync.WaitGroup
@@ -561,6 +660,7 @@ func (t *Trie) FlushArchives() error {
 	for _, i := range dirtyShardsList {
 		delete(t.archiveDirtyShards, i)
 	}
+	t.filterArchiveShardListLocked()
 	t.shardsMu.Unlock()
 	return nil
 }
@@ -573,8 +673,8 @@ func (t *Trie) Activate(key []byte, value []byte) error {
 		return err
 	}
 	t.shardsMu.Lock()
-	t.dirtyShards[shardID] = struct{}{}
-	t.archiveDirtyShards[shardID] = struct{}{}
+	t.markDirtyShardLocked(shardID)
+	t.markArchiveDirtyShardLocked(shardID)
 	t.shardsMu.Unlock()
 	return shard.Activate(key, value)
 }

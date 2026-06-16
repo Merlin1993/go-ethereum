@@ -31,6 +31,7 @@ type BinaryConfig struct {
 	CuckooSlots           int  // Cuckoo filter slots for binary trie
 	NodeCacheLimit        int  // Max binary trie node blobs cached in process; 0 uses default, negative disables cache
 	PhysicalDelete        bool // Physically delete obsolete binary trie state nodes when requested
+	NodeStorageScheme     string
 }
 
 // NodeReader wraps the Node method of a backing trie reader.

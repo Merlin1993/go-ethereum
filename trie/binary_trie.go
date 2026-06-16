@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie/binary"
@@ -40,6 +42,59 @@ type BinaryTrie struct {
 	db         database.NodeDatabase
 	originRoot common.Hash
 	block      uint64
+	flat       BinaryFlatSnapshotResolver
+}
+
+type BinaryFlatSnapshotResolver func(common.Hash) BinaryFlatSnapshot
+
+type BinaryFlatSnapshot interface {
+	AccountRLP(common.Hash) ([]byte, error)
+	Storage(common.Hash, common.Hash) ([]byte, error)
+}
+
+type binarySnapshotFlatReader struct {
+	resolver BinaryFlatSnapshotResolver
+	root     *common.Hash
+}
+
+func (r *binarySnapshotFlatReader) GetFlatValue(key []byte) ([]byte, error) {
+	if r == nil || r.resolver == nil || r.root == nil {
+		return nil, binary.ErrNodeNotFound
+	}
+	snap := r.resolver(*r.root)
+	if snap == nil {
+		return nil, binary.ErrNodeNotFound
+	}
+	switch {
+	case len(key) == common.AddressLength:
+		return snap.AccountRLP(crypto.Keccak256Hash(key))
+	case len(key) == common.AddressLength+common.HashLength:
+		addr := common.BytesToAddress(key[:common.AddressLength])
+		addr[0] ^= 0x01
+		accountHash := crypto.Keccak256Hash(addr.Bytes())
+		storageHash := crypto.Keccak256Hash(key[common.AddressLength:])
+		blob, err := snap.Storage(accountHash, storageHash)
+		if err != nil || len(blob) == 0 {
+			return nil, err
+		}
+		_, content, _, err := rlp.Split(blob)
+		if err != nil {
+			return nil, err
+		}
+		return content, nil
+	default:
+		return nil, binary.ErrNodeNotFound
+	}
+}
+
+func (t *BinaryTrie) installFlatReader() {
+	if t == nil || t.trie == nil || t.flat == nil {
+		return
+	}
+	t.trie.SetFlatReader(&binarySnapshotFlatReader{
+		resolver: t.flat,
+		root:     &t.originRoot,
+	})
 }
 
 var (
@@ -105,7 +160,11 @@ func binaryNodeCacheRemove(hash common.Hash) {
 }
 
 // NewBinaryTrie creates a new binary trie.
-func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Database) (*BinaryTrie, error) {
+func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Database, flatResolvers ...BinaryFlatSnapshotResolver) (*BinaryTrie, error) {
+	var flat BinaryFlatSnapshotResolver
+	if len(flatResolvers) > 0 {
+		flat = flatResolvers[0]
+	}
 	var active *binary.Trie
 
 	// Try to reuse the active trie from database if possible
@@ -126,7 +185,9 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 			if adapter, ok := active.Database().(*binaryDBAdapter); ok {
 				adapter.root = root
 			}
-			return &BinaryTrie{trie: active, db: db, originRoot: root}, nil
+			bt := &BinaryTrie{trie: active, db: db, originRoot: root, flat: flat}
+			bt.installFlatReader()
+			return bt, nil
 		}
 
 		if err := active.Load(root.Bytes()); err == nil {
@@ -135,7 +196,9 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 				adapter.root = root
 				adapter.reader = nil // Clear stale reader
 			}
-			return &BinaryTrie{trie: active, db: db, originRoot: root}, nil
+			bt := &BinaryTrie{trie: active, db: db, originRoot: root, flat: flat}
+			bt.installFlatReader()
+			return bt, nil
 		}
 	}
 
@@ -166,6 +229,9 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 			if dbConf.NodeCacheLimit != 0 {
 				nodeCacheLimit = dbConf.NodeCacheLimit
 			}
+			if dbConf.NodeStorageScheme == binary.NodeStorageHash || dbConf.NodeStorageScheme == binary.NodeStoragePath {
+				config.NodeStorageScheme = dbConf.NodeStorageScheme
+			}
 			physicalDelete = dbConf.PhysicalDelete
 		}
 	}
@@ -187,7 +253,9 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 		trie:       t,
 		db:         db,
 		originRoot: root,
+		flat:       flat,
 	}
+	bt.installFlatReader()
 	// Native persistence for reuse via interface assertion
 	type trieSetter interface {
 		SetBinaryTrie(interface{})
@@ -229,7 +297,7 @@ func (a *binaryDBAdapter) diskDB() ethdb.Database {
 
 func (a *binaryDBAdapter) Put(key, value []byte) error {
 	h := common.BytesToHash(key)
-	if len(key) == 32 {
+	if len(key) == 32 && !binary.IsPathStorageKey(key) {
 		binaryNodeCacheAdd(h, value)
 
 		// [FIX] Record for current NodeSet in Commit
@@ -247,7 +315,8 @@ func (a *binaryDBAdapter) Put(key, value []byte) error {
 }
 
 func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
-	if len(key) == 32 {
+	pathKey := binary.IsPathStorageKey(key)
+	if len(key) == 32 && !pathKey {
 		h := common.BytesToHash(key)
 		if val, ok := binaryNodeCacheGet(h); ok {
 			return val, nil
@@ -268,6 +337,9 @@ func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
 		if err == nil && data != nil {
 			return data, nil
 		}
+	}
+	if pathKey {
+		return nil, nil
 	}
 	// Fallback to trie database node reader.
 	// We might need to try multiple recent roots because asynchronous pruning or
@@ -296,10 +368,11 @@ func (a *binaryDBAdapter) Get(key []byte) ([]byte, error) {
 	return data, err
 }
 func (a *binaryDBAdapter) Delete(key []byte) error {
-	if len(key) == common.HashLength {
+	pathKey := binary.IsPathStorageKey(key)
+	if len(key) == common.HashLength && !pathKey {
 		binaryNodeCacheRemove(common.BytesToHash(key))
 	}
-	if !a.physicalDelete {
+	if !a.physicalDelete && !pathKey {
 		return nil
 	}
 	if db := a.diskDB(); db != nil {
@@ -346,10 +419,11 @@ func (a *binaryBatchAdapter) Put(key, value []byte) error {
 	return nil
 }
 func (a *binaryBatchAdapter) Delete(key []byte) error {
-	if len(key) == common.HashLength {
+	pathKey := binary.IsPathStorageKey(key)
+	if len(key) == common.HashLength && !pathKey {
 		binaryNodeCacheRemove(common.BytesToHash(key))
 	}
-	if !a.physicalDelete {
+	if !a.physicalDelete && !pathKey {
 		return nil
 	}
 	if a.batch != nil {
@@ -386,12 +460,19 @@ func (a *binaryBatchAdapterArchive) Reset()                      { a.Batch.Reset
 func (a *binaryBatchAdapterArchive) ValueSize() int              { return a.Batch.ValueSize() }
 
 type nodeSetBatcher struct {
-	adapter *binaryDBAdapter
-	nodes   *trienode.NodeSet
-	owner   common.Hash
+	adapter  *binaryDBAdapter
+	nodes    *trienode.NodeSet
+	owner    common.Hash
+	rawBatch ethdb.KeyValueWriter
 }
 
 func (b *nodeSetBatcher) Put(key, value []byte) error {
+	if binary.IsPathStorageKey(key) || len(key) != common.HashLength {
+		if b.rawBatch != nil {
+			return b.rawBatch.Put(key, value)
+		}
+		return b.adapter.Put(key, value)
+	}
 	h := common.BytesToHash(key)
 	b.nodes.AddNode(key, trienode.New(h, value))
 
@@ -401,11 +482,61 @@ func (b *nodeSetBatcher) Put(key, value []byte) error {
 	return nil
 }
 func (b *nodeSetBatcher) Delete(key []byte) error {
+	if binary.IsPathStorageKey(key) || len(key) != common.HashLength {
+		if b.rawBatch != nil {
+			return b.rawBatch.Delete(key)
+		}
+		if db := b.adapter.diskDB(); db != nil {
+			return db.Delete(key)
+		}
+		return nil
+	}
 	return b.adapter.Delete(key)
 }
 func (b *nodeSetBatcher) Write() error   { return nil }
 func (b *nodeSetBatcher) Reset()         {}
 func (b *nodeSetBatcher) ValueSize() int { return 0 }
+
+type rawBatchOp struct {
+	key    []byte
+	value  []byte
+	delete bool
+}
+
+type rawBatchBuffer struct {
+	ops []rawBatchOp
+}
+
+func (b *rawBatchBuffer) Put(key, value []byte) error {
+	b.ops = append(b.ops, rawBatchOp{
+		key:   common.CopyBytes(key),
+		value: common.CopyBytes(value),
+	})
+	return nil
+}
+
+func (b *rawBatchBuffer) Delete(key []byte) error {
+	b.ops = append(b.ops, rawBatchOp{
+		key:    common.CopyBytes(key),
+		delete: true,
+	})
+	return nil
+}
+
+func (b *rawBatchBuffer) replay(dst ethdb.KeyValueWriter) error {
+	for _, op := range b.ops {
+		if op.delete {
+			if err := dst.Delete(op.key); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := dst.Put(op.key, op.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 func (t *BinaryTrie) trieDB() database.NodeDatabase {
 	if adapter, ok := t.trie.Database().(*binaryDBAdapter); ok {
@@ -416,7 +547,19 @@ func (t *BinaryTrie) trieDB() database.NodeDatabase {
 
 func (t *BinaryTrie) GetKey(key []byte) []byte { return nil }
 
+func (t *BinaryTrie) flatSnapshot() BinaryFlatSnapshot {
+	if t.flat == nil {
+		return nil
+	}
+	return t.flat(t.originRoot)
+}
+
 func (t *BinaryTrie) GetAccount(address common.Address) (*types.StateAccount, error) {
+	if snap := t.flatSnapshot(); snap != nil {
+		if blob, err := snap.AccountRLP(crypto.Keccak256Hash(address.Bytes())); err == nil && len(blob) > 0 {
+			return types.FullAccount(blob)
+		}
+	}
 	key := address.Bytes()
 	data, err := t.trie.Get(key)
 	if err != nil {
@@ -424,6 +567,9 @@ func (t *BinaryTrie) GetAccount(address common.Address) (*types.StateAccount, er
 			return nil, nil
 		}
 		return nil, err
+	}
+	if acc, err := types.FullAccount(data); err == nil {
+		return acc, nil
 	}
 	var acc types.StateAccount
 	if err := rlp.DecodeBytes(data, &acc); err != nil {
@@ -433,6 +579,17 @@ func (t *BinaryTrie) GetAccount(address common.Address) (*types.StateAccount, er
 }
 
 func (t *BinaryTrie) GetStorage(addr common.Address, key []byte) ([]byte, error) {
+	if snap := t.flatSnapshot(); snap != nil {
+		accountHash := crypto.Keccak256Hash(addr.Bytes())
+		storageHash := crypto.Keccak256Hash(key)
+		if blob, err := snap.Storage(accountHash, storageHash); err == nil && len(blob) > 0 {
+			_, content, _, err := rlp.Split(blob)
+			if err != nil {
+				return nil, err
+			}
+			return content, nil
+		}
+	}
 	compositeKey := make([]byte, 20+len(key))
 	copy(compositeKey, addr.Bytes())
 	compositeKey[0] ^= 0x01 // XOR domain 1 for storage
@@ -445,11 +602,7 @@ func (t *BinaryTrie) GetStorage(addr common.Address, key []byte) ([]byte, error)
 }
 
 func (t *BinaryTrie) UpdateAccount(address common.Address, acc *types.StateAccount, codeLen int) error {
-	data, err := rlp.EncodeToBytes(acc)
-	if err != nil {
-		return err
-	}
-	return t.trie.Put(address.Bytes(), data)
+	return t.trie.Put(address.Bytes(), types.SlimAccountRLP(*acc))
 }
 
 func (t *BinaryTrie) UpdateAccountRLP(address common.Address, account []byte, codeLen int) error {
@@ -494,32 +647,78 @@ func (t *BinaryTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 	commitStart := time.Now()
 	// [SHARD-AWARE COMMIT via Anonymous Interface to break Import Cycle]
 	if adapter, ok := t.trie.Database().(*binaryDBAdapter); ok {
+		var rawBatch ethdb.Batch
+		if disk := adapter.diskDB(); disk != nil {
+			rawBatch = disk.NewBatch()
+			defer rawBatch.Reset()
+		}
 		// 1. Prepare MergedNodeSet for atomic update across owners
 		merged := trienode.NewMergedNodeSet()
 		dirtyShards := t.trie.GetDirtyShards()
 		shardRoots := make(map[int][]byte, len(dirtyShards))
 
-		// 2. Iterate through dirty shards and populate MergedNodeSet
+		// 2. Commit independent path-storage shards in parallel. Each worker
+		// collects trie nodes and raw path/flat writes locally. Results are
+		// replayed in dirty-shard order into the single atomic database batch.
 		shardCommitStart := time.Now()
-		for _, id := range dirtyShards {
-			nodes := trienode.NewNodeSet(common.Hash{})
-			batch := &nodeSetBatcher{adapter: adapter, nodes: nodes}
-			shardRootBytes, err := t.trie.CommitShardToBatch(id, batch, false)
-			if err != nil {
-				fmt.Printf("[DEBUG] BinaryTrie.Commit shard %d error: %v\n", id, err)
+		type shardCommitResult struct {
+			root  []byte
+			nodes *trienode.NodeSet
+			raw   *rawBatchBuffer
+			err   error
+		}
+		results := make([]shardCommitResult, len(dirtyShards))
+		workers := 1
+		if t.trie.Config().UsePathStorage() {
+			workers = runtime.GOMAXPROCS(0)
+			if workers > len(dirtyShards) {
+				workers = len(dirtyShards)
+			}
+		}
+		if workers > 0 {
+			jobs := make(chan int, len(dirtyShards))
+			var wg sync.WaitGroup
+			for worker := 0; worker < workers; worker++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for index := range jobs {
+						id := dirtyShards[index]
+						nodes := trienode.NewNodeSet(common.Hash{})
+						raw := new(rawBatchBuffer)
+						batch := &nodeSetBatcher{adapter: adapter, nodes: nodes, rawBatch: raw}
+						root, err := t.trie.CommitShardToBatch(id, batch, false)
+						results[index] = shardCommitResult{root: root, nodes: nodes, raw: raw, err: err}
+					}
+				}()
+			}
+			for index := range dirtyShards {
+				jobs <- index
+			}
+			close(jobs)
+			wg.Wait()
+		}
+		for index, id := range dirtyShards {
+			result := results[index]
+			if result.err != nil {
+				fmt.Printf("[DEBUG] BinaryTrie.Commit shard %d error: %v\n", id, result.err)
 				return common.Hash{}, nil
 			}
-			if len(shardRootBytes) > 0 {
-				shardRoots[id] = shardRootBytes
+			if len(result.root) > 0 {
+				shardRoots[id] = result.root
 			} else {
 				shardRoots[id] = make([]byte, common.HashLength)
 			}
-
-			shardRoot := common.BytesToHash(shardRoots[id])
-			nodes.Owner = shardRoot
-			if len(nodes.Nodes) > 0 {
-				if err := merged.Merge(nodes); err != nil {
+			result.nodes.Owner = common.BytesToHash(shardRoots[id])
+			if len(result.nodes.Nodes) > 0 {
+				if err := merged.Merge(result.nodes); err != nil {
 					fmt.Printf("[DEBUG] BinaryTrie.Commit merge shard %d error: %v\n", id, err)
+					return common.Hash{}, nil
+				}
+			}
+			if rawBatch != nil {
+				if err := result.raw.replay(rawBatch); err != nil {
+					fmt.Printf("[DEBUG] BinaryTrie.Commit merge raw shard %d error: %v\n", id, err)
 					return common.Hash{}, nil
 				}
 			}
@@ -528,7 +727,7 @@ func (t *BinaryTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 
 		// 3. Commit the top tree container nodes under the zero owner.
 		topNodes := trienode.NewNodeSet(common.Hash{})
-		topBatch := &nodeSetBatcher{adapter: adapter, nodes: topNodes}
+		topBatch := &nodeSetBatcher{adapter: adapter, nodes: topNodes, rawBatch: rawBatch}
 		topTreeStart := time.Now()
 		h, err := t.trie.CommitTopTreeToBatch(shardRoots, dirtyShards, topBatch)
 		if err != nil {
@@ -579,8 +778,15 @@ func (t *BinaryTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 			updateStart := time.Now()
 			if err := u.Update(root, t.originRoot, t.block, merged, nil); err != nil {
 				fmt.Printf("[DEBUG] BinaryTrie.Commit Update error: %v\n", err)
+				return common.Hash{}, nil
 			}
 			updateDuration = time.Since(updateStart)
+		}
+		if rawBatch != nil {
+			if err := rawBatch.Write(); err != nil {
+				fmt.Printf("[DEBUG] BinaryTrie.Commit flat/value batch error: %v\n", err)
+				return common.Hash{}, nil
+			}
 		}
 
 		// 6. Native persistence for reuse

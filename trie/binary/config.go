@@ -7,11 +7,20 @@ import "sort"
 // This must be the ceiling for all path-related overflow checks.
 const MaxPathBits = 416
 
+const (
+	NodeStorageHash = "hash"
+	NodeStoragePath = "path"
+)
+
 // ArchiveStore identifies the interface to store and retrieve archived bucket data.
 type ArchiveStore interface {
 	PutBucket(hash []byte, data []byte) error
 	GetBucket(hash []byte) ([]byte, error)
 	DeleteBucket(hash []byte) error
+}
+
+type FlatValueReader interface {
+	GetFlatValue(key []byte) ([]byte, error)
 }
 
 // Config holds the configuration parameters for the Trie.
@@ -21,10 +30,12 @@ type Config struct {
 	ArchiveItemCacheLimit int          // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
 	CompactArchiveStubs   bool         // Merge adjacent archive stubs synchronously; expensive on hot pruning paths
 	ArchiveDB             ArchiveStore // Separate store for archive data
-	CuckooBuckets         int          // Number of buckets in cuckoo filter (default 32)
-	CuckooSlots           int          // Slots per bucket in cuckoo filter (default 4)
-	InlineValueThreshold  int          // Inline values up to this size into leaf/archive refs; 0 disables
-	DeleteOldValues       bool         // Use key-bound value refs and delete superseded external value blobs
+	FlatReader            FlatValueReader
+	CuckooBuckets         int  // Number of buckets in cuckoo filter (default 32)
+	CuckooSlots           int  // Slots per bucket in cuckoo filter (default 4)
+	InlineValueThreshold  int  // Inline values up to this size into leaf/archive refs; 0 disables
+	DeleteOldValues       bool // Use key-bound value refs and delete superseded external value blobs
+	NodeStorageScheme     string
 }
 
 // DefaultConfig returns a Config with default values.
@@ -36,7 +47,12 @@ func DefaultConfig() *Config {
 		CompactArchiveStubs:   true,
 		CuckooBuckets:         32,
 		CuckooSlots:           4,
+		NodeStorageScheme:     NodeStorageHash,
 	}
+}
+
+func (c *Config) UsePathStorage() bool {
+	return c != nil && c.NodeStorageScheme == NodeStoragePath
 }
 
 // ResolveArchiveBucketSize returns the restricted bucket size based on cuckoo configuration.

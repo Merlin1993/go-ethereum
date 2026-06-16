@@ -2,10 +2,12 @@ package tree
 
 import (
 	"crypto/sha256"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -35,11 +37,13 @@ const (
 )
 
 var (
-	mptStressItems      = flag.Int("mptStressItems", method1TotalData, "Total items to inject in TestTrieStressMPT")
-	mptStressBatchSize  = flag.Int("mptStressBatchSize", method1BatchSize, "Items per commit batch in TestTrieStressMPT")
-	mptStressEpochItems = flag.Int("mptStressEpochItems", 1000000, "Items per metrics window in TestTrieStressMPT")
-	mptStressBaseDir    = flag.String("mptStressBaseDir", mptDir, "Base directory for TestTrieStressMPT")
-	mptStressScheme     = flag.String("mptStressScheme", rawdb.PathScheme, "Trie DB scheme for TestTrieStressMPT: path or hash")
+	mptStressItems       = flag.Int("mptStressItems", method1TotalData, "Total items to inject in TestTrieStressMPT")
+	mptStressBatchSize   = flag.Int("mptStressBatchSize", method1BatchSize, "Items per commit batch in TestTrieStressMPT")
+	mptStressEpochItems  = flag.Int("mptStressEpochItems", 1000000, "Items per metrics window in TestTrieStressMPT")
+	mptStressBaseDir     = flag.String("mptStressBaseDir", mptDir, "Base directory for TestTrieStressMPT")
+	mptStressScheme      = flag.String("mptStressScheme", rawdb.PathScheme, "Trie DB scheme for TestTrieStressMPT: path or hash")
+	mptStressCommitEvery = flag.Int("mptStressCommitInterval", 1, "Persist trie database every N write batches in TestTrieStressMPT")
+	mptStressUpdateRatio = flag.Int("mptStressUpdateRatio", 100, "Random old-key updates per batch as a percentage of mptStressBatchSize")
 )
 
 // Database keys
@@ -116,8 +120,13 @@ func TestTrieStressMPT(t *testing.T) {
 	epochItems := *mptStressEpochItems
 	baseDir := *mptStressBaseDir
 	scheme := *mptStressScheme
-	if totalData <= 0 || batchPerCommit <= 0 || epochItems <= 0 {
-		t.Fatalf("mptStressItems, mptStressBatchSize and mptStressEpochItems must all be positive")
+	commitEvery := *mptStressCommitEvery
+	updateRatio := *mptStressUpdateRatio
+	if totalData <= 0 || batchPerCommit <= 0 || epochItems <= 0 || commitEvery <= 0 {
+		t.Fatalf("mptStressItems, mptStressBatchSize, mptStressEpochItems and mptStressCommitInterval must all be positive")
+	}
+	if updateRatio < 0 {
+		t.Fatalf("mptStressUpdateRatio must be non-negative")
 	}
 	if scheme != rawdb.PathScheme && scheme != rawdb.HashScheme {
 		t.Fatalf("mptStressScheme must be %q or %q, got %q", rawdb.PathScheme, rawdb.HashScheme, scheme)
@@ -163,6 +172,17 @@ func TestTrieStressMPT(t *testing.T) {
 
 	collector := NewMetricsCollector(epochItems, baseDir, "mpt_stress.csv")
 	defer collector.Close()
+	detailFile, err := os.Create(filepath.Join(baseDir, "results", "mpt_stress_detail.csv"))
+	if err != nil {
+		t.Fatalf("Failed to create detail metrics file: %v", err)
+	}
+	defer detailFile.Close()
+	detailWriter := csv.NewWriter(detailFile)
+	defer detailWriter.Flush()
+	detailWriter.Write([]string{
+		"Total_Injected", "Disk_Bytes", "Diff_Bytes", "Node_Buffer_Bytes",
+		"Preimage_Bytes", "Total_With_Cache_Bytes",
+	})
 
 	// Batch write data
 	for i := 0; i < totalData; i += batchPerCommit {
@@ -179,9 +199,9 @@ func TestTrieStressMPT(t *testing.T) {
 			newKeys[j] = key
 		}
 
-		// 2. Randomly update 1,000 keys from the pool (if pool is sufficient)
-		// This maintains a 1:1 ratio as requested.
-		updateKeys := collector.GetRandomKeys(batchSize)
+		// 2. Randomly update old keys from the pool (if pool is sufficient).
+		updateCount := batchSize * updateRatio / 100
+		updateKeys := collector.GetRandomKeys(updateCount)
 		if len(updateKeys) > 0 {
 			for _, key := range updateKeys {
 				_, val := generateRandomData()
@@ -198,17 +218,21 @@ func TestTrieStressMPT(t *testing.T) {
 		collector.AddRootTime(time.Since(rootStart))
 		finalRoot = root
 
+		batchIndex := i / batchPerCommit
+
 		// Update database
 		if err := trieDB.Update(root, lastRoot, uint64(i/batchPerCommit), trienode.NewWithNodeSet(nodes), triedb.NewStateSet()); err != nil {
 			t.Fatalf("Failed to update database: %v", err)
 		}
-		if err := trieDB.Commit(root, false); err != nil {
-			t.Fatalf("Failed to commit database: %v", err)
-		}
+		if (batchIndex+1)%commitEvery == 0 || i+batchSize >= totalData {
+			if err := trieDB.Commit(root, false); err != nil {
+				t.Fatalf("Failed to commit database: %v", err)
+			}
 
-		if scheme == rawdb.HashScheme {
-			if err := trieDB.Cap(0); err != nil {
-				t.Fatalf("Failed to cap trie database: %v", err)
+			if scheme == rawdb.HashScheme {
+				if err := trieDB.Cap(0); err != nil {
+					t.Fatalf("Failed to cap trie database: %v", err)
+				}
 			}
 		}
 
@@ -227,12 +251,25 @@ func TestTrieStressMPT(t *testing.T) {
 
 		if collector.ShouldReport() {
 			diffs, nodes, preimages := trieDB.Size()
-			t.Logf("Period Summary (Total Items: %d), metrics: %s, TrieDBCache[Diffs: %s, Nodes: %s, Preimages: %s]",
+			diskSize, _ := GetDirSize(baseDir)
+			totalWithCache := uint64(diskSize) + uint64(diffs) + uint64(nodes) + uint64(preimages)
+			detailWriter.Write([]string{
+				strconv.FormatInt(collector.totalInjected, 10),
+				strconv.FormatInt(diskSize, 10),
+				strconv.FormatUint(uint64(diffs), 10),
+				strconv.FormatUint(uint64(nodes), 10),
+				strconv.FormatUint(uint64(preimages), 10),
+				strconv.FormatUint(totalWithCache, 10),
+			})
+			detailWriter.Flush()
+			metrics := collector.GetMetricsString()
+			t.Logf("Period Summary (Total Items: %d), metrics: %s, TrieDBCache[Diffs: %s, Nodes: %s, Preimages: %s], TotalWithCache: %s",
 				collector.totalInjected,
-				collector.GetMetricsString(),
+				metrics,
 				bytesToReadable(uint64(diffs)),
 				bytesToReadable(uint64(nodes)),
-				bytesToReadable(uint64(preimages)))
+				bytesToReadable(uint64(preimages)),
+				bytesToReadable(totalWithCache))
 			collector.ResetWindow()
 		}
 	}

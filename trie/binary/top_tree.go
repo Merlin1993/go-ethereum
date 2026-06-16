@@ -3,24 +3,28 @@ package binary
 import (
 	"bytes"
 	"errors"
+	"sync"
 )
 
 const (
 	// TopTreeHeaderPrefix is the byte prefix for TopNode serialization at level 0.
 	TopTreeHeaderPrefix = 0xD0
+	topTreeFanoutBits   = 4
+	topTreeFanout       = 1 << topTreeFanoutBits
+	topTreeFanoutMask   = topTreeFanout - 1
 )
 
 var zeroHash = make([]byte, 32)
 
-// TopNode represents an internal node in the 16-ary top tree.
+// TopNode represents an internal node in the top tree.
 // At Level < maxLevel, Children points to other TopNodes.
 // At Level == maxLevel, the "children" are the actual 32-byte shard hashes.
 type TopNode struct {
-	Level       int          // 0 is the root
-	Children    [16]*TopNode // Pointer to child nodes (nil if empty)
-	Hash        []byte       // Cached hash of this node
-	Dirty       bool         // Check if node needs to be re-hashed
-	ShardHashes [16][]byte   // [NEW] Cache shard hashes at maxLevel
+	Level       int // 0 is the root
+	Children    [topTreeFanout]*TopNode
+	Hash        []byte // Cached hash of this node
+	Dirty       bool   // Check if node needs to be re-hashed
+	ShardHashes [topTreeFanout][]byte
 }
 
 func newTopNode(level int) *TopNode {
@@ -31,17 +35,18 @@ func newTopNode(level int) *TopNode {
 }
 
 // Serialize encodes the TopNode into bytes for hashing and persistence.
-// A TopNode simply serializes its 16 child hashes in order.
+// A TopNode simply serializes its child hashes in order.
 // If a child is missing or its hash is nil, a 32-byte zero hash is used.
 // Optionally, we append a 1-byte level indicator to distinguish nodes from different levels.
 func (n *TopNode) Serialize(shardRoots map[int][]byte, nodePrefix int, maxLevel int) []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(byte(0xD0 + n.Level)) // Simple header to prevent collision
+	buf := make([]byte, 1+topTreeFanout*32)
+	buf[0] = byte(0xD0 + n.Level) // Simple header to prevent collision
 
-	for i := 0; i < 16; i++ {
+	for i := 0; i < topTreeFanout; i++ {
+		offset := 1 + i*32
 		if n.Level == maxLevel {
 			// At maxLevel, the children are the actual shard hashes
-			shardID := (nodePrefix << 4) | i
+			shardID := (nodePrefix << topTreeFanoutBits) | i
 			h := shardRoots[shardID]
 			if h == nil {
 				h = n.ShardHashes[i]
@@ -49,46 +54,48 @@ func (n *TopNode) Serialize(shardRoots map[int][]byte, nodePrefix int, maxLevel 
 				n.ShardHashes[i] = h
 			}
 
-			if h != nil {
-				buf.Write(h)
+			if len(h) == 32 {
+				copy(buf[offset:offset+32], h)
 			} else {
-				buf.Write(zeroHash)
+				copy(buf[offset:offset+32], zeroHash)
 			}
 		} else {
 			// At levels < maxLevel, the children are TopNodes
 			child := n.Children[i]
 			if child != nil && len(child.Hash) == 32 {
-				buf.Write(child.Hash)
+				copy(buf[offset:offset+32], child.Hash)
 			} else {
-				buf.Write(zeroHash)
+				copy(buf[offset:offset+32], zeroHash)
 			}
 		}
 	}
-	return buf.Bytes()
+	return buf
 }
 
-// TopTree coordinates the hierarchical 16-ary tree structure.
+// TopTree coordinates the hierarchical top tree structure.
 // Instead of storing shard hashes flat, it organizes them in levels
-// of 16-ary nodes, updating only the O(log_16 N) paths that change.
+// of wide fanout nodes, updating only the paths that change.
 type TopTree struct {
 	root       *TopNode
 	hasher     Hasher
 	db         Batcher
 	shardDepth int
 	maxLevel   int
+	pathStore  bool
 }
 
-func NewTopTree(hasher Hasher, db Batcher, shardDepth int) *TopTree {
+func NewTopTree(hasher Hasher, db Batcher, shardDepth int, pathStore bool) *TopTree {
 	return &TopTree{
 		root:       newTopNode(0),
 		hasher:     hasher,
 		db:         db,
 		shardDepth: shardDepth,
-		maxLevel:   (shardDepth+3)/4 - 1,
+		maxLevel:   (shardDepth+topTreeFanoutBits-1)/topTreeFanoutBits - 1,
+		pathStore:  pathStore,
 	}
 }
 
-// Compute dynamically updates the 16-ary tree based on the dirty shards and
+// Compute dynamically updates the top tree based on the dirty shards and
 // computes the new root hash. It only processes paths that are marked dirty.
 func (t *TopTree) Compute(shardRoots map[int][]byte, dirtyShards []int, batch Batcher) ([]byte, error) {
 	if t.root == nil {
@@ -102,11 +109,10 @@ func (t *TopTree) Compute(shardRoots map[int][]byte, dirtyShards []int, batch Ba
 		curr := t.root
 		curr.Dirty = true
 
-		// Extract nibbles based on shardDepth
-		numNibbles := t.maxLevel + 1
+		numDigits := t.maxLevel + 1
 		for i := 0; i < t.maxLevel; i++ {
-			shift := (numNibbles - 1 - i) * 4
-			idx := (id >> shift) & 0x0F
+			shift := (numDigits - 1 - i) * topTreeFanoutBits
+			idx := (id >> shift) & topTreeFanoutMask
 
 			if curr.Children[idx] == nil {
 				curr.Children[idx] = newTopNode(i + 1)
@@ -118,7 +124,7 @@ func (t *TopTree) Compute(shardRoots map[int][]byte, dirtyShards []int, batch Ba
 
 	// 2. Re-hash the dirty nodes bottom-up (Post-order traversal)
 	var err error
-	t.root.Hash, err = t.hashNode(t.root, shardRoots, 0, batch, staleHashes)
+	t.root.Hash, err = t.hashRoot(shardRoots, batch, staleHashes)
 	if err != nil {
 		return nil, err
 	}
@@ -126,19 +132,94 @@ func (t *TopTree) Compute(shardRoots map[int][]byte, dirtyShards []int, batch Ba
 		t.root.Dirty = false
 	}
 
-	if batch != nil && len(staleHashes) > 0 {
-		liveHashes := make(map[string]struct{})
-		t.collectLiveHashes(t.root, liveHashes)
-		for key, hash := range staleHashes {
-			if _, live := liveHashes[key]; live {
-				continue
-			}
+	if batch != nil && !t.pathStore && len(staleHashes) > 0 {
+		for _, hash := range staleHashes {
 			if err := batch.Delete(hash); err != nil {
 				return nil, err
 			}
 		}
 	}
 
+	return t.root.Hash, nil
+}
+
+func (t *TopTree) hashRoot(shardRoots map[int][]byte, batch Batcher, staleHashes map[string][]byte) ([]byte, error) {
+	if t.root == nil || !t.root.Dirty || batch == nil || t.maxLevel <= 0 {
+		return t.hashNode(t.root, shardRoots, 0, batch, staleHashes)
+	}
+
+	oldHash := append([]byte(nil), t.root.Hash...)
+
+	type childResult struct {
+		idx   int
+		hash  []byte
+		ops   []memBatchOp
+		stale map[string][]byte
+		err   error
+	}
+
+	results := make(chan childResult, topTreeFanout)
+	var wg sync.WaitGroup
+	for i, child := range t.root.Children {
+		if child == nil || !child.Dirty {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, node *TopNode) {
+			defer wg.Done()
+			localBatch := &memBatcher{ops: make([]memBatchOp, 0, 512)}
+			localStale := make(map[string][]byte)
+			childPrefix := idx
+			h, err := t.hashNode(node, shardRoots, childPrefix, localBatch, localStale)
+			results <- childResult{
+				idx:   idx,
+				hash:  h,
+				ops:   localBatch.ops,
+				stale: localStale,
+				err:   err,
+			}
+		}(i, child)
+	}
+
+	wg.Wait()
+	close(results)
+
+	for res := range results {
+		if res.err != nil {
+			return nil, res.err
+		}
+		child := t.root.Children[res.idx]
+		child.Hash = res.hash
+		child.Dirty = false
+		for _, op := range res.ops {
+			var err error
+			if op.delete {
+				err = batch.Delete(op.k)
+			} else {
+				err = batch.Put(op.k, op.v)
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+		for key, hash := range res.stale {
+			staleHashes[key] = hash
+		}
+	}
+
+	data := t.root.Serialize(shardRoots, 0, t.maxLevel)
+	t.root.Hash = t.hasher.Hash(data)
+	t.root.Dirty = false
+	key := t.root.Hash
+	if t.pathStore {
+		key = pathTopNodeKey(t.root.Level, 0)
+	}
+	if err := batch.Put(key, data); err != nil {
+		return nil, err
+	}
+	if !t.pathStore && len(oldHash) > 0 && !bytes.Equal(oldHash, t.root.Hash) && !bytes.Equal(oldHash, zeroHash) {
+		staleHashes[string(oldHash)] = oldHash
+	}
 	return t.root.Hash, nil
 }
 
@@ -150,10 +231,10 @@ func (t *TopTree) hashNode(n *TopNode, shardRoots map[int][]byte, prefix int, ba
 
 	oldHash := append([]byte(nil), n.Hash...)
 
-	for i := 0; i < 16; i++ {
+	for i := 0; i < topTreeFanout; i++ {
 		child := n.Children[i]
 		if child != nil {
-			childPrefix := (prefix << 4) | i
+			childPrefix := (prefix << topTreeFanoutBits) | i
 			h, err := t.hashNode(child, shardRoots, childPrefix, batch, staleHashes)
 			if err != nil {
 				return nil, err
@@ -172,29 +253,21 @@ func (t *TopTree) hashNode(n *TopNode, shardRoots map[int][]byte, prefix int, ba
 		n.Dirty = false
 	}
 
-	// Persist the internal 16-ary node to the database batch
+	// Persist the internal top tree node to the database batch
 	if batch != nil {
-		if err := batch.Put(n.Hash, data); err != nil {
+		key := n.Hash
+		if t.pathStore {
+			key = pathTopNodeKey(n.Level, prefix)
+		}
+		if err := batch.Put(key, data); err != nil {
 			return nil, err
 		}
-		if len(oldHash) > 0 && !bytes.Equal(oldHash, n.Hash) && !bytes.Equal(oldHash, zeroHash) {
+		if !t.pathStore && len(oldHash) > 0 && !bytes.Equal(oldHash, n.Hash) && !bytes.Equal(oldHash, zeroHash) {
 			staleHashes[string(oldHash)] = oldHash
 		}
 	}
 
 	return n.Hash, nil
-}
-
-func (t *TopTree) collectLiveHashes(n *TopNode, live map[string]struct{}) {
-	if n == nil {
-		return
-	}
-	if len(n.Hash) > 0 && !bytes.Equal(n.Hash, zeroHash) {
-		live[string(n.Hash)] = struct{}{}
-	}
-	for _, child := range n.Children {
-		t.collectLiveHashes(child, live)
-	}
 }
 
 func (t *TopTree) ForEachShardRoot(fn func(id int, hash []byte)) {
@@ -208,13 +281,13 @@ func (t *TopTree) forEachShardRoot(n *TopNode, prefix int, fn func(id int, hash 
 	if n.Level == t.maxLevel {
 		for i, h := range n.ShardHashes {
 			if len(h) > 0 && !bytes.Equal(h, zeroHash) {
-				fn((prefix<<4)|i, append([]byte(nil), h...))
+				fn((prefix<<topTreeFanoutBits)|i, append([]byte(nil), h...))
 			}
 		}
 		return
 	}
 	for i, child := range n.Children {
-		t.forEachShardRoot(child, (prefix<<4)|i, fn)
+		t.forEachShardRoot(child, (prefix<<topTreeFanoutBits)|i, fn)
 	}
 }
 
@@ -223,7 +296,7 @@ func (t *TopTree) Load(rootHash []byte, db KVStore) error {
 	if len(rootHash) == 0 {
 		return nil
 	}
-	newRoot, err := t.loadNode(rootHash, 0, db)
+	newRoot, err := t.loadNode(rootHash, 0, 0, db)
 	if err != nil {
 		return err
 	}
@@ -231,21 +304,31 @@ func (t *TopTree) Load(rootHash []byte, db KVStore) error {
 	return nil
 }
 
-func (t *TopTree) loadNode(hash []byte, level int, db KVStore) (*TopNode, error) {
+func (t *TopTree) loadNode(hash []byte, level int, prefix int, db KVStore) (*TopNode, error) {
 	if len(hash) == 0 || bytes.Equal(hash, make([]byte, 32)) {
 		return nil, nil
 	}
-	data, err := db.Get(hash)
+	key := hash
+	if t.pathStore {
+		key = pathTopNodeKey(level, prefix)
+	}
+	data, err := db.Get(key)
 	if err != nil {
 		return nil, err
 	}
 	if len(data) == 0 {
 		return nil, nil
 	}
+	if t.pathStore && !bytes.Equal(t.hasher.Hash(data), hash) {
+		return nil, errors.New("top node hash mismatch")
+	}
 
 	// Basic validation of header
 	if data[0] != byte(0xD0+level) {
 		return nil, errors.New("invalid top node header")
+	}
+	if len(data) < 1+topTreeFanout*32 {
+		return nil, errors.New("invalid top node length")
 	}
 
 	n := newTopNode(level)
@@ -253,9 +336,10 @@ func (t *TopTree) loadNode(hash []byte, level int, db KVStore) (*TopNode, error)
 	n.Dirty = false
 
 	if level < t.maxLevel {
-		for i := 0; i < 16; i++ {
+		for i := 0; i < topTreeFanout; i++ {
 			childHash := data[1+i*32 : 1+(i+1)*32]
-			child, err := t.loadNode(childHash, level+1, db)
+			childPrefix := (prefix << topTreeFanoutBits) | i
+			child, err := t.loadNode(childHash, level+1, childPrefix, db)
 			if err != nil {
 				return nil, err
 			}
@@ -263,7 +347,7 @@ func (t *TopTree) loadNode(hash []byte, level int, db KVStore) (*TopNode, error)
 		}
 	} else {
 		// At max level, children are just 32-byte hashes stored in data
-		for i := 0; i < 16; i++ {
+		for i := 0; i < topTreeFanout; i++ {
 			shardHash := data[1+i*32 : 1+(i+1)*32]
 			if !bytes.Equal(shardHash, zeroHash) {
 				n.ShardHashes[i] = append([]byte{}, shardHash...)
@@ -281,31 +365,20 @@ func (t *TopTree) GetShardRoot(id int, db KVStore) ([]byte, error) {
 		return nil, nil
 	}
 
-	numNibbles := t.maxLevel + 1
+	numDigits := t.maxLevel + 1
 	for i := 0; i < t.maxLevel; i++ {
-		shift := (numNibbles - 1 - i) * 4
-		idx := (id >> shift) & 0x0F
+		shift := (numDigits - 1 - i) * topTreeFanoutBits
+		idx := (id >> shift) & topTreeFanoutMask
 		curr = curr.Children[idx]
 		if curr == nil {
 			return nil, nil
 		}
 	}
 
-	// At max level, we need to read the shard hash from the node's serialized data
-	if len(curr.Hash) == 0 {
+	idx := id & topTreeFanoutMask
+	h := curr.ShardHashes[idx]
+	if len(h) == 0 || bytes.Equal(h, zeroHash) {
 		return nil, nil
 	}
-	data, err := db.Get(curr.Hash)
-	if err != nil {
-		return nil, err
-	}
-	if len(data) == 0 {
-		return nil, nil
-	}
-	idx := id & 0x0F
-	h := data[1+idx*32 : 1+(idx+1)*32]
-	if bytes.Equal(h, make([]byte, 32)) {
-		return nil, nil
-	}
-	return h, nil
+	return append([]byte(nil), h...), nil
 }
