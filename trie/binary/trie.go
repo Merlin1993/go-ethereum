@@ -13,8 +13,13 @@ type Trie struct {
 	hasher Hasher
 	config *Config
 
-	shards   []*Shard
-	shardsMu sync.RWMutex
+	shards            []*Shard
+	shardsMu          sync.RWMutex
+	nodeCache         *nodeBlobCache
+	pointCache        *commitmentPointCache
+	prunePrefetchMu   sync.Mutex
+	prunePrefetchIdx  int
+	prunePrefetchDone chan struct{}
 
 	// TopTree handles the hierarchical root hash computation
 	topTree *TopTree
@@ -46,6 +51,9 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 		hasher:             hasher,
 		config:             config,
 		shards:             make([]*Shard, 1<<config.ShardDepth),
+		nodeCache:          newNodeBlobCache(config.NodeCacheLimit),
+		pointCache:         newCommitmentPointCache(config.CommitmentPointCacheLimit),
+		prunePrefetchIdx:   -1,
 		globalEpochBit:     0,
 		pruning:            pruning,
 		dirtyShards:        make(map[int]struct{}),
@@ -214,14 +222,14 @@ func (t *Trie) getOrCreateShard(id int) (*Shard, error) {
 	// Try to get existing shard root from TopTree
 	shardRoot, _ := t.topTree.GetShardRoot(id, t.db)
 
-	s, err := NewShard(id, t.db, t.hasher, t.config, shardRoot, t.pruning, func() byte {
+	s, err := newShard(id, t.db, t.hasher, t.config, shardRoot, t.pruning, func() byte {
 		// [Rolling Epoch] 为了防止“提前加热”导致无法归档，每个分片只有在正式被剪枝后才切换到新的 GlobalBit。
 		// 在当前周期内尚未被剪枝的分片应继续使用旧位的补。
 		if id < t.pruneShardIdx {
 			return t.globalEpochBit
 		}
 		return t.globalEpochBit ^ 1
-	})
+	}, t.nodeCache, t.pointCache)
 	if err != nil {
 		return nil, err
 	}
@@ -527,15 +535,60 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	return rootHash, nil
 }
 
+const prunePrefetchNodeLimit = 512
+
+func (t *Trie) waitPrunePrefetch(idx int) {
+	t.prunePrefetchMu.Lock()
+	if t.prunePrefetchIdx != idx || t.prunePrefetchDone == nil {
+		t.prunePrefetchMu.Unlock()
+		return
+	}
+	done := t.prunePrefetchDone
+	t.prunePrefetchIdx = -1
+	t.prunePrefetchDone = nil
+	t.prunePrefetchMu.Unlock()
+	<-done
+}
+
+func (t *Trie) startPrunePrefetch(idx int) {
+	if t.config == nil || !t.config.UsePathStorage() || t.nodeCache == nil {
+		return
+	}
+	root, _ := t.topTree.GetShardRoot(idx, t.db)
+	if len(root) == 0 {
+		return
+	}
+	done := make(chan struct{})
+	epoch := t.globalEpochBit
+	t.prunePrefetchMu.Lock()
+	t.prunePrefetchIdx = idx
+	t.prunePrefetchDone = done
+	t.prunePrefetchMu.Unlock()
+
+	go func(rootHash []byte) {
+		defer close(done)
+		shard := newStatsShardView(idx, t.db, t.hasher, t.config, t.nodeCache, rootHash, t.pruning, func() byte {
+			return epoch
+		})
+		visited := 0
+		shard.prefetchNodeAtPath(rootHash, nil, 0, &visited, prunePrefetchNodeLimit)
+	}(append([]byte(nil), root...))
+}
+
 // PruneNextShard prunes the next shard in cycle.
 func (t *Trie) PruneNextShard() error {
+	totalStart := time.Now()
 	idx := t.pruneShardIdx
+	waitStart := time.Now()
+	t.waitPrunePrefetch(idx)
+	waitDur := time.Since(waitStart)
 	if idx == 0 {
 		t.globalEpochBit ^= 1
 	}
 
 	shard, err := t.getOrCreateShard(idx)
 	if err != nil {
+		recordPruneDiagnostics(time.Since(totalStart).Nanoseconds(), waitDur.Nanoseconds(), 0, 0)
 		return err
 	}
 
@@ -544,12 +597,19 @@ func (t *Trie) PruneNextShard() error {
 	t.markArchiveDirtyShardLocked(idx)
 	t.shardsMu.Unlock()
 
+	shardPruneStart := time.Now()
 	err = shard.Prune(t.globalEpochBit)
+	shardPruneDur := time.Since(shardPruneStart)
 	if err != nil {
+		recordPruneDiagnostics(time.Since(totalStart).Nanoseconds(), waitDur.Nanoseconds(), shardPruneDur.Nanoseconds(), 0)
 		return err
 	}
 
 	t.pruneShardIdx = (idx + 1) % (1 << t.config.ShardDepth)
+	prefetchStart := time.Now()
+	t.startPrunePrefetch(t.pruneShardIdx)
+	prefetchDur := time.Since(prefetchStart)
+	recordPruneDiagnostics(time.Since(totalStart).Nanoseconds(), waitDur.Nanoseconds(), shardPruneDur.Nanoseconds(), prefetchDur.Nanoseconds())
 	return nil
 }
 

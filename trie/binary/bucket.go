@@ -37,6 +37,65 @@ func archivedKeyFromKV(kv ArchivedKV) ArchivedKey {
 	}
 }
 
+func (s *Shard) bucketCommitmentPoint(bucket *ArchiveBucketNode) (*ecmh.Point, error) {
+	if bucket == nil {
+		return nil, nil
+	}
+	bucket.cacheMu.RLock()
+	point := bucket.cachedCommitmentPoint
+	bucket.cacheMu.RUnlock()
+	if point != nil {
+		return point, nil
+	}
+	if s.pointCache != nil {
+		if point, ok := s.pointCache.get(bucket.Commitment); ok {
+			recordCommitmentPointCacheLookupIfEnabled(s.config, true)
+			bucket.cacheMu.Lock()
+			if bucket.cachedCommitmentPoint != nil {
+				point = bucket.cachedCommitmentPoint
+			} else {
+				bucket.cachedCommitmentPoint = point
+			}
+			bucket.cacheMu.Unlock()
+			return point, nil
+		}
+		recordCommitmentPointCacheLookupIfEnabled(s.config, false)
+	}
+	point, err := s.ecmh.DecodePoint(bucket.Commitment)
+	if err != nil {
+		return nil, err
+	}
+	if s.pointCache != nil {
+		s.pointCache.add(bucket.Commitment, point)
+	}
+	bucket.cacheMu.Lock()
+	if bucket.cachedCommitmentPoint != nil {
+		point = bucket.cachedCommitmentPoint
+	} else {
+		bucket.cachedCommitmentPoint = point
+	}
+	bucket.cacheMu.Unlock()
+	return point, nil
+}
+
+func (s *Shard) setBucketCommitmentPoint(bucket *ArchiveBucketNode, point *ecmh.Point) {
+	if bucket == nil {
+		return
+	}
+	bucket.cacheMu.Lock()
+	bucket.cachedCommitmentPoint = point
+	bucket.cacheMu.Unlock()
+}
+
+func (s *Shard) clearBucketCommitmentPoint(bucket *ArchiveBucketNode) {
+	if bucket == nil {
+		return
+	}
+	bucket.cacheMu.Lock()
+	bucket.cachedCommitmentPoint = nil
+	bucket.cacheMu.Unlock()
+}
+
 func archivedKVFromKey(key ArchivedKey) ArchivedKV {
 	return ArchivedKV{
 		Suffix:     common.CopyBytes(key.Suffix),
@@ -301,22 +360,28 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 
 	// 2. 增量更新 ECMH 承诺
 	hashes := make([]common.Hash, 0, len(newItems))
-	valuedItems := make([]ArchivedKV, 0, len(newItems))
+	cacheItems := bucket.cachedItems != nil
+	var valuedItems []ArchivedKV
+	if cacheItems {
+		valuedItems = make([]ArchivedKV, 0, len(newItems))
+	}
 	for _, it := range newItems {
 		key := archivedKeyFromKV(it)
 		h, nextKeyBuf, nextHashBuf := s.archivePointHash(bucket, key, it.Value, keyBuf, hashBuf)
 		hashes = append(hashes, h)
-		valuedItems = append(valuedItems, ArchivedKV{
-			Suffix:     common.CopyBytes(it.Suffix),
-			SuffixBits: it.SuffixBits,
-			Value:      common.CopyBytes(it.Value),
-		})
+		if cacheItems {
+			valuedItems = append(valuedItems, ArchivedKV{
+				Suffix:     common.CopyBytes(it.Suffix),
+				SuffixBits: it.SuffixBits,
+				Value:      common.CopyBytes(it.Value),
+			})
+		}
 		keyBuf = nextKeyBuf
 		hashBuf = nextHashBuf
 	}
-	committer := ecmh.New()
-	newCommitment, _ := committer.Add(bucket.Commitment, hashes)
+	newCommitment, point, _ := s.ecmh.AddWithPoint(bucket.Commitment, hashes)
 	bucket.Commitment = newCommitment
+	bucket.cachedCommitmentPoint = point
 
 	// 3. 更新计数
 	bucket.Count += uint64(len(newItems))
@@ -325,7 +390,7 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 	}
 
 	// 4. 更新缓存的数据项（如果已加载）
-	if bucket.cachedItems != nil {
+	if cacheItems {
 		cachedItems := append(bucket.cachedItems, valuedItems...)
 		if s.shouldCacheArchivedItems(len(cachedItems)) {
 			bucket.cachedItems = cachedItems
@@ -395,6 +460,7 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 	committer := ecmh.New()
 	newCommitment, _ := committer.Delete(bucket.Commitment, hashes)
 	bucket.Commitment = newCommitment
+	bucket.cachedCommitmentPoint = nil
 
 	// 3. 更新计数
 	bucket.Count -= uint64(len(deleteItems))
@@ -448,6 +514,7 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 
 // recomputeBucket 重新计算桶的承诺部分 (Filter, ECMH, Count)
 func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
+	recordBucketRecomputeIfEnabled(s.config)
 	bucket.cacheMu.Lock()
 	defer bucket.cacheMu.Unlock()
 	bucket.dirty = true
@@ -455,7 +522,11 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	filter := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
 	hashes := make([]common.Hash, 0, len(items))
 	keys := make([]ArchivedKey, 0, len(items))
-	cachedItems := make([]ArchivedKV, 0, len(items))
+	cacheItems := s.shouldCacheArchivedItems(len(items))
+	var cachedItems []ArchivedKV
+	if cacheItems {
+		cachedItems = make([]ArchivedKV, 0, len(items))
+	}
 	var keyBuf []byte
 	var hashBuf []byte
 
@@ -468,11 +539,13 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 		h, _, nextHashBuf := s.archivePointHash(bucket, key, item.Value, keyBuf, hashBuf)
 		hashes = append(hashes, h)
 		keys = append(keys, key)
-		cachedItems = append(cachedItems, ArchivedKV{
-			Suffix:     common.CopyBytes(item.Suffix),
-			SuffixBits: item.SuffixBits,
-			Value:      common.CopyBytes(item.Value),
-		})
+		if cacheItems {
+			cachedItems = append(cachedItems, ArchivedKV{
+				Suffix:     common.CopyBytes(item.Suffix),
+				SuffixBits: item.SuffixBits,
+				Value:      common.CopyBytes(item.Value),
+			})
+		}
 		keyBuf = keyWithLen
 		hashBuf = nextHashBuf
 	}
@@ -483,15 +556,16 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 
 	// 更新缓存
 	bucket.cachedFilter = filter
-	if s.shouldCacheArchivedItems(len(cachedItems)) {
+	if cacheItems {
 		bucket.cachedItems = cachedItems
 	} else {
 		bucket.cachedItems = nil
 	}
 
 	// ECMH 承诺
-	comm, _ := s.ecmh.Add(nil, hashes)
+	comm, point, _ := s.ecmh.AddWithPoint(nil, hashes)
 	bucket.Commitment = comm
+	bucket.cachedCommitmentPoint = point
 
 	// 记录待入库的原始数据
 	// 提前计算桶在 Commit 后的哈希，用于 pendingArchives 索引

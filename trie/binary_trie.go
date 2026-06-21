@@ -229,6 +229,13 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 			if dbConf.NodeCacheLimit != 0 {
 				nodeCacheLimit = dbConf.NodeCacheLimit
 			}
+			config.NodeCacheLimit = nodeCacheLimit
+			if dbConf.NodeCacheWarmPathBits != 0 {
+				config.NodeCacheWarmPathBits = dbConf.NodeCacheWarmPathBits
+			}
+			if dbConf.CommitmentPointCacheLimit != 0 {
+				config.CommitmentPointCacheLimit = dbConf.CommitmentPointCacheLimit
+			}
 			if dbConf.NodeStorageScheme == binary.NodeStorageHash || dbConf.NodeStorageScheme == binary.NodeStoragePath {
 				config.NodeStorageScheme = dbConf.NodeStorageScheme
 			}
@@ -237,6 +244,7 @@ func NewBinaryTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Dat
 	}
 
 	configureBinaryNodeCache(nodeCacheLimit)
+	config.NodeCacheLimit = nodeCacheLimit
 
 	// For now, we use a simple adapter for the KVStore and ArchiveDB
 	kvAdapter := &binaryDBAdapter{db: db, root: root, archive: archive, physicalDelete: physicalDelete}

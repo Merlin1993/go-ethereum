@@ -20,22 +20,30 @@ import (
 )
 
 var (
-	stressItems                 = flag.Int("stressItems", 5242880000, "Total items to inject in TestTrieStressBinary")
-	stressEpochItems            = flag.Int("stressEpochItems", 1000000, "Items per metrics window in TestTrieStressBinary")
-	stressBatchSize             = flag.Int("stressBatchSize", 1000, "Items per commit batch in TestTrieStressBinary")
-	stressUpdatesPerBatch       = flag.Int("stressUpdatesPerBatch", -1, "Random update operations per commit batch in TestTrieStressBinary; negative defaults to stressBatchSize")
-	stressGetsPerBatch          = flag.Int("stressGetsPerBatch", 1000, "Random Get operations per commit batch in TestTrieStressBinary")
-	stressGetMissPercent        = flag.Int("stressGetMissPercent", 50, "Percent of random Get operations targeting likely non-existent keys")
-	stressBaseDir               = flag.String("stressBaseDir", "F:\\trie_stress_depth16_batch1000_delete_values", "Base directory for TestTrieStressBinary")
-	stressMaxPool               = flag.Int("stressMaxPool", 10000000, "Maximum sliding key pool size in TestTrieStressBinary")
-	stressShardDepth            = flag.Int("stressShardDepth", 16, "Shard depth for TestTrieStressBinary; 20 means 1,048,576 shards")
-	stressArchiveItemCacheLimit = flag.Int("stressArchiveItemCacheLimit", 0, "Decoded archive item cache limit for TestTrieStressBinary; 0 disables item caching, negative keeps all")
-	stressInlineValueThreshold  = flag.Int("stressInlineValueThreshold", 0, "Inline values up to this many bytes into trie/archive nodes during TestTrieStressBinary; 0 disables")
-	stressDeleteOldValues       = flag.Bool("stressDeleteOldValues", true, "Delete superseded external value blobs during TestTrieStressBinary")
-	stressDestructiveCommit     = flag.Bool("stressDestructiveCommit", true, "Unload committed shard nodes during TestTrieStressBinary commits")
-	stressAsyncIO               = flag.Bool("stressAsyncIO", false, "Pipeline archive flush and LevelDB batch writes behind the next foreground cycle")
-	stressDBBackend             = flag.String("stressDBBackend", "leveldb", "Database backend for TestTrieStressBinary: leveldb or pebble")
-	stressNodeStorage           = flag.String("stressNodeStorage", NodeStorageHash, "ASC node storage scheme: hash or path")
+	stressItems                     = flag.Int("stressItems", 5242880000, "Total items to inject in TestTrieStressBinary")
+	stressEpochItems                = flag.Int("stressEpochItems", 1000000, "Items per metrics window in TestTrieStressBinary")
+	stressBatchSize                 = flag.Int("stressBatchSize", 1000, "Items per commit batch in TestTrieStressBinary")
+	stressUpdatesPerBatch           = flag.Int("stressUpdatesPerBatch", -1, "Random update operations per commit batch in TestTrieStressBinary; negative defaults to stressBatchSize")
+	stressGetsPerBatch              = flag.Int("stressGetsPerBatch", 1000, "Random Get operations per commit batch in TestTrieStressBinary")
+	stressGetMissPercent            = flag.Int("stressGetMissPercent", 50, "Percent of random Get operations targeting likely non-existent keys")
+	stressBaseDir                   = flag.String("stressBaseDir", "F:\\trie_stress_depth16_batch1000_delete_values", "Base directory for TestTrieStressBinary")
+	stressMaxPool                   = flag.Int("stressMaxPool", 10000000, "Maximum sliding key pool size in TestTrieStressBinary")
+	stressShardDepth                = flag.Int("stressShardDepth", 16, "Shard depth for TestTrieStressBinary; 20 means 1,048,576 shards")
+	stressArchiveItemCacheLimit     = flag.Int("stressArchiveItemCacheLimit", 0, "Decoded archive item cache limit for TestTrieStressBinary; 0 disables item caching, negative keeps all")
+	stressInlineValueThreshold      = flag.Int("stressInlineValueThreshold", 0, "Inline values up to this many bytes into trie/archive nodes during TestTrieStressBinary; 0 disables")
+	stressDeleteOldValues           = flag.Bool("stressDeleteOldValues", true, "Delete superseded external value blobs during TestTrieStressBinary")
+	stressDestructiveCommit         = flag.Bool("stressDestructiveCommit", true, "Unload committed shard nodes during TestTrieStressBinary commits")
+	stressAsyncIO                   = flag.Bool("stressAsyncIO", false, "Pipeline archive flush and LevelDB batch writes behind the next foreground cycle")
+	stressDBBackend                 = flag.String("stressDBBackend", "leveldb", "Database backend for TestTrieStressBinary: leveldb or pebble")
+	stressNodeStorage               = flag.String("stressNodeStorage", NodeStorageHash, "ASC node storage scheme: hash or path")
+	stressNodeCacheLimit            = flag.Int("stressNodeCacheLimit", DefaultNodeCacheLimit, "Serialized binary node blob cache limit; 0 uses default, negative disables")
+	stressNodeCacheWarmPathBits     = flag.Int("stressNodeCacheWarmPathBits", DefaultNodeCacheWarmPathBits, "Path-mode eager cache warming depth; 0 uses default, -1 keeps root-only, <-1 disables eager warming")
+	stressCommitmentPointCacheLimit = flag.Int("stressCommitmentPointCacheLimit", DefaultCommitmentPointCacheLimit, "Decoded ECMH commitment point cache limit; 0 uses default, negative disables")
+	stressPathDiagnostics           = flag.Bool("stressPathDiagnostics", false, "Record path/cache diagnostics during TestTrieStressBinary")
+	stressFullStatsEvery            = flag.Int("stressFullStatsEvery", 5, "Run exact structural stats every N metrics windows in TestTrieStressBinary; 0 disables exact stats")
+	stressFinalStats                = flag.Bool("stressFinalStats", false, "Run one exact structural Stats() pass at the end of TestTrieStressBinary")
+	stressFilterFPSamplesPerBucket  = flag.Int("stressFilterFPSamplesPerBucket", 0, "At the end of TestTrieStressBinary, sample this many non-member suffixes per archive bucket for Cuckoo false-positive rate; 0 disables")
+	stressFilterFPSeed              = flag.Int64("stressFilterFPSeed", 1, "Random seed for archive filter false-positive sampling")
 )
 
 type stressAsyncResult struct {
@@ -44,20 +52,23 @@ type stressAsyncResult struct {
 }
 
 type stressTiming struct {
-	root     time.Duration
-	wall     time.Duration
-	prune    time.Duration
-	insert   time.Duration
-	update   time.Duration
-	get      time.Duration
-	commit   time.Duration
-	shard    time.Duration
-	topTree  time.Duration
-	flush    time.Duration
-	write    time.Duration
-	rawFlush time.Duration
-	rawWrite time.Duration
-	batch    stressBatchStats
+	root          time.Duration
+	wall          time.Duration
+	prune         time.Duration
+	pruneWait     time.Duration
+	pruneShard    time.Duration
+	prunePrefetch time.Duration
+	insert        time.Duration
+	update        time.Duration
+	get           time.Duration
+	commit        time.Duration
+	shard         time.Duration
+	topTree       time.Duration
+	flush         time.Duration
+	write         time.Duration
+	rawFlush      time.Duration
+	rawWrite      time.Duration
+	batch         stressBatchStats
 }
 
 type stressBatchStats struct {
@@ -249,6 +260,10 @@ func TestTrieStressBinary(t *testing.T) {
 	config.DeleteOldValues = *stressDeleteOldValues
 	config.ShardDepth = *stressShardDepth
 	config.NodeStorageScheme = *stressNodeStorage
+	config.NodeCacheLimit = *stressNodeCacheLimit
+	config.NodeCacheWarmPathBits = *stressNodeCacheWarmPathBits
+	config.CommitmentPointCacheLimit = *stressCommitmentPointCacheLimit
+	config.EnablePathDiagnostics = *stressPathDiagnostics
 	config.ArchiveDB = &stressDBAdapter{adb}
 	trie := NewTrie(nil, &stressDBAdapter{sdb}, hasher, config, true)
 
@@ -279,8 +294,14 @@ func TestTrieStressBinary(t *testing.T) {
 		"State_MB", "Archive_MB", "Leaf_Count", "Archive_Items", "Bucket_Count", "Max_Buckets_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max", "RSS_MB", "Heap_MB",
 		"Insert_ms", "Update_ms", "Get_ms", "ShardCommit_ms", "TopTree_ms", "Untracked_ms",
 		"Batch_KB", "Batch_Puts", "Batch_Deletes", "Flat_Puts", "Flat_Deletes", "Tree_Puts", "Tree_Deletes",
+		"FalsePositive_Count", "FalsePositive_Rate",
+		"Stats_ms", "Stats_Mode", "NodeCache_Hits", "NodeCache_Misses", "PathNode_DBGets", "Promotion_Checks", "Promotion_Hits", "Bucket_Recomputes",
+		"Prune_Wait_ms", "Prune_Shard_ms", "Prune_PrefetchStart_ms", "Prune_Other_ms", "CommitmentPointCache_Hits", "CommitmentPointCache_Misses",
+		"Prune_Internal_Visits", "Prune_Hot_Skips", "Prune_Child_Hits", "Prune_Child_Skips", "Prune_Bulk_Collects",
+		"Prune_Collected_Leaves", "Prune_Collected_Stubs", "Prune_Build_Items", "Prune_Build_Buckets", "Prune_ArchiveBuild_Parallel",
 	}
 	writer.Write(header)
+	ResetCommitDiagnostics()
 
 	// 4. 压力测试循环
 	fmt.Printf("开始压力测试: 目标 %d 条\n", TargetItems)
@@ -291,6 +312,10 @@ func TestTrieStressBinary(t *testing.T) {
 	totalInjected := 0
 	batch := newStressBatcher(trie.db.NewBatch()) // Assuming trie.db is the KVStore for state
 	defer batch.Reset()
+	statsEvery := *stressFullStatsEvery
+	var lastStats *TrieStats
+	var prevDiag CommitDiagnostics
+	var prevFalsePositiveCount int64
 	var pendingWrite <-chan stressAsyncResult
 	startAsync := func(fn func() error) <-chan stressAsyncResult {
 		ch := make(chan stressAsyncResult, 1)
@@ -309,7 +334,9 @@ func TestTrieStressBinary(t *testing.T) {
 
 			// 触发剪枝 (模拟持续负载下的归档)
 			startPrune := time.Now()
-			trie.PruneNextShard()
+			if err := trie.PruneNextShard(); err != nil {
+				t.Fatalf("Failed to prune shard: %v", err)
+			}
 			pruneDur := time.Since(startPrune)
 
 			var (
@@ -438,20 +465,23 @@ func TestTrieStressBinary(t *testing.T) {
 			wallDur := time.Since(loopStart)
 
 			calcTimes = append(calcTimes, stressTiming{
-				root:     rootDur,
-				wall:     wallDur,
-				prune:    pruneDur,
-				insert:   insertDur,
-				update:   updateDur,
-				get:      getDur,
-				commit:   commitDur,
-				shard:    shardCommitDur,
-				topTree:  topTreeDur,
-				flush:    flushDur,
-				write:    writeDur,
-				rawFlush: rawFlushDur,
-				rawWrite: rawWriteDur,
-				batch:    batchStats,
+				root:          rootDur,
+				wall:          wallDur,
+				prune:         pruneDur,
+				pruneWait:     time.Duration(diag.PruneWaitNanos),
+				pruneShard:    time.Duration(diag.PruneShardNanos),
+				prunePrefetch: time.Duration(diag.PrunePrefetchNanos),
+				insert:        insertDur,
+				update:        updateDur,
+				get:           getDur,
+				commit:        commitDur,
+				shard:         shardCommitDur,
+				topTree:       topTreeDur,
+				flush:         flushDur,
+				write:         writeDur,
+				rawFlush:      rawFlushDur,
+				rawWrite:      rawWriteDur,
+				batch:         batchStats,
 			})
 
 			totalInjected += BatchSize
@@ -463,7 +493,8 @@ func TestTrieStressBinary(t *testing.T) {
 		}
 
 		fTimes := make([]float64, len(calcTimes))
-		var sumRoot, sumPrune, sumInsert, sumUpdate, sumGet, sumCommit, sumShard, sumTopTree, sumFlush float64
+		var sumRoot, sumPrune, sumPruneWait, sumPruneShard, sumPrunePrefetch float64
+		var sumInsert, sumUpdate, sumGet, sumCommit, sumShard, sumTopTree, sumFlush float64
 		var sumWall, sumWrite, sumRawFlush, sumRawWrite float64
 		var sumBatchBytes, sumBatchPuts, sumBatchDeletes, sumFlatPuts, sumFlatDeletes, sumTreePuts, sumTreeDeletes int64
 		for idx, d := range calcTimes {
@@ -472,6 +503,9 @@ func TestTrieStressBinary(t *testing.T) {
 			sumRoot += val
 			sumWall += float64(d.wall.Nanoseconds()) / 1000000.0
 			sumPrune += float64(d.prune.Nanoseconds()) / 1000000.0
+			sumPruneWait += float64(d.pruneWait.Nanoseconds()) / 1000000.0
+			sumPruneShard += float64(d.pruneShard.Nanoseconds()) / 1000000.0
+			sumPrunePrefetch += float64(d.prunePrefetch.Nanoseconds()) / 1000000.0
 			sumInsert += float64(d.insert.Nanoseconds()) / 1000000.0
 			sumUpdate += float64(d.update.Nanoseconds()) / 1000000.0
 			sumGet += float64(d.get.Nanoseconds()) / 1000000.0
@@ -500,6 +534,13 @@ func TestTrieStressBinary(t *testing.T) {
 		avgRoot := sumRoot / float64(n)
 		avgWall := sumWall / float64(n)
 		avgPrune := sumPrune / float64(n)
+		avgPruneWait := sumPruneWait / float64(n)
+		avgPruneShardOnly := sumPruneShard / float64(n)
+		avgPrunePrefetch := sumPrunePrefetch / float64(n)
+		avgPruneOther := avgPrune - avgPruneWait - avgPruneShardOnly - avgPrunePrefetch
+		if avgPruneOther < 0 {
+			avgPruneOther = 0
+		}
 		avgInsert := sumInsert / float64(n)
 		avgUpdate := sumUpdate / float64(n)
 		avgGet := sumGet / float64(n)
@@ -536,12 +577,57 @@ func TestTrieStressBinary(t *testing.T) {
 		proc.MemoryInfo() // 刷新
 		memInfo, _ := proc.MemoryInfo()
 		runtime.ReadMemStats(&mem)
-		stats := trie.Stats()
+		statsStart := time.Now()
+		statsMode := "disabled"
+		if statsEvery > 0 {
+			statsMode = "cached"
+			if lastStats == nil || epoch%statsEvery == 0 {
+				lastStats = trie.Stats()
+				statsMode = "exact"
+			}
+		}
+		statsDur := time.Since(statsStart)
+		stats := lastStats
+		if stats == nil {
+			stats = &TrieStats{}
+		}
+		falsePositiveDelta := stats.FalsePositiveCount - prevFalsePositiveCount
+		if falsePositiveDelta < 0 {
+			falsePositiveDelta = 0
+		}
+		if statsMode == "exact" {
+			prevFalsePositiveCount = stats.FalsePositiveCount
+		}
+		falsePositiveRate := 0.0
+		getOps := int64(n * *stressGetsPerBatch)
+		if getOps > 0 {
+			falsePositiveRate = float64(falsePositiveDelta) / float64(getOps)
+		}
+		diagNow := LastCommitDiagnostics()
+		nodeCacheHits := diagNow.NodeCacheHits - prevDiag.NodeCacheHits
+		nodeCacheMisses := diagNow.NodeCacheMisses - prevDiag.NodeCacheMisses
+		pathNodeDBGets := diagNow.PathNodeDBGets - prevDiag.PathNodeDBGets
+		promotionChecks := diagNow.ArchivePromotionChecks - prevDiag.ArchivePromotionChecks
+		promotionHits := diagNow.ArchivePromotionHits - prevDiag.ArchivePromotionHits
+		bucketRecomputes := diagNow.BucketRecomputes - prevDiag.BucketRecomputes
+		commitmentPointCacheHits := diagNow.CommitmentPointCacheHits - prevDiag.CommitmentPointCacheHits
+		commitmentPointCacheMisses := diagNow.CommitmentPointCacheMisses - prevDiag.CommitmentPointCacheMisses
+		pruneInternalVisits := diagNow.PruneInternalVisits - prevDiag.PruneInternalVisits
+		pruneHotSkips := diagNow.PruneHotSkips - prevDiag.PruneHotSkips
+		pruneChildHits := diagNow.PruneChildHits - prevDiag.PruneChildHits
+		pruneChildSkips := diagNow.PruneChildSkips - prevDiag.PruneChildSkips
+		pruneBulkCollects := diagNow.PruneBulkCollects - prevDiag.PruneBulkCollects
+		pruneCollectedLeaves := diagNow.PruneCollectedLeaves - prevDiag.PruneCollectedLeaves
+		pruneCollectedStubs := diagNow.PruneCollectedStubs - prevDiag.PruneCollectedStubs
+		pruneBuildItems := diagNow.PruneBuildItems - prevDiag.PruneBuildItems
+		pruneBuildBuckets := diagNow.PruneBuildBuckets - prevDiag.PruneBuildBuckets
+		pruneArchiveBuildParallels := diagNow.PruneArchiveBuildParallels - prevDiag.PruneArchiveBuildParallels
+		prevDiag = diagNow
 
 		// 归档增长强校验 (Panic Check)
 		// 只有在完成两个完整裁剪周期后，归档数据才应该有规模性增长。
 		cycleItems := (1 << config.ShardDepth) * BatchSize
-		if totalInjected > 2*cycleItems {
+		if lastStats != nil && totalInjected > 2*cycleItems {
 			// 在 50% 的更新率下，理论归档期望约为 0.5 * cycleItems。
 			// 这里设定 10% 为硬性红线，若低于此值则判定归档逻辑失效。
 			minExpected := int64(float64(cycleItems) * 0.1)
@@ -605,11 +691,37 @@ func TestTrieStressBinary(t *testing.T) {
 			fmt.Sprintf("%.2f", avgFlatDeletes),
 			fmt.Sprintf("%.2f", avgTreePuts),
 			fmt.Sprintf("%.2f", avgTreeDeletes),
+			fmt.Sprintf("%d", falsePositiveDelta),
+			fmt.Sprintf("%.8f", falsePositiveRate),
+			fmt.Sprintf("%.2f", float64(statsDur.Nanoseconds())/1000000.0),
+			statsMode,
+			fmt.Sprintf("%d", nodeCacheHits),
+			fmt.Sprintf("%d", nodeCacheMisses),
+			fmt.Sprintf("%d", pathNodeDBGets),
+			fmt.Sprintf("%d", promotionChecks),
+			fmt.Sprintf("%d", promotionHits),
+			fmt.Sprintf("%d", bucketRecomputes),
+			fmt.Sprintf("%.2f", avgPruneWait),
+			fmt.Sprintf("%.2f", avgPruneShardOnly),
+			fmt.Sprintf("%.2f", avgPrunePrefetch),
+			fmt.Sprintf("%.2f", avgPruneOther),
+			fmt.Sprintf("%d", commitmentPointCacheHits),
+			fmt.Sprintf("%d", commitmentPointCacheMisses),
+			fmt.Sprintf("%d", pruneInternalVisits),
+			fmt.Sprintf("%d", pruneHotSkips),
+			fmt.Sprintf("%d", pruneChildHits),
+			fmt.Sprintf("%d", pruneChildSkips),
+			fmt.Sprintf("%d", pruneBulkCollects),
+			fmt.Sprintf("%d", pruneCollectedLeaves),
+			fmt.Sprintf("%d", pruneCollectedStubs),
+			fmt.Sprintf("%d", pruneBuildItems),
+			fmt.Sprintf("%d", pruneBuildBuckets),
+			fmt.Sprintf("%d", pruneArchiveBuildParallels),
 		}
 		writer.Write(record)
 		writer.Flush()
 
-		fmt.Printf("TrieStats: LeafCount=%d, ArchiveItems=%d, BucketCount=%d, MaxBucketsPath=%d, BucketItemsAvg=%.2f, BucketItemsP50=%d, BucketItemsP95=%d, BucketItemsP99=%d, BucketItemsMax=%d\n",
+		fmt.Printf("TrieStats: LeafCount=%d, ArchiveItems=%d, BucketCount=%d, MaxBucketsPath=%d, BucketItemsAvg=%.2f, BucketItemsP50=%d, BucketItemsP95=%d, BucketItemsP99=%d, BucketItemsMax=%d, FalsePositiveDelta=%d, FalsePositiveRate=%.8f\n",
 			stats.LeafCount,
 			stats.ArchivedDataSize,
 			stats.BucketCount,
@@ -619,8 +731,10 @@ func TestTrieStressBinary(t *testing.T) {
 			stats.BucketItemsP95,
 			stats.BucketItemsP99,
 			stats.BucketItemsMax,
+			falsePositiveDelta,
+			falsePositiveRate,
 		)
-		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Leaves: %d, ArchiveItems: %d, Buckets: %d, MaxBucketsPath: %d, BucketItems[Avg: %.2f, P50: %d, P95: %d, P99: %d, Max: %d], Injected: %.2fM, Pool: %d, Root: %.2fms, Wall: %.2fms (Prune: %.2fms, Commit: %.2fms, FlushWait: %.2fms, WriteWait: %.2fms, RawFlush: %.2fms, RawWrite: %.2fms), RootP95: %.2fms, RootP99: %.2fms, RootBox[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
+		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Leaves: %d, ArchiveItems: %d, Buckets: %d, MaxBucketsPath: %d, BucketItems[Avg: %.2f, P50: %d, P95: %d, P99: %d, Max: %d], Injected: %.2fM, Pool: %d, Root: %.2fms, Wall: %.2fms (Prune: %.2fms, Commit: %.2fms, FlushWait: %.2fms, WriteWait: %.2fms, RawFlush: %.2fms, RawWrite: %.2fms), PruneSplit[Wait: %.2fms, Shard: %.2fms, PrefetchStart: %.2fms, Other: %.2fms], RootP95: %.2fms, RootP99: %.2fms, RootBox[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
 			startItem, endItem,
 			bytesToReadable(uint64(stateSize)),
 			bytesToReadable(uint64(archiveSize)),
@@ -636,6 +750,10 @@ func TestTrieStressBinary(t *testing.T) {
 			float64(totalInjected)/1000000.0,
 			len(keyPool),
 			avgRoot, avgWall, avgPrune, avgCommit, avgFlush, avgWrite, avgRawFlush, avgRawWrite,
+			avgPruneWait,
+			avgPruneShardOnly,
+			avgPrunePrefetch,
+			avgPruneOther,
 			p95,
 			p99,
 			minVal,
@@ -653,6 +771,104 @@ func TestTrieStressBinary(t *testing.T) {
 			t.Fatalf("Failed to write final async batch: %v", res.err)
 		}
 		pendingWrite = nil
+	}
+	if *stressFinalStats {
+		finalStatsStart := time.Now()
+		finalStats := trie.Stats()
+		finalStatsDur := time.Since(finalStatsStart)
+		finalStatsPath := filepath.Join(resultsDir, "final_structure_stats.csv")
+		finalStatsFile, err := os.Create(finalStatsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		finalStatsWriter := csv.NewWriter(finalStatsFile)
+		_ = finalStatsWriter.Write([]string{
+			"Total_Injected",
+			"Stats_ms",
+			"Leaf_Count",
+			"Archive_Items",
+			"Bucket_Count",
+			"Max_Buckets_Path",
+			"Bucket_Items_Avg",
+			"Bucket_Items_P50",
+			"Bucket_Items_P95",
+			"Bucket_Items_P99",
+			"Bucket_Items_Max",
+			"FalsePositive_Count",
+			"ArchiveStorage_MB",
+		})
+		_ = finalStatsWriter.Write([]string{
+			fmt.Sprintf("%d", totalInjected),
+			fmt.Sprintf("%.2f", float64(finalStatsDur.Nanoseconds())/1000000.0),
+			fmt.Sprintf("%d", finalStats.LeafCount),
+			fmt.Sprintf("%d", finalStats.ArchivedDataSize),
+			fmt.Sprintf("%d", finalStats.BucketCount),
+			fmt.Sprintf("%d", finalStats.MaxBucketsPath),
+			fmt.Sprintf("%.2f", finalStats.BucketItemsAvg),
+			fmt.Sprintf("%d", finalStats.BucketItemsP50),
+			fmt.Sprintf("%d", finalStats.BucketItemsP95),
+			fmt.Sprintf("%d", finalStats.BucketItemsP99),
+			fmt.Sprintf("%d", finalStats.BucketItemsMax),
+			fmt.Sprintf("%d", finalStats.FalsePositiveCount),
+			fmt.Sprintf("%.2f", float64(finalStats.ArchiveStorageSize)/(1024.0*1024.0)),
+		})
+		finalStatsWriter.Flush()
+		if err := finalStatsFile.Close(); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Printf("FinalStats: LeafCount=%d, ArchiveItems=%d, BucketCount=%d, MaxBucketsPath=%d, BucketItemsAvg=%.2f, BucketItemsP50=%d, BucketItemsP95=%d, BucketItemsP99=%d, BucketItemsMax=%d, StatsTime=%s\n",
+			finalStats.LeafCount,
+			finalStats.ArchivedDataSize,
+			finalStats.BucketCount,
+			finalStats.MaxBucketsPath,
+			finalStats.BucketItemsAvg,
+			finalStats.BucketItemsP50,
+			finalStats.BucketItemsP95,
+			finalStats.BucketItemsP99,
+			finalStats.BucketItemsMax,
+			finalStatsDur,
+		)
+	}
+	if *stressFilterFPSamplesPerBucket > 0 {
+		sampleStart := time.Now()
+		fpStats := trie.SampleArchiveFilterFalsePositives(*stressFilterFPSamplesPerBucket, *stressFilterFPSeed)
+		sampleDur := time.Since(sampleStart)
+		fpPath := filepath.Join(resultsDir, "archive_filter_fp.csv")
+		fpFile, err := os.Create(fpPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fpWriter := csv.NewWriter(fpFile)
+		_ = fpWriter.Write([]string{
+			"Samples_Per_Bucket",
+			"Bucket_Count",
+			"Sampled_Buckets",
+			"Samples",
+			"False_Positives",
+			"False_Positive_Rate",
+			"Sample_ms",
+		})
+		_ = fpWriter.Write([]string{
+			fmt.Sprintf("%d", *stressFilterFPSamplesPerBucket),
+			fmt.Sprintf("%d", fpStats.BucketCount),
+			fmt.Sprintf("%d", fpStats.SampledBuckets),
+			fmt.Sprintf("%d", fpStats.Samples),
+			fmt.Sprintf("%d", fpStats.FalsePositives),
+			fmt.Sprintf("%.10f", fpStats.Rate),
+			fmt.Sprintf("%.2f", float64(sampleDur.Nanoseconds())/1000000.0),
+		})
+		fpWriter.Flush()
+		if err := fpFile.Close(); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Printf("ArchiveFilterFP: Buckets=%d, SampledBuckets=%d, Samples=%d, FalsePositives=%d, Rate=%.10f, SampleTime=%s\n",
+			fpStats.BucketCount,
+			fpStats.SampledBuckets,
+			fpStats.Samples,
+			fpStats.FalsePositives,
+			fpStats.Rate,
+			sampleDur,
+		)
 	}
 }
 

@@ -168,6 +168,7 @@ func TestArchivedWritePromotionUsesBucketValueRef(t *testing.T) {
 	key := bytes.Repeat([]byte{0x3f}, 32)
 	oldValue := []byte("old-value")
 	oldValueRef := valueRefForKeyValue(key, oldValue)
+	shard.stageFlatValueForKey(key, oldValue)
 	bucket := &ArchiveBucketNode{dirty: true}
 	shard.recomputeBucket(bucket, []ArchivedKV{{
 		Suffix:     common.CopyBytes(key),
@@ -663,6 +664,529 @@ func TestSparseArchiveStubsCompactTowardBucketLimit(t *testing.T) {
 	}
 }
 
+func TestSideMountedBucketStaysUntilSinkThreshold(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ArchiveBucketSize = 10
+	config.CuckooBuckets = 64
+	config.CuckooSlots = 4
+	config.CompactArchiveStubs = true
+	config.ArchiveDB = db
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parent := &InternalNode{}
+	for i := 0; i < 6; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x20
+		key[31] = byte(i)
+		valueRef := shard.stageValueForKey(key, []byte{byte(i)})
+		prefix := shard.prefixBits(key, 8, nil)
+		suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, prefix, 8)
+		bucket := &ArchiveBucketNode{Path: prefix, PathBits: 8, dirty: true}
+		shard.recomputeBucket(bucket, []ArchivedKV{{
+			Suffix:     suffix,
+			SuffixBits: suffixBits,
+			Value:      valueRef,
+		}})
+		shard.attachStubs(parent, []*ArchiveBucketNode{bucket})
+	}
+	sunk, err := shard.sinkFirstMatureStub(parent, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sunk {
+		t.Fatal("bucket below 70% threshold should stay side-mounted")
+	}
+	if len(parent.StubList) != 1 || parent.StubList[0].Count != 6 {
+		t.Fatalf("unexpected side-mounted bucket state: stubs=%d", len(parent.StubList))
+	}
+	if parent.Left != nil || parent.Right != nil {
+		t.Fatal("below-threshold side-mounted bucket was placed on a child edge")
+	}
+}
+
+func TestMatureSideMountedBucketSinksToArchiveLeaf(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ArchiveBucketSize = 10
+	config.CuckooBuckets = 64
+	config.CuckooSlots = 4
+	config.CompactArchiveStubs = true
+	config.ArchiveDB = db
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parent := &InternalNode{}
+	keys := make([][]byte, 0, 7)
+	for i := 0; i < 7; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x20
+		key[31] = byte(i)
+		keys = append(keys, key)
+		value := []byte{byte(i), byte(i + 1)}
+		valueRef := shard.stageValueForKey(key, value)
+		prefix := shard.prefixBits(key, 8, nil)
+		suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, prefix, 8)
+		bucket := &ArchiveBucketNode{Path: prefix, PathBits: 8, dirty: true}
+		shard.recomputeBucket(bucket, []ArchivedKV{{
+			Suffix:     suffix,
+			SuffixBits: suffixBits,
+			Value:      valueRef,
+		}})
+		shard.attachStubs(parent, []*ArchiveBucketNode{bucket})
+	}
+	sunk, err := shard.sinkFirstMatureStub(parent, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sunk {
+		t.Fatal("bucket at 70% threshold did not sink")
+	}
+	if len(parent.StubList) != 0 {
+		t.Fatalf("mature bucket remained side-mounted: stubs=%d", len(parent.StubList))
+	}
+	child, ok := parent.Left.(*ArchiveBucketNode)
+	if !ok {
+		t.Fatalf("mature bucket should sink to a child archive leaf, got left=%T right=%T", parent.Left, parent.Right)
+	}
+	if child.Count != uint64(len(keys)) {
+		t.Fatalf("sunk bucket count mismatch: got %d want %d", child.Count, len(keys))
+	}
+	for i, key := range keys {
+		got, fromArchive, err := shard.getFromBucket(child, key, 0)
+		if err != nil || !fromArchive || !bytes.Equal(got, []byte{byte(i), byte(i + 1)}) {
+			t.Fatalf("sunk bucket lost key %d: got=%x fromArchive=%v err=%v", i, got, fromArchive, err)
+		}
+	}
+}
+
+func TestAttachAtPathSinksOnlyTriggeredMatureBucket(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ArchiveBucketSize = 10
+	config.CuckooBuckets = 64
+	config.CuckooSlots = 4
+	config.CompactArchiveStubs = true
+	config.ArchiveDB = db
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parent := &InternalNode{}
+	keys := make([][]byte, 0, 7)
+	for i := 0; i < 7; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x20
+		key[31] = byte(i)
+		keys = append(keys, key)
+		valueRef := shard.stageValueForKey(key, []byte{byte(i)})
+		prefix := shard.prefixBits(key, 8, nil)
+		item := ArchivedKV{
+			Suffix:     key,
+			SuffixBits: len(key) * 8,
+			Value:      valueRef,
+		}
+		changed, err := shard.collectAndAttachToStubListAtPath(parent, []ArchivedKV{item}, prefix, 8, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !changed {
+			t.Fatal("expected attach to mark parent changed")
+		}
+	}
+
+	if len(parent.StubList) != 0 {
+		t.Fatalf("triggered mature bucket should leave StubList, got %d stubs", len(parent.StubList))
+	}
+	child, ok := parent.Left.(*ArchiveBucketNode)
+	if !ok {
+		t.Fatalf("triggered bucket should sink on the ordinary child edge, got left=%T right=%T", parent.Left, parent.Right)
+	}
+	if child.Count != uint64(len(keys)) {
+		t.Fatalf("sunk bucket count mismatch: got %d want %d", child.Count, len(keys))
+	}
+}
+
+func TestMatureBucketSinksIntoHotChildAsArchiveSubtree(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ArchiveBucketSize = 10
+	config.CuckooBuckets = 64
+	config.CuckooSlots = 4
+	config.CompactArchiveStubs = true
+	config.ArchiveDB = db
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parent := &InternalNode{}
+	hotKey := make([]byte, 32)
+	hotKey[0] = 0x20
+	hotKey[31] = 0xff
+	hotValue := []byte("hot-value")
+	hotLeaf := &LeafNode{
+		Path:      shard.getSuffix(hotKey, 1, nil),
+		PathBits:  len(hotKey)*8 - 1,
+		ValueHash: shard.stageValueForKey(hotKey, hotValue),
+		dirty:     true,
+	}
+	shard.updateEpoch(hotLeaf)
+	parent.Left = hotLeaf
+	parent.LeftEpoch = hotLeaf.Epoch()
+
+	archiveKeys := make([][]byte, 0, 7)
+	archiveItems := make([]ArchivedKV, 0, 7)
+	prefix := shard.prefixBits(hotKey, 8, nil)
+	for i := 0; i < 7; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x20
+		key[31] = byte(i)
+		archiveKeys = append(archiveKeys, key)
+		value := []byte{byte(i), byte(i + 1)}
+		valueRef := shard.stageValueForKey(key, value)
+		suffix, suffixBits := shard.stripPrefix(key, len(key)*8, 0, prefix, 8)
+		archiveItems = append(archiveItems, ArchivedKV{
+			Suffix:     suffix,
+			SuffixBits: suffixBits,
+			Value:      valueRef,
+		})
+	}
+	bucket := &ArchiveBucketNode{Path: prefix, PathBits: 8, dirty: true}
+	shard.recomputeBucket(bucket, archiveItems)
+
+	if _, err := shard.attachStubsAtPath(parent, []*ArchiveBucketNode{bucket}, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if len(parent.StubList) != 0 {
+		t.Fatalf("mature bucket should sink instead of staying side-mounted, stubs=%d", len(parent.StubList))
+	}
+	if parent.Left == nil {
+		t.Fatal("mature bucket sink dropped the hot child")
+	}
+	stubs := shard.collectArchiveBucketStubs(parent.Left, nil)
+	var total uint64
+	for _, stub := range stubs {
+		total += stub.Count
+	}
+	if total != uint64(len(archiveKeys)) {
+		t.Fatalf("sunk archive subtree item count mismatch: got %d want %d", total, len(archiveKeys))
+	}
+
+	got, _, err := shard.get(parent, hotKey, 0)
+	if err != nil || !bytes.Equal(got, hotValue) {
+		t.Fatalf("hot key lost after sink: got=%q err=%v", got, err)
+	}
+	for i, key := range archiveKeys {
+		want := []byte{byte(i), byte(i + 1)}
+		got, _, err := shard.get(parent, key, 0)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("archive key %d lost after sink: got=%x want=%x err=%v", i, got, want, err)
+		}
+	}
+}
+
+func TestPathNodeCacheServesDestructiveReload(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.NodeStorageScheme = NodeStoragePath
+	config.EnablePathDiagnostics = true
+	config.NodeCacheLimit = 128
+	config.NodeCacheWarmPathBits = -1
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	key := make([]byte, 32)
+	key[0] = 0x42
+	value := []byte("cached-value")
+	if err := trie.Put(key, value); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := trie.CommitToBatch(batch, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	ResetCommitDiagnostics()
+	got, err := trie.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("cached reload value mismatch: got %q want %q", got, value)
+	}
+	diag := LastCommitDiagnostics()
+	if diag.NodeCacheHits == 0 {
+		t.Fatal("expected destructive reload to hit node blob cache")
+	}
+	if diag.PathNodeDBGets != 0 {
+		t.Fatalf("expected cached destructive reload to avoid path DB gets, got %d", diag.PathNodeDBGets)
+	}
+}
+
+func TestPathNodeCacheLazyDefaultWarmsAfterLoad(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.NodeStorageScheme = NodeStoragePath
+	config.EnablePathDiagnostics = true
+	config.NodeCacheLimit = 128
+	trie := NewTrie(nil, db, hasher, config, true)
+
+	key := make([]byte, 32)
+	key[0] = 0x24
+	value := []byte("lazy-cached-value")
+	if err := trie.Put(key, value); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := trie.CommitToBatch(batch, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	ResetCommitDiagnostics()
+	got, err := trie.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("first lazy reload value mismatch: got %q want %q", got, value)
+	}
+	diag := LastCommitDiagnostics()
+	if diag.NodeCacheMisses == 0 || diag.PathNodeDBGets == 0 {
+		t.Fatalf("expected default lazy reload to miss cache and read path DB, diag=%s", diag)
+	}
+
+	shardID := trie.GetShardID(key)
+	rootHash := trie.GetShardRoot(shardID)
+	shard := trie.shards[shardID]
+	shard.Reset(nil)
+	shard.Reset(rootHash)
+
+	ResetCommitDiagnostics()
+	got, err = trie.Get(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("second lazy reload value mismatch: got %q want %q", got, value)
+	}
+	diag = LastCommitDiagnostics()
+	if diag.NodeCacheHits == 0 {
+		t.Fatalf("expected second lazy reload to hit node blob cache, diag=%s", diag)
+	}
+	if diag.PathNodeDBGets != 0 {
+		t.Fatalf("expected second lazy reload to avoid path DB gets, got %d", diag.PathNodeDBGets)
+	}
+}
+
+func TestPathNodeCacheRemovesStalePath(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.NodeStorageScheme = NodeStoragePath
+	shard, err := NewShard(0, db, NewPooledKeccakHasher(), config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := pathNodeKey(0, []byte{0x80}, 1)
+	shard.cacheNodeBlob(key, []byte("stale-node"))
+	shard.staleSet[string(key)] = struct{}{}
+	if err := shard.commitStaleDeletes(db.NewBatch()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := shard.nodeCache.get(key); ok {
+		t.Fatal("stale path remained in node blob cache")
+	}
+}
+
+func TestCommitmentPointCacheServesReloadedBucket(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.EnablePathDiagnostics = true
+	config.CommitmentPointCacheLimit = 128
+	shard, err := NewShard(0, db, NewPooledKeccakHasher(), config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := []byte{0x80}
+	bucket := shard.buildArchiveBucket([]ArchivedKV{{
+		Suffix:     key,
+		SuffixBits: 8,
+		Value:      valueRefForKeyValue(key, []byte("cached-point-value")),
+	}}, nil, 0).(*ArchiveBucketNode)
+	shard.clearBucketCommitmentPoint(bucket)
+
+	ResetCommitDiagnostics()
+	if _, err := shard.bucketCommitmentPoint(bucket); err != nil {
+		t.Fatal(err)
+	}
+	diag := LastCommitDiagnostics()
+	if diag.CommitmentPointCacheMisses == 0 {
+		t.Fatalf("expected first point lookup to miss cache, diag=%s", diag)
+	}
+
+	reloaded := &ArchiveBucketNode{Commitment: common.CopyBytes(bucket.Commitment)}
+	ResetCommitDiagnostics()
+	if _, err := shard.bucketCommitmentPoint(reloaded); err != nil {
+		t.Fatal(err)
+	}
+	diag = LastCommitDiagnostics()
+	if diag.CommitmentPointCacheHits == 0 {
+		t.Fatalf("expected reloaded bucket point lookup to hit cache, diag=%s", diag)
+	}
+}
+
+func TestPutSkipsArchiveRemovalForFlatMiss(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.EnablePathDiagnostics = true
+	shard, err := NewShard(0, db, NewPooledKeccakHasher(), config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := make([]byte, 32)
+	key[0] = 0x9a
+	bucket := &ArchiveBucketNode{dirty: true}
+	shard.recomputeBucket(bucket, []ArchivedKV{{
+		Suffix:     common.CopyBytes(key),
+		SuffixBits: len(key) * 8,
+		Value:      valueRefForKeyValue(key, []byte("old-flat-value")),
+	}})
+	shard.root = bucket
+
+	ResetCommitDiagnostics()
+	if err := shard.putLocked(key, []byte("new-flat-value")); err != nil {
+		t.Fatalf("flat miss should skip archive removal probe: %v", err)
+	}
+	if bucket.Count != 1 {
+		t.Fatalf("flat miss removed archived membership: count=%d", bucket.Count)
+	}
+	diag := LastCommitDiagnostics()
+	if diag.ArchivePromotionChecks != 1 || diag.ArchivePromotionHits != 0 {
+		t.Fatalf("unexpected promotion diagnostics: checks=%d hits=%d", diag.ArchivePromotionChecks, diag.ArchivePromotionHits)
+	}
+}
+
+func TestPutSkipsPromotionProbeWhenNoArchivePossible(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.EnablePathDiagnostics = true
+	shard, err := NewShard(0, db, NewPooledKeccakHasher(), config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := make([]byte, 32)
+	key[0] = 0x4c
+	shard.root = &InternalNode{}
+	shard.refreshInternalEpochMask(shard.root.(*InternalNode))
+
+	ResetCommitDiagnostics()
+	if err := shard.putLocked(key, []byte("new-flat-value")); err != nil {
+		t.Fatalf("put with no possible archive: %v", err)
+	}
+	diag := LastCommitDiagnostics()
+	if diag.ArchivePromotionChecks != 0 || diag.ArchivePromotionHits != 0 {
+		t.Fatalf("archive-impossible write should not probe flat KV: checks=%d hits=%d", diag.ArchivePromotionChecks, diag.ArchivePromotionHits)
+	}
+}
+
+func TestPutSkipsFlatProbeForPersistedArchiveFilterMiss(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 0
+	config.NodeStorageScheme = NodeStoragePath
+	config.NodeCacheLimit = -1
+	config.NodeCacheWarmPathBits = -2
+	config.EnablePathDiagnostics = true
+	shard, err := NewShard(0, db, NewPooledKeccakHasher(), config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	archiveKey := make([]byte, 32)
+	archiveKey[0] = 0x10
+	newKey := make([]byte, 32)
+	newKey[0] = 0x11
+	bucket := &ArchiveBucketNode{dirty: true}
+	shard.recomputeBucket(bucket, []ArchivedKV{{
+		Suffix:     common.CopyBytes(archiveKey),
+		SuffixBits: len(archiveKey) * 8,
+		Value:      valueRefForKeyValue(archiveKey, []byte("old-archived-value")),
+	}})
+	root := &InternalNode{Left: bucket, dirty: true}
+	shard.root = root
+	batch := db.NewBatch()
+	if _, err := shard.CommitToBatch(batch, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if root.Left != nil || len(root.LeftHash) == 0 {
+		t.Fatal("expected destructive commit to leave only the persisted left child hash")
+	}
+
+	ResetCommitDiagnostics()
+	if err := shard.putLocked(newKey, []byte("new-hot-value")); err != nil {
+		t.Fatal(err)
+	}
+	diag := LastCommitDiagnostics()
+	if diag.ArchivePromotionChecks != 0 || diag.ArchivePromotionHits != 0 {
+		t.Fatalf("filter miss should avoid flat promotion probe: checks=%d hits=%d", diag.ArchivePromotionChecks, diag.ArchivePromotionHits)
+	}
+	if diag.PathNodeDBGets == 0 {
+		t.Fatalf("expected path-aware archive probe to load persisted child, diag=%s", diag)
+	}
+}
+
+func TestArchivePresenceSummarySurvivesSerialization(t *testing.T) {
+	shard, err := NewShard(0, NewMemoryDBAdapter(), NewPooledKeccakHasher(), DefaultConfig(), nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := &InternalNode{Left: &ArchiveBucketNode{Path: []byte{0x00}, PathBits: 8, Count: 1}}
+	parent.LeftEpoch = parent.Left.Epoch()
+	shard.refreshInternalEpochMask(parent)
+	present, ok := shard.subtreeArchivePresence(parent)
+	if !ok || !present {
+		t.Fatalf("expected live archive summary, present=%v ok=%v", present, ok)
+	}
+
+	data, err := parent.Serialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DeserializeNode(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decodedInternal := decoded.(*InternalNode)
+	present, ok = shard.subtreeArchivePresence(decodedInternal)
+	if !ok || !present {
+		t.Fatalf("expected persisted archive summary, present=%v ok=%v", present, ok)
+	}
+}
+
 func TestArchiveSubtreeKeepsBucketSizeLimitOnDegeneratePrefix(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
@@ -970,6 +1494,44 @@ func archiveShardForTest(trie *Trie, shardID int) error {
 	}
 	trie.pruneShardIdx = shardID
 	return trie.PruneNextShard()
+}
+
+func TestRollingEpochPrunesShardWrittenBeforeCursor(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 2
+	config.NodeStorageScheme = NodeStoragePath
+	config.ArchiveDB = db
+
+	trie := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
+	if err := trie.PruneNextShard(); err != nil {
+		t.Fatalf("initial prune failed: %v", err)
+	}
+
+	key := make([]byte, 32)
+	key[0] = 0x40 // first two bits 01 => shard 1
+	value := []byte("written-before-cursor")
+	if err := trie.Put(key, value); err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+	if _, err := trie.Commit(); err != nil {
+		t.Fatalf("commit failed: %v", err)
+	}
+
+	if err := trie.PruneNextShard(); err != nil {
+		t.Fatalf("second prune failed: %v", err)
+	}
+	stats := trie.Stats()
+	if stats.ArchivedDataSize != 1 {
+		t.Fatalf("expected shard-1 write to be archived, got %d archived items and %d leaves", stats.ArchivedDataSize, stats.LeafCount)
+	}
+	got, err := trie.Get(key)
+	if err != nil {
+		t.Fatalf("archived key lookup failed: %v", err)
+	}
+	if !bytes.Equal(got, value) {
+		t.Fatalf("archived value mismatch: got %q want %q", got, value)
+	}
 }
 
 func TestBasicOperations(t *testing.T) {
@@ -1804,6 +2366,48 @@ func TestPathStorageDestructiveCommitBoundsNodePaths(t *testing.T) {
 	}
 	if _, ok := shard.nodePaths[string(shard.rootHash)]; !ok {
 		t.Fatal("destructive commit did not retain the root hash-to-path mapping")
+	}
+}
+
+func TestStatsDoesNotRevivePathStorageShard(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	hasher := NewPooledKeccakHasher()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.NodeStorageScheme = NodeStoragePath
+
+	trie := NewTrie(nil, db, hasher, config, true)
+	for i := 0; i < 128; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x77
+		key[1] = byte(i)
+		if err := trie.Put(key, []byte{byte(i)}); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if _, err := trie.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	shard := trie.shards[0x77]
+	if shard == nil {
+		t.Fatal("expected path-storage shard")
+	}
+
+	beforeRootHash := append([]byte(nil), shard.rootHash...)
+	if stats := trie.Stats(); stats.LeafCount != 128 {
+		t.Fatalf("stats leaf count mismatch: got %d want 128", stats.LeafCount)
+	}
+
+	shard.mu.RLock()
+	defer shard.mu.RUnlock()
+	if shard.root != nil {
+		t.Fatal("Stats revived the destructive path-storage shard root")
+	}
+	if !bytes.Equal(shard.rootHash, beforeRootHash) {
+		t.Fatal("Stats changed the shard root hash")
+	}
+	if len(shard.nodePaths) != 1 {
+		t.Fatalf("Stats retained %d path mappings, want only root mapping", len(shard.nodePaths))
 	}
 }
 

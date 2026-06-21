@@ -100,6 +100,77 @@ func TestECMHIncremental(t *testing.T) {
 }
 
 // TestECMHVerifyFailure 测试 Verify 的失败情况。
+func TestECMHMerge(t *testing.T) {
+	committer := New()
+	left := []common.Hash{randomHash(), randomHash()}
+	right := []common.Hash{randomHash(), randomHash(), randomHash()}
+
+	leftCommitment, err := committer.Add(nil, left)
+	if err != nil {
+		t.Fatalf("left Add failed: %v", err)
+	}
+	rightCommitment, err := committer.Add(nil, right)
+	if err != nil {
+		t.Fatalf("right Add failed: %v", err)
+	}
+	merged, err := committer.Merge(leftCommitment, rightCommitment)
+	if err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+
+	all := append(append([]common.Hash{}, left...), right...)
+	direct, err := committer.Add(nil, all)
+	if err != nil {
+		t.Fatalf("direct Add failed: %v", err)
+	}
+	if !reflect.DeepEqual(merged, direct) {
+		t.Fatalf("merged commitment mismatch: merged %x direct %x", merged, direct)
+	}
+}
+
+func TestECMHMergePoints(t *testing.T) {
+	committer := New()
+	left := []common.Hash{randomHash(), randomHash()}
+	right := []common.Hash{randomHash(), randomHash(), randomHash()}
+
+	leftCommitment, err := committer.Add(nil, left)
+	if err != nil {
+		t.Fatalf("left Add failed: %v", err)
+	}
+	rightCommitment, err := committer.Add(nil, right)
+	if err != nil {
+		t.Fatalf("right Add failed: %v", err)
+	}
+	leftPoint, err := committer.DecodePoint(leftCommitment)
+	if err != nil {
+		t.Fatalf("decode left failed: %v", err)
+	}
+	rightPoint, err := committer.DecodePoint(rightCommitment)
+	if err != nil {
+		t.Fatalf("decode right failed: %v", err)
+	}
+
+	mergedPoints, cachedPoint, err := committer.MergePoints(leftPoint, rightPoint)
+	if err != nil {
+		t.Fatalf("MergePoints failed: %v", err)
+	}
+	mergedAgain, _, err := committer.MergePoints(cachedPoint)
+	if err != nil {
+		t.Fatalf("MergePoints cached point failed: %v", err)
+	}
+	if !reflect.DeepEqual(mergedPoints, mergedAgain) {
+		t.Fatalf("cached point commitment mismatch: merged %x cached %x", mergedPoints, mergedAgain)
+	}
+
+	merged, err := committer.Merge(leftCommitment, rightCommitment)
+	if err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+	if !reflect.DeepEqual(mergedPoints, merged) {
+		t.Fatalf("point merge mismatch: points %x merge %x", mergedPoints, merged)
+	}
+}
+
 func TestECMHVerifyFailure(t *testing.T) {
 	committer := New()
 	hashes := []common.Hash{randomHash(), randomHash()}

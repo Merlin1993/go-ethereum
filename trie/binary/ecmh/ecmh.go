@@ -32,6 +32,8 @@ var (
 	errInvalidCommitment = errors.New("invalid commitment encoding")
 )
 
+const parallelHashThreshold = 8
+
 // Committer 提供 ECMH (Elliptic Curve Multiset Hash) 承诺功能。
 // 它可以将一组哈希值映射到椭圆曲线上的点并进行累加，结果与添加顺序无关。
 type Committer struct {
@@ -53,32 +55,83 @@ type curvePoint struct {
 	y *big.Int
 }
 
+// Point is a decoded ECMH commitment point. It is an in-memory cache helper and
+// is not a serialized representation.
+type Point struct {
+	j secp256k1.JacobianPoint
+}
+
 // Add 为给定的承诺增加多个哈希。如果旧承诺为空，则从零点开始。
 // 返回更新后的承诺。
 func (c *Committer) Add(commitment []byte, hashes []common.Hash) ([]byte, error) {
 	if len(hashes) == 0 {
 		return commitment, nil
 	}
+	encoded, _, err := c.AddWithPoint(commitment, hashes)
+	return encoded, err
+}
+
+func (c *Committer) AddWithPoint(commitment []byte, hashes []common.Hash) ([]byte, *Point, error) {
+	var curr secp256k1.JacobianPoint
+	if len(commitment) != 0 {
+		if err := c.decodeJacobian(commitment, &curr); err != nil {
+			return nil, nil, err
+		}
+	}
+	if len(hashes) == 0 {
+		encoded := c.encodeJacobian(&curr)
+		return encoded, &Point{j: curr}, nil
+	}
 	if len(commitment) == 0 && len(hashes) == 1 {
 		point := c.hashToJacobianPoint(hashes[0])
-		return c.encodeJacobian(&point), nil
-	}
-	if len(commitment) == 0 && len(hashes) < 4 {
-		sum := c.hashesToJacobianSum(hashes, false)
-		return c.encodeJacobian(&sum), nil
-	}
-	if len(hashes) < 4 {
-		return c.addBigInt(commitment, hashes)
-	}
-	var curr secp256k1.JacobianPoint
-	if err := c.decodeJacobian(commitment, &curr); err != nil {
-		return nil, err
+		encoded := c.encodeJacobian(&point)
+		return encoded, &Point{j: point}, nil
 	}
 
 	sum := c.hashesToJacobianSum(hashes, false)
 	secp256k1.AddNonConst(&curr, &sum, &curr)
 
+	encoded := c.encodeJacobian(&curr)
+	return encoded, &Point{j: curr}, nil
+}
+
+// Merge adds already-encoded ECMH commitments together.
+func (c *Committer) Merge(commitment []byte, others ...[]byte) ([]byte, error) {
+	var curr secp256k1.JacobianPoint
+	if err := c.decodeJacobian(commitment, &curr); err != nil {
+		return nil, err
+	}
+	for _, other := range others {
+		if len(other) == 0 {
+			continue
+		}
+		var point secp256k1.JacobianPoint
+		if err := c.decodeJacobian(other, &point); err != nil {
+			return nil, err
+		}
+		secp256k1.AddNonConst(&curr, &point, &curr)
+	}
 	return c.encodeJacobian(&curr), nil
+}
+
+func (c *Committer) DecodePoint(commitment []byte) (*Point, error) {
+	var point secp256k1.JacobianPoint
+	if err := c.decodeJacobian(commitment, &point); err != nil {
+		return nil, err
+	}
+	return &Point{j: point}, nil
+}
+
+func (c *Committer) MergePoints(points ...*Point) ([]byte, *Point, error) {
+	var curr secp256k1.JacobianPoint
+	for _, point := range points {
+		if point == nil {
+			continue
+		}
+		secp256k1.AddNonConst(&curr, &point.j, &curr)
+	}
+	encoded := c.encodeJacobian(&curr)
+	return encoded, &Point{j: curr}, nil
 }
 
 func (c *Committer) addBigInt(commitment []byte, hashes []common.Hash) ([]byte, error) {
@@ -153,7 +206,7 @@ func (c *Committer) hashesToPoints(hashes []common.Hash) []curvePoint {
 	if len(hashes) == 0 {
 		return points
 	}
-	if len(hashes) < 8 || runtime.GOMAXPROCS(0) <= 1 {
+	if len(hashes) < parallelHashThreshold || runtime.GOMAXPROCS(0) <= 1 {
 		for i, h := range hashes {
 			x, y := c.hashToPoint(h)
 			points[i] = curvePoint{x: x, y: y}
@@ -187,7 +240,7 @@ func (c *Committer) hashesToJacobianPoints(hashes []common.Hash) []secp256k1.Jac
 	if len(hashes) == 0 {
 		return points
 	}
-	if len(hashes) < 8 || runtime.GOMAXPROCS(0) <= 1 {
+	if len(hashes) < parallelHashThreshold || runtime.GOMAXPROCS(0) <= 1 {
 		for i, h := range hashes {
 			points[i] = c.hashToJacobianPoint(h)
 		}
@@ -219,7 +272,7 @@ func (c *Committer) hashesToJacobianSum(hashes []common.Hash, negate bool) secp2
 	if len(hashes) == 0 {
 		return sum
 	}
-	if len(hashes) < 8 || runtime.GOMAXPROCS(0) <= 1 {
+	if len(hashes) < parallelHashThreshold || runtime.GOMAXPROCS(0) <= 1 {
 		for _, h := range hashes {
 			point := c.hashToJacobianPoint(h)
 			if negate {

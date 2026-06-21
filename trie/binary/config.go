@@ -25,29 +25,36 @@ type FlatValueReader interface {
 
 // Config holds the configuration parameters for the Trie.
 type Config struct {
-	ShardDepth            int          // Number of bits for shard routing (default 16)
-	ArchiveBucketSize     int          // Max number of items in an archive bucket before splitting (default 100)
-	ArchiveItemCacheLimit int          // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
-	CompactArchiveStubs   bool         // Merge adjacent archive stubs synchronously; expensive on hot pruning paths
-	ArchiveDB             ArchiveStore // Separate store for archive data
-	FlatReader            FlatValueReader
-	CuckooBuckets         int  // Number of buckets in cuckoo filter (default 32)
-	CuckooSlots           int  // Slots per bucket in cuckoo filter (default 4)
-	InlineValueThreshold  int  // Inline values up to this size into leaf/archive refs; 0 disables
-	DeleteOldValues       bool // Use key-bound value refs and delete superseded external value blobs
-	NodeStorageScheme     string
+	ShardDepth                int          // Number of bits for shard routing (default 16)
+	ArchiveBucketSize         int          // Max number of items in an archive bucket before splitting (default 100)
+	ArchiveItemCacheLimit     int          // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
+	NodeCacheLimit            int          // Max serialized node blobs cached in process; 0 uses default, negative disables
+	NodeCacheWarmPathBits     int          // Path-mode eager warming depth; 0 uses default, -1 keeps root-only, <-1 disables eager warming
+	CommitmentPointCacheLimit int          // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
+	EnablePathDiagnostics     bool         // Record path/cache diagnostics; disabled by default for hot experiments
+	CompactArchiveStubs       bool         // Merge adjacent archive stubs synchronously; expensive on hot pruning paths
+	ArchiveDB                 ArchiveStore // Separate store for archive data
+	FlatReader                FlatValueReader
+	CuckooBuckets             int  // Number of buckets in cuckoo filter (default 32)
+	CuckooSlots               int  // Slots per bucket in cuckoo filter (default 4)
+	InlineValueThreshold      int  // Inline values up to this size into leaf/archive refs; 0 disables
+	DeleteOldValues           bool // Use key-bound value refs and delete superseded external value blobs
+	NodeStorageScheme         string
 }
 
 // DefaultConfig returns a Config with default values.
 func DefaultConfig() *Config {
 	return &Config{
-		ShardDepth:            16,
-		ArchiveBucketSize:     100,
-		ArchiveItemCacheLimit: -1,
-		CompactArchiveStubs:   true,
-		CuckooBuckets:         32,
-		CuckooSlots:           4,
-		NodeStorageScheme:     NodeStorageHash,
+		ShardDepth:                16,
+		ArchiveBucketSize:         100,
+		ArchiveItemCacheLimit:     -1,
+		NodeCacheLimit:            DefaultNodeCacheLimit,
+		NodeCacheWarmPathBits:     DefaultNodeCacheWarmPathBits,
+		CommitmentPointCacheLimit: DefaultCommitmentPointCacheLimit,
+		CompactArchiveStubs:       true,
+		CuckooBuckets:             32,
+		CuckooSlots:               4,
+		NodeStorageScheme:         NodeStorageHash,
 	}
 }
 
@@ -109,7 +116,7 @@ func (t *Trie) Stats() *TrieStats {
 			continue
 		}
 		seen[i] = struct{}{}
-		shard.accumulateStats(stats)
+		shard.accumulateStatsIsolated(stats)
 	}
 
 	if t.topTree != nil {
@@ -126,20 +133,33 @@ func (t *Trie) Stats() *TrieStats {
 
 		for id, root := range roots {
 			shardID := id
-			shard, err := NewShard(shardID, t.db, t.hasher, t.config, root, t.pruning, func() byte {
+			shard := newStatsShardView(shardID, t.db, t.hasher, t.config, nil, root, t.pruning, func() byte {
 				if shardID < t.pruneShardIdx {
 					return t.globalEpochBit
 				}
 				return t.globalEpochBit ^ 1
 			})
-			if err == nil && shard != nil {
-				shard.accumulateStats(stats)
-			}
+			shard.accumulateStats(stats)
 		}
 	}
 
 	stats.finalizeBucketItemStats()
 	return stats
+}
+
+func newStatsShardView(id int, db KVStore, hasher Hasher, config *Config, nodeCache *nodeBlobCache, rootHash []byte, pruning bool, globalEpochBit func() byte) *Shard {
+	return &Shard{
+		id:             id,
+		db:             db,
+		hasher:         hasher,
+		config:         config,
+		nodeCache:      nodeCache,
+		rootHash:       append([]byte(nil), rootHash...),
+		nodePaths:      make(map[string]persistedNodePath),
+		pruning:        pruning,
+		globalEpochBit: globalEpochBit,
+		stats:          &TrieStats{},
+	}
 }
 
 func (s *TrieStats) addBucketItemCount(count uint64) {
@@ -199,33 +219,48 @@ func percentileRank(total int, p float64) int {
 }
 
 func (s *Shard) accumulateStats(stats *TrieStats) {
+	s.accumulateStatsWithCache(stats, s.nodeCache)
+}
+
+func (s *Shard) accumulateStatsIsolated(stats *TrieStats) {
+	s.accumulateStatsWithCache(stats, nil)
+}
+
+func (s *Shard) accumulateStatsWithCache(stats *TrieStats, nodeCache *nodeBlobCache) {
 	s.mu.RLock()
-	if s.root == nil && len(s.rootHash) > 0 {
-		s.mu.RUnlock()
-		s.mu.Lock()
-		if s.root == nil {
-			node, _ := s.loadNode(s.rootHash)
-			s.root = node
-		}
-		s.mu.Unlock()
-		s.mu.RLock()
-	}
 	root := s.root
+	rootHash := append([]byte(nil), s.rootHash...)
 	s.mu.RUnlock()
 
-	s.statsMut.Lock()
-	stats.ArchiveReadCount += s.stats.ArchiveReadCount
-	stats.FalsePositiveCount += s.stats.FalsePositiveCount
-	stats.ArchiveStorageSize += s.stats.ArchiveStorageSize
-	s.statsMut.Unlock()
+	if s.stats != nil {
+		s.statsMut.Lock()
+		stats.ArchiveReadCount += s.stats.ArchiveReadCount
+		stats.FalsePositiveCount += s.stats.FalsePositiveCount
+		stats.ArchiveStorageSize += s.stats.ArchiveStorageSize
+		s.statsMut.Unlock()
+	}
+
+	if root == nil && len(rootHash) > 0 {
+		view := newStatsShardView(s.id, s.db, s.hasher, s.config, nodeCache, rootHash, s.pruning, s.globalEpochBit)
+		loaded, err := view.loadNodeAtPath(rootHash, nil, 0)
+		if err == nil {
+			root = loaded
+			view.nodeStatsAtPath(root, nil, 0, 0, stats)
+			return
+		}
+	}
 
 	if root == nil {
 		return
 	}
-	s.nodeStats(root, 0, stats)
+	s.nodeStatsAtPath(root, nil, 0, 0, stats)
 }
 
 func (s *Shard) nodeStats(node Node, currentPathBuckets int, stats *TrieStats) {
+	s.nodeStatsAtPath(node, nil, 0, currentPathBuckets, stats)
+}
+
+func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPathBuckets int, stats *TrieStats) {
 	if node == nil {
 		return
 	}
@@ -246,24 +281,23 @@ func (s *Shard) nodeStats(node Node, currentPathBuckets int, stats *TrieStats) {
 		}
 
 		// Recurse to children
+		leftPath, leftBits := s.childStoragePath(path, pathBits, n, 0)
 		if n.Left != nil {
-			s.nodeStats(n.Left, newPathBuckets, stats)
+			s.nodeStatsAtPath(n.Left, leftPath, leftBits, newPathBuckets, stats)
 		} else if len(n.LeftHash) > 0 {
-			// In a real implementation, we might not want to load all nodes for stats
-			// but for this task we assume we can or just count what's in memory.
-			// Let's at least try to load if we want accurate stats.
-			loaded, _ := s.loadNode(n.LeftHash)
+			loaded, _ := s.loadNodeAtPath(n.LeftHash, leftPath, leftBits)
 			if loaded != nil {
-				s.nodeStats(loaded, newPathBuckets, stats)
+				s.nodeStatsAtPath(loaded, leftPath, leftBits, newPathBuckets, stats)
 			}
 		}
 
+		rightPath, rightBits := s.childStoragePath(path, pathBits, n, 1)
 		if n.Right != nil {
-			s.nodeStats(n.Right, newPathBuckets, stats)
+			s.nodeStatsAtPath(n.Right, rightPath, rightBits, newPathBuckets, stats)
 		} else if len(n.RightHash) > 0 {
-			loaded, _ := s.loadNode(n.RightHash)
+			loaded, _ := s.loadNodeAtPath(n.RightHash, rightPath, rightBits)
 			if loaded != nil {
-				s.nodeStats(loaded, newPathBuckets, stats)
+				s.nodeStatsAtPath(loaded, rightPath, rightBits, newPathBuckets, stats)
 			}
 		}
 	case *LeafNode:

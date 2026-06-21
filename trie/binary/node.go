@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/trie/binary/cuckoo"
+	"github.com/ethereum/go-ethereum/trie/binary/ecmh"
 )
 
 const (
@@ -19,6 +20,8 @@ const (
 	epochSubtreeMaskBits  = 0x06
 	epochSubtreeMaskShift = 1
 	epochSubtreeMaskValid = 0x08
+	epochArchivePresent   = 0x10
+	epochArchiveValid     = 0x20
 )
 
 func leafEpochMask(epoch byte) byte {
@@ -39,6 +42,25 @@ func setStoredSubtreeEpochMask(epoch byte, mask byte) byte {
 
 func clearStoredSubtreeEpochMask(epoch byte) byte {
 	return epoch &^ (epochSubtreeMaskBits | epochSubtreeMaskValid)
+}
+
+func storedSubtreeArchivePresence(epoch byte) (bool, bool) {
+	if epoch&epochArchiveValid == 0 {
+		return false, false
+	}
+	return epoch&epochArchivePresent != 0, true
+}
+
+func setStoredSubtreeArchivePresence(epoch byte, present bool) byte {
+	epoch |= epochArchiveValid
+	if present {
+		return epoch | epochArchivePresent
+	}
+	return epoch &^ epochArchivePresent
+}
+
+func clearStoredSubtreeArchivePresence(epoch byte) byte {
+	return epoch &^ (epochArchivePresent | epochArchiveValid)
 }
 
 // Node 接口：统一描述二叉 Trie 节点的核心行为
@@ -375,11 +397,12 @@ type ArchiveBucketNode struct {
 
 	// [CACHE] 缓存解码后的过滤器和数据项，避免重复解码/反序列化。
 	// 这些字段不序列化到磁盘。
-	cachedFilter *cuckoo.Filter
-	cachedItems  []ArchivedKV
-	cachedMeta   []byte
-	cacheMu      sync.RWMutex
-	metaMu       sync.RWMutex
+	cachedFilter          *cuckoo.Filter
+	cachedItems           []ArchivedKV
+	cachedCommitmentPoint *ecmh.Point
+	cachedMeta            []byte
+	cacheMu               sync.RWMutex
+	metaMu                sync.RWMutex
 }
 
 func NewArchiveBucketNode(path []byte, bits int, filter []byte, commitment []byte, count uint64) *ArchiveBucketNode {
@@ -399,7 +422,7 @@ func (n *ArchiveBucketNode) Type() byte {
 }
 
 func (n *ArchiveBucketNode) Epoch() byte {
-	return 0 // 归档数据无 Epoch 演进
+	return epochArchiveValid | epochArchivePresent
 }
 
 func (n *ArchiveBucketNode) SetEpoch(e byte) {
@@ -505,6 +528,7 @@ func (n *ArchiveBucketNode) ClearCaches() {
 	n.cacheMu.Lock()
 	n.cachedFilter = nil
 	n.cachedItems = nil
+	n.cachedCommitmentPoint = nil
 	n.cacheMu.Unlock()
 	n.invalidateMetaCache()
 }

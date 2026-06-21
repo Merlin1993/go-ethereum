@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,14 +32,16 @@ func decodeInlineValue(ref []byte) ([]byte, bool) {
 
 // Shard 表示一个二叉 Merkle Patricia Trie 的分片（子树）。
 type Shard struct {
-	mu        sync.RWMutex // Protects root, rootHash, and staleSet
-	root      Node
-	db        KVStore
-	hasher    Hasher
-	pruning   bool
-	staleSet  map[string]struct{} // Set of hashes as string keys (for pruning)
-	rootHash  []byte              // Last persisted root hash for lazy loading
-	nodePaths map[string]persistedNodePath
+	mu         sync.RWMutex // Protects root, rootHash, and staleSet
+	root       Node
+	db         KVStore
+	hasher     Hasher
+	pruning    bool
+	staleSet   map[string]struct{} // Set of hashes as string keys (for pruning)
+	rootHash   []byte              // Last persisted root hash for lazy loading
+	nodePaths  map[string]persistedNodePath
+	nodeCache  *nodeBlobCache
+	pointCache *commitmentPointCache
 
 	// Shard specific state
 	id       int
@@ -132,6 +133,10 @@ func flatValueDataKey(key []byte) []byte {
 
 // NewShard 创建一个新的 Shard（若提供 rootHash 则从 DB 加载根节点）。
 func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte, pruning bool, globalEpochBit func() byte) (*Shard, error) {
+	return newShard(id, db, hasher, config, rootHash, pruning, globalEpochBit, newNodeBlobCache(configNodeCacheLimit(config)), newCommitmentPointCache(configCommitmentPointCacheLimit(config)))
+}
+
+func newShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte, pruning bool, globalEpochBit func() byte, nodeCache *nodeBlobCache, pointCache *commitmentPointCache) (*Shard, error) {
 	s := &Shard{
 		id:                      id,
 		db:                      db,
@@ -139,6 +144,8 @@ func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte
 		pruning:                 pruning,
 		staleSet:                make(map[string]struct{}),
 		nodePaths:               make(map[string]persistedNodePath),
+		nodeCache:               nodeCache,
+		pointCache:              pointCache,
 		config:                  config,
 		globalEpochBit:          globalEpochBit,
 		isPruned:                false,
@@ -165,6 +172,20 @@ func NewShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte
 		s.root = node
 	}
 	return s, nil
+}
+
+func configNodeCacheLimit(config *Config) int {
+	if config == nil {
+		return DefaultNodeCacheLimit
+	}
+	return config.NodeCacheLimit
+}
+
+func configCommitmentPointCacheLimit(config *Config) int {
+	if config == nil {
+		return DefaultCommitmentPointCacheLimit
+	}
+	return config.CommitmentPointCacheLimit
 }
 
 // ClearCaches 清除分片内存中的缓存数据。
@@ -212,9 +233,18 @@ func (s *Shard) loadNode(hash []byte) (Node, error) {
 		}
 		storageKey = pathNodeKey(s.id, persisted.path, persisted.bits)
 	}
-	data, err := s.db.Get(storageKey)
-	if err != nil {
-		return nil, err
+	data, ok := s.getCachedNodeBlob(storageKey)
+	if !ok {
+		var err error
+		data, err = s.db.Get(storageKey)
+		recordPathDBGetIfEnabled(s.config)
+		if err != nil {
+			if s.config != nil && s.config.UsePathStorage() {
+				return nil, fmt.Errorf("load node at shard %d path %x/%d hash %x: %w", s.id, persisted.path, persisted.bits, hash, err)
+			}
+			return nil, fmt.Errorf("load node at shard %d hash %x: %w", s.id, hash, err)
+		}
+		s.cacheNodeBlob(storageKey, data)
 	}
 	if data == nil {
 		return nil, fmt.Errorf("node not found: hash %x in shard %d", hash, s.id)
@@ -224,7 +254,25 @@ func (s *Shard) loadNode(hash []byte) (Node, error) {
 		return nil, err
 	}
 	if s.config != nil && s.config.UsePathStorage() && !bytes.Equal(s.hasher.Hash(data), hash) {
-		return nil, fmt.Errorf("node hash mismatch at path %x/%d in shard %d", persisted.path, persisted.bits, s.id)
+		if ok {
+			s.removeCachedNodeBlob(storageKey)
+			data, err = s.db.Get(storageKey)
+			recordPathDBGetIfEnabled(s.config)
+			if err != nil {
+				return nil, fmt.Errorf("load node at shard %d path %x/%d hash %x: %w", s.id, persisted.path, persisted.bits, hash, err)
+			}
+			if data == nil {
+				return nil, fmt.Errorf("node not found: hash %x in shard %d", hash, s.id)
+			}
+			s.cacheNodeBlob(storageKey, data)
+			node, err = DeserializeNode(data)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !bytes.Equal(s.hasher.Hash(data), hash) {
+			return nil, fmt.Errorf("node hash mismatch at path %x/%d in shard %d", persisted.path, persisted.bits, s.id)
+		}
 	}
 	node.SetHash(hash)
 	node.SetOriginalHash(hash) // 记录节点当前持久化版本，用于之后修剪
@@ -235,9 +283,111 @@ func (s *Shard) loadNode(hash []byte) (Node, error) {
 	return node, nil
 }
 
+func (s *Shard) loadNodeAtPath(hash, path []byte, bits int) (Node, error) {
+	if len(hash) == 0 {
+		return nil, nil
+	}
+	storageKey := hash
+	if s.config != nil && s.config.UsePathStorage() {
+		storageKey = pathNodeKey(s.id, path, bits)
+	}
+	data, ok := s.getCachedNodeBlob(storageKey)
+	if !ok {
+		var err error
+		data, err = s.db.Get(storageKey)
+		recordPathDBGetIfEnabled(s.config)
+		if err != nil {
+			if s.config != nil && s.config.UsePathStorage() {
+				return nil, fmt.Errorf("load node at shard %d path %x/%d hash %x: %w", s.id, path, bits, hash, err)
+			}
+			return nil, fmt.Errorf("load node at shard %d hash %x: %w", s.id, hash, err)
+		}
+		s.cacheNodeBlob(storageKey, data)
+	}
+	if data == nil {
+		return nil, fmt.Errorf("node not found: hash %x in shard %d", hash, s.id)
+	}
+	node, err := DeserializeNode(data)
+	if err != nil {
+		return nil, err
+	}
+	if s.config != nil && s.config.UsePathStorage() && !bytes.Equal(s.hasher.Hash(data), hash) {
+		if ok {
+			s.removeCachedNodeBlob(storageKey)
+			data, err = s.db.Get(storageKey)
+			recordPathDBGetIfEnabled(s.config)
+			if err != nil {
+				return nil, fmt.Errorf("load node at shard %d path %x/%d hash %x: %w", s.id, path, bits, hash, err)
+			}
+			if data == nil {
+				return nil, fmt.Errorf("node not found: hash %x in shard %d", hash, s.id)
+			}
+			s.cacheNodeBlob(storageKey, data)
+			node, err = DeserializeNode(data)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !bytes.Equal(s.hasher.Hash(data), hash) {
+			return nil, fmt.Errorf("node hash mismatch at path %x/%d in shard %d", path, bits, s.id)
+		}
+	}
+	node.SetHash(hash)
+	node.SetOriginalHash(hash)
+	if s.config != nil && s.config.UsePathStorage() {
+		node.SetStoragePath(path, bits)
+	}
+	return node, nil
+}
+
+func (s *Shard) loadChildNode(parent *InternalNode, bit byte, hash []byte) (Node, error) {
+	if len(hash) == 0 {
+		return nil, nil
+	}
+	if s.config == nil || !s.config.UsePathStorage() {
+		return s.loadNode(hash)
+	}
+	path, bits := s.childNodeStoragePath(parent, bit)
+	if persisted, ok := s.nodePaths[string(hash)]; ok {
+		path, bits = persisted.path, persisted.bits
+	}
+	node, err := s.loadNodeAtPath(hash, path, bits)
+	if err != nil {
+		return nil, err
+	}
+	s.registerChildPaths(node, path, bits)
+	return node, nil
+}
+
+func (s *Shard) prefetchNodeAtPath(hash, path []byte, bits int, visited *int, limit int) {
+	if len(hash) == 0 || visited == nil || (limit > 0 && *visited >= limit) {
+		return
+	}
+	node, err := s.loadNodeAtPath(hash, path, bits)
+	if err != nil || node == nil {
+		return
+	}
+	*visited++
+	n, ok := node.(*InternalNode)
+	if !ok {
+		return
+	}
+	if len(n.LeftHash) > 0 {
+		childPath, childBits := s.childStoragePath(path, bits, n, 0)
+		s.prefetchNodeAtPath(n.LeftHash, childPath, childBits, visited, limit)
+	}
+	if len(n.RightHash) > 0 {
+		childPath, childBits := s.childStoragePath(path, bits, n, 1)
+		s.prefetchNodeAtPath(n.RightHash, childPath, childBits, visited, limit)
+	}
+}
+
 func (s *Shard) registerNodePath(hash, path []byte, bits int) {
 	if s.config == nil || !s.config.UsePathStorage() || len(hash) == 0 {
 		return
+	}
+	if s.nodePaths == nil {
+		s.nodePaths = make(map[string]persistedNodePath)
 	}
 	s.nodePaths[string(hash)] = persistedNodePath{
 		path: append([]byte(nil), path...),
@@ -245,9 +395,28 @@ func (s *Shard) registerNodePath(hash, path []byte, bits int) {
 	}
 }
 
+func (s *Shard) getCachedNodeBlob(storageKey []byte) ([]byte, bool) {
+	data, ok := s.nodeCache.get(storageKey)
+	recordNodeCacheLookupIfEnabled(s.config, ok)
+	return data, ok
+}
+
+func (s *Shard) cacheNodeBlob(storageKey, data []byte) {
+	s.nodeCache.add(storageKey, data)
+}
+
+func (s *Shard) removeCachedNodeBlob(storageKey []byte) {
+	s.nodeCache.remove(storageKey)
+}
+
 func (s *Shard) childStoragePath(parentPath []byte, parentBits int, n *InternalNode, bit byte) ([]byte, int) {
 	nodePath, nodeBits := s.prependPath(n.Path, n.PathBits, parentPath, parentBits)
 	return s.concatPath(nodePath, nodeBits, bit, nil, 0)
+}
+
+func (s *Shard) childNodeStoragePath(n *InternalNode, bit byte) ([]byte, int) {
+	parentPath, parentBits := n.StoragePath()
+	return s.childStoragePath(parentPath, parentBits, n, bit)
 }
 
 func (s *Shard) registerChildPaths(node Node, path []byte, bits int) {
@@ -375,125 +544,186 @@ func (s *Shard) markArchiveDataDelete(hash []byte, oldSize int) {
 }
 
 func (s *Shard) attachStubs(parent *InternalNode, stubs []*ArchiveBucketNode) {
+	_, _ = s.attachStubsInternal(parent, stubs, nil, 0, false)
+}
+
+func (s *Shard) attachStubsAtPath(parent *InternalNode, stubs []*ArchiveBucketNode, nodePath []byte, nodeBits int) (bool, error) {
+	return s.attachStubsInternal(parent, stubs, nodePath, nodeBits, true)
+}
+
+func (s *Shard) attachStubsInternal(parent *InternalNode, stubs []*ArchiveBucketNode, nodePath []byte, nodeBits int, sinkMature bool) (bool, error) {
 	if parent == nil || len(stubs) == 0 {
-		return
+		return false, nil
 	}
 	s.markPersistedNodeStale(parent)
+	changed := false
 	for _, stub := range stubs {
-		if stub != nil {
+		if stub == nil {
+			continue
+		}
+		s.detachArchiveStub(stub)
+		var target *ArchiveBucketNode
+		if s.config != nil && s.config.CompactArchiveStubs {
+			target = s.mergeStubIntoList(parent, stub)
+		} else {
 			parent.StubList = append(parent.StubList, stub)
+			target = stub
+		}
+		changed = true
+		if sinkMature && s.shouldSinkSideMountedBucket(target) {
+			sunk, err := s.sinkSpecificMatureStub(parent, nodePath, nodeBits, target)
+			if err != nil {
+				return changed, err
+			}
+			if sunk {
+				changed = true
+			}
 		}
 	}
-	if s.config != nil && s.config.CompactArchiveStubs {
-		s.compactStubList(parent)
-	}
+	s.refreshInternalEpochMask(parent)
 	parent.SetDirty(true)
+	return changed, nil
+}
+
+func (s *Shard) detachArchiveStub(bucket *ArchiveBucketNode) {
+	if bucket == nil || s.config == nil || !s.config.UsePathStorage() {
+		return
+	}
+	bucket.originalHash = nil
+	bucket.storagePath = nil
+	bucket.storageBits = 0
 }
 
 func (s *Shard) compactStubList(parent *InternalNode) {
 	if parent == nil || len(parent.StubList) < 2 {
 		return
 	}
-	limit := s.config.ResolveArchiveBucketSize()
+	stubs := parent.StubList
+	parent.StubList = nil
+	for _, stub := range stubs {
+		if stub != nil {
+			s.mergeStubIntoList(parent, stub)
+		}
+	}
+	s.refreshInternalEpochMask(parent)
+	parent.SetDirty(true)
+}
+
+func (s *Shard) mergeStubIntoList(parent *InternalNode, stub *ArchiveBucketNode) *ArchiveBucketNode {
+	if parent == nil || stub == nil {
+		return nil
+	}
+	limit := 0
+	if s.config != nil {
+		limit = s.config.ResolveArchiveBucketSize()
+	}
 	if limit <= 0 {
 		limit = int(^uint(0) >> 1)
 	}
 
-	stubs := make([]*ArchiveBucketNode, 0, len(parent.StubList))
-	changed := false
-	for _, bucket := range parent.StubList {
-		if bucket == nil {
-			changed = true
-			continue
+	current := stub
+	for {
+		if s.shouldSinkSideMountedBucket(current) {
+			parent.StubList = append(parent.StubList, current)
+			return current
 		}
-		stubs = append(stubs, bucket)
-	}
-	if len(stubs) < 2 {
-		if changed {
-			parent.StubList = stubs
-			parent.SetDirty(true)
+		idx, path, bits := s.findMergeCandidate(parent.StubList, current, limit)
+		if idx < 0 {
+			parent.StubList = append(parent.StubList, current)
+			return current
 		}
-		return
-	}
-
-	sort.SliceStable(stubs, func(i, j int) bool {
-		return s.archiveBucketPathLess(stubs[i], stubs[j])
-	})
-
-	newList := make([]*ArchiveBucketNode, 0, len(stubs))
-	for i := 0; i < len(stubs); {
-		bucket := stubs[i]
-		total := bucket.Count
-		commonPath := s.prefixBits(bucket.Path, bucket.PathBits, nil)
-		commonBits := bucket.PathBits
-		end := i
-
-		for j := i + 1; j < len(stubs); j++ {
-			next := stubs[j]
-			if total+next.Count > uint64(limit) {
-				break
-			}
-			commonPath, commonBits = s.commonArchivePath(commonPath, commonBits, next.Path, next.PathBits)
-			total += next.Count
-			end = j
-		}
-
-		if end == i {
-			newList = append(newList, bucket)
-			i++
-			continue
-		}
-
-		group := stubs[i : end+1]
-		items := make([]ArchivedKV, 0, total)
-		oldHashes := make([][]byte, 0, len(group))
-		oldSizes := make([]int, 0, len(group))
-		ok := true
-		for _, oldBucket := range group {
-			hash := s.ensureBucketHash(oldBucket)
-			bucketItems, err := s.bucketItemsWithValueRefs(oldBucket)
-			if err != nil {
-				ok = false
-				break
-			}
-			for _, item := range bucketItems {
-				absPath, absBits := s.prependPath(item.Suffix, item.SuffixBits, oldBucket.Path, oldBucket.PathBits)
-				suffix, suffixBits := s.stripPrefix(absPath, absBits, 0, commonPath, commonBits)
-				items = append(items, ArchivedKV{
-					Suffix:     suffix,
-					SuffixBits: suffixBits,
-					Value:      item.Value,
-				})
-			}
-			oldHashes = append(oldHashes, common.CopyBytes(hash))
-			oldSizes = append(oldSizes, -1)
-		}
+		merged, ok := s.mergeArchiveBuckets(parent.StubList[idx], current, path, bits)
 		if !ok {
-			newList = append(newList, group...)
-			i = end + 1
+			parent.StubList = append(parent.StubList, current)
+			return current
+		}
+		parent.StubList = append(parent.StubList[:idx], parent.StubList[idx+1:]...)
+		current = merged
+	}
+}
+
+func (s *Shard) findMergeCandidate(stubs []*ArchiveBucketNode, target *ArchiveBucketNode, limit int) (int, []byte, int) {
+	bestIdx := -1
+	bestBits := -1
+	var bestPath []byte
+	for i, bucket := range stubs {
+		if bucket == nil || target.Count+bucket.Count > uint64(limit) {
 			continue
 		}
+		path, bits := s.commonArchivePath(target.Path, target.PathBits, bucket.Path, bucket.PathBits)
+		if bits > bestBits {
+			bestIdx = i
+			bestBits = bits
+			bestPath = path
+		}
+	}
+	return bestIdx, bestPath, bestBits
+}
 
-		merged := &ArchiveBucketNode{
-			Path:     common.CopyBytes(commonPath),
-			PathBits: commonBits,
-			dirty:    true,
+func (s *Shard) mergeArchiveBuckets(a, b *ArchiveBucketNode, path []byte, bits int) (*ArchiveBucketNode, bool) {
+	if a == nil || b == nil {
+		return nil, false
+	}
+	group := []*ArchiveBucketNode{a, b}
+	keys := make([]ArchivedKey, 0, int(a.Count+b.Count))
+	oldHashes := make([][]byte, 0, len(group))
+	filter := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
+	var keyBuf []byte
+	for _, bucket := range group {
+		hash := s.ensureBucketHash(bucket)
+		bucketKeys, err := s.bucketKeys(bucket)
+		if err != nil {
+			return nil, false
 		}
-		s.recomputeBucket(merged, items)
-		for j := range group {
-			if s.pruning && (s.config == nil || !s.config.UsePathStorage()) && len(oldHashes[j]) > 0 {
-				s.staleSet[string(oldHashes[j])] = struct{}{}
+		for _, key := range bucketKeys {
+			absPath, absBits := s.prependPath(key.Suffix, key.SuffixBits, bucket.Path, bucket.PathBits)
+			suffix, suffixBits := s.stripPrefix(absPath, absBits, 0, path, bits)
+			mergedKey := ArchivedKey{
+				Suffix:     suffix,
+				SuffixBits: suffixBits,
+				ValueRef:   common.CopyBytes(key.ValueRef),
 			}
-			s.markArchiveDataDelete(oldHashes[j], oldSizes[j])
+			keys = append(keys, mergedKey)
+			keyWithLen := appendArchiveItemKey(keyBuf, suffixBits, suffix)
+			filter.Insert(keyWithLen)
+			keyBuf = keyWithLen
 		}
-		newList = append(newList, merged)
-		changed = true
-		i = end + 1
+		oldHashes = append(oldHashes, common.CopyBytes(hash))
 	}
-	if changed {
-		parent.StubList = newList
-		parent.SetDirty(true)
+	aPoint, err := s.bucketCommitmentPoint(a)
+	if err != nil {
+		return nil, false
 	}
+	bPoint, err := s.bucketCommitmentPoint(b)
+	if err != nil {
+		return nil, false
+	}
+	commitment, point, err := s.ecmh.MergePoints(aPoint, bPoint)
+	if err != nil {
+		return nil, false
+	}
+
+	merged := &ArchiveBucketNode{
+		Path:       common.CopyBytes(path),
+		PathBits:   bits,
+		Filter:     filter.Encode(),
+		Commitment: commitment,
+		Keys:       keys,
+		Count:      uint64(len(keys)),
+		dirty:      true,
+	}
+	merged.cachedFilter = filter
+	s.setBucketCommitmentPoint(merged, point)
+	merged.invalidateMetaCache()
+	meta, _ := merged.Serialize()
+	merged.SetHash(append([]byte{}, s.hasher.Hash(meta)...))
+	for _, hash := range oldHashes {
+		if s.pruning && (s.config == nil || !s.config.UsePathStorage()) && len(hash) > 0 {
+			s.staleSet[string(hash)] = struct{}{}
+		}
+		s.markArchiveDataDelete(hash, -1)
+	}
+	return merged, true
 }
 
 func (s *Shard) archiveBucketPathLess(a, b *ArchiveBucketNode) bool {
@@ -633,6 +863,162 @@ func (s *Shard) getFlatValue(key []byte) ([]byte, error) {
 		return value, nil
 	}
 	return nil, ErrNodeNotFound
+}
+
+func (s *Shard) hasFlatValue(key []byte) bool {
+	if len(key) == 0 {
+		return false
+	}
+	id := string(key)
+	if _, ok := s.pendingFlatValues[id]; ok {
+		return true
+	}
+	if _, ok := s.pendingFlatValueDeletes[id]; ok {
+		return false
+	}
+	for i := len(s.stagedFlatValues) - 1; i >= 0; i-- {
+		if _, ok := s.stagedFlatValues[i][id]; ok {
+			return true
+		}
+	}
+	if s.config != nil && s.config.FlatReader != nil {
+		if value, err := s.config.FlatReader.GetFlatValue(key); err == nil && value != nil {
+			return true
+		}
+	}
+	value, err := s.db.Get(flatValueDataKey(key))
+	return err == nil && value != nil
+}
+
+func (s *Shard) archiveMayContainKey(node Node, key []byte, depth int) bool {
+	if node == nil {
+		return false
+	}
+	if present, ok := s.subtreeArchivePresence(node); ok && !present {
+		return false
+	}
+
+	switch n := node.(type) {
+	case *ArchiveBucketNode:
+		return s.archiveBucketMayContainKey(n, key)
+	case *LeafNode:
+		return false
+	case *InternalNode:
+		for _, bucket := range n.StubList {
+			if s.archiveBucketMayContainKey(bucket, key) {
+				return true
+			}
+		}
+		if n.PathBits > 0 {
+			matched := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
+			if matched != n.PathBits {
+				return false
+			}
+			depth += n.PathBits
+		}
+
+		bit := s.getBit(key, depth)
+		var child Node
+		var childEpoch byte
+		var hasChildHash bool
+		if bit == 0 {
+			child = n.Left
+			childEpoch = n.LeftEpoch
+			hasChildHash = len(n.LeftHash) > 0
+		} else {
+			child = n.Right
+			childEpoch = n.RightEpoch
+			hasChildHash = len(n.RightHash) > 0
+		}
+		if child != nil {
+			return s.archiveMayContainKey(child, key, depth+1)
+		}
+		if present, ok := storedSubtreeArchivePresence(childEpoch); ok {
+			if !present {
+				return false
+			}
+			loaded, err := s.loadChildNode(n, bit, childHashForBit(n, bit))
+			if err != nil || loaded == nil {
+				return true
+			}
+			if bit == 0 {
+				n.Left = loaded
+			} else {
+				n.Right = loaded
+			}
+			return s.archiveMayContainKey(loaded, key, depth+1)
+		}
+		if !hasChildHash {
+			return false
+		}
+		loaded, err := s.loadChildNode(n, bit, childHashForBit(n, bit))
+		if err != nil || loaded == nil {
+			return true
+		}
+		if bit == 0 {
+			n.Left = loaded
+		} else {
+			n.Right = loaded
+		}
+		return s.archiveMayContainKey(loaded, key, depth+1)
+	default:
+		return false
+	}
+}
+
+func childHashForBit(n *InternalNode, bit byte) []byte {
+	if n == nil {
+		return nil
+	}
+	if bit == 0 {
+		return n.LeftHash
+	}
+	return n.RightHash
+}
+
+func (s *Shard) archiveBucketMayContainKey(bucket *ArchiveBucketNode, key []byte) bool {
+	if bucket == nil || bucket.Count == 0 {
+		return false
+	}
+	matched := s.commonPrefixLen(bucket.Path, bucket.PathBits, key, 0)
+	if matched != bucket.PathBits {
+		return false
+	}
+	filter := s.archiveBucketFilter(bucket)
+	if filter == nil {
+		return true
+	}
+	innerDepth := bucket.PathBits
+	shardKey := s.getSuffix(key, innerDepth, nil)
+	suffixBits := len(key)*8 - innerDepth
+	keyWithLen := archiveItemKey(suffixBits, shardKey)
+	return filter.Lookup(keyWithLen)
+}
+
+func (s *Shard) archiveBucketFilter(bucket *ArchiveBucketNode) *cuckoo.Filter {
+	if bucket == nil || s.config == nil {
+		return nil
+	}
+	bucket.cacheMu.RLock()
+	filter := bucket.cachedFilter
+	bucket.cacheMu.RUnlock()
+	if filter != nil {
+		return filter
+	}
+	if len(bucket.Filter) == 0 {
+		return nil
+	}
+	bucket.cacheMu.Lock()
+	defer bucket.cacheMu.Unlock()
+	if bucket.cachedFilter != nil {
+		return bucket.cachedFilter
+	}
+	filter = cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
+	if err := filter.Decode(bucket.Filter, s.config.CuckooBuckets, s.config.CuckooSlots); err != nil {
+		return nil
+	}
+	bucket.cachedFilter = filter
+	return filter
 }
 
 func (s *Shard) commitPendingValues(batch Batcher) error {
@@ -1037,8 +1423,16 @@ func (s *Shard) putLocked(key []byte, value []byte) error {
 			return err
 		}
 	}
-	if _, err := s.removeArchivedVersionForWrite(key); err != nil {
-		return err
+	if s.archiveMayContainKey(s.root, key, s.config.ShardDepth) {
+		if s.hasFlatValue(key) {
+			removed, err := s.removeArchivedVersionForWrite(key)
+			recordArchivePromotionCheckIfEnabled(s.config, removed)
+			if err != nil {
+				return err
+			}
+		} else {
+			recordArchivePromotionCheckIfEnabled(s.config, false)
+		}
 	}
 	valHash := s.stageValueForKey(key, value)
 
@@ -1176,7 +1570,7 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) (bool, erro
 		}
 
 		if next == nil && len(nextHash) > 0 {
-			loaded, _ := s.loadNode(nextHash)
+			loaded, _ := s.loadChildNode(n, bit, nextHash)
 			if loaded != nil {
 				if bit == 0 {
 					n.Left = loaded
@@ -1377,7 +1771,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		if bit == 0 {
 			if n.Left == nil && len(n.LeftHash) > 0 {
 				var err error
-				n.Left, err = s.loadNode(n.LeftHash)
+				n.Left, err = s.loadChildNode(n, 0, n.LeftHash)
 				if err != nil {
 					return nil, err
 				}
@@ -1390,7 +1784,7 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 		} else {
 			if n.Right == nil && len(n.RightHash) > 0 {
 				var err error
-				n.Right, err = s.loadNode(n.RightHash)
+				n.Right, err = s.loadChildNode(n, 1, n.RightHash)
 				if err != nil {
 					return nil, err
 				}
@@ -1408,20 +1802,59 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 
 	case *ArchiveBucketNode:
 		parent := s.pool.GetInternal()
-		if n.PathBits > depth {
-			if s.getBitFromBytes(n.Path, depth) == 0 {
+		if n.PathBits <= depth {
+			if splitNode, ok, err := s.splitArchiveBucketForHotInsert(n, depth+1); err != nil {
+				return nil, err
+			} else if ok && splitNode != n {
+				return s.insert(splitNode, key, depth, valueHash)
+			}
+			s.attachStubs(parent, []*ArchiveBucketNode{n})
+			parent.SetDirty(true)
+			s.refreshInternalEpochMask(parent)
+			return s.insert(parent, key, depth, valueHash)
+		}
+
+		bucketSuffix := s.shiftBits(n.Path, n.PathBits, depth, nil)
+		bucketSuffixBits := n.PathBits - depth
+		matchBits := s.commonPrefixLen(bucketSuffix, bucketSuffixBits, key, depth)
+		parent.Path = s.prefixBits(bucketSuffix, matchBits, nil)
+		parent.PathBits = matchBits
+
+		if matchBits == bucketSuffixBits {
+			if splitNode, ok, err := s.splitArchiveBucketForHotInsert(n, depth+matchBits+1); err != nil {
+				return nil, err
+			} else if ok && splitNode != n {
+				return s.insert(splitNode, key, depth, valueHash)
+			}
+			s.attachStubs(parent, []*ArchiveBucketNode{n})
+		} else {
+			bucketBit := s.getBitFromBytes(bucketSuffix, matchBits)
+			if bucketBit == 0 {
 				parent.Left = n
 				parent.LeftEpoch = n.Epoch()
 			} else {
 				parent.Right = n
 				parent.RightEpoch = n.Epoch()
 			}
-		} else {
-			s.attachStubs(parent, []*ArchiveBucketNode{n})
 		}
+
+		newBit := s.getBit(key, depth+matchBits)
+		newLeafPath := s.getSuffix(key, depth+matchBits+1, nil)
+		newLeafBits := len(key)*8 - (depth + matchBits + 1)
+		newLeaf := s.pool.GetLeaf()
+		newLeaf.Path = newLeafPath
+		newLeaf.PathBits = newLeafBits
+		newLeaf.ValueHash = valueHash
+		s.updateEpoch(newLeaf)
+		if newBit == 0 {
+			parent.Left = newLeaf
+		} else {
+			parent.Right = newLeaf
+		}
+
 		parent.SetDirty(true)
 		s.refreshInternalEpochMask(parent)
-		return s.insert(parent, key, depth, valueHash)
+		return parent, nil
 
 	default:
 		return nil, errors.New("unknown node type")
@@ -1499,7 +1932,7 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 		}
 
 		if child == nil && len(childHash) > 0 {
-			loaded, _ := s.loadNode(childHash)
+			loaded, _ := s.loadChildNode(n, bit, childHash)
 			child = loaded
 			if bit == 0 {
 				n.Left = child
@@ -1663,6 +2096,7 @@ func (s *Shard) commitStaleDeletes(batch Batcher) error {
 		if s.config != nil && s.config.UsePathStorage() && !bytes.HasPrefix([]byte(h), pathNodePrefix) {
 			continue
 		}
+		s.removeCachedNodeBlob([]byte(h))
 		if err := batch.Delete([]byte(h)); err != nil {
 			return err
 		}
@@ -1735,7 +2169,7 @@ func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value [
 				return false
 			}
 		} else if len(n.LeftHash) > 0 {
-			loaded, _ := s.loadNode(n.LeftHash)
+			loaded, _ := s.loadChildNode(n, 0, n.LeftHash)
 			if loaded != nil {
 				if !s.forEach(loaded, leftPrefix, leftBits, fn) {
 					return false
@@ -1749,7 +2183,7 @@ func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value [
 				return false
 			}
 		} else if len(n.RightHash) > 0 {
-			loaded, _ := s.loadNode(n.RightHash)
+			loaded, _ := s.loadChildNode(n, 1, n.RightHash)
 			if loaded != nil {
 				if !s.forEach(loaded, rightPrefix, rightBits, fn) {
 					return false
@@ -1827,7 +2261,7 @@ func (s *Shard) forEachPrefix(node Node, prefix []byte, bits int, matchPrefix []
 					return false
 				}
 			} else if len(n.LeftHash) > 0 {
-				loaded, _ := s.loadNode(n.LeftHash)
+				loaded, _ := s.loadChildNode(n, 0, n.LeftHash)
 				if loaded != nil && !s.forEachPrefix(loaded, leftPrefix, leftBits, matchPrefix, matchBits, fn) {
 					return false
 				}
@@ -1841,7 +2275,7 @@ func (s *Shard) forEachPrefix(node Node, prefix []byte, bits int, matchPrefix []
 					return false
 				}
 			} else if len(n.RightHash) > 0 {
-				loaded, _ := s.loadNode(n.RightHash)
+				loaded, _ := s.loadChildNode(n, 1, n.RightHash)
 				if loaded != nil && !s.forEachPrefix(loaded, rightPrefix, rightBits, matchPrefix, matchBits, fn) {
 					return false
 				}
@@ -1911,7 +2345,7 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		}
 
 		if batch != nil {
-			if err := s.persistNode(batch, n, h, data, path, pathBits); err != nil {
+			if err := s.persistNode(batch, n, h, data, path, pathBits, destructive); err != nil {
 				return nil, err
 			}
 		}
@@ -1961,7 +2395,7 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		n.SetHash(h)
 
 		if batch != nil {
-			if err := s.persistNode(batch, n, h, data, path, pathBits); err != nil {
+			if err := s.persistNode(batch, n, h, data, path, pathBits, destructive); err != nil {
 				return nil, err
 			}
 		}
@@ -1977,7 +2411,7 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		n.SetHash(h)
 
 		if batch != nil {
-			if err = s.persistNode(batch, n, h, data, path, pathBits); err != nil {
+			if err = s.persistNode(batch, n, h, data, path, pathBits, destructive); err != nil {
 				return nil, err
 			}
 		}
@@ -1988,7 +2422,7 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 	}
 }
 
-func (s *Shard) persistNode(batch Batcher, node Node, hash, data, path []byte, pathBits int) error {
+func (s *Shard) persistNode(batch Batcher, node Node, hash, data, path []byte, pathBits int, destructive bool) error {
 	key := hash
 	var (
 		oldHash []byte
@@ -2007,6 +2441,9 @@ func (s *Shard) persistNode(batch Batcher, node Node, hash, data, path []byte, p
 	if err := batch.Put(key, data); err != nil {
 		return err
 	}
+	if s.shouldWarmPersistedNodeCache(node, pathBits) {
+		s.cacheNodeBlob(key, data)
+	}
 	if s.config != nil && s.config.UsePathStorage() && len(oldHash) > 0 && !bytes.Equal(oldHash, hash) {
 		if persisted, ok := s.nodePaths[string(oldHash)]; ok &&
 			persisted.bits == oldBits && bytes.Equal(persisted.path, oldPath) {
@@ -2017,10 +2454,35 @@ func (s *Shard) persistNode(batch Batcher, node Node, hash, data, path []byte, p
 	node.SetOriginalHash(hash)
 	if s.config != nil && s.config.UsePathStorage() {
 		node.SetStoragePath(path, pathBits)
-		s.registerNodePath(hash, path, pathBits)
-		s.registerChildPaths(node, path, pathBits)
+		if !destructive {
+			s.registerNodePath(hash, path, pathBits)
+			s.registerChildPaths(node, path, pathBits)
+		}
 	}
 	return nil
+}
+
+func (s *Shard) shouldWarmPersistedNodeCache(node Node, pathBits int) bool {
+	if s.config != nil && s.config.UsePathStorage() {
+		warmPathBits := s.config.NodeCacheWarmPathBits
+		if warmPathBits < -1 {
+			return false
+		}
+		if pathBits == 0 {
+			return true
+		}
+		if _, ok := node.(*InternalNode); !ok {
+			return false
+		}
+		if warmPathBits == 0 {
+			warmPathBits = DefaultNodeCacheWarmPathBits
+		}
+		if warmPathBits < 0 {
+			return false
+		}
+		return pathBits <= warmPathBits
+	}
+	return true
 }
 
 func (s *Shard) updateEpoch(node Node) {
@@ -2057,6 +2519,24 @@ func (s *Shard) subtreeEpochMask(node Node) (byte, bool) {
 	}
 }
 
+func (s *Shard) subtreeArchivePresence(node Node) (bool, bool) {
+	switch n := node.(type) {
+	case nil:
+		return false, true
+	case *LeafNode:
+		return false, true
+	case *ArchiveBucketNode:
+		return true, true
+	case *InternalNode:
+		if present, ok := storedSubtreeArchivePresence(n.Epoch()); ok {
+			return present, true
+		}
+		return s.computeInternalArchivePresence(n)
+	default:
+		return false, false
+	}
+}
+
 func (s *Shard) childEpochMask(node Node, epoch byte, hasHash bool) (byte, bool) {
 	if node != nil {
 		return s.subtreeEpochMask(node)
@@ -2070,6 +2550,19 @@ func (s *Shard) childEpochMask(node Node, epoch byte, hasHash bool) (byte, bool)
 	return 0, false
 }
 
+func (s *Shard) childArchivePresence(node Node, epoch byte, hasHash bool) (bool, bool) {
+	if node != nil {
+		return s.subtreeArchivePresence(node)
+	}
+	if !hasHash {
+		return false, true
+	}
+	if present, ok := storedSubtreeArchivePresence(epoch); ok {
+		return present, true
+	}
+	return false, false
+}
+
 func (s *Shard) computeInternalEpochMask(n *InternalNode) (byte, bool) {
 	leftMask, leftOK := s.childEpochMask(n.Left, n.LeftEpoch, len(n.LeftHash) > 0)
 	rightMask, rightOK := s.childEpochMask(n.Right, n.RightEpoch, len(n.RightHash) > 0)
@@ -2079,13 +2572,31 @@ func (s *Shard) computeInternalEpochMask(n *InternalNode) (byte, bool) {
 	return leftMask | rightMask, true
 }
 
+func (s *Shard) computeInternalArchivePresence(n *InternalNode) (bool, bool) {
+	if len(n.StubList) > 0 {
+		return true, true
+	}
+	leftPresent, leftOK := s.childArchivePresence(n.Left, n.LeftEpoch, len(n.LeftHash) > 0)
+	rightPresent, rightOK := s.childArchivePresence(n.Right, n.RightEpoch, len(n.RightHash) > 0)
+	if !leftOK || !rightOK {
+		return false, false
+	}
+	return leftPresent || rightPresent, true
+}
+
 func (s *Shard) refreshInternalEpochMask(n *InternalNode) {
 	mask, ok := s.computeInternalEpochMask(n)
 	if !ok {
 		n.epoch = clearStoredSubtreeEpochMask(n.epoch)
+	} else {
+		n.epoch = setStoredSubtreeEpochMask(n.epoch, mask)
+	}
+	present, ok := s.computeInternalArchivePresence(n)
+	if !ok {
+		n.epoch = clearStoredSubtreeArchivePresence(n.epoch)
 		return
 	}
-	n.epoch = setStoredSubtreeEpochMask(n.epoch, mask)
+	n.epoch = setStoredSubtreeArchivePresence(n.epoch, present)
 }
 
 func (s *Shard) shrinkLocal(n *InternalNode) Node {
@@ -2121,7 +2632,7 @@ func (s *Shard) shrinkLocal(n *InternalNode) Node {
 
 	if remaining == nil && len(remainingHash) > 0 {
 		var err error
-		remaining, err = s.loadNode(remainingHash)
+		remaining, err = s.loadChildNode(n, remainingBit, remainingHash)
 		if err != nil {
 			return n // 无法加载，降级
 		}
@@ -2216,7 +2727,7 @@ func (s *Shard) shrinkPromote(n *InternalNode) (Node, []*ArchiveBucketNode) {
 
 	if remaining == nil && len(remainingHash) > 0 {
 		var err error
-		remaining, err = s.loadNode(remainingHash)
+		remaining, err = s.loadChildNode(n, remainingBit, remainingHash)
 		if err != nil {
 			return n, nil
 		}
