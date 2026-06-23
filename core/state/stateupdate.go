@@ -102,6 +102,11 @@ type StateUpdate struct {
 
 	Codes map[common.Address]*ContractCode // Codes contains the set of dirty codes
 	Nodes *trienode.MergedNodeSet          // Aggregated dirty nodes caused by state changes
+
+	// CacheTrieAsync indicates that this update should be committed to live
+	// SWMT first; the backing MPT receives it later through an async merge
+	// round selected by SWMT watermarks.
+	CacheTrieAsync bool
 }
 
 // Empty returns a flag indicating the state transition is empty or not.

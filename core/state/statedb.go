@@ -64,6 +64,17 @@ func (m *mutation) isDelete() bool {
 	return m.typ == deletion
 }
 
+type cacheTrieRecorder interface {
+	setCacheTrieBlock(block uint64)
+	beginCacheTrieBlock(block uint64, origin common.Hash)
+	stageCacheTrieAccount(address common.Address, account *types.StateAccount)
+	stageCacheTrieStorage(address common.Address, slot common.Hash, value common.Hash)
+}
+
+type cacheTrieRootProvider interface {
+	cacheTrieRoots() (common.Hash, common.Hash, bool)
+}
+
 // StateDB structs within the ethereum protocol are used to store anything
 // within the merkle trie. StateDBs take care of caching and storing
 // nested states. It's the general query interface to retrieve:
@@ -167,6 +178,10 @@ type StateDB struct {
 	CodeLoadBytes   int // Total bytes of resolved code
 	CodeUpdated     int // Number of contracts with code changes that persisted
 	CodeUpdateBytes int // Total bytes of persisted code written
+
+	cacheTrieBlock    uint64
+	cacheTrieBlockSet bool
+	cacheTrieAsync    bool
 }
 
 // New creates a new state from a given trie.
@@ -432,6 +447,63 @@ func (s *StateDB) Reader() Reader {
 	return s.reader
 }
 
+// SetBlockNum sets the block number used by cachetrie's sliding window. The
+// canonical StateDB semantics are unchanged; this only gives the cache layer the
+// same per-block context as the execution pipeline.
+func (s *StateDB) SetBlockNum(block uint64) {
+	s.cacheTrieBlock = block
+	s.cacheTrieBlockSet = true
+	if recorder, ok := s.db.(cacheTrieRecorder); ok {
+		recorder.setCacheTrieBlock(block)
+	}
+}
+
+// SetCacheTrieAsync controls whether the next Commit should publish writes into
+// SWMT only and let SWMT's watermark pipeline merge them into the backing MPT.
+func (s *StateDB) SetCacheTrieAsync(enabled bool) {
+	s.cacheTrieAsync = enabled
+}
+
+// CacheTrieAsync reports whether the next Commit uses SWMT async mode.
+func (s *StateDB) CacheTrieAsync() bool {
+	return s.cacheTrieAsync
+}
+
+// CacheTrieRoots returns the disclosed global state root and the live SWMT
+// commitment for the current staged block transition.
+func (s *StateDB) CacheTrieRoots() (common.Hash, common.Hash, bool) {
+	provider, ok := s.db.(cacheTrieRootProvider)
+	if !ok {
+		return common.Hash{}, common.Hash{}, false
+	}
+	return provider.cacheTrieRoots()
+}
+
+func (s *StateDB) cacheTrieBlockNum() uint64 {
+	if s.cacheTrieBlockSet {
+		return s.cacheTrieBlock
+	}
+	return 0
+}
+
+func (s *StateDB) beginCacheTrieWrite() {
+	if recorder, ok := s.db.(cacheTrieRecorder); ok {
+		recorder.beginCacheTrieBlock(s.cacheTrieBlockNum(), s.originalRoot)
+	}
+}
+
+func (s *StateDB) stageCacheTrieAccount(address common.Address, account *types.StateAccount) {
+	if recorder, ok := s.db.(cacheTrieRecorder); ok {
+		recorder.stageCacheTrieAccount(address, account)
+	}
+}
+
+func (s *StateDB) stageCacheTrieStorage(address common.Address, slot common.Hash, value common.Hash) {
+	if recorder, ok := s.db.(cacheTrieRecorder); ok {
+		recorder.stageCacheTrieStorage(address, slot, value)
+	}
+}
+
 func (s *StateDB) HasSelfDestructed(addr common.Address) bool {
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
@@ -570,6 +642,7 @@ func (s *StateDB) GetTransientState(addr common.Address, key common.Hash) common
 // updateStateObject writes the given object to the trie.
 func (s *StateDB) updateStateObject(obj *stateObject) {
 	// Encode the account and update the account trie
+	s.stageCacheTrieAccount(obj.Address(), &obj.data)
 	if err := s.trie.UpdateAccount(obj.Address(), &obj.data, len(obj.code)); err != nil {
 		s.setError(fmt.Errorf("updateStateObject (%x) error: %v", obj.Address(), err))
 	}
@@ -580,9 +653,28 @@ func (s *StateDB) updateStateObject(obj *stateObject) {
 
 // deleteStateObject removes the given object from the state trie.
 func (s *StateDB) deleteStateObject(addr common.Address) {
+	s.stageCacheTrieAccount(addr, nil)
 	if err := s.trie.DeleteAccount(addr); err != nil {
 		s.setError(fmt.Errorf("deleteStateObject (%x) error: %v", addr[:], err))
 	}
+}
+
+func (s *StateDB) setCacheTrieMergeAccount(addr common.Address, account *types.StateAccount, tombstone bool) {
+	if tombstone || account == nil {
+		if obj := s.getStateObject(addr); obj != nil {
+			s.stateObjectsDestruct[addr] = obj
+		}
+		delete(s.stateObjects, addr)
+		s.markDelete(addr)
+		return
+	}
+	obj := s.getStateObject(addr)
+	if obj == nil {
+		obj = newObject(s, addr, nil)
+	}
+	obj.data = *account.Copy()
+	s.setStateObject(obj)
+	s.markUpdate(addr)
 }
 
 // getStateObject retrieves a state object given by the address, returning nil if
@@ -863,6 +955,7 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 		}
 		s.trie = tr
 	}
+	s.beginCacheTrieWrite()
 	// If there was a trie prefetcher operating, terminate it async so that the
 	// individual storage tries can be updated as soon as the disk load finishes.
 	if s.prefetcher != nil {
@@ -1184,6 +1277,9 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool, blockNum
 	if s.dbErr != nil {
 		return nil, fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
 	}
+	if !s.cacheTrieBlockSet || s.cacheTrieBlock != blockNumber {
+		s.SetBlockNum(blockNumber)
+	}
 	// Finalize any pending changes and merge everything into the tries
 	root := s.IntermediateRoot(deleteEmptyObjects)
 
@@ -1332,7 +1428,9 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool, blockNum
 	if noStorageWiping {
 		typ = StorageKeyPlain
 	}
-	return NewStateUpdate(typ, origin, root, blockNumber, deletes, updates, nodes), nil
+	ret := NewStateUpdate(typ, origin, root, blockNumber, deletes, updates, nodes)
+	ret.CacheTrieAsync = s.cacheTrieAsync
+	return ret, nil
 }
 
 // commitAndFlush is a wrapper of commit which also commits the state mutations
@@ -1352,6 +1450,12 @@ func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorag
 		return nil, err
 	}
 	s.DatabaseCommits = time.Since(start)
+	if s.cacheTrieAsync {
+		if globalRoot, _, ok := s.CacheTrieRoots(); ok {
+			ret.Root = globalRoot
+			s.originalRoot = globalRoot
+		}
+	}
 
 	// The reader update must be performed as the final step, otherwise,
 	// the new state would not be visible before db.commit.

@@ -174,6 +174,9 @@ type BlockChainConfig struct {
 	StateScheme       string // Scheme used to store ethereum states and merkle tree nodes on top
 	ArchiveMode       bool   // Whether to enable the archive mode
 	BinTrieGroupDepth int    // Number of levels per serialized group in binary trie (1-8)
+	CacheTrie         bool   // Whether to enable the root-aware sliding state cache
+	CacheTrieWindow   uint64 // Number of recent blocks retained by cache trie
+	CacheTrieMaxItems int    // Maximum number of cached account/storage entries
 
 	// Number of blocks from the chain head for which state histories are retained.
 	// If set to 0, all state histories across the entire chain will be retained;
@@ -264,6 +267,9 @@ func (cfg *BlockChainConfig) triedbConfig(isUBT bool) *triedb.Config {
 		Preimages:         cfg.Preimages,
 		IsUBT:             isUBT,
 		BinTrieGroupDepth: cfg.BinTrieGroupDepth,
+		CacheTrie:         cfg.CacheTrie,
+		CacheTrieWindow:   cfg.CacheTrieWindow,
+		CacheTrieMaxItems: cfg.CacheTrieMaxItems,
 	}
 	if cfg.StateScheme == rawdb.HashScheme {
 		config.HashDB = &hashdb.Config{

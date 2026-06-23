@@ -352,6 +352,7 @@ func (s *stateObject) updateTrie() (Trie, error) {
 			continue
 		}
 		if (value != common.Hash{}) {
+			s.db.stageCacheTrieStorage(s.address, key, value)
 			if err := tr.UpdateStorage(s.address, key[:], common.TrimLeftZeroes(value[:])); err != nil {
 				s.db.setError(err)
 				return nil, err
@@ -364,6 +365,7 @@ func (s *stateObject) updateTrie() (Trie, error) {
 		used = append(used, key) // Copy needed for closure
 	}
 	for _, key := range deletions {
+		s.db.stageCacheTrieStorage(s.address, key, common.Hash{})
 		if err := tr.DeleteStorage(s.address, key[:]); err != nil {
 			s.db.setError(err)
 			return nil, err

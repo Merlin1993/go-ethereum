@@ -19,6 +19,7 @@ package triedb
 import (
 	"errors"
 
+	"github.com/ethereum/go-ethereum/cachetrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
@@ -34,6 +35,9 @@ type Config struct {
 	Preimages         bool           // Flag whether the preimage of node key is recorded
 	IsUBT             bool           // Flag whether the db is holding a unified binary tree
 	BinTrieGroupDepth int            // Number of levels per serialized group in binary trie (1-8, default 8)
+	CacheTrie         bool           // Flag whether the sliding cache trie is enabled
+	CacheTrieWindow   uint64         // Number of recent blocks retained by cache trie
+	CacheTrieMaxItems int            // Maximum number of cached account/storage entries
 	HashDB            *hashdb.Config // Configs for hash-based scheme
 	PathDB            *pathdb.Config // Configs for experimental path-based scheme
 }
@@ -87,10 +91,11 @@ type backend interface {
 // types of node backend as an entrypoint. It's responsible for all interactions
 // relevant with trie nodes and node preimages.
 type Database struct {
-	disk      ethdb.Database
-	config    *Config        // Configuration for trie database
-	preimages *preimageStore // The store for caching preimages
-	backend   backend        // The backend for managing trie nodes
+	disk      ethdb.Database       // Persistent key-value store
+	config    *Config              // Configuration for trie database
+	preimages *preimageStore       // The store for caching preimages
+	backend   backend              // The backend for managing trie nodes
+	cacheTrie *cachetrie.CacheTrie // Optional sliding state cache
 }
 
 // NewDatabase initializes the trie database with default settings, note
@@ -117,7 +122,15 @@ func NewDatabase(diskdb ethdb.Database, config *Config) *Database {
 	} else {
 		db.backend = hashdb.New(diskdb, config.HashDB)
 	}
+	if config.CacheTrie && !config.IsUBT {
+		db.cacheTrie = cachetrie.NewCacheTrie(0, config.CacheTrieWindow, config.CacheTrieMaxItems)
+	}
 	return db
+}
+
+// CacheTrie returns the optional sliding state cache.
+func (db *Database) CacheTrie() *cachetrie.CacheTrie {
+	return db.cacheTrie
 }
 
 // NodeReader returns a reader for accessing trie nodes within the specified state.

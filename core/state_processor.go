@@ -76,6 +76,7 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	if hooks := cfg.Tracer; hooks != nil {
 		tracingStateDB = state.NewHookedState(statedb, hooks)
 	}
+	statedb.SetBlockNum(block.NumberU64())
 
 	// Mutate the block and state according to any hard-fork specs
 	if config.DAOForkSupport && config.DAOForkBlock != nil && config.DAOForkBlock.Cmp(block.Number()) == 0 {
@@ -381,6 +382,16 @@ func onSystemCallStart(tracer *tracing.Hooks, ctx *tracing.VMContext) {
 // body and receipts.
 func AssembleBlock(engine consensus.Engine, chain consensus.ChainHeaderReader, header *types.Header, state *state.StateDB, body *types.Body, receipts []*types.Receipt) *types.Block {
 	engine.Finalize(chain, header, state, body)
-	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	root := state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	if state.CacheTrieAsync() {
+		if globalRoot, swmtRoot, ok := state.CacheTrieRoots(); ok {
+			header.Root = globalRoot
+			header.SWMTRoot = &swmtRoot
+		} else {
+			header.Root = root
+		}
+	} else {
+		header.Root = root
+	}
 	return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil))
 }

@@ -105,6 +105,10 @@ type Header struct {
 
 	// SlotNumber was added by EIP-7843 and is ignored in legacy headers.
 	SlotNumber *uint64 `json:"slotNumber" rlp:"optional"`
+
+	// SWMTRoot commits to the live SWMT overlay while Root commits to the
+	// disclosed backing state tree root.
+	SWMTRoot *common.Hash `json:"swmtRoot" rlp:"optional"`
 }
 
 // field type overrides for gencodec
@@ -333,6 +337,10 @@ func CopyHeader(h *Header) *Header {
 		cpy.SlotNumber = new(uint64)
 		*cpy.SlotNumber = *h.SlotNumber
 	}
+	if h.SWMTRoot != nil {
+		cpy.SWMTRoot = new(common.Hash)
+		*cpy.SWMTRoot = *h.SWMTRoot
+	}
 	return &cpy
 }
 
@@ -415,6 +423,15 @@ func (b *Block) BaseFee() *big.Int {
 
 func (b *Block) BeaconRoot() *common.Hash   { return b.header.ParentBeaconRoot }
 func (b *Block) RequestsHash() *common.Hash { return b.header.RequestsHash }
+
+func (b *Block) SWMTRoot() *common.Hash {
+	if b.header.SWMTRoot == nil {
+		return nil
+	}
+	root := new(common.Hash)
+	*root = *b.header.SWMTRoot
+	return root
+}
 
 func (b *Block) ExcessBlobGas() *uint64 {
 	var excessBlobGas *uint64

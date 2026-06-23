@@ -128,6 +128,8 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 		return errors.New("nil ProcessResult value")
 	}
 	header := block.Header()
+	statedb.SetBlockNum(block.NumberU64())
+	statedb.SetCacheTrieAsync(header.SWMTRoot != nil)
 	if block.GasUsed() != res.GasUsed {
 		return fmt.Errorf("invalid gas used (remote: %d local: %d)", block.GasUsed(), res.GasUsed)
 	}
@@ -162,6 +164,20 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 	}
 	// Validate the state root against the received state root and throw
 	// an error if they don't match.
+	if header.SWMTRoot != nil {
+		statedb.IntermediateRoot(v.config.IsEIP158(header.Number))
+		globalRoot, swmtRoot, ok := statedb.CacheTrieRoots()
+		if !ok {
+			return errors.New("block has swmt root but state database has no cachetrie")
+		}
+		if header.Root != globalRoot {
+			return fmt.Errorf("invalid disclosed merkle root (remote: %x local: %x) dberr: %w", header.Root, globalRoot, statedb.Error())
+		}
+		if *header.SWMTRoot != swmtRoot {
+			return fmt.Errorf("invalid swmt root (remote: %x local: %x) dberr: %w", *header.SWMTRoot, swmtRoot, statedb.Error())
+		}
+		return nil
+	}
 	if root := statedb.IntermediateRoot(v.config.IsEIP158(header.Number)); header.Root != root {
 		return fmt.Errorf("invalid merkle root (remote: %x local: %x) dberr: %w", header.Root, root, statedb.Error())
 	}

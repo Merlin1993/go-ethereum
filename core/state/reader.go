@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/ethereum/go-ethereum/cachetrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/overlay"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -32,6 +33,8 @@ import (
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/database"
 )
+
+var errCacheTrieMiss = errors.New("cachetrie miss")
 
 // ContractCodeReader defines the interface for accessing contract code.
 //
@@ -69,6 +72,33 @@ type StateReader interface {
 	// - Returns an error only if an unexpected issue occurs
 	// - The returned storage slot is safe to modify after the call
 	Storage(addr common.Address, slot common.Hash) (common.Hash, error)
+}
+
+// cacheTrieReader serves recently committed state values from cachetrie.
+type cacheTrieReader struct {
+	cache *cachetrie.CacheTrie
+}
+
+func newCacheTrieReader(cache *cachetrie.CacheTrie) *cacheTrieReader {
+	return &cacheTrieReader{cache: cache}
+}
+
+// Account implements StateReader, retrieving the account specified by address.
+func (r *cacheTrieReader) Account(addr common.Address) (*types.StateAccount, error) {
+	account, ok := r.cache.Account(addr)
+	if !ok {
+		return nil, errCacheTrieMiss
+	}
+	return account, nil
+}
+
+// Storage implements StateReader, retrieving the storage slot specified by key.
+func (r *cacheTrieReader) Storage(addr common.Address, key common.Hash) (common.Hash, error) {
+	value, ok := r.cache.Storage(addr, key)
+	if !ok {
+		return common.Hash{}, errCacheTrieMiss
+	}
+	return value, nil
 }
 
 // Reader defines the interface for accessing accounts, storage slots and contract

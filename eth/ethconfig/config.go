@@ -61,6 +61,8 @@ var Defaults = Config{
 	TrienodeHistory:         pathdb.Defaults.TrienodeHistory,
 	NodeFullValueCheckpoint: pathdb.Defaults.FullValueCheckpoint,
 	BinTrieGroupDepth:       triedb.DefaultBinTrieGroupDepth,
+	CacheTrieWindow:         256,
+	CacheTrieMaxItems:       1_000_000,
 	DatabaseCache:           2048,
 	TrieCleanCache:          614,
 	TrieDirtyCache:          1024,
@@ -131,6 +133,12 @@ type Config struct {
 	// Valid values are 1-8, with 8 being the default (byte-aligned groups).
 	// Lower values create smaller groups with more nodes.
 	BinTrieGroupDepth int `toml:",omitempty"`
+
+	// CacheTrie enables a root-aware sliding state cache for committed account
+	// and storage values. It is write-through and does not replace the canonical trie.
+	CacheTrie         bool   `toml:",omitempty"`
+	CacheTrieWindow   uint64 `toml:",omitempty"`
+	CacheTrieMaxItems int    `toml:",omitempty"`
 
 	// RequiredBlocks is a set of block number -> hash mappings which must be in the
 	// canonical chain of all remote peers. Setting the option makes geth verify the

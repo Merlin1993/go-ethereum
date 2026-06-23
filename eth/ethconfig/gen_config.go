@@ -35,6 +35,9 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		NodeFullValueCheckpoint uint32                 `toml:",omitempty"`
 		StateScheme             string                 `toml:",omitempty"`
 		BinTrieGroupDepth       int                    `toml:",omitempty"`
+		CacheTrie               bool                   `toml:",omitempty"`
+		CacheTrieWindow         uint64                 `toml:",omitempty"`
+		CacheTrieMaxItems       int                    `toml:",omitempty"`
 		RequiredBlocks          map[uint64]common.Hash `toml:"-"`
 		SlowBlockThreshold      time.Duration          `toml:",omitempty"`
 		SkipBcVersionCheck      bool                   `toml:"-"`
@@ -89,6 +92,9 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.NodeFullValueCheckpoint = c.NodeFullValueCheckpoint
 	enc.StateScheme = c.StateScheme
 	enc.BinTrieGroupDepth = c.BinTrieGroupDepth
+	enc.CacheTrie = c.CacheTrie
+	enc.CacheTrieWindow = c.CacheTrieWindow
+	enc.CacheTrieMaxItems = c.CacheTrieMaxItems
 	enc.RequiredBlocks = c.RequiredBlocks
 	enc.SlowBlockThreshold = c.SlowBlockThreshold
 	enc.SkipBcVersionCheck = c.SkipBcVersionCheck
@@ -147,6 +153,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		NodeFullValueCheckpoint *uint32                `toml:",omitempty"`
 		StateScheme             *string                `toml:",omitempty"`
 		BinTrieGroupDepth       *int                   `toml:",omitempty"`
+		CacheTrie               *bool                  `toml:",omitempty"`
+		CacheTrieWindow         *uint64                `toml:",omitempty"`
+		CacheTrieMaxItems       *int                   `toml:",omitempty"`
 		RequiredBlocks          map[uint64]common.Hash `toml:"-"`
 		SlowBlockThreshold      *time.Duration         `toml:",omitempty"`
 		SkipBcVersionCheck      *bool                  `toml:"-"`
@@ -239,6 +248,15 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.BinTrieGroupDepth != nil {
 		c.BinTrieGroupDepth = *dec.BinTrieGroupDepth
+	}
+	if dec.CacheTrie != nil {
+		c.CacheTrie = *dec.CacheTrie
+	}
+	if dec.CacheTrieWindow != nil {
+		c.CacheTrieWindow = *dec.CacheTrieWindow
+	}
+	if dec.CacheTrieMaxItems != nil {
+		c.CacheTrieMaxItems = *dec.CacheTrieMaxItems
 	}
 	if dec.RequiredBlocks != nil {
 		c.RequiredBlocks = dec.RequiredBlocks

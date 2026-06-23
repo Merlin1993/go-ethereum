@@ -93,6 +93,9 @@ var (
 		utils.TrienodeHistoryFlag,
 		utils.TrienodeHistoryFullValueCheckpointFlag,
 		utils.BinTrieGroupDepthFlag,
+		utils.CacheTrieStateFlag,
+		utils.CacheTrieWindowFlag,
+		utils.CacheTrieMaxItemsFlag,
 		utils.LightKDFFlag,
 		utils.EthRequiredBlocksFlag,
 		utils.LegacyWhitelistFlag, // deprecated

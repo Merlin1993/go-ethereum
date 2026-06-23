@@ -39,6 +39,7 @@ func (h Header) MarshalJSON() ([]byte, error) {
 		RequestsHash        *common.Hash    `json:"requestsHash" rlp:"optional"`
 		BlockAccessListHash *common.Hash    `json:"balHash" rlp:"optional"`
 		SlotNumber          *hexutil.Uint64 `json:"slotNumber" rlp:"optional"`
+		SWMTRoot            *common.Hash    `json:"swmtRoot" rlp:"optional"`
 		Hash                common.Hash     `json:"hash"`
 	}
 	var enc Header
@@ -65,6 +66,7 @@ func (h Header) MarshalJSON() ([]byte, error) {
 	enc.RequestsHash = h.RequestsHash
 	enc.BlockAccessListHash = h.BlockAccessListHash
 	enc.SlotNumber = (*hexutil.Uint64)(h.SlotNumber)
+	enc.SWMTRoot = h.SWMTRoot
 	enc.Hash = h.Hash()
 	return json.Marshal(&enc)
 }
@@ -95,6 +97,7 @@ func (h *Header) UnmarshalJSON(input []byte) error {
 		RequestsHash        *common.Hash    `json:"requestsHash" rlp:"optional"`
 		BlockAccessListHash *common.Hash    `json:"balHash" rlp:"optional"`
 		SlotNumber          *hexutil.Uint64 `json:"slotNumber" rlp:"optional"`
+		SWMTRoot            *common.Hash    `json:"swmtRoot" rlp:"optional"`
 	}
 	var dec Header
 	if err := json.Unmarshal(input, &dec); err != nil {
@@ -180,6 +183,9 @@ func (h *Header) UnmarshalJSON(input []byte) error {
 	}
 	if dec.SlotNumber != nil {
 		h.SlotNumber = (*uint64)(dec.SlotNumber)
+	}
+	if dec.SWMTRoot != nil {
+		h.SWMTRoot = dec.SWMTRoot
 	}
 	return nil
 }

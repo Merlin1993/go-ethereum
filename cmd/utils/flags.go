@@ -303,6 +303,24 @@ var (
 		Value:    5,
 		Category: flags.StateCategory,
 	}
+	CacheTrieStateFlag = &cli.BoolFlag{
+		Name:     "cachetrie",
+		Usage:    "Enable root-aware sliding state cache for account and storage reads",
+		Value:    ethconfig.Defaults.CacheTrie,
+		Category: flags.StateCategory,
+	}
+	CacheTrieWindowFlag = &cli.Uint64Flag{
+		Name:     "cachetrie.window",
+		Usage:    "Number of recent blocks retained by the sliding state cache",
+		Value:    ethconfig.Defaults.CacheTrieWindow,
+		Category: flags.StateCategory,
+	}
+	CacheTrieMaxItemsFlag = &cli.IntFlag{
+		Name:     "cachetrie.maxitems",
+		Usage:    "Maximum number of account and storage entries retained by the sliding state cache",
+		Value:    ethconfig.Defaults.CacheTrieMaxItems,
+		Category: flags.StateCategory,
+	}
 	StateHistoryFlag = &cli.Uint64Flag{
 		Name:     "history.state",
 		Usage:    "Number of recent blocks to retain state history for, only relevant in state.scheme=path (default = 90,000 blocks, 0 = entire chain)",
@@ -1826,6 +1844,15 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(BinTrieGroupDepthFlag.Name) {
 		cfg.BinTrieGroupDepth = ctx.Int(BinTrieGroupDepthFlag.Name)
 	}
+	if ctx.IsSet(CacheTrieStateFlag.Name) {
+		cfg.CacheTrie = ctx.Bool(CacheTrieStateFlag.Name)
+	}
+	if ctx.IsSet(CacheTrieWindowFlag.Name) {
+		cfg.CacheTrieWindow = ctx.Uint64(CacheTrieWindowFlag.Name)
+	}
+	if ctx.IsSet(CacheTrieMaxItemsFlag.Name) {
+		cfg.CacheTrieMaxItems = ctx.Int(CacheTrieMaxItemsFlag.Name)
+	}
 	if ctx.IsSet(StateSchemeFlag.Name) {
 		cfg.StateScheme = ctx.String(StateSchemeFlag.Name)
 	}
@@ -2443,6 +2470,9 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 		TrienodeHistory:         ctx.Int64(TrienodeHistoryFlag.Name),
 		NodeFullValueCheckpoint: uint32(ctx.Uint(TrienodeHistoryFullValueCheckpointFlag.Name)),
 		BinTrieGroupDepth:       ctx.Int(BinTrieGroupDepthFlag.Name),
+		CacheTrie:               ctx.Bool(CacheTrieStateFlag.Name),
+		CacheTrieWindow:         ctx.Uint64(CacheTrieWindowFlag.Name),
+		CacheTrieMaxItems:       ctx.Int(CacheTrieMaxItemsFlag.Name),
 
 		// Disable transaction indexing/unindexing.
 		TxLookupLimit: -1,
@@ -2528,8 +2558,11 @@ func MakeConsolePreloads(ctx *cli.Context) []string {
 // MakeTrieDatabase constructs a trie database based on the configured scheme.
 func MakeTrieDatabase(ctx *cli.Context, stack *node.Node, disk ethdb.Database, preimage bool, readOnly bool, isUBT bool) *triedb.Database {
 	config := &triedb.Config{
-		Preimages: preimage,
-		IsUBT:     isUBT,
+		Preimages:         preimage,
+		IsUBT:             isUBT,
+		CacheTrie:         ctx.Bool(CacheTrieStateFlag.Name),
+		CacheTrieWindow:   ctx.Uint64(CacheTrieWindowFlag.Name),
+		CacheTrieMaxItems: ctx.Int(CacheTrieMaxItemsFlag.Name),
 	}
 	scheme, err := rawdb.ParseStateScheme(ctx.String(StateSchemeFlag.Name), disk)
 	if err != nil {
