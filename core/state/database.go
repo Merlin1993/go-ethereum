@@ -234,9 +234,9 @@ func (db *CachingDB) OpenTrie(root common.Hash) (Trie, error) {
 	if db.triedb.IsVerkle() {
 		baseTrie, err = trie.NewVerkleTrie(root, db.triedb, db.pointCache)
 	} else if db.triedb.IsBinary() {
-		var flat trie.BinaryFlatSnapshotResolver
+		var flat trie.ArchiveFlatSnapshotResolver
 		if db.snap != nil {
-			flat = func(root common.Hash) trie.BinaryFlatSnapshot {
+			flat = func(root common.Hash) trie.ArchiveFlatSnapshot {
 				snap := db.snap.Snapshot(root)
 				if snap == nil {
 					return nil
@@ -244,7 +244,7 @@ func (db *CachingDB) OpenTrie(root common.Hash) (Trie, error) {
 				return snap
 			}
 		}
-		baseTrie, err = trie.NewBinaryTrie(root, db.triedb, db.triedb.Archive(), flat)
+		baseTrie, err = trie.NewArchiveTrie(root, db.triedb, db.triedb.Archive(), flat)
 	} else {
 		baseTrie, err = trie.NewStateTrie(trie.StateTrieID(root), db.triedb)
 	}
@@ -271,8 +271,8 @@ func (db *CachingDB) OpenStorageTrie(stateRoot common.Hash, address common.Addre
 		return self, nil
 	}
 	if db.triedb.IsBinary() {
-		if bt, ok := self.(*trie.BinaryTrie); ok {
-			return trie.NewBinaryStorageTrie(address, bt), nil
+		if bt, ok := self.(*trie.ArchiveTrie); ok {
+			return trie.NewArchiveStorageTrie(address, bt), nil
 		}
 		return self, nil
 	}

@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync/atomic"
@@ -29,7 +30,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/params"
-	binarytrie "github.com/ethereum/go-ethereum/trie/binary"
+	archivetrie "github.com/ethereum/go-ethereum/trie/archive"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/database"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
@@ -64,17 +65,23 @@ var (
 	maxBlocks        = flag.Int("blocks", 0, "Maximum number of blocks to process during processor or consistency tests (0 = all)")
 
 	// Binary Trie Ablation flags
-	shardDepth            = flag.Int("shardDepth", 8, "Binary trie shard depth")
-	archiveBucketSize     = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
-	archiveItemCacheLimit = flag.Int("archiveItemCacheLimit", 0, "Binary trie decoded archive item cache limit; 0 disables item caching, negative keeps all")
-	cuckooBuckets         = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
-	cuckooSlots           = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
-	binaryNodeCacheLimit  = flag.Int("binaryNodeCacheLimit", 262144, "Binary trie process node cache limit; 0 uses default, negative disables cache")
-	binaryPhysicalDelete  = flag.Bool("binaryPhysicalDelete", false, "Physically delete obsolete binary trie state nodes from stateDB")
-	binaryNodeStorage     = flag.String("binaryNodeStorage", "path", "Binary trie node storage scheme: hash or path")
-	maxRootPipelineMs     = flag.Int("maxRootPipelineMs", 0, "Abort if any block root pipeline exceeds this many milliseconds; 0 disables")
-	maxHandleDestructMs   = flag.Int("maxHandleDestructionMs", 0, "Abort if any block handleDestruction exceeds this many milliseconds; 0 disables")
-	maxPruningMs          = flag.Int("maxPruningMs", 0, "Abort if any binary pruning step exceeds this many milliseconds; 0 disables")
+	shardDepth                  = flag.Int("shardDepth", 8, "Binary trie shard depth")
+	archiveBucketSize           = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
+	archiveItemCacheLimit       = flag.Int("archiveItemCacheLimit", 0, "Binary trie decoded archive item cache limit; 0 disables item caching, negative keeps all")
+	cuckooBuckets               = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
+	cuckooSlots                 = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
+	binaryNodeCacheLimit        = flag.Int("binaryNodeCacheLimit", 262144, "Binary trie process node cache entry limit; 0 uses default, negative disables cache")
+	binaryNodeCacheBytesLimitMB = flag.Int("binaryNodeCacheBytesLimitMB", 512, "Binary trie process node cache byte limit in MiB; 0 uses default, negative disables byte cap")
+	binaryPathDiagnostics       = flag.Bool("binaryPathDiagnostics", false, "Enable binary trie path/cache diagnostics")
+	binaryPruneShardMetrics     = flag.Bool("binaryPruneShardMetrics", false, "Write per-prune binary shard pressure metrics CSV")
+	binaryAsyncPrune            = flag.Bool("binaryAsyncPrune", false, "Run binary shard pruning asynchronously and wait before root commit")
+	binaryCommitWorkers         = flag.Int("binaryCommitWorkers", 0, "Max parallel binary shard commit workers; 0 uses binary default cap")
+	binaryCommitWatchdog        = flag.Int("binaryCommitWatchdogSec", 0, "Dump goroutines if one binary wrapper commit exceeds this many seconds; 0 disables")
+	binaryPhysicalDelete        = flag.Bool("binaryPhysicalDelete", false, "Physically delete obsolete binary trie state nodes from stateDB")
+	binaryNodeStorage           = flag.String("binaryNodeStorage", "path", "Binary trie node storage scheme: hash or path")
+	maxRootPipelineMs           = flag.Int("maxRootPipelineMs", 0, "Abort if any block root pipeline exceeds this many milliseconds; 0 disables")
+	maxHandleDestructMs         = flag.Int("maxHandleDestructionMs", 0, "Abort if any block handleDestruction exceeds this many milliseconds; 0 disables")
+	maxPruningMs                = flag.Int("maxPruningMs", 0, "Abort if any binary pruning step exceeds this many milliseconds; 0 disables")
 )
 
 func TestMain(m *testing.M) {
@@ -101,17 +108,23 @@ type ProcessorConfig struct {
 	MaxBlocks        int
 
 	// Ablation params
-	ShardDepth            int
-	ArchiveBucketSize     int
-	ArchiveItemCacheLimit int
-	CuckooBuckets         int
-	CuckooSlots           int
-	BinaryNodeCacheLimit  int
-	BinaryPhysicalDelete  bool
-	BinaryNodeStorage     string
-	MaxRootPipelineMs     int
-	MaxHandleDestructMs   int
-	MaxPruningMs          int
+	ShardDepth                  int
+	ArchiveBucketSize           int
+	ArchiveItemCacheLimit       int
+	CuckooBuckets               int
+	CuckooSlots                 int
+	BinaryNodeCacheLimit        int
+	BinaryNodeCacheBytesLimitMB int
+	BinaryPathDiagnostics       bool
+	BinaryPruneShardMetrics     bool
+	BinaryAsyncPrune            bool
+	BinaryCommitWorkers         int
+	BinaryCommitWatchdog        int
+	BinaryPhysicalDelete        bool
+	BinaryNodeStorage           string
+	MaxRootPipelineMs           int
+	MaxHandleDestructMs         int
+	MaxPruningMs                int
 }
 
 func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
@@ -160,6 +173,11 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 			CuckooBuckets:         cfg.CuckooBuckets,
 			CuckooSlots:           cfg.CuckooSlots,
 			NodeCacheLimit:        cfg.BinaryNodeCacheLimit,
+			NodeCacheBytesLimit:   int64(cfg.BinaryNodeCacheBytesLimitMB) * 1024 * 1024,
+			EnablePathDiagnostics: cfg.BinaryPathDiagnostics,
+			AsyncPrune:            cfg.BinaryAsyncPrune,
+			CommitWorkers:         cfg.BinaryCommitWorkers,
+			CommitWatchdogSeconds: cfg.BinaryCommitWatchdog,
 			PhysicalDelete:        cfg.BinaryPhysicalDelete,
 			NodeStorageScheme:     cfg.BinaryNodeStorage,
 		},
@@ -216,30 +234,36 @@ func TestExpireStateProcessor(t *testing.T) {
 		flag.Parse()
 	}
 	cfg := &ProcessorConfig{
-		DbDir:                 *dbDir,
-		DataDir:               *dataDir,
-		StartFileIdx:          *startIdx,
-		EndFileIdx:            *endIdx,
-		UseVerkle:             *useVerkle,
-		UseBinaryTrie:         *useBinaryTrie && !*useKV,
-		UseKV:                 *useKV,
-		UseMemory:             *useMemory,
-		BinaryArchiveDir:      *binaryArchiveDir,
-		MetricsDir:            *metricsDir,
-		StartNum:              46147,
-		PruneInterval:         *pruneInterval,
-		MaxBlocks:             *maxBlocks,
-		ShardDepth:            *shardDepth,
-		ArchiveBucketSize:     *archiveBucketSize,
-		ArchiveItemCacheLimit: *archiveItemCacheLimit,
-		CuckooBuckets:         *cuckooBuckets,
-		CuckooSlots:           *cuckooSlots,
-		BinaryNodeCacheLimit:  *binaryNodeCacheLimit,
-		BinaryPhysicalDelete:  *binaryPhysicalDelete,
-		BinaryNodeStorage:     *binaryNodeStorage,
-		MaxRootPipelineMs:     *maxRootPipelineMs,
-		MaxHandleDestructMs:   *maxHandleDestructMs,
-		MaxPruningMs:          *maxPruningMs,
+		DbDir:                       *dbDir,
+		DataDir:                     *dataDir,
+		StartFileIdx:                *startIdx,
+		EndFileIdx:                  *endIdx,
+		UseVerkle:                   *useVerkle,
+		UseBinaryTrie:               *useBinaryTrie && !*useKV,
+		UseKV:                       *useKV,
+		UseMemory:                   *useMemory,
+		BinaryArchiveDir:            *binaryArchiveDir,
+		MetricsDir:                  *metricsDir,
+		StartNum:                    46147,
+		PruneInterval:               *pruneInterval,
+		MaxBlocks:                   *maxBlocks,
+		ShardDepth:                  *shardDepth,
+		ArchiveBucketSize:           *archiveBucketSize,
+		ArchiveItemCacheLimit:       *archiveItemCacheLimit,
+		CuckooBuckets:               *cuckooBuckets,
+		CuckooSlots:                 *cuckooSlots,
+		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,
+		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
+		BinaryPathDiagnostics:       *binaryPathDiagnostics,
+		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
+		BinaryAsyncPrune:            *binaryAsyncPrune,
+		BinaryCommitWorkers:         *binaryCommitWorkers,
+		BinaryCommitWatchdog:        *binaryCommitWatchdog,
+		BinaryPhysicalDelete:        *binaryPhysicalDelete,
+		BinaryNodeStorage:           *binaryNodeStorage,
+		MaxRootPipelineMs:           *maxRootPipelineMs,
+		MaxHandleDestructMs:         *maxHandleDestructMs,
+		MaxPruningMs:                *maxPruningMs,
 	}
 
 	common.UseVerkle = cfg.UseVerkle
@@ -266,8 +290,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		Config: params.TestChainConfig,
 		Alloc:  core.GenesisAlloc{},
 	}
-	gspec.MustCommit(host.db, host.trieDB)
-	lastStateRoot := types.EmptyRootHash
+	genesis := gspec.MustCommit(host.db, host.trieDB)
+	lastStateRoot := genesis.Root()
 	fmt.Printf(">>> Genesis block committed, root: %s\n", lastStateRoot.Hex())
 
 	// Statistics tracking
@@ -286,12 +310,18 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalRootPipelineTime  time.Duration
 		maxRootPipelineTime    time.Duration
 		maxRootPipelineBlock   uint64
+		totalRootComputeTime   time.Duration
+		maxRootComputeTime     time.Duration
 		totalHandleDestruct    time.Duration
 		maxHandleDestruct      time.Duration
 		maxHandleDestructBlock uint64
 		totalPruneTime         time.Duration
 		maxPruneTime           time.Duration
 		maxPruneBlock          uint64
+		totalArchiveCompute    time.Duration
+		maxArchiveCompute      time.Duration
+		totalArchiveWait       time.Duration
+		maxArchiveWait         time.Duration
 		maxProofSizeBlockBlock uint64
 		pruneCount             uint64
 		totalStorageSize       int64 // Cumulative storage size
@@ -327,20 +357,54 @@ func TestExpireStateProcessor(t *testing.T) {
 	kvStatsWriter := csv.NewWriter(kvStatsFile)
 	defer kvStatsWriter.Flush()
 
+	var pruneShardWriter *csv.Writer
+	var pruneShardFile *os.File
+	if cfg.UseBinaryTrie && cfg.BinaryPruneShardMetrics {
+		pruneShardFile, err = os.Create(filepath.Join(outputDir, "asct_prune_shard_metrics.csv"))
+		if err != nil {
+			t.Fatalf("failed to create prune shard metrics csv file: %v", err)
+		}
+		defer pruneShardFile.Close()
+		pruneShardWriter = csv.NewWriter(pruneShardFile)
+		defer pruneShardWriter.Flush()
+		pruneShardWriter.Write([]string{
+			"Block", "Shard_ID",
+			"Total_us", "Wait_us", "Shard_us", "Prefetch_us",
+			"Internal_Visits", "Hot_Skips", "Child_Hits", "Child_Skips", "Bulk_Collects",
+			"Collected_Leaves", "Collected_Stubs", "Build_Items", "Build_Buckets", "ArchiveBuild_Parallel",
+		})
+	}
+	if cfg.UseBinaryTrie {
+		archivetrie.ResetPrunePressureDiagnostics()
+	}
+
 	// Write CSV Header
 	writer.Write([]string{
 		"Epoch_ID", "Tree_Type", "Cumulative_Storage_Bytes",
 		"State_Storage_Bytes", "Archived_Storage_Bytes",
 		"State_Storage_Share_Pct", "Archive_Storage_Share_Pct",
+		// 内存相关列用于判断是否真泄漏：Heap 持续增长说明仍有长期引用；
+		// NodeCache_MB 顶到上限则说明缓存保护生效，后续可调 bytes limit 做性能/内存折中。
+		"Heap_Alloc_MB", "Heap_Sys_MB", "Runtime_Sys_MB", "NodeCache_MB", "NodeCache_Entries",
 		"Archive_Bytes_Per_Item", "State_Bytes_Per_Active_Leaf",
 		"Trie_Child_Node_Count", "Total_Archived_Items", "Total_Bucket_Count",
 		"Max_Buckets_On_Single_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max",
 		"Avg_Finalise_Time_ms", "Max_Finalise_Time_ms",
 		"Avg_State_Commit_Time_ms", "Max_State_Commit_Time_ms",
 		"Avg_Root_Pipeline_Time_ms", "Max_Root_Pipeline_Time_ms",
+		"Avg_Root_Compute_Excl_Archive_Wait_ms", "Max_Root_Compute_Excl_Archive_Wait_ms",
 		"Max_State_Commit_Block", "Max_Root_Pipeline_Block",
 		"Avg_Handle_Destruction_Time_ms", "Max_Handle_Destruction_Time_ms", "Max_Handle_Destruction_Block",
 		"Avg_Pruning_Time_us", "Max_Pruning_Time_us",
+		"Avg_Archive_Compute_Time_us", "Max_Archive_Compute_Time_us",
+		"Avg_Archive_Wait_Time_us", "Max_Archive_Wait_Time_us",
+		"Max_Pruning_Shard_ID", "Max_Pruning_Shard_Time_us", "Max_Pruning_Shard_Total_us",
+		"Max_Pruning_Shard_Wait_us", "Max_Pruning_Shard_Prefetch_us",
+		"Max_Pruning_Shard_Internal_Visits", "Max_Pruning_Shard_Hot_Skips",
+		"Max_Pruning_Shard_Child_Hits", "Max_Pruning_Shard_Child_Skips",
+		"Max_Pruning_Shard_Bulk_Collects", "Max_Pruning_Shard_Collected_Leaves",
+		"Max_Pruning_Shard_Collected_Stubs", "Max_Pruning_Shard_Build_Items",
+		"Max_Pruning_Shard_Build_Buckets", "Max_Pruning_Shard_ArchiveBuild_Parallel",
 		"Hit_Count", "Miss_NonExistent_Count", "Miss_Existent_Count",
 		"Avg_Proof_Gen_Time_ms", "Max_Proof_Gen_Time_ms", "Avg_Proof_Verify_Time_ms", "Max_Proof_Verify_Time_ms",
 		"Avg_Proof_Size_Byte", "Max_Proof_Size_Byte",
@@ -387,8 +451,8 @@ func TestExpireStateProcessor(t *testing.T) {
 			bucketItemsMax     int
 		)
 		if cfg.UseBinaryTrie {
-			if active := host.trieDB.GetBinaryTrie(); active != nil {
-				if bt, ok := active.(*binarytrie.Trie); ok {
+			if active := host.trieDB.GetArchiveTrie(); active != nil {
+				if bt, ok := active.(*archivetrie.Trie); ok {
 					stats := bt.Stats()
 					trieChildNodeCount = stats.LeafCount
 					totalArchivedItems = stats.ArchivedDataSize
@@ -416,6 +480,13 @@ func TestExpireStateProcessor(t *testing.T) {
 		if trieChildNodeCount > 0 {
 			stateBytesPerActiveLeaf = float64(stateStorageSize) / float64(trieChildNodeCount)
 		}
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+		var commitDiag archivetrie.CommitDiagnostics
+		if cfg.UseBinaryTrie {
+			// LastCommitDiagnostics 里带有 wrapper 每次 commit 记录的 node cache 体量。
+			commitDiag = archivetrie.LastCommitDiagnostics()
+		}
 
 		fmt.Printf("  Blocks: %d - %d (Processed Blocks Count)\n", totalProcessedBlocks-intervalBlocks, totalProcessedBlocks-1)
 		fmt.Printf("  Tx Execution   - Avg: %v, Max: %v\n", totalTxTime/time.Duration(intervalBlocks), maxTxTime)
@@ -425,23 +496,60 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  Finalise - Avg: %.2f ms, Max: %v\n", float64(totalFinaliseTime.Milliseconds())/float64(intervalBlocks), maxFinaliseTime)
 		fmt.Printf("  State Commit - Avg: %.2f ms, Max: %v\n", float64(totalCommitTime.Milliseconds())/float64(intervalBlocks), maxCommitTime)
 		fmt.Printf("  Root Pipeline - Avg: %.2f ms, Max: %v\n", float64(totalRootPipelineTime.Milliseconds())/float64(intervalBlocks), maxRootPipelineTime)
+		fmt.Printf("  Root Compute excl archive wait - Avg: %.2f ms, Max: %v\n", float64(totalRootComputeTime.Milliseconds())/float64(intervalBlocks), maxRootComputeTime)
 		fmt.Printf("  Storage bytes: total=%d, state=%d, archive=%d\n", totalStorageSize, stateStorageSize, archiveStorageSize)
 		fmt.Printf("  Storage shares: state=%.2f%%, archive=%.2f%%, archiveBytesPerItem=%.2f, stateBytesPerActiveLeaf=%.2f\n",
 			stateStorageSharePct, archiveStorageSharePct, archiveBytesPerItem, stateBytesPerActiveLeaf)
+		fmt.Printf("  Memory - HeapAlloc=%dMB HeapSys=%dMB RuntimeSys=%dMB NodeCache=%dMB entries=%d\n",
+			memStats.HeapAlloc/(1024*1024),
+			memStats.HeapSys/(1024*1024),
+			memStats.Sys/(1024*1024),
+			commitDiag.NodeCacheBytes/(1024*1024),
+			commitDiag.NodeCacheEntries,
+		)
 		if cfg.UseBinaryTrie {
 			fmt.Printf("  ASCT Struct - Leaves=%d, ArchiveItems=%d, Buckets=%d, MaxBucketsPath=%d\n",
 				trieChildNodeCount, totalArchivedItems, totalBucketCount, maxBucketsPath)
 		}
 
 		avgBinaryPruneTime := 0.0
+		avgArchiveCompute := 0.0
+		avgArchiveWait := 0.0
 		if pruneCount > 0 {
 			avgBinaryPruneTime = float64(totalPruneTime) / float64(pruneCount) / float64(time.Microsecond) // ns -> us
+			avgArchiveCompute = float64(totalArchiveCompute) / float64(pruneCount) / float64(time.Microsecond)
+			avgArchiveWait = float64(totalArchiveWait) / float64(pruneCount) / float64(time.Microsecond)
+		}
+		var prunePressure archivetrie.PrunePressureDiagnostics
+		if cfg.UseBinaryTrie {
+			prunePressure = archivetrie.LastPrunePressureDiagnostics()
+		}
+		if pruneCount > 0 {
+			fmt.Printf("  ASCT archive compute - Avg: %.2f us, Max: %v, WaitAvg: %.2f us, WaitMax: %v\n",
+				float64(totalArchiveCompute)/float64(pruneCount)/float64(time.Microsecond),
+				maxArchiveCompute,
+				float64(totalArchiveWait)/float64(pruneCount)/float64(time.Microsecond),
+				maxArchiveWait,
+			)
 		}
 		fmt.Printf("  平均二进制裁剪耗时: %.2f us\n", avgBinaryPruneTime)
 		fmt.Printf("  最大二进制裁剪耗时: %.2f us\n", float64(maxPruneTime)/float64(time.Microsecond))
 		fmt.Printf("  命中热状态次数: %d\n", atomic.LoadInt64(&common.BinaryHitCount))
 		fmt.Printf("  未命中且数据不存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissNonExistentCount))
 		fmt.Printf("  未命中但数据存在次数: %d\n", atomic.LoadInt64(&common.BinaryMissExistentCount))
+
+		if cfg.UseBinaryTrie {
+			fmt.Printf("  ASCT Prune Pressure - MaxShard=%d ShardTime=%v Total=%v Leaves=%d Stubs=%d BuildItems=%d BuildBuckets=%d InternalVisits=%d\n",
+				prunePressure.MaxShardID,
+				time.Duration(prunePressure.MaxShardNanos),
+				time.Duration(prunePressure.MaxTotalNanos),
+				prunePressure.MaxLeaves,
+				prunePressure.MaxStubs,
+				prunePressure.MaxBuildItems,
+				prunePressure.MaxBuildBuckets,
+				prunePressure.MaxInternalVisits,
+			)
+		}
 
 		missExistent := atomic.LoadInt64(&common.BinaryMissExistentCount)
 		avgGenTime := 0.0
@@ -512,6 +620,11 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(archiveStorageSize, 10),
 			fmt.Sprintf("%.2f", stateStorageSharePct),
 			fmt.Sprintf("%.2f", archiveStorageSharePct),
+			strconv.FormatUint(memStats.HeapAlloc/(1024*1024), 10),
+			strconv.FormatUint(memStats.HeapSys/(1024*1024), 10),
+			strconv.FormatUint(memStats.Sys/(1024*1024), 10),
+			strconv.FormatInt(commitDiag.NodeCacheBytes/(1024*1024), 10),
+			strconv.FormatInt(commitDiag.NodeCacheEntries, 10),
 			fmt.Sprintf("%.2f", archiveBytesPerItem),
 			fmt.Sprintf("%.2f", stateBytesPerActiveLeaf),
 			strconv.FormatInt(trieChildNodeCount, 10),
@@ -529,6 +642,8 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(maxCommitTime.Milliseconds(), 10),
 			fmt.Sprintf("%.2f", float64(totalRootPipelineTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxRootPipelineTime.Milliseconds(), 10),
+			fmt.Sprintf("%.2f", float64(totalRootComputeTime.Milliseconds())/float64(intervalBlocks)),
+			strconv.FormatInt(maxRootComputeTime.Milliseconds(), 10),
 			strconv.FormatUint(maxCommitBlock, 10),
 			strconv.FormatUint(maxRootPipelineBlock, 10),
 			fmt.Sprintf("%.2f", float64(totalHandleDestruct.Milliseconds())/float64(intervalBlocks)),
@@ -536,6 +651,25 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatUint(maxHandleDestructBlock, 10),
 			fmt.Sprintf("%.2f", avgBinaryPruneTime),
 			strconv.FormatInt(maxPruneTime.Microseconds(), 10),
+			fmt.Sprintf("%.2f", avgArchiveCompute),
+			strconv.FormatInt(maxArchiveCompute.Microseconds(), 10),
+			fmt.Sprintf("%.2f", avgArchiveWait),
+			strconv.FormatInt(maxArchiveWait.Microseconds(), 10),
+			strconv.FormatInt(prunePressure.MaxShardID, 10),
+			strconv.FormatInt(prunePressure.MaxShardNanos/int64(time.Microsecond), 10),
+			strconv.FormatInt(prunePressure.MaxTotalNanos/int64(time.Microsecond), 10),
+			strconv.FormatInt(prunePressure.MaxWaitNanos/int64(time.Microsecond), 10),
+			strconv.FormatInt(prunePressure.MaxPrefetchNanos/int64(time.Microsecond), 10),
+			strconv.FormatInt(prunePressure.MaxInternalVisits, 10),
+			strconv.FormatInt(prunePressure.MaxHotSkips, 10),
+			strconv.FormatInt(prunePressure.MaxChildHits, 10),
+			strconv.FormatInt(prunePressure.MaxChildSkips, 10),
+			strconv.FormatInt(prunePressure.MaxBulkCollects, 10),
+			strconv.FormatInt(prunePressure.MaxLeaves, 10),
+			strconv.FormatInt(prunePressure.MaxStubs, 10),
+			strconv.FormatInt(prunePressure.MaxBuildItems, 10),
+			strconv.FormatInt(prunePressure.MaxBuildBuckets, 10),
+			strconv.FormatInt(prunePressure.MaxParallelBuilds, 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
@@ -570,12 +704,18 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalRootPipelineTime = 0
 		maxRootPipelineTime = 0
 		maxRootPipelineBlock = 0
+		totalRootComputeTime = 0
+		maxRootComputeTime = 0
 		totalHandleDestruct = 0
 		maxHandleDestruct = 0
 		maxHandleDestructBlock = 0
 		totalPruneTime = 0
 		maxPruneTime = 0
 		maxPruneBlock = 0
+		totalArchiveCompute = 0
+		maxArchiveCompute = 0
+		totalArchiveWait = 0
+		maxArchiveWait = 0
 		maxProofSizeBlockBlock = 0
 		pruneCount = 0
 		totalTxTime = 0 // Reset Tx Execution stats
@@ -601,6 +741,15 @@ func TestExpireStateProcessor(t *testing.T) {
 		common.BinaryItemProofSizeMin = 0
 		common.BinaryItemProofSizeMax = 0
 		common.BinaryStatsMu.Unlock()
+		// FP 分布只用于窗口/最终统计。及时写出并清空切片，避免高误报场景下
+		// BinaryFPDistribution 自己成为长跑内存增长源。
+		flushGlobalFPDistribution(outputDir)
+		if cfg.UseBinaryTrie {
+			archivetrie.ResetPrunePressureDiagnostics()
+			if pruneShardWriter != nil {
+				pruneShardWriter.Flush()
+			}
+		}
 	}
 
 	recordKVBlockStats := func(block uint64) {
@@ -628,6 +777,59 @@ func TestExpireStateProcessor(t *testing.T) {
 		if block%100000 == 0 {
 			kvStatsWriter.Flush()
 		}
+	}
+
+	recordPruneShardMetrics := func(block uint64) {
+		if pruneShardWriter == nil {
+			return
+		}
+		p := archivetrie.LastPrunePressureDiagnostics()
+		pruneShardWriter.Write([]string{
+			strconv.FormatUint(block, 10),
+			strconv.FormatInt(p.LastShardID, 10),
+			strconv.FormatInt(p.LastTotalNanos/int64(time.Microsecond), 10),
+			strconv.FormatInt(p.LastWaitNanos/int64(time.Microsecond), 10),
+			strconv.FormatInt(p.LastShardNanos/int64(time.Microsecond), 10),
+			strconv.FormatInt(p.LastPrefetchNanos/int64(time.Microsecond), 10),
+			strconv.FormatInt(p.LastInternalVisits, 10),
+			strconv.FormatInt(p.LastHotSkips, 10),
+			strconv.FormatInt(p.LastChildHits, 10),
+			strconv.FormatInt(p.LastChildSkips, 10),
+			strconv.FormatInt(p.LastBulkCollects, 10),
+			strconv.FormatInt(p.LastLeaves, 10),
+			strconv.FormatInt(p.LastStubs, 10),
+			strconv.FormatInt(p.LastBuildItems, 10),
+			strconv.FormatInt(p.LastBuildBuckets, 10),
+			strconv.FormatInt(p.LastParallelBuilds, 10),
+		})
+		if block%1000 == 0 {
+			pruneShardWriter.Flush()
+		}
+	}
+	recordArchiveAfterCommit := func(block uint64, pruned bool, rootDuration time.Duration) time.Duration {
+		rootComputeDuration := rootDuration
+		if !pruned || !cfg.UseBinaryTrie {
+			return rootComputeDuration
+		}
+		p := archivetrie.LastPrunePressureDiagnostics()
+		archiveCompute := time.Duration(p.LastShardNanos)
+		archiveWait := time.Duration(p.LastWaitNanos)
+		totalArchiveCompute += archiveCompute
+		if archiveCompute > maxArchiveCompute {
+			maxArchiveCompute = archiveCompute
+		}
+		totalArchiveWait += archiveWait
+		if archiveWait > maxArchiveWait {
+			maxArchiveWait = archiveWait
+		}
+		if cfg.BinaryAsyncPrune && archiveWait > 0 && archiveWait < rootComputeDuration {
+			rootComputeDuration -= archiveWait
+		}
+		recordPruneShardMetrics(block)
+		if cfg.BinaryAsyncPrune {
+			checkDurationLimit(t, "binary archive compute", block, archiveCompute, cfg.MaxPruningMs)
+		}
+		return rootComputeDuration
 	}
 
 	var (
@@ -710,6 +912,10 @@ processFiles:
 					AddBalanceSilent(statedb, miner, reward)
 				}
 
+				if cfg.UseBinaryTrie {
+					archivetrie.ResetCommitDiagnostics()
+				}
+				prunedThisBlock := false
 				if cfg.UseBinaryTrie && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
 					pruneStart := time.Now()
 					statedb.PruneNextShard()
@@ -720,6 +926,7 @@ processFiles:
 						maxPruneBlock = b
 					}
 					pruneCount++
+					prunedThisBlock = true
 					checkDurationLimit(t, "binary pruning", b, pruneDuration, cfg.MaxPruningMs)
 				}
 				rootStart := time.Now()
@@ -728,9 +935,6 @@ processFiles:
 				finaliseDuration := time.Since(finaliseStart)
 
 				commitStart := time.Now()
-				if cfg.UseBinaryTrie {
-					binarytrie.ResetCommitDiagnostics()
-				}
 				preCommitStart := time.Now()
 				if _, _, err := statedb.PreCommit(false); err != nil {
 					t.Fatalf("pre-commit failed at empty block %d: %v", b, err)
@@ -750,7 +954,7 @@ processFiles:
 					extra := ""
 					if cfg.UseBinaryTrie {
 						treeLabel = "ASCT"
-						extra = " " + binarytrie.LastCommitDiagnostics().String()
+						extra = " " + archivetrie.LastCommitDiagnostics().String() + " " + archivetrie.LastPrunePressureDiagnostics().String()
 					} else if cfg.UseVerkle {
 						treeLabel = "Verkle"
 					}
@@ -759,6 +963,7 @@ processFiles:
 				}
 				checkDurationLimit(t, "root pipeline", b, rootDuration, cfg.MaxRootPipelineMs)
 				checkDurationLimit(t, "handleDestruction", b, statedb.CommitHandleDestruction, cfg.MaxHandleDestructMs)
+				rootComputeDuration := recordArchiveAfterCommit(b, prunedThisBlock, rootDuration)
 				lastStateRoot = h
 
 				totalFinaliseTime += finaliseDuration
@@ -779,6 +984,10 @@ processFiles:
 				if rootDuration > maxRootPipelineTime {
 					maxRootPipelineTime = rootDuration
 					maxRootPipelineBlock = b
+				}
+				totalRootComputeTime += rootComputeDuration
+				if rootComputeDuration > maxRootComputeTime {
+					maxRootComputeTime = rootComputeDuration
 				}
 				if b%1000 == 0 {
 					host.trieDB.Commit(h, false)
@@ -874,6 +1083,10 @@ processFiles:
 				maxTxTime = txDuration
 			}
 
+			if cfg.UseBinaryTrie {
+				archivetrie.ResetCommitDiagnostics()
+			}
+			prunedThisBlock := false
 			if cfg.UseBinaryTrie && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
 				pruneStart := time.Now()
 				statedb.PruneNextShard()
@@ -884,6 +1097,7 @@ processFiles:
 					maxPruneBlock = b
 				}
 				pruneCount++
+				prunedThisBlock = true
 				checkDurationLimit(t, "binary pruning", b, pruneDuration, cfg.MaxPruningMs)
 			}
 
@@ -894,9 +1108,6 @@ processFiles:
 			finaliseDuration := time.Since(finaliseStart)
 
 			commitStart := time.Now()
-			if cfg.UseBinaryTrie {
-				binarytrie.ResetCommitDiagnostics()
-			}
 			preCommitStart := time.Now()
 			if _, _, err := statedb.PreCommit(false); err != nil {
 				t.Fatalf("pre-commit failed at block %d: %v", b, err)
@@ -917,7 +1128,7 @@ processFiles:
 				extra := ""
 				if cfg.UseBinaryTrie {
 					treeLabel = "ASCT"
-					extra = " " + binarytrie.LastCommitDiagnostics().String()
+					extra = " " + archivetrie.LastCommitDiagnostics().String() + " " + archivetrie.LastPrunePressureDiagnostics().String()
 				} else if cfg.UseVerkle {
 					treeLabel = "Verkle"
 				}
@@ -926,6 +1137,7 @@ processFiles:
 			}
 			checkDurationLimit(t, "root pipeline", b, rootDuration, cfg.MaxRootPipelineMs)
 			checkDurationLimit(t, "handleDestruction", b, statedb.CommitHandleDestruction, cfg.MaxHandleDestructMs)
+			rootComputeDuration := recordArchiveAfterCommit(b, prunedThisBlock, rootDuration)
 
 			if b%100000 == 0 {
 				fmt.Printf("[测试] block %d: finalise=%v, commit=%v, root_pipeline=%v\n",
@@ -981,6 +1193,10 @@ processFiles:
 			if rootDuration > maxRootPipelineTime {
 				maxRootPipelineTime = rootDuration
 				maxRootPipelineBlock = b
+			}
+			totalRootComputeTime += rootComputeDuration
+			if rootComputeDuration > maxRootComputeTime {
+				maxRootComputeTime = rootComputeDuration
 			}
 
 			intervalBlocks++
@@ -1173,25 +1389,31 @@ func TestBinaryTrieConsistency(t *testing.T) {
 
 	// 2. Binary Trie Host setup
 	binCfg := &ProcessorConfig{
-		DbDir:                 filepath.Join(os.TempDir(), "bin_consistency_db"),
-		DataDir:               *dataDir,
-		StartFileIdx:          *startIdx,
-		EndFileIdx:            *endIdx,
-		UseVerkle:             false,
-		UseBinaryTrie:         true,
-		UseMemory:             false,
-		BinaryArchiveDir:      filepath.Join(os.TempDir(), "bin_consistency_archive"),
-		StartNum:              46147,
-		PruneInterval:         *pruneInterval,
-		MaxBlocks:             *maxBlocks,
-		ShardDepth:            *shardDepth,
-		ArchiveBucketSize:     *archiveBucketSize,
-		ArchiveItemCacheLimit: *archiveItemCacheLimit,
-		CuckooBuckets:         *cuckooBuckets,
-		CuckooSlots:           *cuckooSlots,
-		BinaryNodeCacheLimit:  *binaryNodeCacheLimit,
-		BinaryPhysicalDelete:  *binaryPhysicalDelete,
-		BinaryNodeStorage:     *binaryNodeStorage,
+		DbDir:                       filepath.Join(os.TempDir(), "bin_consistency_db"),
+		DataDir:                     *dataDir,
+		StartFileIdx:                *startIdx,
+		EndFileIdx:                  *endIdx,
+		UseVerkle:                   false,
+		UseBinaryTrie:               true,
+		UseMemory:                   false,
+		BinaryArchiveDir:            filepath.Join(os.TempDir(), "bin_consistency_archive"),
+		StartNum:                    46147,
+		PruneInterval:               *pruneInterval,
+		MaxBlocks:                   *maxBlocks,
+		ShardDepth:                  *shardDepth,
+		ArchiveBucketSize:           *archiveBucketSize,
+		ArchiveItemCacheLimit:       *archiveItemCacheLimit,
+		CuckooBuckets:               *cuckooBuckets,
+		CuckooSlots:                 *cuckooSlots,
+		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,
+		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
+		BinaryPathDiagnostics:       *binaryPathDiagnostics,
+		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
+		BinaryAsyncPrune:            *binaryAsyncPrune,
+		BinaryCommitWorkers:         *binaryCommitWorkers,
+		BinaryCommitWatchdog:        *binaryCommitWatchdog,
+		BinaryPhysicalDelete:        *binaryPhysicalDelete,
+		BinaryNodeStorage:           *binaryNodeStorage,
 	}
 	os.RemoveAll(binCfg.DbDir)
 	os.RemoveAll(binCfg.BinaryArchiveDir)

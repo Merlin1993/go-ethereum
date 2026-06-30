@@ -289,7 +289,7 @@ func newTrieReader(root common.Hash, db *triedb.Database, cache *utils.PointCach
 	if db.IsVerkle() {
 		tr, err = trie.NewVerkleTrie(root, db, cache)
 	} else if db.IsBinary() {
-		tr, err = trie.NewBinaryTrie(root, db, db.Archive())
+		tr, err = trie.NewArchiveTrie(root, db, db.Archive())
 	} else {
 		tr, err = trie.NewStateTrie(trie.StateTrieID(root), db)
 	}

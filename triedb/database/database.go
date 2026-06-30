@@ -24,15 +24,21 @@ import (
 
 // BinaryConfig holds the configuration parameters for binary trie ablation.
 type BinaryConfig struct {
-	ShardDepth                int  // Shard depth for binary trie
-	ArchiveBucketSize         int  // Archive bucket size for binary trie
-	ArchiveItemCacheLimit     int  // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
-	CuckooBuckets             int  // Cuckoo filter buckets for binary trie
-	CuckooSlots               int  // Cuckoo filter slots for binary trie
-	NodeCacheLimit            int  // Max binary trie node blobs cached in process; 0 uses default, negative disables cache
-	NodeCacheWarmPathBits     int  // Path-mode eager warming depth; 0 uses binary default, -1 keeps root-only, <-1 disables eager warming
-	CommitmentPointCacheLimit int  // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
-	PhysicalDelete            bool // Physically delete obsolete binary trie state nodes when requested
+	ShardDepth                int   // Shard depth for binary trie
+	ArchiveBucketSize         int   // Archive bucket size for binary trie
+	ArchiveItemCacheLimit     int   // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
+	CuckooBuckets             int   // Cuckoo filter buckets for binary trie
+	CuckooSlots               int   // Cuckoo filter slots for binary trie
+	NodeCacheLimit            int   // Max binary trie node blobs cached in process; 0 uses default, negative disables cache
+	NodeCacheBytesLimit       int64 // Max binary trie node blob bytes cached in process; 0 uses default, negative disables byte cap
+	NodeCacheWarmPathBits     int   // Path-mode eager warming depth; 0 uses binary default, -1 keeps root-only, <-1 disables eager warming
+	CommitmentPointCacheLimit int   // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
+	ArchiveStubMaxBucketsPath int   // Max side-mounted archive buckets at one node before pressure-sinking; 0 uses binary default, negative disables
+	AsyncPrune                bool  // Run binary shard pruning in the background and apply it before root commit
+	CommitWorkers             int   // Max parallel binary shard commit workers; 0 uses binary default
+	CommitWatchdogSeconds     int   // Dump goroutines if one binary wrapper commit exceeds this many seconds; 0 disables
+	EnablePathDiagnostics     bool  // Record path/cache diagnostics during binary trie experiments
+	PhysicalDelete            bool  // Physically delete obsolete binary trie state nodes when requested
 	NodeStorageScheme         string
 }
 

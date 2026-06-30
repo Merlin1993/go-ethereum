@@ -101,23 +101,29 @@ type backend interface {
 // Database是底层后端的包装器，由不同类型的节点后端作为入口点共享。
 // 它负责与trie节点和节点preimages相关的所有交互。
 type Database struct {
-	disk      ethdb.Database
-	config    *Config              // Configuration for trie database
-	preimages *preimageStore       // The store for caching preimages
-	backend   backend              // The backend for managing trie nodes
-	cacheTrie *cachetrie.CacheTrie // Cache trie used for enhanced caching
-	archive   ethdb.Database       // Separate archive database for binary trie
-	activeBT  interface{}          // Persistent binary trie instance
+	disk              ethdb.Database
+	config            *Config              // Configuration for trie database
+	preimages         *preimageStore       // The store for caching preimages
+	backend           backend              // The backend for managing trie nodes
+	cacheTrie         *cachetrie.CacheTrie // Cache trie used for enhanced caching
+	archive           ethdb.Database       // Separate archive database for binary trie
+	activeArchiveTrie interface{}          // Persistent archive trie instance
+	blockNum          uint64               // Current block number for diagnostics
 }
 
 func (db *Database) UpdateBlockNum(num uint64) {
-	if db.config.IsBinary && db.activeBT != nil {
-		if bt, ok := db.activeBT.(interface {
+	db.blockNum = num
+	if db.config.IsBinary && db.activeArchiveTrie != nil {
+		if bt, ok := db.activeArchiveTrie.(interface {
 			SetGlobalEpoch(byte)
 		}); ok {
 			bt.SetGlobalEpoch(byte(num/1000) % 2) // Example logic: alternate epoch every 1000 blocks
 		}
 	}
+}
+
+func (db *Database) CurrentBlockNum() uint64 {
+	return db.blockNum
 }
 
 func (db *Database) GetBackend() *pathdb.Database {
@@ -507,14 +513,14 @@ func (db *Database) ReadCache() bool {
 	return db.config.ReadCache
 }
 
-// SetBinaryTrie stores a persistent binary trie instance in the database.
-func (db *Database) SetBinaryTrie(trie interface{}) {
-	db.activeBT = trie
+// SetArchiveTrie stores a persistent archive trie instance in the database.
+func (db *Database) SetArchiveTrie(trie interface{}) {
+	db.activeArchiveTrie = trie
 }
 
-// GetBinaryTrie retrieves the persistent binary trie instance from the database.
-func (db *Database) GetBinaryTrie() interface{} {
-	return db.activeBT
+// GetArchiveTrie retrieves the persistent archive trie instance from the database.
+func (db *Database) GetArchiveTrie() interface{} {
+	return db.activeArchiveTrie
 }
 
 // BinaryAblationConfig returns the configuration for binary trie ablation.
