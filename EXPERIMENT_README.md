@@ -251,8 +251,6 @@ go test ./trie/archive -run TestArchiveTrieStress -timeout 0 -args \
   -stressBaseDir <asct-stress-dir> \
   -stressShardDepth 16 \
   -stressMaxPool 10000000 \
-  -stressArchiveItemCacheLimit 0 \
-  -stressDeleteOldValues=true \
   -stressDestructiveCommit=true
 ```
 

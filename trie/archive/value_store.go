@@ -1,37 +1,6 @@
 package archive
 
-import (
-	"bytes"
-
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
-)
-
-var inlineValueMarker = []byte{'B', 'I', 'V', '1'}
-
-func encodeInlineValue(value []byte) []byte {
-	ref := make([]byte, len(inlineValueMarker)+len(value))
-	copy(ref, inlineValueMarker)
-	copy(ref[len(inlineValueMarker):], value)
-	return ref
-}
-
-func decodeInlineValue(ref []byte) ([]byte, bool) {
-	if len(ref) == common.HashLength || !bytes.HasPrefix(ref, inlineValueMarker) {
-		return nil, false
-	}
-	return common.CopyBytes(ref[len(inlineValueMarker):]), true
-}
-
-func valueDataKey(hash []byte) []byte {
-	if len(hash) == 0 {
-		return nil
-	}
-	key := make([]byte, len(hash)+1)
-	copy(key, hash)
-	key[len(hash)] = 0x02
-	return key
-}
+import "github.com/ethereum/go-ethereum/common"
 
 var flatValuePrefix = []byte{'B', 'F', 'V', '1'}
 
@@ -45,18 +14,9 @@ func flatValueDataKey(key []byte) []byte {
 	return dataKey
 }
 
-func (s *Shard) stageValue(value []byte) []byte {
-	return s.stageValueWithRef(crypto.Keccak256Hash(value).Bytes(), value)
-}
-
+// stageValueForKey 把真实 value 写入 flat store 的 pending 区，并返回树中保存的 key-bound valueRef。
 func (s *Shard) stageValueForKey(key []byte, value []byte) []byte {
 	s.stageFlatValueForKey(key, value)
-	if s.config != nil && s.config.InlineValueThreshold > 0 &&
-		len(value) <= s.config.InlineValueThreshold &&
-		len(value)+len(inlineValueMarker) <= 255 &&
-		len(value)+len(inlineValueMarker) != common.HashLength {
-		return encodeInlineValue(value)
-	}
 	return valueRefForKeyValue(key, value)
 }
 
@@ -78,51 +38,8 @@ func (s *Shard) stageFlatDeleteForKey(key []byte) {
 	s.pendingFlatValueDeletes[id] = struct{}{}
 }
 
-func (s *Shard) stageValueWithRef(valueHash []byte, value []byte) []byte {
-	if s.pendingValues == nil {
-		s.pendingValues = make(map[string][]byte)
-	}
-	key := string(valueHash)
-	if _, ok := s.pendingValues[key]; !ok {
-		s.pendingValues[key] = common.CopyBytes(value)
-	}
-	delete(s.pendingValueDeletes, key)
-	return valueHash
-}
-
-func (s *Shard) releaseValue(valueRef []byte) {
-	if s.config == nil || !s.config.DeleteOldValues || len(valueRef) == 0 {
-		return
-	}
-	if _, ok := decodeInlineValue(valueRef); ok {
-		return
-	}
-	key := string(valueRef)
-	if _, ok := s.pendingValues[key]; ok {
-		delete(s.pendingValues, key)
-		return
-	}
-}
-
-func (s *Shard) getValue(valueHash []byte) ([]byte, error) {
-	if len(valueHash) == 0 {
-		return nil, ErrNodeNotFound
-	}
-	if value, ok := decodeInlineValue(valueHash); ok {
-		return value, nil
-	}
-	key := string(valueHash)
-	if val, ok := s.pendingValues[key]; ok {
-		return val, nil
-	}
-	for i := len(s.stagedValues) - 1; i >= 0; i-- {
-		if val, ok := s.stagedValues[i][key]; ok {
-			return val, nil
-		}
-	}
-	return s.getStoredValue(valueHash)
-}
-
+// getFlatValue 是真实 value 的唯一读取路径。archive metadata 只证明 membership，
+// 执行读取仍从 pending、staged、外部 snapshot reader 或本地 flat-value 表取值。
 func (s *Shard) getFlatValue(key []byte) ([]byte, error) {
 	if len(key) == 0 {
 		return nil, ErrNodeNotFound
@@ -176,8 +93,10 @@ func (s *Shard) hasFlatValue(key []byte) bool {
 	return err == nil && value != nil
 }
 
+// commitPendingValues 刷新 pending flat value，并只保留很小的 staged 窗口。
+// 这样 commit 后、外层数据库视图完全追上前，读路径仍能看到刚提交的数据。
 func (s *Shard) commitPendingValues(batch Batcher) error {
-	if len(s.pendingValues) == 0 && len(s.pendingValueDeletes) == 0 && len(s.pendingFlatValues) == 0 && len(s.pendingFlatValueDeletes) == 0 {
+	if len(s.pendingFlatValues) == 0 && len(s.pendingFlatValueDeletes) == 0 {
 		return nil
 	}
 	flatValues := s.pendingFlatValues
@@ -188,16 +107,6 @@ func (s *Shard) commitPendingValues(batch Batcher) error {
 	if len(s.stagedFlatValues) > 2 {
 		s.stagedFlatValues = append([]map[string][]byte(nil), s.stagedFlatValues[len(s.stagedFlatValues)-2:]...)
 	}
-	values := s.pendingValues
-	if err := s.commitValueStore(batch, values, s.pendingValueDeletes); err != nil {
-		return err
-	}
-	s.stagedValues = append(s.stagedValues, values)
-	if len(s.stagedValues) > 2 {
-		s.stagedValues = append([]map[string][]byte(nil), s.stagedValues[len(s.stagedValues)-2:]...)
-	}
-	s.pendingValues = make(map[string][]byte)
-	s.pendingValueDeletes = make(map[string]struct{})
 	s.pendingFlatValues = make(map[string][]byte)
 	s.pendingFlatValueDeletes = make(map[string]struct{})
 	return nil
@@ -224,100 +133,6 @@ func (s *Shard) commitFlatValueStore(batch Batcher, values map[string][]byte, de
 	}
 	for key, value := range values {
 		if err := batch.Put(flatValueDataKey([]byte(key)), value); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Shard) getStoredValue(valueHash []byte) ([]byte, error) {
-	dataKey := valueDataKey(valueHash)
-	if s.config != nil && s.config.ArchiveDB != nil {
-		if value, err := s.config.ArchiveDB.GetBucket(dataKey); err == nil && value != nil {
-			return value, nil
-		}
-	}
-	if value, err := s.db.Get(dataKey); err == nil && value != nil {
-		return value, nil
-	}
-	if value, err := s.db.Get(valueHash); err == nil && value != nil {
-		return value, nil
-	}
-	return nil, ErrNodeNotFound
-}
-
-func (s *Shard) commitValueStore(batch Batcher, values map[string][]byte, deletes map[string]struct{}) error {
-	if s.config != nil && s.config.ArchiveDB != nil {
-		if err := s.commitValuesToArchiveStore(values, deletes); err != nil {
-			return err
-		}
-		if batch != nil {
-			for h := range deletes {
-				if err := batch.Delete(valueDataKey([]byte(h))); err != nil {
-					return err
-				}
-				if err := batch.Delete([]byte(h)); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	if batch == nil {
-		for h := range deletes {
-			if err := s.db.Delete(valueDataKey([]byte(h))); err != nil {
-				return err
-			}
-			if err := s.db.Delete([]byte(h)); err != nil {
-				return err
-			}
-		}
-		for h, value := range values {
-			if err := s.db.Put(valueDataKey([]byte(h)), value); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	for h := range deletes {
-		if err := batch.Delete(valueDataKey([]byte(h))); err != nil {
-			return err
-		}
-		if err := batch.Delete([]byte(h)); err != nil {
-			return err
-		}
-	}
-	for h, value := range values {
-		if err := batch.Put(valueDataKey([]byte(h)), value); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *Shard) commitValuesToArchiveStore(values map[string][]byte, deletes map[string]struct{}) error {
-	if batchStore, ok := s.config.ArchiveDB.(interface{ NewBatch() Batcher }); ok {
-		batch := batchStore.NewBatch()
-		defer batch.Reset()
-		for h := range deletes {
-			if err := batch.Delete(valueDataKey([]byte(h))); err != nil {
-				return err
-			}
-		}
-		for h, value := range values {
-			if err := batch.Put(valueDataKey([]byte(h)), value); err != nil {
-				return err
-			}
-		}
-		return batch.Write()
-	}
-	for h := range deletes {
-		if err := s.config.ArchiveDB.DeleteBucket(valueDataKey([]byte(h))); err != nil {
-			return err
-		}
-	}
-	for h, value := range values {
-		if err := s.config.ArchiveDB.PutBucket(valueDataKey([]byte(h)), value); err != nil {
 			return err
 		}
 	}

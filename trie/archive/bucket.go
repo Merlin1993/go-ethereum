@@ -3,6 +3,7 @@ package archive
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"sync/atomic"
 	"time"
 
@@ -112,30 +113,6 @@ func archivedKeyMatchesKV(key ArchivedKey, kv ArchivedKV) bool {
 	return key.SuffixBits == kv.SuffixBits && bytes.Equal(key.Suffix, kv.Suffix)
 }
 
-// serializeArchivedKV 将 ArchivedKV 列表序列化为二进制数据
-func (s *Shard) serializeArchivedKV(items []ArchivedKV) ([]byte, error) {
-	size := uvarintLen(uint64(len(items)))
-	for _, kv := range items {
-		size += uvarintLen(uint64(kv.SuffixBits))
-		size += len(kv.Suffix) + 1 + len(kv.Value)
-	}
-
-	buf := make([]byte, 0, size)
-	var scratch [binary.MaxVarintLen64]byte
-
-	nBits := binary.PutUvarint(scratch[:], uint64(len(items)))
-	buf = append(buf, scratch[:nBits]...)
-
-	for _, kv := range items {
-		nBits = binary.PutUvarint(scratch[:], uint64(kv.SuffixBits))
-		buf = append(buf, scratch[:nBits]...)
-		buf = append(buf, kv.Suffix...)
-		buf = append(buf, byte(len(kv.Value)))
-		buf = append(buf, kv.Value...)
-	}
-	return buf, nil
-}
-
 func uvarintLen(x uint64) int {
 	n := 1
 	for x >= 0x80 {
@@ -143,55 +120,6 @@ func uvarintLen(x uint64) int {
 		n++
 	}
 	return n
-}
-
-// deserializeArchivedKV 从二进制数据反序列化为 ArchivedKV 列表
-func (s *Shard) deserializeArchivedKV(data []byte) ([]ArchivedKV, error) {
-	reader := bytes.NewReader(data)
-	count, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return nil, err
-	}
-
-	items := make([]ArchivedKV, 0, count)
-	for i := uint64(0); i < count; i++ {
-		suffixBits, err := binary.ReadUvarint(reader)
-		if err != nil {
-			return nil, err
-		}
-		suffixLen := (int(suffixBits) + 7) / 8
-		suffix := make([]byte, suffixLen)
-		if _, err := reader.Read(suffix); err != nil {
-			return nil, err
-		}
-
-		valLen, err := reader.ReadByte()
-		if err != nil {
-			return nil, err
-		}
-		val := make([]byte, int(valLen))
-		if _, err := reader.Read(val); err != nil {
-			return nil, err
-		}
-
-		items = append(items, ArchivedKV{
-			Suffix:     suffix,
-			SuffixBits: int(suffixBits),
-			Value:      val,
-		})
-	}
-	return items, nil
-}
-
-func (s *Shard) shouldCacheArchivedItems(count int) bool {
-	switch limit := s.config.ArchiveItemCacheLimit; {
-	case limit < 0:
-		return true
-	case limit == 0:
-		return false
-	default:
-		return count <= limit
-	}
 }
 
 func archiveItemKey(suffixBits int, suffix []byte) []byte {
@@ -242,23 +170,13 @@ func (s *Shard) bucketKeys(bucket *ArchiveBucketNode) ([]ArchivedKey, error) {
 	if bucket == nil {
 		return nil, nil
 	}
-	if len(bucket.Keys) > 0 || bucket.Count == 0 {
+	if len(bucket.Keys) == int(bucket.Count) {
 		return bucket.Keys, nil
 	}
-	data, err := s.getBucketData(s.ensureBucketHash(bucket))
-	if err != nil {
-		return nil, err
+	if bucket.Count == 0 && len(bucket.Keys) == 0 {
+		return nil, nil
 	}
-	items, err := s.deserializeArchivedKV(data)
-	if err != nil {
-		return nil, err
-	}
-	keys := make([]ArchivedKey, len(items))
-	for i, item := range items {
-		keys[i] = archivedKeyFromKV(item)
-	}
-	bucket.Keys = keys
-	return keys, nil
+	return nil, errors.New("archive bucket key list is missing or incomplete")
 }
 
 func (s *Shard) ensureBucketKeyList(bucket *ArchiveBucketNode) error {
@@ -273,29 +191,13 @@ func (s *Shard) bucketItemsWithValueRefs(bucket *ArchiveBucketNode) ([]ArchivedK
 	if bucket == nil {
 		return nil, nil
 	}
-	bucket.cacheMu.RLock()
-	if bucket.cachedItems != nil && len(bucket.cachedItems) == int(bucket.Count) {
-		items := make([]ArchivedKV, len(bucket.cachedItems))
-		copy(items, bucket.cachedItems)
-		bucket.cacheMu.RUnlock()
-		return items, nil
-	}
-	bucket.cacheMu.RUnlock()
-
-	if len(bucket.Keys) > 0 || bucket.Count == 0 {
-		items := make([]ArchivedKV, 0, len(bucket.Keys))
-		for _, key := range bucket.Keys {
-			items = append(items, archivedKVFromKey(key))
-		}
-		return items, nil
-	}
-	data, err := s.getBucketData(s.ensureBucketHash(bucket))
+	keys, err := s.bucketKeys(bucket)
 	if err != nil {
 		return nil, err
 	}
-	items, err := s.deserializeArchivedKV(data)
-	if err != nil {
-		return nil, err
+	items := make([]ArchivedKV, 0, len(keys))
+	for _, key := range keys {
+		items = append(items, archivedKVFromKey(key))
 	}
 	return items, nil
 }
@@ -360,22 +262,10 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 
 	// 2. 增量更新 ECMH 承诺
 	hashes := make([]common.Hash, 0, len(newItems))
-	cacheItems := bucket.cachedItems != nil
-	var valuedItems []ArchivedKV
-	if cacheItems {
-		valuedItems = make([]ArchivedKV, 0, len(newItems))
-	}
 	for _, it := range newItems {
 		key := archivedKeyFromKV(it)
 		h, nextKeyBuf, nextHashBuf := s.archivePointHash(bucket, key, it.Value, keyBuf, hashBuf)
 		hashes = append(hashes, h)
-		if cacheItems {
-			valuedItems = append(valuedItems, ArchivedKV{
-				Suffix:     common.CopyBytes(it.Suffix),
-				SuffixBits: it.SuffixBits,
-				Value:      common.CopyBytes(it.Value),
-			})
-		}
 		keyBuf = nextKeyBuf
 		hashBuf = nextHashBuf
 	}
@@ -389,18 +279,7 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 		bucket.Keys = append(bucket.Keys, archivedKeyFromKV(it))
 	}
 
-	// 4. 更新缓存的数据项（如果已加载）
-	if cacheItems {
-		cachedItems := append(bucket.cachedItems, valuedItems...)
-		if s.shouldCacheArchivedItems(len(cachedItems)) {
-			bucket.cachedItems = cachedItems
-		} else {
-			bucket.cachedItems = nil
-		}
-	}
-
-	// 5. 记录追加任务
-	// 清除旧哈希以重新计算元数据哈希
+	// 4. 清除旧哈希以重新计算元数据哈希
 	bucket.SetHash(nil)
 	bucket.SetDirty(true)
 	bucket.invalidateMetaCache()
@@ -481,29 +360,7 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 		bucket.Keys = newKeys
 	}
 
-	// 4. 更新缓存的数据项（如果已加载）
-	if bucket.cachedItems != nil {
-		newItems := make([]ArchivedKV, 0, len(bucket.cachedItems))
-		for _, it := range bucket.cachedItems {
-			found := false
-			for _, del := range deleteItems {
-				if it.SuffixBits == del.SuffixBits && bytes.Equal(it.Suffix, del.Suffix) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				newItems = append(newItems, it)
-			}
-		}
-		if s.shouldCacheArchivedItems(len(newItems)) {
-			bucket.cachedItems = newItems
-		} else {
-			bucket.cachedItems = nil
-		}
-	}
-
-	// 清除旧哈希以重新计算元数据哈希
+	// 4. 清除旧哈希以重新计算元数据哈希
 	bucket.SetHash(nil)
 	bucket.SetDirty(true)
 	bucket.invalidateMetaCache()
@@ -522,11 +379,6 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	filter := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
 	hashes := make([]common.Hash, 0, len(items))
 	keys := make([]ArchivedKey, 0, len(items))
-	cacheItems := s.shouldCacheArchivedItems(len(items))
-	var cachedItems []ArchivedKV
-	if cacheItems {
-		cachedItems = make([]ArchivedKV, 0, len(items))
-	}
 	var keyBuf []byte
 	var hashBuf []byte
 
@@ -539,13 +391,6 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 		h, _, nextHashBuf := s.archivePointHash(bucket, key, item.Value, keyBuf, hashBuf)
 		hashes = append(hashes, h)
 		keys = append(keys, key)
-		if cacheItems {
-			cachedItems = append(cachedItems, ArchivedKV{
-				Suffix:     common.CopyBytes(item.Suffix),
-				SuffixBits: item.SuffixBits,
-				Value:      common.CopyBytes(item.Value),
-			})
-		}
 		keyBuf = keyWithLen
 		hashBuf = nextHashBuf
 	}
@@ -556,19 +401,13 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 
 	// 更新缓存
 	bucket.cachedFilter = filter
-	if cacheItems {
-		bucket.cachedItems = cachedItems
-	} else {
-		bucket.cachedItems = nil
-	}
 
 	// ECMH 承诺
 	comm, point, _ := s.ecmh.AddWithPoint(nil, hashes)
 	bucket.Commitment = comm
 	bucket.cachedCommitmentPoint = point
 
-	// 记录待入库的原始数据
-	// 提前计算桶在 Commit 后的哈希，用于 pendingArchives 索引
+	// 提前计算桶在 Commit 后的哈希，便于后续增量修改登记旧节点 stale。
 	// 注意：哈希前必须清除老的 hash 字段，确保哈希只针对元数据内容
 	bucket.SetHash(nil)
 	bucket.invalidateMetaCache()
@@ -580,17 +419,9 @@ func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 // verifyBucket 验证桶的 ECMH 承诺是否正确。返回布尔值及验证耗时（纳秒）。
 func (s *Shard) verifyBucket(bucket *ArchiveBucketNode) (bool, int64) {
 	start := time.Now()
-	bucket.cacheMu.RLock()
-	items := bucket.cachedItems
-	bucket.cacheMu.RUnlock()
-
-	if items == nil {
-		var err error
-		items, err = s.bucketItemsWithValueRefs(bucket)
-		if err != nil {
-			return false, time.Since(start).Nanoseconds()
-		}
-		// 不需要在这里写回缓存，因为 load 过程通常已经处理了缓存。
+	items, err := s.bucketItemsWithValueRefs(bucket)
+	if err != nil {
+		return false, time.Since(start).Nanoseconds()
 	}
 
 	hashes := make([]common.Hash, 0, len(items))

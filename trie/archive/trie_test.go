@@ -29,11 +29,8 @@ var (
 	stressBaseDir                   = flag.String("stressBaseDir", "F:\\trie_stress_depth16_batch1000_delete_values", "Base directory for TestArchiveTrieStress")
 	stressMaxPool                   = flag.Int("stressMaxPool", 10000000, "Maximum sliding key pool size in TestArchiveTrieStress")
 	stressShardDepth                = flag.Int("stressShardDepth", 16, "Shard depth for TestArchiveTrieStress; 20 means 1,048,576 shards")
-	stressArchiveItemCacheLimit     = flag.Int("stressArchiveItemCacheLimit", 0, "Decoded archive item cache limit for TestArchiveTrieStress; 0 disables item caching, negative keeps all")
-	stressInlineValueThreshold      = flag.Int("stressInlineValueThreshold", 0, "Inline values up to this many bytes into trie/archive nodes during TestArchiveTrieStress; 0 disables")
-	stressDeleteOldValues           = flag.Bool("stressDeleteOldValues", true, "Delete superseded external value blobs during TestArchiveTrieStress")
 	stressDestructiveCommit         = flag.Bool("stressDestructiveCommit", true, "Unload committed shard nodes during TestArchiveTrieStress commits")
-	stressAsyncIO                   = flag.Bool("stressAsyncIO", false, "Pipeline archive flush and LevelDB batch writes behind the next foreground cycle")
+	stressAsyncIO                   = flag.Bool("stressAsyncIO", false, "Pipeline LevelDB batch writes behind the next foreground cycle")
 	stressDBBackend                 = flag.String("stressDBBackend", "leveldb", "Database backend for TestArchiveTrieStress: leveldb or pebble")
 	stressNodeStorage               = flag.String("stressNodeStorage", NodeStorageHash, "ASC node storage scheme: hash or path")
 	stressNodeCacheLimit            = flag.Int("stressNodeCacheLimit", DefaultNodeCacheLimit, "Serialized archive node blob cache entry limit; 0 uses default, negative disables")
@@ -66,9 +63,7 @@ type stressTiming struct {
 	commit        time.Duration
 	shard         time.Duration
 	topTree       time.Duration
-	flush         time.Duration
 	write         time.Duration
-	rawFlush      time.Duration
 	rawWrite      time.Duration
 	batch         stressBatchStats
 }
@@ -188,9 +183,6 @@ func TestArchiveTrieStress(t *testing.T) {
 	if *stressShardDepth < 0 || *stressShardDepth > 30 {
 		t.Fatalf("stressShardDepth is a bit depth, not a shard count; use 20 for 1,048,576 shards, got %d", *stressShardDepth)
 	}
-	if *stressInlineValueThreshold < 0 {
-		t.Fatalf("stressInlineValueThreshold must be non-negative")
-	}
 	if *stressGetsPerBatch < 0 || *stressGetMissPercent < 0 || *stressGetMissPercent > 100 {
 		t.Fatalf("stressGetsPerBatch must be non-negative and stressGetMissPercent must be in [0,100]")
 	}
@@ -211,39 +203,27 @@ func TestArchiveTrieStress(t *testing.T) {
 
 	// Create fixed directories for the stress test results
 	stateDir := filepath.Join(baseDir, "asct_state_db")
-	archiveDir := filepath.Join(baseDir, "asct_archive_db")
 
 	// Try to clean up previous runs
 	os.RemoveAll(stateDir)
-	os.RemoveAll(archiveDir)
 
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(archiveDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 
 	// Cleanup at the end (optional, commented out for manual inspection)
 	// defer os.RemoveAll(stateDir)
-	// defer os.RemoveAll(archiveDir)
 
 	// 初始化 DB
 	var (
-		sdb, adb ethdb.KeyValueStore
-		err      error
+		sdb ethdb.KeyValueStore
+		err error
 	)
 	switch *stressDBBackend {
 	case "leveldb":
 		sdb, err = leveldb.New(stateDir, 512, 256, "state", false)
-		if err == nil {
-			adb, err = leveldb.New(archiveDir, 512, 256, "archive", false)
-		}
 	case "pebble":
 		sdb, err = pebble.New(stateDir, 512, 256, "state", false)
-		if err == nil {
-			adb, err = pebble.New(archiveDir, 512, 256, "archive", false)
-		}
 	}
 	if err != nil {
 		if sdb != nil {
@@ -252,14 +232,10 @@ func TestArchiveTrieStress(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sdb.Close()
-	defer adb.Close()
 
 	// 初始化 Trie
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
-	config.ArchiveItemCacheLimit = *stressArchiveItemCacheLimit
-	config.InlineValueThreshold = *stressInlineValueThreshold
-	config.DeleteOldValues = *stressDeleteOldValues
 	config.ShardDepth = *stressShardDepth
 	config.NodeStorageScheme = *stressNodeStorage
 	config.NodeCacheLimit = *stressNodeCacheLimit
@@ -268,7 +244,6 @@ func TestArchiveTrieStress(t *testing.T) {
 	config.CommitmentPointCacheLimit = *stressCommitmentPointCacheLimit
 	config.ArchiveStubMaxBucketsPath = *stressArchiveStubMaxBucketsPath
 	config.EnablePathDiagnostics = *stressPathDiagnostics
-	config.ArchiveDB = &stressDBAdapter{adb}
 	trie := NewTrie(nil, &stressDBAdapter{sdb}, hasher, config, true)
 
 	// 3. Sliding window setup
@@ -293,9 +268,9 @@ func TestArchiveTrieStress(t *testing.T) {
 	defer writer.Flush()
 
 	header := []string{
-		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Avg_LoopWall_ms", "Prune_ms", "Commit_ms", "Flush_ms", "Write_ms", "Raw_Flush_ms", "Raw_Write_ms", "Max_Root_ms",
+		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Avg_LoopWall_ms", "Prune_ms", "Commit_ms", "Write_ms", "Raw_Write_ms", "Max_Root_ms",
 		"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
-		"State_MB", "Archive_MB", "Leaf_Count", "Archive_Items", "Bucket_Count", "Max_Buckets_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max", "RSS_MB", "Heap_MB",
+		"State_MB", "Leaf_Count", "Archive_Items", "Bucket_Count", "Max_Buckets_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max", "RSS_MB", "Heap_MB",
 		"Insert_ms", "Update_ms", "Get_ms", "ShardCommit_ms", "TopTree_ms", "Untracked_ms",
 		"Batch_KB", "Batch_Puts", "Batch_Deletes", "Flat_Puts", "Flat_Deletes", "Tree_Puts", "Tree_Deletes",
 		"FalsePositive_Count", "FalsePositive_Rate",
@@ -345,22 +320,6 @@ func TestArchiveTrieStress(t *testing.T) {
 				t.Fatalf("Failed to prune shard: %v", err)
 			}
 			pruneDur := time.Since(startPrune)
-
-			var (
-				flushCh     <-chan stressAsyncResult
-				rawFlushDur time.Duration
-				flushDur    time.Duration
-			)
-			if *stressAsyncIO {
-				flushCh = startAsync(trie.FlushArchives)
-			} else {
-				startFlush := time.Now()
-				if err := trie.FlushArchives(); err != nil {
-					t.Fatalf("Failed to flush archives: %v", err)
-				}
-				flushDur = time.Since(startFlush)
-				rawFlushDur = flushDur
-			}
 
 			// 1. Insert new keys (BatchSize items)
 			startInsert := time.Now()
@@ -429,16 +388,6 @@ func TestArchiveTrieStress(t *testing.T) {
 			shardCommitDur := time.Duration(diag.ShardCommitNanos)
 			topTreeDur := time.Duration(diag.TopTreeNanos)
 
-			if flushCh != nil {
-				waitStart := time.Now()
-				res := <-flushCh
-				flushDur = time.Since(waitStart)
-				rawFlushDur = res.dur
-				if res.err != nil {
-					t.Fatalf("Failed to flush archives: %v", res.err)
-				}
-			}
-
 			var rawWriteDur, writeDur time.Duration
 			batchStats := batch.snapshot()
 			if *stressAsyncIO {
@@ -484,9 +433,7 @@ func TestArchiveTrieStress(t *testing.T) {
 				commit:        commitDur,
 				shard:         shardCommitDur,
 				topTree:       topTreeDur,
-				flush:         flushDur,
 				write:         writeDur,
-				rawFlush:      rawFlushDur,
 				rawWrite:      rawWriteDur,
 				batch:         batchStats,
 			})
@@ -501,8 +448,8 @@ func TestArchiveTrieStress(t *testing.T) {
 
 		fTimes := make([]float64, len(calcTimes))
 		var sumRoot, sumPrune, sumPruneWait, sumPruneShard, sumPrunePrefetch float64
-		var sumInsert, sumUpdate, sumGet, sumCommit, sumShard, sumTopTree, sumFlush float64
-		var sumWall, sumWrite, sumRawFlush, sumRawWrite float64
+		var sumInsert, sumUpdate, sumGet, sumCommit, sumShard, sumTopTree float64
+		var sumWall, sumWrite, sumRawWrite float64
 		var sumBatchBytes, sumBatchPuts, sumBatchDeletes, sumFlatPuts, sumFlatDeletes, sumTreePuts, sumTreeDeletes int64
 		for idx, d := range calcTimes {
 			val := float64(d.root.Nanoseconds()) / 1000000.0
@@ -519,9 +466,7 @@ func TestArchiveTrieStress(t *testing.T) {
 			sumCommit += float64(d.commit.Nanoseconds()) / 1000000.0
 			sumShard += float64(d.shard.Nanoseconds()) / 1000000.0
 			sumTopTree += float64(d.topTree.Nanoseconds()) / 1000000.0
-			sumFlush += float64(d.flush.Nanoseconds()) / 1000000.0
 			sumWrite += float64(d.write.Nanoseconds()) / 1000000.0
-			sumRawFlush += float64(d.rawFlush.Nanoseconds()) / 1000000.0
 			sumRawWrite += float64(d.rawWrite.Nanoseconds()) / 1000000.0
 			sumBatchBytes += int64(d.batch.bytes)
 			sumBatchPuts += int64(d.batch.puts)
@@ -554,9 +499,7 @@ func TestArchiveTrieStress(t *testing.T) {
 		avgCommit := sumCommit / float64(n)
 		avgShard := sumShard / float64(n)
 		avgTopTree := sumTopTree / float64(n)
-		avgFlush := sumFlush / float64(n)
 		avgWrite := sumWrite / float64(n)
-		avgRawFlush := sumRawFlush / float64(n)
 		avgRawWrite := sumRawWrite / float64(n)
 		avgBatchKB := float64(sumBatchBytes) / float64(n) / 1024.0
 		avgBatchPuts := float64(sumBatchPuts) / float64(n)
@@ -565,7 +508,7 @@ func TestArchiveTrieStress(t *testing.T) {
 		avgFlatDeletes := float64(sumFlatDeletes) / float64(n)
 		avgTreePuts := float64(sumTreePuts) / float64(n)
 		avgTreeDeletes := float64(sumTreeDeletes) / float64(n)
-		avgTrackedWall := avgPrune + avgInsert + avgUpdate + avgGet + avgCommit + avgFlush + avgWrite
+		avgTrackedWall := avgPrune + avgInsert + avgUpdate + avgGet + avgCommit + avgWrite
 		avgUntracked := avgWall - avgTrackedWall
 		if avgUntracked < 0 {
 			avgUntracked = 0
@@ -580,7 +523,6 @@ func TestArchiveTrieStress(t *testing.T) {
 		q3 := getPercentile(0.75)
 
 		stateSize := getDirSize(stateDir)
-		archiveSize := getDirSize(archiveDir)
 		proc.MemoryInfo() // 刷新
 		memInfo, _ := proc.MemoryInfo()
 		runtime.ReadMemStats(&mem)
@@ -662,9 +604,7 @@ func TestArchiveTrieStress(t *testing.T) {
 			fmt.Sprintf("%.2f", avgWall),
 			fmt.Sprintf("%.2f", avgPrune),
 			fmt.Sprintf("%.2f", avgCommit),
-			fmt.Sprintf("%.2f", avgFlush),
 			fmt.Sprintf("%.2f", avgWrite),
-			fmt.Sprintf("%.2f", avgRawFlush),
 			fmt.Sprintf("%.2f", avgRawWrite),
 			fmt.Sprintf("%.2f", maxVal),
 			fmt.Sprintf("%.2f", p95),
@@ -674,7 +614,6 @@ func TestArchiveTrieStress(t *testing.T) {
 			fmt.Sprintf("%.2f", median),
 			fmt.Sprintf("%.2f", q3),
 			fmt.Sprintf("%d", stateSize/(1024*1024)),
-			fmt.Sprintf("%d", archiveSize/(1024*1024)),
 			fmt.Sprintf("%d", stats.LeafCount),
 			fmt.Sprintf("%d", stats.ArchivedDataSize),
 			fmt.Sprintf("%d", stats.BucketCount),
@@ -751,10 +690,9 @@ func TestArchiveTrieStress(t *testing.T) {
 			falsePositiveDelta,
 			falsePositiveRate,
 		)
-		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Archive: %s, Leaves: %d, ArchiveItems: %d, Buckets: %d, MaxBucketsPath: %d, BucketItems[Avg: %.2f, P50: %d, P95: %d, P99: %d, Max: %d], Injected: %.2fM, Pool: %d, Root: %.2fms, Wall: %.2fms (Prune: %.2fms, Commit: %.2fms, FlushWait: %.2fms, WriteWait: %.2fms, RawFlush: %.2fms, RawWrite: %.2fms), PruneSplit[Wait: %.2fms, Shard: %.2fms, PrefetchStart: %.2fms, Other: %.2fms], RootP95: %.2fms, RootP99: %.2fms, RootBox[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
+		fmt.Printf("Items: %d - %d (Processed Items Count), metrics: State: %s, Leaves: %d, ArchiveItems: %d, Buckets: %d, MaxBucketsPath: %d, BucketItems[Avg: %.2f, P50: %d, P95: %d, P99: %d, Max: %d], Injected: %.2fM, Pool: %d, Root: %.2fms, Wall: %.2fms (Prune: %.2fms, Commit: %.2fms, WriteWait: %.2fms, RawWrite: %.2fms), PruneSplit[Wait: %.2fms, Shard: %.2fms, PrefetchStart: %.2fms, Other: %.2fms], RootP95: %.2fms, RootP99: %.2fms, RootBox[Min: %.1f, Q1: %.1f, Med: %.1f, Q3: %.1f, Max: %.1f], RSS: %dMB, Heap: %dMB\n",
 			startItem, endItem,
 			bytesToReadable(uint64(stateSize)),
-			bytesToReadable(uint64(archiveSize)),
 			stats.LeafCount,
 			stats.ArchivedDataSize,
 			stats.BucketCount,
@@ -766,7 +704,7 @@ func TestArchiveTrieStress(t *testing.T) {
 			stats.BucketItemsMax,
 			float64(totalInjected)/1000000.0,
 			len(keyPool),
-			avgRoot, avgWall, avgPrune, avgCommit, avgFlush, avgWrite, avgRawFlush, avgRawWrite,
+			avgRoot, avgWall, avgPrune, avgCommit, avgWrite, avgRawWrite,
 			avgPruneWait,
 			avgPruneShardOnly,
 			avgPrunePrefetch,
@@ -812,7 +750,6 @@ func TestArchiveTrieStress(t *testing.T) {
 			"Bucket_Items_P99",
 			"Bucket_Items_Max",
 			"FalsePositive_Count",
-			"ArchiveStorage_MB",
 		})
 		_ = finalStatsWriter.Write([]string{
 			fmt.Sprintf("%d", totalInjected),
@@ -827,7 +764,6 @@ func TestArchiveTrieStress(t *testing.T) {
 			fmt.Sprintf("%d", finalStats.BucketItemsP99),
 			fmt.Sprintf("%d", finalStats.BucketItemsMax),
 			fmt.Sprintf("%d", finalStats.FalsePositiveCount),
-			fmt.Sprintf("%.2f", float64(finalStats.ArchiveStorageSize)/(1024.0*1024.0)),
 		})
 		finalStatsWriter.Flush()
 		if err := finalStatsFile.Close(); err != nil {

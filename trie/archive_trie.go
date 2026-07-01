@@ -365,7 +365,6 @@ func NewArchiveTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Da
 			if dbConf.ArchiveBucketSize > 0 {
 				config.ArchiveBucketSize = dbConf.ArchiveBucketSize
 			}
-			config.ArchiveItemCacheLimit = dbConf.ArchiveItemCacheLimit
 			if dbConf.CuckooBuckets > 0 {
 				config.CuckooBuckets = dbConf.CuckooBuckets
 			}
@@ -410,14 +409,9 @@ func NewArchiveTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Da
 	config.NodeCacheBytesLimit = nodeCacheBytesLimit
 	config.PhysicalDelete = physicalDelete
 
-	// kvAdapter 负责把 archivetrie.Trie 的 KV 读写接到 triedb/disk/archive 三个后端。
-	kvAdapter := &archiveDBAdapter{db: db, root: root, archive: archive, physicalDelete: physicalDelete}
-
-	if archive != nil {
-		config.ArchiveDB = &archiveDBAdapterArchive{db: archive}
-	} else {
-		config.ArchiveDB = kvAdapter
-	}
+	// kvAdapter 负责把 archivetrie.Trie 的 KV 读写接到 triedb/disk 两个后端。
+	_ = archive
+	kvAdapter := &archiveDBAdapter{db: db, root: root, physicalDelete: physicalDelete}
 
 	// pruning=true 表示下层 trie 以归档裁剪模式运行。
 	t := archivetrie.NewTrie(root.Bytes(), kvAdapter, archivetrie.NewPooledKeccakHasher(), config, true)
@@ -466,16 +460,10 @@ type archiveDBAdapter struct {
 	root           common.Hash
 	reader         database.NodeReader
 	disk           ethdb.Database
-	archive        ethdb.Database
 	values         map[common.Hash][]byte
-	pendingNodes   *trienode.NodeSet // [FIX] Tracks all nodes written between commits
+	pendingNodes   *trienode.NodeSet // 记录两次 commit 之间写出的所有节点。
 	physicalDelete bool
 	mu             sync.RWMutex
-}
-
-// archiveDB 返回独立 archive DB；未配置时由主 disk DB 承接。
-func (a *archiveDBAdapter) archiveDB() ethdb.Database {
-	return a.archive
 }
 
 // diskDB 懒加载 triedb 暴露的底层 ethdb，避免构造时强依赖具体数据库类型。
@@ -499,7 +487,7 @@ func (a *archiveDBAdapter) Put(key, value []byte) error {
 	if len(key) == 32 && !archivetrie.IsPathStorageKey(key) {
 		archiveNodeCacheAdd(h, value)
 
-		// [FIX] Record for current NodeSet in Commit
+		// 记录到当前 Commit 的 NodeSet。
 		a.mu.Lock()
 		if a.pendingNodes != nil {
 			a.pendingNodes.AddNode(key, trienode.New(h, value))
@@ -532,13 +520,6 @@ func (a *archiveDBAdapter) Get(key []byte) ([]byte, error) {
 			return data, nil
 		}
 	}
-	// Try Archive
-	if db := a.archiveDB(); db != nil {
-		data, err := db.Get(key)
-		if err == nil && data != nil {
-			return data, nil
-		}
-	}
 	if pathKey {
 		return nil, nil
 	}
@@ -561,8 +542,7 @@ func (a *archiveDBAdapter) Get(key []byte) ([]byte, error) {
 	h := common.BytesToHash(key)
 	data, err := a.reader.Node(common.Hash{}, nil, h)
 	if err == nil && data != nil {
-		// [FIX] Warm the cache! Once a node is found, keep it in globalArchiveNodeCache
-		// to ensure cross-block and cross-reset visibility.
+		// NodeReader 命中后写入进程缓存，保证跨 block / reset 的可见性稳定。
 		archiveNodeCacheAdd(h, data)
 		return data, nil
 	}
@@ -591,43 +571,6 @@ func (a *archiveDBAdapter) NewBatch() archivetrie.Batcher {
 	}
 	return &archiveBatchAdapter{db: a.db, physicalDelete: a.physicalDelete}
 }
-
-// ArchiveStore implementation for archiveDBAdapter.
-// bucket 归档也复用同一个读写路径，让 archive DB/disk DB 的选择保持一致。
-func (a *archiveDBAdapter) PutBucket(hash, data []byte) error     { return a.Put(hash, data) }
-func (a *archiveDBAdapter) GetBucket(hash []byte) ([]byte, error) { return a.Get(hash) }
-
-// DeleteBucket 删除归档 bucket，实际删除策略由 adapter.Delete 控制。
-func (a *archiveDBAdapter) DeleteBucket(hash []byte) error { return a.Delete(hash) }
-
-// archiveDBAdapterArchive 是独立 archive DB 的轻量适配器。
-// 配置了 BinaryArchiveDir 时，bucket 归档写入这里，避免挤占主 state DB。
-type archiveDBAdapterArchive struct {
-	db ethdb.Database
-}
-
-// Put 写入独立 archive DB。
-func (a *archiveDBAdapterArchive) Put(key, value []byte) error { return a.db.Put(key, value) }
-
-// Get 从独立 archive DB 读取。
-func (a *archiveDBAdapterArchive) Get(key []byte) ([]byte, error) { return a.db.Get(key) }
-
-// Delete 从独立 archive DB 删除。
-func (a *archiveDBAdapterArchive) Delete(key []byte) error { return a.db.Delete(key) }
-
-// NewBatch 创建独立 archive DB 的批量写入器。
-func (a *archiveDBAdapterArchive) NewBatch() archivetrie.Batcher {
-	return &archiveBatchAdapterArchive{a.db.NewBatch()}
-}
-
-// PutBucket 写入 bucket 数据。
-func (a *archiveDBAdapterArchive) PutBucket(hash, data []byte) error { return a.db.Put(hash, data) }
-
-// GetBucket 读取 bucket 数据。
-func (a *archiveDBAdapterArchive) GetBucket(hash []byte) ([]byte, error) { return a.db.Get(hash) }
-
-// DeleteBucket 删除 bucket 数据。
-func (a *archiveDBAdapterArchive) DeleteBucket(hash []byte) error { return a.db.Delete(hash) }
 
 // archiveBatchAdapter 包装 ethdb.Batch，并在删除时同步维护进程级节点缓存。
 type archiveBatchAdapter struct {
@@ -682,26 +625,6 @@ func (a *archiveBatchAdapter) ValueSize() int {
 	return 0
 }
 
-// archiveBatchAdapterArchive 直接把独立 archive DB 的 batch 暴露给 archivetrie.Trie。
-type archiveBatchAdapterArchive struct {
-	ethdb.Batch
-}
-
-// Put 写入独立 archive batch。
-func (a *archiveBatchAdapterArchive) Put(key, value []byte) error { return a.Batch.Put(key, value) }
-
-// Delete 删除独立 archive batch 中的 key。
-func (a *archiveBatchAdapterArchive) Delete(key []byte) error { return a.Batch.Delete(key) }
-
-// Write 提交独立 archive batch。
-func (a *archiveBatchAdapterArchive) Write() error { return a.Batch.Write() }
-
-// Reset 释放独立 archive batch 缓冲。
-func (a *archiveBatchAdapterArchive) Reset() { a.Batch.Reset() }
-
-// ValueSize 返回独立 archive batch 当前累计 value 字节数。
-func (a *archiveBatchAdapterArchive) ValueSize() int { return a.Batch.ValueSize() }
-
 // nodeSetBatcher 把 commit 产出的 hash-mode 节点收集到 NodeSet。
 // raw path/flat 写入则转发到 rawBatch，最终与 triedb update 保持同一个 commit 边界。
 type nodeSetBatcher struct {
@@ -722,7 +645,7 @@ func (b *nodeSetBatcher) Put(key, value []byte) error {
 	h := common.BytesToHash(key)
 	b.nodes.AddNode(key, trienode.New(h, value))
 
-	// [FIX] Update global cache for immediate visibility in subsequent adapter.Get across blocks
+	// 更新进程缓存，保证后续 adapter.Get 立刻可见。
 	archiveNodeCacheAdd(h, value)
 
 	return nil
@@ -972,7 +895,6 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 	// shard-aware commit：先并行提交 dirty shards，再提交 top tree，最后统一更新 triedb。
 	if adapter, ok := t.trie.Database().(*archiveDBAdapter); ok {
 		if err := t.trie.FinishAsyncPrune(); err != nil {
-			fmt.Printf("[DEBUG] ArchiveTrie.Commit async prune error: %v\n", err)
 			return common.Hash{}, nil
 		}
 		var rawBatch ethdb.Batch
@@ -1053,13 +975,11 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 		var rawMaxShardID int64
 		var rawMaxOps, rawMaxBytes int64
 		var firstErr error
-		firstErrShard := 0
 		for result := range resultCh {
 			id := result.id
 			if result.err != nil {
 				if firstErr == nil {
 					firstErr = result.err
-					firstErrShard = id
 				}
 				continue
 			}
@@ -1075,7 +995,6 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 			if len(result.nodes.Nodes) > 0 {
 				if err := merged.Merge(result.nodes); err != nil {
 					firstErr = err
-					firstErrShard = id
 					continue
 				}
 			}
@@ -1095,7 +1014,6 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 				replayStart := time.Now()
 				if err := result.raw.replay(rawBatch); err != nil {
 					firstErr = err
-					firstErrShard = id
 					continue
 				}
 				if result.commitDur > 500*time.Millisecond || time.Since(replayStart) > 500*time.Millisecond {
@@ -1105,7 +1023,6 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 			}
 		}
 		if firstErr != nil {
-			fmt.Printf("[DEBUG] ArchiveTrie.Commit shard %d error: %v\n", firstErrShard, firstErr)
 			return common.Hash{}, nil
 		}
 		shardCommitDuration := time.Since(shardCommitStart)
@@ -1117,14 +1034,12 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 		topTreeStart := time.Now()
 		h, err := t.trie.CommitTopTreeToBatch(shardRoots, dirtyShards, topBatch)
 		if err != nil {
-			fmt.Printf("[DEBUG] ArchiveTrie.Commit top tree error: %v\n", err)
 			return common.Hash{}, nil
 		}
 		topTreeDuration := time.Since(topTreeStart)
 		root := common.BytesToHash(h)
 		if len(topNodes.Nodes) > 0 {
 			if err := merged.Merge(topNodes); err != nil {
-				fmt.Printf("[DEBUG] ArchiveTrie.Commit merge top tree error: %v\n", err)
 				return common.Hash{}, nil
 			}
 		}
@@ -1135,7 +1050,6 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 		if adapter.pendingNodes != nil && len(adapter.pendingNodes.Nodes) > 0 {
 			if err := merged.Merge(adapter.pendingNodes); err != nil {
 				adapter.mu.Unlock()
-				fmt.Printf("[DEBUG] ArchiveTrie.Commit merge pending nodes error: %v\n", err)
 				return common.Hash{}, nil
 			}
 			adapter.pendingNodes = nil
@@ -1147,7 +1061,6 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 			}
 			if err := merged.Merge(vNodes); err != nil {
 				adapter.mu.Unlock()
-				fmt.Printf("[DEBUG] ArchiveTrie.Commit merge values error: %v\n", err)
 				return common.Hash{}, nil
 			}
 			adapter.values = nil
@@ -1163,7 +1076,6 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 		if u, ok := t.db.(updater); ok {
 			updateStart := time.Now()
 			if err := u.Update(root, t.originRoot, block, merged, nil); err != nil {
-				fmt.Printf("[DEBUG] ArchiveTrie.Commit Update error: %v\n", err)
 				return common.Hash{}, nil
 			}
 			updateDuration = time.Since(updateStart)
@@ -1174,7 +1086,6 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 			batchOps, batchBytes = rawBatchStats(rawBatch)
 			batchWriteStart := time.Now()
 			if err := rawBatch.Write(); err != nil {
-				fmt.Printf("[DEBUG] ArchiveTrie.Commit flat/value batch error: %v\n", err)
 				return common.Hash{}, nil
 			}
 			batchWriteDuration = time.Since(batchWriteStart)

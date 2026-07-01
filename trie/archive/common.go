@@ -54,46 +54,6 @@ type Batcher interface {
 	ValueSize() int
 }
 
-// SafeBatcher wraps a Batcher with a mutex to allow concurrent Put/Delete calls.
-type SafeBatcher struct {
-	mu sync.Mutex
-	b  Batcher
-}
-
-func NewSafeBatcher(b Batcher) *SafeBatcher {
-	return &SafeBatcher{b: b}
-}
-
-func (sb *SafeBatcher) Put(key []byte, value []byte) error {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	return sb.b.Put(key, value)
-}
-
-func (sb *SafeBatcher) Delete(key []byte) error {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	return sb.b.Delete(key)
-}
-
-func (sb *SafeBatcher) Write() error {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	return sb.b.Write()
-}
-
-func (sb *SafeBatcher) Reset() {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	sb.b.Reset()
-}
-
-func (sb *SafeBatcher) ValueSize() int {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	return sb.b.ValueSize()
-}
-
 var (
 	keccakPool = &sync.Pool{}
 )

@@ -13,7 +13,10 @@ import (
 	"github.com/ethereum/go-ethereum/trie/archive/ecmh"
 )
 
-// Shard 表示一个二叉 Merkle Patricia Trie 的分片（子树）。
+// Shard 表示 ASCT 中一个 key 前缀分片。
+//
+// 它是加锁、剪枝、懒加载和提交的基本单位。destructive commit 后可以卸载 live root，
+// 后续访问再用 rootHash 从数据库懒加载回来。
 type Shard struct {
 	mu         sync.RWMutex // Protects root, rootHash, and staleSet
 	root       Node
@@ -43,27 +46,7 @@ type Shard struct {
 	statsMut       sync.Mutex
 	lastCommitDiag ShardCommitDiagnostics
 
-	// Legacy archive payload queues. Plus-mode bucket metadata is persisted in
-	// ASC nodes; these maps only support old ArchiveDB/FlushArchives callers.
-	pendingArchives map[string][]byte
-
-	// Pending archive items for newly-created legacy payloads.
-	pendingArchiveItems map[string][]ArchivedKV
-
-	// Pending appends to existing legacy payloads. Key is the new bucket hash.
-	pendingAppends map[string]appendTask
-
-	// Pending deletes from existing legacy payloads. Key is the new bucket hash.
-	pendingDeletes map[string]deleteTask
-
-	// Pending whole legacy archive payload deletes. Key is the obsolete bucket hash.
-	pendingArchiveDeletes map[string]int
-
-	// Value writes are staged until commit. Flat values are the execution truth;
-	// pendingValues remains for inline/legacy value-blob compatibility.
-	pendingValues           map[string][]byte
-	pendingValueDeletes     map[string]struct{}
-	stagedValues            []map[string][]byte
+	// Flat value writes are staged until commit. The tree stores only valueRef.
 	pendingFlatValues       map[string][]byte
 	pendingFlatValueDeletes map[string]struct{}
 	stagedFlatValues        []map[string][]byte
@@ -93,13 +76,6 @@ func newShard(id int, db KVStore, hasher Hasher, config *Config, rootHash []byte
 		scratch:                 make([]byte, 128),
 		ecmh:                    ecmh.New(),
 		stats:                   &TrieStats{},
-		pendingArchives:         make(map[string][]byte),
-		pendingArchiveItems:     make(map[string][]ArchivedKV),
-		pendingAppends:          make(map[string]appendTask),
-		pendingDeletes:          make(map[string]deleteTask),
-		pendingArchiveDeletes:   make(map[string]int),
-		pendingValues:           make(map[string][]byte),
-		pendingValueDeletes:     make(map[string]struct{}),
 		pendingFlatValues:       make(map[string][]byte),
 		pendingFlatValueDeletes: make(map[string]struct{}),
 		pool:                    NewNodePool(),
@@ -158,9 +134,6 @@ func (s *Shard) Reset(shardRoot []byte) {
 	s.root = nil
 	s.nodePaths = make(map[string]persistedNodePath)
 	s.registerNodePath(shardRoot, nil, 0)
-	s.pendingValues = make(map[string][]byte)
-	s.pendingValueDeletes = make(map[string]struct{})
-	s.stagedValues = nil
 	s.pendingFlatValues = make(map[string][]byte)
 	s.pendingFlatValueDeletes = make(map[string]struct{})
 	s.stagedFlatValues = nil
@@ -513,6 +486,8 @@ func (s *Shard) archiveBucketFilter(bucket *ArchiveBucketNode) *cuckoo.Filter {
 	return filter
 }
 
+// Get 在单个 shard 内查找 key。顺序是先走热 child，再查侧挂 StubList，
+// 最后处理直接命中的 ArchiveBucketNode。
 func (s *Shard) Get(key []byte) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -551,9 +526,6 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 		if matchLen == n.PathBits && depth+matchLen == len(key)*8 {
 			atomic.AddInt64(&common.BinaryHitCount, 1)
 			val, err := s.getFlatValue(key)
-			if err != nil {
-				val, err = s.getValue(n.ValueHash)
-			}
 			return val, false, err
 		}
 		return nil, false, ErrNodeNotFound
@@ -653,6 +625,8 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 	}
 }
 
+// getFromBucket 分三步验证冷桶 membership：bucket path 前缀、Cuckoo filter、
+// entry suffix 精确匹配。返回的真实 value 仍来自 flat value store，并用 valueRef 校验。
 func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]byte, bool, error) {
 	proofStart := time.Now()
 
@@ -712,9 +686,7 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]b
 						return nil, true, err
 					}
 					if len(item.ValueRef) == common.HashLength && !bytes.Equal(item.ValueRef, valueRefForKeyValue(key, val)) {
-						if legacyValue, legacyErr := s.getValue(item.ValueRef); legacyErr != nil || !bytes.Equal(legacyValue, val) {
-							return nil, true, errors.New("archive bucket valueRef verification failed")
-						}
+						return nil, true, errors.New("archive bucket valueRef verification failed")
 					}
 					return val, true, nil
 				}
@@ -742,6 +714,7 @@ func updateAtomicMax(addr *int64, val int64) {
 	}
 }
 
+// Put 把 key 写回热树。如果该 key 有冷归档副本，会先删除旧冷 entry，再插入新热 leaf。
 func (s *Shard) Put(key []byte, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -759,6 +732,7 @@ func (s *Shard) PutBatch(entries []KeyValue) error {
 	return nil
 }
 
+// putLocked 暂存 flat value，删除旧冷 membership，然后插入只包含新 valueRef 的热 leaf。
 func (s *Shard) putLocked(key []byte, value []byte) error {
 	if s.root == nil && len(s.rootHash) > 0 {
 		var err error
@@ -871,10 +845,6 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) (bool, erro
 					if innerDepth+item.SuffixBits == keyBits && s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits) {
 						// 命中：执行盲删除
 						oldHash := s.ensureBucketHash(bucket)
-						oldSize := -1
-						if bucketData, err := s.getStoredBucketData(oldHash); err == nil {
-							oldSize = len(bucketData)
-						}
 
 						s.blindDeleteFromBucket(bucket, []ArchivedKV{{
 							Suffix:     item.Suffix,
@@ -883,7 +853,9 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) (bool, erro
 						}})
 
 						if bucket.Count == 0 {
-							s.markArchiveDataDelete(oldHash, oldSize)
+							if s.pruning && (s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage())) && len(oldHash) > 0 {
+								s.staleSet[string(oldHash)] = struct{}{}
+							}
 							n.StubList = append(n.StubList[:i], n.StubList[i+1:]...)
 						}
 						n.SetDirty(true)
@@ -932,7 +904,9 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) (bool, erro
 			}
 			if removed {
 				if bucket, ok := next.(*ArchiveBucketNode); ok && bucket.Count == 0 {
-					s.markArchiveDataDelete(s.ensureBucketHash(bucket), -1)
+					if oldHash := s.ensureBucketHash(bucket); s.pruning && (s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage())) && len(oldHash) > 0 {
+						s.staleSet[string(oldHash)] = struct{}{}
+					}
 					if bit == 0 {
 						n.Left, n.LeftHash = nil, nil
 						n.LeftEpoch = 0
@@ -960,10 +934,6 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) (bool, erro
 			for _, item := range items {
 				if innerDepth+item.SuffixBits == keyBits && s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits) {
 					oldHash := s.ensureBucketHash(n)
-					oldSize := -1
-					if bucketData, err := s.getStoredBucketData(oldHash); err == nil {
-						oldSize = len(bucketData)
-					}
 
 					s.blindDeleteFromBucket(n, []ArchivedKV{{
 						Suffix:     item.Suffix,
@@ -971,7 +941,9 @@ func (s *Shard) removeFromStubList(node Node, key []byte, depth int) (bool, erro
 						Value:      item.ValueRef,
 					}})
 					if n.Count == 0 {
-						s.markArchiveDataDelete(oldHash, oldSize)
+						if s.pruning && (s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage())) && len(oldHash) > 0 {
+							s.staleSet[string(oldHash)] = struct{}{}
+						}
 						// 此处无法直接移除 node，需由调用者处理 s.root = nil
 					}
 					return true, nil
@@ -1004,9 +976,6 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 
 		// 完全匹配：更新值哈希
 		if matchBits == n.PathBits && depth+matchBits == len(key)*8 {
-			if !bytes.Equal(n.ValueHash, valueHash) {
-				s.releaseValue(n.ValueHash)
-			}
 			n.ValueHash = valueHash
 			n.SetDirty(true)
 			s.updateEpoch(n)
@@ -1016,9 +985,6 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 
 		// [Robust] 绝不分叉已达 256 位极限的节点内容。
 		if matchBits == n.PathBits {
-			if !bytes.Equal(n.ValueHash, valueHash) {
-				s.releaseValue(n.ValueHash)
-			}
 			n.ValueHash = valueHash
 			n.PathBits = len(key)*8 - depth
 			n.Path = s.getSuffix(key, depth, nil)
@@ -1248,7 +1214,6 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 	case *LeafNode:
 		matchLen := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
 		if matchLen == n.PathBits && depth+matchLen == len(key)*8 {
-			s.releaseValue(n.ValueHash)
 			s.markPersistedNodeStale(n)
 			return nil, true, nil
 		}
@@ -1392,7 +1357,8 @@ type ChildInfo struct {
 	bit  byte
 }
 
-// CommitToBatch 递归提交改动。
+// CommitToBatch 递归提交 dirty trie metadata、stale delete 和 pending value。
+// destructive=true 时会在提交后卸载 live root，用 rootHash 作为后续懒加载入口。
 func (s *Shard) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1442,8 +1408,6 @@ func (s *Shard) CommitToBatchWithDiagnostics(batch Batcher, destructive bool) ([
 	diag := ShardCommitDiagnostics{
 		LockWaitNanos:           lockWait.Nanoseconds(),
 		StaleSetLen:             int64(len(s.staleSet)),
-		PendingValuePuts:        int64(len(s.pendingValues)),
-		PendingValueDeletes:     int64(len(s.pendingValueDeletes)),
 		PendingFlatValuePuts:    int64(len(s.pendingFlatValues)),
 		PendingFlatValueDeletes: int64(len(s.pendingFlatValueDeletes)),
 	}
@@ -1556,10 +1520,7 @@ func (s *Shard) archiveItemFlatValue(bucket *ArchiveBucketNode, kv ArchivedKV) (
 	if val, err := s.getFlatValue(fullK); err == nil {
 		return fullK, val
 	}
-	if val, err := s.getValue(kv.Value); err == nil {
-		return fullK, val
-	}
-	return fullK, kv.Value
+	return fullK, nil
 }
 
 func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value []byte) bool) bool {
@@ -1569,10 +1530,7 @@ func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value [
 	switch n := node.(type) {
 	case *LeafNode:
 		fullKey, _ := s.prependPath(n.Path, n.PathBits, prefix, bits)
-		val, err := s.getFlatValue(fullKey)
-		if err != nil {
-			val, _ = s.getValue(n.ValueHash)
-		}
+		val, _ := s.getFlatValue(fullKey)
 		return fn(fullKey, val)
 	case *ArchiveBucketNode:
 		kvs, err := s.bucketItemsWithValueRefs(n)
@@ -1668,10 +1626,7 @@ func (s *Shard) forEachPrefix(node Node, prefix []byte, bits int, matchPrefix []
 		if !hasBitPrefix(fullKey, fullBits, matchPrefix, matchBits) {
 			return true
 		}
-		val, err := s.getFlatValue(fullKey)
-		if err != nil {
-			val, _ = s.getValue(n.ValueHash)
-		}
+		val, _ := s.getFlatValue(fullKey)
 		return fn(fullKey, val)
 	case *ArchiveBucketNode:
 		return s.forEachArchiveBucketPrefix(n, matchPrefix, matchBits, fn)
@@ -1872,7 +1827,7 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		return h, nil
 
 	case *LeafNode:
-		// [FIX] Do NOT updateEpoch during commit — same reason as InternalNode.
+		// commit 只负责序列化当前节点；epoch 变化属于写入/剪枝语义，不属于落盘语义。
 		serializeStart := time.Now()
 		data, err := n.Serialize()
 		if stats != nil {

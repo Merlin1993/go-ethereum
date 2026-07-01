@@ -12,39 +12,28 @@ const (
 	NodeStoragePath = "path"
 )
 
-// ArchiveStore identifies the interface to store and retrieve archived bucket data.
-type ArchiveStore interface {
-	PutBucket(hash []byte, data []byte) error
-	GetBucket(hash []byte) ([]byte, error)
-	DeleteBucket(hash []byte) error
-}
-
 type FlatValueReader interface {
 	GetFlatValue(key []byte) ([]byte, error)
 }
 
 // Config holds the configuration parameters for the Trie.
 type Config struct {
-	ShardDepth                int          // Number of bits for shard routing (default 16)
-	ArchiveBucketSize         int          // Max number of items in an archive bucket before splitting (default 100)
-	ArchiveItemCacheLimit     int          // Max decoded archived items cached per bucket; 0 disables item caching, negative keeps all
-	NodeCacheLimit            int          // Max serialized node blobs cached in process; 0 uses default, negative disables
-	NodeCacheBytesLimit       int64        // Max serialized node blob bytes cached in process; 0 uses default, negative disables byte cap
-	NodeCacheWarmPathBits     int          // Path-mode eager warming depth; 0 uses default, -1 keeps root-only, <-1 disables eager warming
-	CommitmentPointCacheLimit int          // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
-	EnablePathDiagnostics     bool         // Record path/cache diagnostics; disabled by default for hot experiments
-	CompactArchiveStubs       bool         // Merge adjacent archive stubs synchronously; expensive on hot pruning paths
-	ArchiveStubMaxBucketsPath int          // Max side-mounted archive buckets at one node before pressure-sinking; 0 uses default, negative disables
-	AsyncPrune                bool         // Run shard pruning in the background and apply it before root commit
-	CommitWorkers             int          // Max parallel shard commit workers; 0 uses default
-	CommitWatchdogSeconds     int          // Dump goroutines if one wrapper commit exceeds this many seconds; 0 disables
-	PhysicalDelete            bool         // Physically delete obsolete trie nodes; false leaves unreachable path nodes for offline cleanup
-	ArchiveDB                 ArchiveStore // Separate store for archive data
+	ShardDepth                int   // Number of bits for shard routing (default 16)
+	ArchiveBucketSize         int   // Max number of items in an archive bucket before splitting (default 100)
+	NodeCacheLimit            int   // Max serialized node blobs cached in process; 0 uses default, negative disables
+	NodeCacheBytesLimit       int64 // Max serialized node blob bytes cached in process; 0 uses default, negative disables byte cap
+	NodeCacheWarmPathBits     int   // Path-mode eager warming depth; 0 uses default, -1 keeps root-only, <-1 disables eager warming
+	CommitmentPointCacheLimit int   // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
+	EnablePathDiagnostics     bool  // Record path/cache diagnostics; disabled by default for hot experiments
+	CompactArchiveStubs       bool  // Merge adjacent archive stubs synchronously; expensive on hot pruning paths
+	ArchiveStubMaxBucketsPath int   // Max side-mounted archive buckets at one node before pressure-sinking; 0 uses default, negative disables
+	AsyncPrune                bool  // Run shard pruning in the background and apply it before root commit
+	CommitWorkers             int   // Max parallel shard commit workers; 0 uses default
+	CommitWatchdogSeconds     int   // Dump goroutines if one wrapper commit exceeds this many seconds; 0 disables
+	PhysicalDelete            bool  // Physically delete obsolete trie nodes; false leaves unreachable path nodes for offline cleanup
 	FlatReader                FlatValueReader
-	CuckooBuckets             int  // Number of buckets in cuckoo filter (default 32)
-	CuckooSlots               int  // Slots per bucket in cuckoo filter (default 4)
-	InlineValueThreshold      int  // Inline values up to this size into leaf/archive refs; 0 disables
-	DeleteOldValues           bool // Use key-bound value refs and delete superseded external value blobs
+	CuckooBuckets             int // Number of buckets in cuckoo filter (default 32)
+	CuckooSlots               int // Slots per bucket in cuckoo filter (default 4)
 	NodeStorageScheme         string
 }
 
@@ -53,7 +42,6 @@ func DefaultConfig() *Config {
 	return &Config{
 		ShardDepth:                16,
 		ArchiveBucketSize:         100,
-		ArchiveItemCacheLimit:     -1,
 		NodeCacheLimit:            DefaultNodeCacheLimit,
 		NodeCacheBytesLimit:       DefaultNodeCacheBytesLimit,
 		NodeCacheWarmPathBits:     DefaultNodeCacheWarmPathBits,
@@ -103,12 +91,10 @@ type TrieStats struct {
 
 	bucketItemHist map[int]int
 
-	ArchiveReadCount   int64 // Number of times archive store was accessed
 	FalsePositiveCount int64 // Number of false positives from Cuckoo Filter
 	TotalProofSize     int64 // Total size of generated proofs
 	ExistProofCount    int64 // Count of existence proofs
 	NonExistProofCount int64 // Count of non-existence proofs
-	ArchiveStorageSize int64 // Total size of archived data persisted in archive storage
 }
 
 // Stats returns the statistics for the entire Trie.
@@ -245,9 +231,7 @@ func (s *Shard) accumulateStatsWithCache(stats *TrieStats, nodeCache *nodeBlobCa
 
 	if s.stats != nil {
 		s.statsMut.Lock()
-		stats.ArchiveReadCount += s.stats.ArchiveReadCount
 		stats.FalsePositiveCount += s.stats.FalsePositiveCount
-		stats.ArchiveStorageSize += s.stats.ArchiveStorageSize
 		s.statsMut.Unlock()
 	}
 

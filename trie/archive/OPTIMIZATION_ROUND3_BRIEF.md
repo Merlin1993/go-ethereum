@@ -1,5 +1,8 @@
 # ASCT Round 3 Optimization Brief
 
+本文是第三波实验线程的任务卡，不是逻辑说明。必须保留的 ASCT Plus 语义以
+`trie/archive/doc/ARCHIVE_CODE_PLUS.md` 为准。
+
 第三波优化的目标不是继续调参，而是先判断瓶颈来自设计、数据分布，还是工程实现。
 
 ## 1. 目标
@@ -15,8 +18,7 @@
 先读：
 
 ```text
-trie/archive/ARCHIVE_LOGIC_PLUS.md
-trie/archive/ARCHIVE_CODE_PLUS.md
+trie/archive/doc/ARCHIVE_CODE_PLUS.md
 ```
 
 ## 2. 当前最重要的判断
@@ -80,8 +82,8 @@ prune time
 ```text
 ASC path node puts/deletes: BPN1 / BPT1
 Flat KV puts/deletes: BFV1
-legacy archive payload: hash || 0x01
-legacy value blob: hash || 0x02
+archive bucket node puts/deletes
+archive filter / entry metadata writes
 other raw writes
 ```
 
@@ -207,21 +209,14 @@ mainnet replay 诊断 run 建议开启：
 20  target stress case
 ```
 
-## 6. 关键参考文件
+## 6. 关键阅读入口
 
 ```text
-trie/archive/config.go
-trie/archive/trie.go
-trie/archive/shard.go
-trie/archive/archive.go
-trie/archive/archive_build.go
-trie/archive/archive_stubs.go
-trie/archive/bucket.go
-trie/archive/value_store.go
-trie/archive/path_storage.go
-trie/archive/diagnostics.go
-trie/archive_trie.go
-core/tree_test/processor_expire_state_test.go
+当前实现说明: trie/archive/doc/ARCHIVE_CODE_PLUS.md
+归档核心包: trie/archive/
+外层适配: trie/archive_trie.go
+实验入口: core/tree_test/processor_expire_state_test.go
+实验说明: EXPERIMENT_README.md
 ```
 
 ## 7. 关键结果目录

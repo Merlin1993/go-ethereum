@@ -28,10 +28,8 @@ func TestArchiveViaPrune(t *testing.T) {
 	}
 
 	trie.Commit()
-	trie.FlushArchives()
 
 	trie.Commit()
-	trie.FlushArchives()
 
 	// 4. 验证数据仍然可读（自动触发赎回或直接读取归档）
 	for i := 0; i < 60; i++ {
@@ -80,12 +78,10 @@ func TestExplicitActivate(t *testing.T) {
 		trie.Put(keys[i], []byte("val"))
 	}
 	trie.Commit()
-	trie.FlushArchives()
 	if err := archiveShardForTest(trie, 0); err != nil {
 		t.Fatalf("Prune failed: %v", err)
 	}
 	trie.Commit()
-	trie.FlushArchives()
 
 	// 2. 显式激活其中一条数据
 	targetKey := keys[30]

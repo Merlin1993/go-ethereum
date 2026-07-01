@@ -7,6 +7,8 @@ import (
 
 const parallelArchiveBuildThreshold = 256
 
+// buildArchiveSubtreeFast 把归档 item 打包成 bucket 或紧凑的归档子树。
+// 它会先压缩所有 item 的公共前缀，再继续按 bit 拆分，直到每个 bucket 都满足容量上限。
 func (s *Shard) buildArchiveSubtreeFast(items []ArchivedKV, path []byte, bits int) Node {
 	if len(items) == 0 {
 		return nil
@@ -82,6 +84,8 @@ func (s *Shard) buildArchiveSubtreeFast(items []ArchivedKV, path []byte, bits in
 	return n
 }
 
+// buildArchiveSubtreeForce 用在冷子树必须展开到至少 forceBits 的场景。
+// 典型情况是冷子树要和已有热 child 并列，需要在同一条边深度上对齐。
 func (s *Shard) buildArchiveSubtreeForce(items []ArchivedKV, path []byte, bits int, forceBits int) Node {
 	if len(items) == 0 {
 		return nil
@@ -140,6 +144,7 @@ func (s *Shard) buildArchiveSubtreeForce(items []ArchivedKV, path []byte, bits i
 	return n
 }
 
+// buildArchiveBucket 把绝对归档路径转换成 bucket 内部 suffix，并重算 filter 和 ECMH。
 func (s *Shard) buildArchiveBucket(items []ArchivedKV, path []byte, bits int) Node {
 	recordPruneBuildBucketIfEnabled(s.config, len(items))
 	localItems := make([]ArchivedKV, len(items))
@@ -203,6 +208,9 @@ func (s *Shard) partitionArchiveItemsByBit(items []ArchivedKV, bit int) int {
 	return left
 }
 
+// collectAndAttachToStubListAtPath 为刚收集到的冷 item 选择最小可用表示。
+//
+// 小 bucket 会先留在 StubList，等待后续剪枝继续合并；更大的 bucket/subtree 会直接下沉到 child edge。
 func (s *Shard) collectAndAttachToStubListAtPath(parent *InternalNode, items []ArchivedKV, absPath []byte, absBits int, nodePath []byte, nodeBits int) (bool, error) {
 	if len(items) == 0 {
 		return false, nil

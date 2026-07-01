@@ -2,13 +2,10 @@ package archive
 
 import (
 	"math/rand"
-	"path/filepath"
 	"testing"
-
-	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 )
 
-func benchmarkArchiveWriteCycle(b *testing.B, stateDB KVStore, archiveDB ArchiveStore, archiveItemCacheLimit int) {
+func benchmarkArchiveWriteCycle(b *testing.B, stateDB KVStore) {
 	const (
 		poolSize   = 1 << 15
 		batchSize  = 1000
@@ -20,8 +17,6 @@ func benchmarkArchiveWriteCycle(b *testing.B, stateDB KVStore, archiveDB Archive
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = shardDepth
-	config.ArchiveItemCacheLimit = archiveItemCacheLimit
-	config.ArchiveDB = archiveDB
 	trie := NewTrie(nil, stateDB, hasher, config, true)
 
 	rng := rand.New(rand.NewSource(1))
@@ -51,9 +46,6 @@ func benchmarkArchiveWriteCycle(b *testing.B, stateDB KVStore, archiveDB Archive
 	for i := 0; i < b.N; i++ {
 		if err := trie.PruneNextShard(); err != nil {
 			b.Fatalf("prune failed: %v", err)
-		}
-		if err := trie.FlushArchives(); err != nil {
-			b.Fatalf("flush failed: %v", err)
 		}
 
 		for j := 0; j < batchSize; j++ {
@@ -85,28 +77,5 @@ func benchmarkArchiveWriteCycle(b *testing.B, stateDB KVStore, archiveDB Archive
 
 func BenchmarkArchiveWriteCycleMemory(b *testing.B) {
 	db := NewMemoryDBAdapter()
-	benchmarkArchiveWriteCycle(b, db, db, 0)
-}
-
-func BenchmarkArchiveWriteCycleMemoryCached(b *testing.B) {
-	db := NewMemoryDBAdapter()
-	benchmarkArchiveWriteCycle(b, db, db, -1)
-}
-
-func BenchmarkArchiveWriteCycleLevelDB(b *testing.B) {
-	baseDir := b.TempDir()
-
-	stateDB, err := leveldb.New(filepath.Join(baseDir, "state"), 512, 256, "state", false)
-	if err != nil {
-		b.Fatalf("open state db failed: %v", err)
-	}
-	defer stateDB.Close()
-
-	archiveDB, err := leveldb.New(filepath.Join(baseDir, "archive"), 512, 256, "archive", false)
-	if err != nil {
-		b.Fatalf("open archive db failed: %v", err)
-	}
-	defer archiveDB.Close()
-
-	benchmarkArchiveWriteCycle(b, &LevelDBAdapter{stateDB}, &LevelDBAdapter{archiveDB}, 0)
+	benchmarkArchiveWriteCycle(b, db)
 }

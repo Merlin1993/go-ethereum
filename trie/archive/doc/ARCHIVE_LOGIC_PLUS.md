@@ -1,6 +1,8 @@
 # ASC Archive Logical Plus
 
-本文档是当前 ASC archive 逻辑的第一准则。`ARCHIVE_LOGIC.md` 仅作为旧版历史参考；实现、测试和实验结论若与本文档冲突，以本文档为准。
+> 旧设计归档：本文记录 ASCT Plus 早期逻辑整理和迁移边界，其中部分兼容路径已被删除。当前代码结构、流程和有效配置以 `ARCHIVE_CODE_PLUS.md` 为准。
+
+本文档曾作为 ASC archive plus 逻辑准则。当前实现若与本文档冲突，以 `ARCHIVE_CODE_PLUS.md` 和代码为准。
 
 本文档描述 ASC 归档逻辑的 plus 版本。核心目标是把执行读取与证明骨架解耦：
 

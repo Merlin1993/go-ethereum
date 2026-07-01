@@ -29,7 +29,6 @@ func TestResurrectionMetrics(t *testing.T) {
 	trie.Put(key, val)
 	trie.SetGlobalEpoch(0)
 	trie.Commit()
-	trie.FlushArchives()
 
 	// Move to archive under the rolling-epoch policy.
 	if err := archiveShardForTest(trie, 1); err != nil {
@@ -42,18 +41,6 @@ func TestResurrectionMetrics(t *testing.T) {
 	}
 
 	trie.Commit()
-	trie.FlushArchives()
-
-	// Manual DB check
-	// Find the shard
-	shardID := trie.GetShardID(key)
-	shard := trie.shards[shardID]
-	if shard == nil {
-		t.Fatalf("Shard %d not loaded", shardID)
-	}
-	// The root of the shard should be an ArchiveBucketNode or an InternalNode containing it
-	// But let's check what's in pendingArchives etc.
-	t.Logf("Shard %d pendingArchives: %d", shardID, len(shard.pendingArchives))
 
 	// 4. Get the data (Resurrection)
 	got, err := trie.Get(key)

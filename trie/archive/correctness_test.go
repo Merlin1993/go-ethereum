@@ -118,8 +118,6 @@ func TestShardHashDoesNotClearDirtyBeforeCommit(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 4
-	config.InlineValueThreshold = 0
-	config.DeleteOldValues = true
 
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
@@ -199,7 +197,6 @@ func setupTrie() (*Trie, Hasher) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
-	config.ArchiveDB = db // Use the same memory DB for archive for testing
 	return NewTrie(nil, db, hasher, config, true), hasher
 }
 
@@ -208,7 +205,6 @@ func TestCommitToBatchPropagatesStaleDeletesNonDestructive(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 4
-	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	key := bytes.Repeat([]byte{0x42}, 32)
@@ -248,7 +244,6 @@ func TestPruneMarksArchivedSubtreeNodesStale(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 4
-	config.ArchiveDB = db
 
 	global := byte(1)
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return global })
@@ -318,12 +313,11 @@ func collectPersistedNodeHashesForTest(node Node, hashes map[string]struct{}) {
 	}
 }
 
-func TestFlushArchivesAfterNonDestructiveCommitReload(t *testing.T) {
+func TestArchiveBucketReloadAfterNonDestructiveCommit(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 8
-	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	key := make([]byte, 32)
@@ -353,9 +347,6 @@ func TestFlushArchivesAfterNonDestructiveCommitReload(t *testing.T) {
 	if err := batch.Write(); err != nil {
 		t.Fatal(err)
 	}
-	if err := trie.FlushArchives(); err != nil {
-		t.Fatal(err)
-	}
 
 	reloaded := NewTrie(root, db, hasher, config, true)
 	got, err := reloaded.Get(key)
@@ -372,8 +363,6 @@ func TestForEachPrefixDoesNotScanUnrelatedArchivedShard(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 8
-	config.ArchiveDB = db
-	config.InlineValueThreshold = 0
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	keyA := []byte{0x10, 0xaa, 0x01, 0x02}
@@ -408,9 +397,6 @@ func TestForEachPrefixDoesNotScanUnrelatedArchivedShard(t *testing.T) {
 	if err := batch.Write(); err != nil {
 		t.Fatal(err)
 	}
-	if err := trie.FlushArchives(); err != nil {
-		t.Fatal(err)
-	}
 
 	reloaded := NewTrie(root, db, hasher, config, true)
 	db.ResetArchiveDataGets()
@@ -439,7 +425,6 @@ func TestShrinkPromotesStubList(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -487,7 +472,6 @@ func TestCompactStubListMergesCommonPrefixBuckets(t *testing.T) {
 	config := DefaultConfig()
 	config.ArchiveBucketSize = 4
 	config.CompactArchiveStubs = true
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -540,7 +524,6 @@ func TestAttachStubsDoesNotReadArchiveDataByDefault(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ArchiveBucketSize = 4
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -582,7 +565,6 @@ func TestPruneCollectKeepsExistingArchiveBucketOpaque(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ArchiveBucketSize = 4
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -628,7 +610,6 @@ func TestSparseArchiveStubsCompactTowardBucketLimit(t *testing.T) {
 	config.CuckooBuckets = 64
 	config.CuckooSlots = 4
 	config.CompactArchiveStubs = true
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -675,7 +656,6 @@ func TestArchiveSubtreeAttachKeepsChildShape(t *testing.T) {
 	config.CuckooBuckets = 64
 	config.CuckooSlots = 4
 	config.CompactArchiveStubs = true
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -728,7 +708,6 @@ func TestSmallArchiveChildDoesNotCollapseBackToStub(t *testing.T) {
 	config.CuckooBuckets = 64
 	config.CuckooSlots = 4
 	config.CompactArchiveStubs = true
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -763,7 +742,6 @@ func TestSideMountedBucketStaysUntilSinkThreshold(t *testing.T) {
 	config.CuckooBuckets = 64
 	config.CuckooSlots = 4
 	config.CompactArchiveStubs = true
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -808,7 +786,6 @@ func TestMatureSideMountedBucketSinksToArchiveLeaf(t *testing.T) {
 	config.CuckooBuckets = 64
 	config.CuckooSlots = 4
 	config.CompactArchiveStubs = true
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -866,7 +843,6 @@ func TestAttachAtPathSinksOnlyTriggeredMatureBucket(t *testing.T) {
 	config.CuckooBuckets = 64
 	config.CuckooSlots = 4
 	config.CompactArchiveStubs = true
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -916,7 +892,6 @@ func TestStubPathPressureSinksSparseBuckets(t *testing.T) {
 	config.CuckooSlots = 4
 	config.CompactArchiveStubs = false
 	config.ArchiveStubMaxBucketsPath = 4
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -973,7 +948,6 @@ func TestStubPathPressureSinksIntoHotChild(t *testing.T) {
 	config.CuckooSlots = 4
 	config.CompactArchiveStubs = false
 	config.ArchiveStubMaxBucketsPath = 1
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -1037,7 +1011,6 @@ func TestMatureBucketSinksIntoHotChildAsArchiveSubtree(t *testing.T) {
 	config.CuckooBuckets = 64
 	config.CuckooSlots = 4
 	config.CompactArchiveStubs = true
-	config.ArchiveDB = db
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
 		t.Fatal(err)
@@ -1498,7 +1471,6 @@ func TestArchiveSubtreeKeepsBucketSizeLimitOnDegeneratePrefix(t *testing.T) {
 	config.ArchiveBucketSize = 4
 	config.CuckooBuckets = 64
 	config.CuckooSlots = 4
-	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	keys := make([][]byte, 20)
@@ -1548,8 +1520,6 @@ func TestInlineSmallValueSkipsValueBlobAndReloads(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 4
-	config.InlineValueThreshold = 32
-	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	key := bytes.Repeat([]byte{0x23}, 32)
@@ -1577,9 +1547,6 @@ func TestInlineSmallValueSkipsValueBlobAndReloads(t *testing.T) {
 	if err := archiveShardForTest(reloaded, reloaded.GetShardID(key)); err != nil {
 		t.Fatal(err)
 	}
-	if err := reloaded.FlushArchives(); err != nil {
-		t.Fatal(err)
-	}
 	got, err = reloaded.Get(key)
 	if err != nil {
 		t.Fatal(err)
@@ -1594,24 +1561,17 @@ func TestFlatValueOverwrittenOnUpdate(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 4
-	config.DeleteOldValues = true
-	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	key := bytes.Repeat([]byte{0x35}, 32)
 	oldValue := []byte("old-value")
 	newValue := []byte("new-value")
-	oldRef := valueRefForKeyValue(key, oldValue)
-	newRef := valueRefForKeyValue(key, newValue)
 
 	if err := trie.Put(key, oldValue); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := trie.Commit(); err != nil {
 		t.Fatal(err)
-	}
-	if ok, _ := db.Has(valueDataKey(oldRef)); ok {
-		t.Fatalf("plus mode should not copy old value into value store")
 	}
 	if got, _ := db.Get(flatValueDataKey(key)); !bytes.Equal(got, oldValue) {
 		t.Fatalf("expected old value in flat store, got %x", got)
@@ -1623,12 +1583,6 @@ func TestFlatValueOverwrittenOnUpdate(t *testing.T) {
 	root, err := trie.Commit()
 	if err != nil {
 		t.Fatal(err)
-	}
-	if ok, _ := db.Has(valueDataKey(oldRef)); ok {
-		t.Fatalf("plus mode should not keep superseded value blob")
-	}
-	if ok, _ := db.Has(valueDataKey(newRef)); ok {
-		t.Fatalf("plus mode should not copy new value into value store")
 	}
 	if got, _ := db.Get(flatValueDataKey(key)); !bytes.Equal(got, newValue) {
 		t.Fatalf("expected new value in flat store, got %x", got)
@@ -1644,21 +1598,16 @@ func TestFlatValueOverwrittenOnUpdate(t *testing.T) {
 	}
 }
 
-func TestArchiveDBDoesNotStoreExecutionValues(t *testing.T) {
+func TestFlatStoreKeepsExecutionValues(t *testing.T) {
 	stateDB := NewMemoryDBAdapter()
-	valueDB := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 4
-	config.DeleteOldValues = true
-	config.ArchiveDB = valueDB
 	trie := NewTrie(nil, stateDB, hasher, config, true)
 
 	key := bytes.Repeat([]byte{0x44}, 32)
 	oldValue := []byte("old-external-value")
 	newValue := []byte("new-external-value")
-	oldRef := valueRefForKeyValue(key, oldValue)
-	newRef := valueRefForKeyValue(key, newValue)
 
 	if err := trie.Put(key, oldValue); err != nil {
 		t.Fatal(err)
@@ -1666,15 +1615,6 @@ func TestArchiveDBDoesNotStoreExecutionValues(t *testing.T) {
 	root, err := trie.Commit()
 	if err != nil {
 		t.Fatal(err)
-	}
-	if ok, _ := stateDB.Has(valueDataKey(oldRef)); ok {
-		t.Fatalf("stateDB should not contain external value blob")
-	}
-	if ok, _ := stateDB.Has(oldRef); ok {
-		t.Fatalf("stateDB should not contain legacy raw value blob")
-	}
-	if ok, _ := valueDB.Has(valueDataKey(oldRef)); ok {
-		t.Fatalf("archive/value DB should not contain execution value blob in plus mode")
 	}
 	if got, _ := stateDB.Get(flatValueDataKey(key)); !bytes.Equal(got, oldValue) {
 		t.Fatalf("stateDB flat store mismatch: got %x want %x", got, oldValue)
@@ -1712,12 +1652,6 @@ func TestArchiveDBDoesNotStoreExecutionValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := valueDB.Has(valueDataKey(oldRef)); ok {
-		t.Fatalf("archive/value DB should not contain superseded execution value blob")
-	}
-	if ok, _ := valueDB.Has(valueDataKey(newRef)); ok {
-		t.Fatalf("archive/value DB should not contain new execution value blob")
-	}
 	if got, _ := stateDB.Get(flatValueDataKey(key)); !bytes.Equal(got, newValue) {
 		t.Fatalf("stateDB flat store mismatch after update: got %x want %x", got, newValue)
 	}
@@ -1737,7 +1671,6 @@ func TestTopTreeDeletesSupersededRootNode(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 4
-	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	key1 := bytes.Repeat([]byte{0x11}, 32)
@@ -1804,7 +1737,6 @@ func TestRollingEpochPrunesShardWrittenBeforeCursor(t *testing.T) {
 	config := DefaultConfig()
 	config.ShardDepth = 2
 	config.NodeStorageScheme = NodeStoragePath
-	config.ArchiveDB = db
 
 	trie := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
 	if err := trie.PruneNextShard(); err != nil {
@@ -1842,7 +1774,6 @@ func TestAsyncPruneAppliesBeforeHash(t *testing.T) {
 	config := DefaultConfig()
 	config.ShardDepth = 2
 	config.NodeStorageScheme = NodeStoragePath
-	config.ArchiveDB = db
 	config.AsyncPrune = true
 
 	trie := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
@@ -1929,9 +1860,6 @@ func TestDeleteArchivedBucketEntry(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 4
-	config.ArchiveDB = db
-	config.InlineValueThreshold = 0
-	config.DeleteOldValues = true
 
 	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
 	if err != nil {
@@ -1959,14 +1887,6 @@ func TestDeleteArchivedBucketEntry(t *testing.T) {
 	}
 	bucket := &ArchiveBucketNode{Path: path, PathBits: 8, dirty: true}
 	shard.recomputeBucket(bucket, items)
-	data, err := shard.serializeArchivedKV(items)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hash := shard.ensureBucketHash(bucket)
-	if err := db.PutBucket(archiveDataKey(hash), data); err != nil {
-		t.Fatal(err)
-	}
 	shard.root = bucket
 
 	if err := shard.Delete(key1); err != nil {
@@ -2340,7 +2260,6 @@ func TestArchiveBucketSplitAndMovement(t *testing.T) {
 	config := &Config{
 		ShardDepth:        16,
 		ArchiveBucketSize: 2,
-		ArchiveDB:         db,
 	}
 	trie := NewTrie(nil, db, hasher, config, true)
 
@@ -2357,14 +2276,12 @@ func TestArchiveBucketSplitAndMovement(t *testing.T) {
 
 	trie.SetGlobalEpoch(0)
 	trie.Commit()
-	trie.FlushArchives()
 
 	// Switch epoch and trigger archiving
 	if err := archiveShardForTest(trie, 0); err != nil {
 		t.Fatalf("Prune failed: %v", err)
 	}
 	trie.Commit()
-	trie.FlushArchives()
 
 	// Verify stats before reads, since Get automatically activates archived data.
 	stats := trie.Stats()
@@ -2393,7 +2310,6 @@ func TestDataActivation(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
-	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	key := make([]byte, 32)
@@ -2404,12 +2320,10 @@ func TestDataActivation(t *testing.T) {
 	trie.Put(key, val)
 	trie.SetGlobalEpoch(0)
 	trie.Commit()
-	trie.FlushArchives()
 	if err := archiveShardForTest(trie, 0); err != nil {
 		t.Fatalf("Prune failed: %v", err)
 	}
 	trie.Commit()
-	trie.FlushArchives()
 
 	// Verify it's archived
 	statsBefore := trie.Stats()
@@ -2425,7 +2339,6 @@ func TestDataActivation(t *testing.T) {
 		t.Fatalf("Activate failed: %v", err)
 	}
 	trie.Commit()
-	trie.FlushArchives()
 
 	// 3. Verify archived count dropped
 	statsAfter := trie.Stats()
@@ -2445,7 +2358,6 @@ func TestPutRemovesArchivedVersion(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 8
-	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	key := make([]byte, 32)
@@ -2476,9 +2388,6 @@ func TestPutRemovesArchivedVersion(t *testing.T) {
 	if err := batch.Write(); err != nil {
 		t.Fatal(err)
 	}
-	if err := trie.FlushArchives(); err != nil {
-		t.Fatal(err)
-	}
 
 	archived := NewTrie(root, db, hasher, config, true)
 	stats := archived.Stats()
@@ -2495,9 +2404,6 @@ func TestPutRemovesArchivedVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := batch.Write(); err != nil {
-		t.Fatal(err)
-	}
-	if err := trie.FlushArchives(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2525,7 +2431,6 @@ func TestTrieStatistics(t *testing.T) {
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
 	config.ShardDepth = 16
-	config.ArchiveDB = db
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	// Write some hot data
@@ -2544,12 +2449,10 @@ func TestTrieStatistics(t *testing.T) {
 	// Archive the data
 	trie.SetGlobalEpoch(0)
 	trie.Commit()
-	trie.FlushArchives()
 	if err := archiveShardForTest(trie, 0x0102); err != nil {
 		t.Fatalf("Prune failed: %v", err)
 	}
 	trie.Commit()
-	trie.FlushArchives()
 
 	stats = trie.Stats()
 	if stats.ArchivedDataSize != 5 {
@@ -2811,7 +2714,6 @@ func TestPathStorageArchivePromotionReload(t *testing.T) {
 	config := DefaultConfig()
 	config.ShardDepth = 8
 	config.NodeStorageScheme = NodeStoragePath
-	config.ArchiveDB = db
 
 	key := make([]byte, 32)
 	key[0] = 0x35
@@ -2830,9 +2732,6 @@ func TestPathStorageArchivePromotionReload(t *testing.T) {
 	}
 	root, err := trie.Commit()
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := trie.FlushArchives(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2858,67 +2757,52 @@ func TestPathStorageArchivePromotionReload(t *testing.T) {
 }
 
 func TestGetDoesNotPromoteArchivedData(t *testing.T) {
-	// 1. 设置 Trie 并插入数据
 	trie, _ := setupTrie()
 
 	key := make([]byte, 32)
 	rand.Read(key)
-	// 强制落在 Shard 0，方便测试 Prune
 	key[0], key[1] = 0x00, 0x00
 	val := []byte("flat-read-no-promotion-test")
 
-	trie.Put(key, val)
+	if err := trie.Put(key, val); err != nil {
+		t.Fatal(err)
+	}
 	trie.SetGlobalEpoch(0)
-	trie.Commit()
-	trie.FlushArchives()
-
-	// 2. 增加 Epoch 并执行剪枝，将数据转入归档桶
+	if _, err := trie.Commit(); err != nil {
+		t.Fatal(err)
+	}
 	if err := archiveShardForTest(trie, 0); err != nil {
 		t.Fatalf("Prune failed: %v", err)
 	}
-	trie.Commit()
-	trie.FlushArchives()
+	if _, err := trie.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
-	// 验证数据已在归档中
 	stats := trie.Stats()
 	if stats.ArchivedDataSize != 1 {
-		t.Fatalf("Expected 1 archived item, got %d", stats.ArchivedDataSize)
+		t.Fatalf("expected 1 archived item, got %d", stats.ArchivedDataSize)
 	}
-
-	// 记录初始计数器
 	initialMissExistent := atomic.LoadInt64(&common.BinaryMissExistentCount)
 
-	// 3. 执行 Get 操作，应该触发自动赎回
 	got, err := trie.Get(key)
 	if err != nil {
-		t.Fatalf("First Get failed: %v", err)
+		t.Fatalf("first Get failed: %v", err)
 	}
 	if !bytes.Equal(got, val) {
-		t.Errorf("Value mismatch: got %x, want %x", got, val)
+		t.Fatalf("value mismatch: got %x want %x", got, val)
 	}
-
-	// 验证第一次 Get 记录为 MissExistent (因为是从归档中找回的)
 	if atomic.LoadInt64(&common.BinaryMissExistentCount) < initialMissExistent {
-		t.Errorf("BinaryMissExistentCount moved backwards")
+		t.Fatalf("BinaryMissExistentCount moved backwards")
+	}
+	if statsAfter := trie.Stats(); statsAfter.ArchivedDataSize != 1 {
+		t.Fatalf("expected archived item to remain cold after Get, got %d", statsAfter.ArchivedDataSize)
 	}
 
-	// 4. 验证数据已回热路径
-	statsAfter := trie.Stats()
-	if statsAfter.ArchivedDataSize != 1 {
-		t.Errorf("Expected archived item to remain cold after Get, got %d", statsAfter.ArchivedDataSize)
-	}
-
-	// 5. 验证第二次 Get 是热路径命中 (Hit)
-	got2, err := trie.Get(key)
+	got, err = trie.Get(key)
 	if err != nil {
-		t.Fatalf("Second Get failed: %v", err)
+		t.Fatalf("second Get failed: %v", err)
 	}
-	if !bytes.Equal(got2, val) {
-		t.Errorf("Value mismatch on second Get")
-	}
-
-	statsAfterSecondRead := trie.Stats()
-	if statsAfterSecondRead.ArchivedDataSize != 1 {
-		t.Errorf("Expected archived item to remain cold after repeated Get, got %d", statsAfterSecondRead.ArchivedDataSize)
+	if !bytes.Equal(got, val) {
+		t.Fatalf("second value mismatch: got %x want %x", got, val)
 	}
 }

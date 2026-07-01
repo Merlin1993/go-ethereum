@@ -12,7 +12,6 @@ func TestConfigAndStats(t *testing.T) {
 	config := &Config{
 		ShardDepth:        4,
 		ArchiveBucketSize: 5,
-		ArchiveDB:         db,
 	}
 	trie := NewTrie(nil, db, hasher, config, true)
 
@@ -60,7 +59,6 @@ func TestStatsDoesNotCreateEmptyShards(t *testing.T) {
 	config := &Config{
 		ShardDepth:        8,
 		ArchiveBucketSize: 5,
-		ArchiveDB:         db,
 	}
 	trie := NewTrie(nil, db, hasher, config, true)
 

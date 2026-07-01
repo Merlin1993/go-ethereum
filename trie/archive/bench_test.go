@@ -60,7 +60,3 @@ func (a *archiveBatchAdapterForTest) Delete(key []byte) error     { return a.Bat
 func (a *archiveBatchAdapterForTest) Write() error                { return a.Batch.Write() }
 func (a *archiveBatchAdapterForTest) Reset()                      { a.Batch.Reset() }
 func (a *archiveBatchAdapterForTest) ValueSize() int              { return a.Batch.ValueSize() }
-
-type testHasher struct{}
-
-func (h *testHasher) Hash(data []byte) []byte { return data } // simplified

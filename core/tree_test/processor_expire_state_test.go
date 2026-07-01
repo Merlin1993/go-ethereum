@@ -67,7 +67,6 @@ var (
 	// Binary Trie Ablation flags
 	shardDepth                  = flag.Int("shardDepth", 8, "Binary trie shard depth")
 	archiveBucketSize           = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
-	archiveItemCacheLimit       = flag.Int("archiveItemCacheLimit", 0, "Binary trie decoded archive item cache limit; 0 disables item caching, negative keeps all")
 	cuckooBuckets               = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
 	cuckooSlots                 = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
 	binaryNodeCacheLimit        = flag.Int("binaryNodeCacheLimit", 262144, "Binary trie process node cache entry limit; 0 uses default, negative disables cache")
@@ -110,7 +109,6 @@ type ProcessorConfig struct {
 	// Ablation params
 	ShardDepth                  int
 	ArchiveBucketSize           int
-	ArchiveItemCacheLimit       int
 	CuckooBuckets               int
 	CuckooSlots                 int
 	BinaryNodeCacheLimit        int
@@ -169,7 +167,6 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 		BinaryAblationConfig: &database.BinaryConfig{
 			ShardDepth:            cfg.ShardDepth,
 			ArchiveBucketSize:     cfg.ArchiveBucketSize,
-			ArchiveItemCacheLimit: cfg.ArchiveItemCacheLimit,
 			CuckooBuckets:         cfg.CuckooBuckets,
 			CuckooSlots:           cfg.CuckooSlots,
 			NodeCacheLimit:        cfg.BinaryNodeCacheLimit,
@@ -249,7 +246,6 @@ func TestExpireStateProcessor(t *testing.T) {
 		MaxBlocks:                   *maxBlocks,
 		ShardDepth:                  *shardDepth,
 		ArchiveBucketSize:           *archiveBucketSize,
-		ArchiveItemCacheLimit:       *archiveItemCacheLimit,
 		CuckooBuckets:               *cuckooBuckets,
 		CuckooSlots:                 *cuckooSlots,
 		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,
@@ -1402,7 +1398,6 @@ func TestBinaryTrieConsistency(t *testing.T) {
 		MaxBlocks:                   *maxBlocks,
 		ShardDepth:                  *shardDepth,
 		ArchiveBucketSize:           *archiveBucketSize,
-		ArchiveItemCacheLimit:       *archiveItemCacheLimit,
 		CuckooBuckets:               *cuckooBuckets,
 		CuckooSlots:                 *cuckooSlots,
 		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,

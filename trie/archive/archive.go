@@ -2,7 +2,10 @@ package archive
 
 import "github.com/ethereum/go-ethereum/common"
 
-// Prune 执行分片级别的状态剪枝和归档。
+// Prune 扫描一个 shard，把过期热 leaf 转成归档桶。
+//
+// 返回时 shard root 仍然同时表示热数据和冷数据：当前 epoch 的 leaf 保持热状态；
+// 过期 leaf 会进入冷 bucket，先侧挂到 StubList，或在成熟/压力过高时下沉到 child edge。
 func (s *Shard) Prune(global byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -19,9 +22,8 @@ func (s *Shard) Prune(global byte) error {
 		return nil
 	}
 
-	// [FIX] Do NOT early-return based on root.Epoch() alone.
-	// Insert operations update the root's epoch, but child nodes may still have
-	// stale epochs that need pruning. pruneAndArchive checks per-node epoch correctly.
+	// 不能只看 root epoch 来跳过剪枝。写入会刷新插入路径上的祖先节点，
+	// 但未触碰的子树仍可能保留旧 epoch，所以必须继续向下检查。
 
 	// 1. 获取当前分片的物理前缀 (Absolute Prefix)
 	prefix, prefixBits := s.getShardPrefix()
@@ -161,7 +163,10 @@ func (s *Shard) detachLeadingPathBit(node Node) (byte, bool) {
 	}
 }
 
-// pruneAndArchive 递归处理节点，items 返回值始终是 MaxPathBits 范围内的绝对路径。
+// pruneAndArchive 递归改写一个子树。
+//
+// 返回的 items 始终使用 MaxPathBits 范围内的绝对路径。调用方再决定把这些 item
+// 向上聚合、挂入 StubList，还是构造成普通归档 child 子树。
 func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global byte) (Node, []ArchivedKV, []*ArchiveBucketNode, error) {
 	if node == nil {
 		return nil, nil, nil, nil
@@ -171,7 +176,6 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 	case *LeafNode:
 		if (n.Epoch() & 1) != global {
 			s.markPersistedNodeStale(n)
-			s.releaseValue(n.ValueHash)
 			// 组装绝对路径
 			absP, absB := s.prependPath(n.Path, n.PathBits, prefix, prefixBits)
 			item := ArchivedKV{
@@ -187,10 +191,8 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 		recordPruneInternalVisitIfEnabled(s.config)
 		var err error
 		origStubCount := len(n.StubList)
-		// [FIX] Do NOT use InternalNode.epoch for fast-path archival.
-		// insert() updates InternalNode.epoch along the traversal path, which
-		// makes them appear "current" even when their leaf children are stale.
-		// Always recurse into children to check individual leaf epochs.
+		// InternalNode 的 epoch 只是摘要。最近写入的路径可能让祖先看起来是当前 epoch，
+		// 但兄弟 leaf 仍然过期，所以 fast path 只能依赖 subtree mask。
 		if mask, ok := s.subtreeEpochMask(n); ok {
 			hotMask := leafEpochMask(global)
 			if mask&^hotMask == 0 {
@@ -380,7 +382,6 @@ func (s *Shard) collectLeavesAndMarkStaleRecursive(node Node, prefix []byte, pre
 	case *LeafNode:
 		recordPruneCollectedLeafIfEnabled(s.config)
 		s.markPersistedNodeStale(n)
-		s.releaseValue(n.ValueHash)
 		absP, absB := s.prependPath(n.Path, n.PathBits, prefix, prefixBits)
 		return []ArchivedKV{{
 			Suffix:     absP,
@@ -615,7 +616,6 @@ func (s *Shard) markSubtreeStaleRecursive(node Node) error {
 			if s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage()) {
 				s.staleSet[string(hash)] = struct{}{}
 			}
-			s.markArchiveDataDelete(hash, -1)
 		}
 	}
 	return nil
@@ -778,7 +778,9 @@ func (s *Shard) sinkArchiveBucketsIntoChild(child Node, buckets []*ArchiveBucket
 	}
 	for _, bucket := range buckets {
 		if oldHash := s.ensureBucketHash(bucket); len(oldHash) > 0 {
-			s.markArchiveDataDelete(oldHash, -1)
+			if s.pruning && (s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage())) {
+				s.staleSet[string(oldHash)] = struct{}{}
+			}
 		}
 	}
 	return rebuilt, true, nil
@@ -1061,7 +1063,9 @@ func (s *Shard) sinkBucketIntoArchiveChild(child Node, bucket *ArchiveBucketNode
 		return child, false, err
 	}
 	if oldHash := s.ensureBucketHash(bucket); len(oldHash) > 0 {
-		s.markArchiveDataDelete(oldHash, -1)
+		if s.pruning && (s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage())) {
+			s.staleSet[string(oldHash)] = struct{}{}
+		}
 	}
 	return s.buildArchiveSubtreeFast(items, childPath, childBits), true, nil
 }
@@ -1090,7 +1094,9 @@ func (s *Shard) splitArchiveBucketForHotInsert(bucket *ArchiveBucketNode, forceB
 	}
 	s.markPersistedNodeStale(bucket)
 	if oldHash := s.ensureBucketHash(bucket); len(oldHash) > 0 {
-		s.markArchiveDataDelete(oldHash, -1)
+		if s.pruning && (s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage())) {
+			s.staleSet[string(oldHash)] = struct{}{}
+		}
 	}
 	return s.buildArchiveSubtreeForce(items, bucket.Path, bucket.PathBits, forceBits), true, nil
 }
@@ -1120,7 +1126,9 @@ func (s *Shard) rebuildMixedChildWithArchiveBucket(child Node, bucket *ArchiveBu
 		return child, false, err
 	}
 	if oldHash := s.ensureBucketHash(bucket); len(oldHash) > 0 {
-		s.markArchiveDataDelete(oldHash, -1)
+		if s.pruning && (s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage())) {
+			s.staleSet[string(oldHash)] = struct{}{}
+		}
 	}
 	if rebuilt != nil {
 		rebuilt.SetDirty(true)

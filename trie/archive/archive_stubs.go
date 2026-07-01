@@ -5,6 +5,10 @@ import (
 	"github.com/ethereum/go-ethereum/trie/archive/cuckoo"
 )
 
+// StubList 是小归档桶的短期侧挂缓冲。
+//
+// 一轮剪枝经常只产生很小的冷 bucket。如果每个小桶都立刻下沉到 child edge，
+// 路径会很快变长；因此先挂在父节点上，尽量和后续 bucket 合并，成熟或路径压力过高时再下沉。
 func (s *Shard) attachStubs(parent *InternalNode, stubs []*ArchiveBucketNode) {
 	_, _ = s.attachStubsInternal(parent, stubs, nil, 0, false)
 }
@@ -65,6 +69,8 @@ func (s *Shard) detachArchiveStub(bucket *ArchiveBucketNode) {
 	bucket.storageBits = 0
 }
 
+// mergeStubIntoList 把新 bucket 和最合适的现有侧挂 bucket 反复合并，
+// 前提是合并后仍不超过 bucket 容量上限。
 func (s *Shard) mergeStubIntoList(parent *InternalNode, stub *ArchiveBucketNode) *ArchiveBucketNode {
 	if parent == nil || stub == nil {
 		return nil
@@ -98,6 +104,8 @@ func (s *Shard) mergeStubIntoList(parent *InternalNode, stub *ArchiveBucketNode)
 	}
 }
 
+// findMergeCandidate 选择公共绝对路径前缀最长的可合并 bucket，
+// 让合并后的 bucket 尽量保持空间局部性。
 func (s *Shard) findMergeCandidate(stubs []*ArchiveBucketNode, target *ArchiveBucketNode, limit int) (int, []byte, int) {
 	bestIdx := -1
 	bestBits := -1
@@ -116,6 +124,7 @@ func (s *Shard) findMergeCandidate(stubs []*ArchiveBucketNode, target *ArchiveBu
 	return bestIdx, bestPath, bestBits
 }
 
+// mergeArchiveBuckets 在两个侧挂 bucket 的公共路径前缀下重建本地 suffix、filter 和 ECMH。
 func (s *Shard) mergeArchiveBuckets(a, b *ArchiveBucketNode, path []byte, bits int) (*ArchiveBucketNode, bool) {
 	if a == nil || b == nil {
 		return nil, false
@@ -177,7 +186,6 @@ func (s *Shard) mergeArchiveBuckets(a, b *ArchiveBucketNode, path []byte, bits i
 		if s.pruning && (s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage())) && len(hash) > 0 {
 			s.staleSet[string(hash)] = struct{}{}
 		}
-		s.markArchiveDataDelete(hash, -1)
 	}
 	return merged, true
 }

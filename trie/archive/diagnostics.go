@@ -2,6 +2,7 @@ package archive
 
 import (
 	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,7 +11,6 @@ import (
 // CommitDiagnostics is a snapshot of the most recent ASCT commit breakdown.
 type CommitDiagnostics struct {
 	TotalNanos         int64
-	FlushArchivesNanos int64
 	CommitToBatchNanos int64
 	ShardCommitNanos   int64
 	TopTreeNanos       int64
@@ -22,18 +22,7 @@ type CommitDiagnostics struct {
 	PruneShardNanos    int64
 	PrunePrefetchNanos int64
 
-	DirtyShards        int64
-	ArchiveDirtyShards int64
-	FlushShards        int64
-
-	FlushShardCount      int64
-	FlushShardTotalNanos int64
-	FlushShardMaxNanos   int64
-
-	PendingArchives       int64
-	PendingAppends        int64
-	PendingDeletes        int64
-	PendingArchiveDeletes int64
+	DirtyShards int64
 
 	NodeCacheHits              int64
 	NodeCacheMisses            int64
@@ -179,15 +168,13 @@ type ShardCommitDiagnostics struct {
 
 	NodeCount               int64
 	StaleSetLen             int64
-	PendingValuePuts        int64
-	PendingValueDeletes     int64
 	PendingFlatValuePuts    int64
 	PendingFlatValueDeletes int64
 	RootWasNil              bool
 }
 
 func (d ShardCommitDiagnostics) PendingValuesTotal() int64 {
-	return d.PendingValuePuts + d.PendingValueDeletes
+	return d.PendingFlatValuePuts + d.PendingFlatValueDeletes
 }
 
 func (d ShardCommitDiagnostics) PendingFlatValuesTotal() int64 {
@@ -272,7 +259,6 @@ type pruneCounterSnapshot struct {
 
 var (
 	commitDiagTotalNanos                 int64
-	commitDiagFlushArchivesNanos         int64
 	commitDiagCommitToBatchNanos         int64
 	commitDiagShardCommitNanos           int64
 	commitDiagTopTreeNanos               int64
@@ -284,15 +270,6 @@ var (
 	commitDiagPruneShardNanos            int64
 	commitDiagPrunePrefetchNanos         int64
 	commitDiagDirtyShards                int64
-	commitDiagArchiveDirtyShards         int64
-	commitDiagFlushShards                int64
-	commitDiagFlushShardCount            int64
-	commitDiagFlushShardTotalNanos       int64
-	commitDiagFlushShardMaxNanos         int64
-	commitDiagPendingArchives            int64
-	commitDiagPendingAppends             int64
-	commitDiagPendingDeletes             int64
-	commitDiagPendingArchiveDeletes      int64
 	commitDiagNodeCacheHits              int64
 	commitDiagNodeCacheMisses            int64
 	commitDiagPathNodeDBGets             int64
@@ -362,7 +339,6 @@ var (
 // ResetCommitDiagnostics clears the global commit diagnostic counters.
 func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagTotalNanos, 0)
-	atomic.StoreInt64(&commitDiagFlushArchivesNanos, 0)
 	atomic.StoreInt64(&commitDiagCommitToBatchNanos, 0)
 	atomic.StoreInt64(&commitDiagShardCommitNanos, 0)
 	atomic.StoreInt64(&commitDiagTopTreeNanos, 0)
@@ -374,15 +350,6 @@ func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagPruneShardNanos, 0)
 	atomic.StoreInt64(&commitDiagPrunePrefetchNanos, 0)
 	atomic.StoreInt64(&commitDiagDirtyShards, 0)
-	atomic.StoreInt64(&commitDiagArchiveDirtyShards, 0)
-	atomic.StoreInt64(&commitDiagFlushShards, 0)
-	atomic.StoreInt64(&commitDiagFlushShardCount, 0)
-	atomic.StoreInt64(&commitDiagFlushShardTotalNanos, 0)
-	atomic.StoreInt64(&commitDiagFlushShardMaxNanos, 0)
-	atomic.StoreInt64(&commitDiagPendingArchives, 0)
-	atomic.StoreInt64(&commitDiagPendingAppends, 0)
-	atomic.StoreInt64(&commitDiagPendingDeletes, 0)
-	atomic.StoreInt64(&commitDiagPendingArchiveDeletes, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheHits, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheMisses, 0)
 	atomic.StoreInt64(&commitDiagPathNodeDBGets, 0)
@@ -445,14 +412,11 @@ func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagRuntimeLastPauseNs, 0)
 }
 
-func recordCommitDiagnostics(total, flushArchives, commitToBatch, batchWrite int64, dirtyShards, archiveDirtyShards, flushShards int) {
+func recordCommitDiagnostics(total, commitToBatch, batchWrite int64, dirtyShards int) {
 	atomic.StoreInt64(&commitDiagTotalNanos, total)
-	atomic.StoreInt64(&commitDiagFlushArchivesNanos, flushArchives)
 	atomic.StoreInt64(&commitDiagCommitToBatchNanos, commitToBatch)
 	atomic.StoreInt64(&commitDiagBatchWriteNanos, batchWrite)
 	atomic.StoreInt64(&commitDiagDirtyShards, int64(dirtyShards))
-	atomic.StoreInt64(&commitDiagArchiveDirtyShards, int64(archiveDirtyShards))
-	atomic.StoreInt64(&commitDiagFlushShards, int64(flushShards))
 }
 
 func recordCommitToBatchDiagnostics(shardCommit, topTree int64) {
@@ -617,21 +581,6 @@ func RecordWrapperResourceDiagnostics(rawOps, rawBytes, rawMaxShardID, rawMaxOps
 	atomic.StoreInt64(&commitDiagRuntimeLastPauseNs, int64(lastPause))
 }
 
-func recordShardFlushDiagnostics(duration int64, pendingArchives, pendingAppends, pendingDeletes, pendingArchiveDeletes int) {
-	atomic.AddInt64(&commitDiagFlushShardCount, 1)
-	atomic.AddInt64(&commitDiagFlushShardTotalNanos, duration)
-	atomic.AddInt64(&commitDiagPendingArchives, int64(pendingArchives))
-	atomic.AddInt64(&commitDiagPendingAppends, int64(pendingAppends))
-	atomic.AddInt64(&commitDiagPendingDeletes, int64(pendingDeletes))
-	atomic.AddInt64(&commitDiagPendingArchiveDeletes, int64(pendingArchiveDeletes))
-	for {
-		old := atomic.LoadInt64(&commitDiagFlushShardMaxNanos)
-		if duration <= old || atomic.CompareAndSwapInt64(&commitDiagFlushShardMaxNanos, old, duration) {
-			return
-		}
-	}
-}
-
 func recordNodeCacheLookupIfEnabled(config *Config, hit bool) {
 	if config == nil || !config.EnablePathDiagnostics {
 		return
@@ -735,7 +684,6 @@ func recordPruneArchiveBuildParallelIfEnabled(config *Config) {
 func LastCommitDiagnostics() CommitDiagnostics {
 	return CommitDiagnostics{
 		TotalNanos:                 atomic.LoadInt64(&commitDiagTotalNanos),
-		FlushArchivesNanos:         atomic.LoadInt64(&commitDiagFlushArchivesNanos),
 		CommitToBatchNanos:         atomic.LoadInt64(&commitDiagCommitToBatchNanos),
 		ShardCommitNanos:           atomic.LoadInt64(&commitDiagShardCommitNanos),
 		TopTreeNanos:               atomic.LoadInt64(&commitDiagTopTreeNanos),
@@ -747,15 +695,6 @@ func LastCommitDiagnostics() CommitDiagnostics {
 		PruneShardNanos:            atomic.LoadInt64(&commitDiagPruneShardNanos),
 		PrunePrefetchNanos:         atomic.LoadInt64(&commitDiagPrunePrefetchNanos),
 		DirtyShards:                atomic.LoadInt64(&commitDiagDirtyShards),
-		ArchiveDirtyShards:         atomic.LoadInt64(&commitDiagArchiveDirtyShards),
-		FlushShards:                atomic.LoadInt64(&commitDiagFlushShards),
-		FlushShardCount:            atomic.LoadInt64(&commitDiagFlushShardCount),
-		FlushShardTotalNanos:       atomic.LoadInt64(&commitDiagFlushShardTotalNanos),
-		FlushShardMaxNanos:         atomic.LoadInt64(&commitDiagFlushShardMaxNanos),
-		PendingArchives:            atomic.LoadInt64(&commitDiagPendingArchives),
-		PendingAppends:             atomic.LoadInt64(&commitDiagPendingAppends),
-		PendingDeletes:             atomic.LoadInt64(&commitDiagPendingDeletes),
-		PendingArchiveDeletes:      atomic.LoadInt64(&commitDiagPendingArchiveDeletes),
 		NodeCacheHits:              atomic.LoadInt64(&commitDiagNodeCacheHits),
 		NodeCacheMisses:            atomic.LoadInt64(&commitDiagNodeCacheMisses),
 		PathNodeDBGets:             atomic.LoadInt64(&commitDiagPathNodeDBGets),
@@ -823,9 +762,8 @@ func LastCommitDiagnostics() CommitDiagnostics {
 
 func (d CommitDiagnostics) String() string {
 	return fmt.Sprintf(
-		"total=%v flushArchives=%v commitToBatch=%v shardCommit=%v topTree=%v batchWrite=%v adapterMerge=%v trieDBUpdate=%v pruneTotal=%v pruneWait=%v pruneShard=%v prunePrefetchStart=%v dirtyShards=%d archiveDirtyShards=%d flushShards=%d flushShardCount=%d flushShardTotal=%v flushShardMax=%v pendingArchives=%d pendingAppends=%d pendingDeletes=%d pendingArchiveDeletes=%d nodeCacheHits=%d nodeCacheMisses=%d pathNodeDBGets=%d archivePromotionChecks=%d archivePromotionHits=%d bucketRecomputes=%d commitmentPointCacheHits=%d commitmentPointCacheMisses=%d pruneInternalVisits=%d pruneHotSkips=%d pruneChildHits=%d pruneChildSkips=%d pruneBulkCollects=%d pruneCollectedLeaves=%d pruneCollectedStubs=%d pruneBuildItems=%d pruneBuildBuckets=%d pruneArchiveBuildParallels=%d shardMaxID=%d shardMaxCommit=%v shardMaxLockWait=%v shardMaxRootCommit=%v shardMaxSerialize=%v shardMaxHash=%v shardMaxPersist=%v shardMaxBatchPut=%v shardMaxCache=%v shardMaxBookkeep=%v shardMaxNode=%v shardMaxNodeType=%d shardMaxNodeBytes=%d shardMaxStaleDeletes=%v shardMaxPendingValues=%v shardMaxNodeCount=%d shardMaxStaleSetLen=%d shardMaxPendingValuesCount=%d shardMaxPendingFlatValuesCount=%d topTreeDirtyChildren=%d topTreeMaxChildPrefix=%d topTreeMaxChildCompute=%v topTreeMaxChildOps=%d topTreeMaxChildBytes=%d topTreeMaxApplyPrefix=%d topTreeMaxApply=%v topTreeOps=%d topTreeBytes=%d rawBatchOps=%d rawBatchBytes=%d rawShardMaxID=%d rawShardMaxOps=%d rawShardMaxBytes=%d nodeCacheEntries=%d nodeCacheBytes=%d heapAlloc=%d heapSys=%d heapInuse=%d runtimeSys=%d numGC=%d pauseTotal=%v lastPause=%v",
+		"total=%v commitToBatch=%v shardCommit=%v topTree=%v batchWrite=%v adapterMerge=%v trieDBUpdate=%v pruneTotal=%v pruneWait=%v pruneShard=%v prunePrefetchStart=%v dirtyShards=%d nodeCacheHits=%d nodeCacheMisses=%d pathNodeDBGets=%d archivePromotionChecks=%d archivePromotionHits=%d bucketRecomputes=%d commitmentPointCacheHits=%d commitmentPointCacheMisses=%d pruneInternalVisits=%d pruneHotSkips=%d pruneChildHits=%d pruneChildSkips=%d pruneBulkCollects=%d pruneCollectedLeaves=%d pruneCollectedStubs=%d pruneBuildItems=%d pruneBuildBuckets=%d pruneArchiveBuildParallels=%d shardMaxID=%d shardMaxCommit=%v shardMaxLockWait=%v shardMaxRootCommit=%v shardMaxSerialize=%v shardMaxHash=%v shardMaxPersist=%v shardMaxBatchPut=%v shardMaxCache=%v shardMaxBookkeep=%v shardMaxNode=%v shardMaxNodeType=%d shardMaxNodeBytes=%d shardMaxStaleDeletes=%v shardMaxPendingValues=%v shardMaxNodeCount=%d shardMaxStaleSetLen=%d shardMaxPendingValuesCount=%d shardMaxPendingFlatValuesCount=%d topTreeDirtyChildren=%d topTreeMaxChildPrefix=%d topTreeMaxChildCompute=%v topTreeMaxChildOps=%d topTreeMaxChildBytes=%d topTreeMaxApplyPrefix=%d topTreeMaxApply=%v topTreeOps=%d topTreeBytes=%d rawBatchOps=%d rawBatchBytes=%d rawShardMaxID=%d rawShardMaxOps=%d rawShardMaxBytes=%d nodeCacheEntries=%d nodeCacheBytes=%d heapAlloc=%d heapSys=%d heapInuse=%d runtimeSys=%d numGC=%d pauseTotal=%v lastPause=%v",
 		time.Duration(d.TotalNanos),
-		time.Duration(d.FlushArchivesNanos),
 		time.Duration(d.CommitToBatchNanos),
 		time.Duration(d.ShardCommitNanos),
 		time.Duration(d.TopTreeNanos),
@@ -837,15 +775,6 @@ func (d CommitDiagnostics) String() string {
 		time.Duration(d.PruneShardNanos),
 		time.Duration(d.PrunePrefetchNanos),
 		d.DirtyShards,
-		d.ArchiveDirtyShards,
-		d.FlushShards,
-		d.FlushShardCount,
-		time.Duration(d.FlushShardTotalNanos),
-		time.Duration(d.FlushShardMaxNanos),
-		d.PendingArchives,
-		d.PendingAppends,
-		d.PendingDeletes,
-		d.PendingArchiveDeletes,
 		d.NodeCacheHits,
 		d.NodeCacheMisses,
 		d.PathNodeDBGets,
@@ -907,4 +836,178 @@ func (d CommitDiagnostics) String() string {
 		time.Duration(d.RuntimePauseTotal),
 		time.Duration(d.RuntimeLastPauseNs),
 	)
+}
+
+// ArchiveFilterFPStats summarizes direct Cuckoo filter false-positive sampling.
+type ArchiveFilterFPStats struct {
+	BucketCount    int64
+	SampledBuckets int64
+	Samples        int64
+	FalsePositives int64
+	Rate           float64
+}
+
+// SampleArchiveFilterFalsePositives samples non-member suffixes directly against
+// archive bucket filters. It is a diagnostic helper and does not affect roots.
+func (t *Trie) SampleArchiveFilterFalsePositives(samplesPerBucket int, seed int64) *ArchiveFilterFPStats {
+	stats := &ArchiveFilterFPStats{}
+	if t == nil || samplesPerBucket <= 0 {
+		return stats
+	}
+	rng := rand.New(rand.NewSource(seed))
+
+	t.shardsMu.RLock()
+	shards := make([]*Shard, len(t.shards))
+	copy(shards, t.shards)
+	t.shardsMu.RUnlock()
+
+	seen := make(map[int]struct{}, len(shards))
+	for i, shard := range shards {
+		if shard == nil {
+			continue
+		}
+		seen[i] = struct{}{}
+		shard.sampleArchiveFilterFPIsolated(stats, rng, samplesPerBucket)
+	}
+
+	if t.topTree != nil {
+		roots := make(map[int][]byte)
+		t.topTree.ForEachShardRoot(func(id int, hash []byte) {
+			if id < 0 || id >= len(shards) {
+				return
+			}
+			if _, ok := seen[id]; ok {
+				return
+			}
+			roots[id] = hash
+		})
+		for id, root := range roots {
+			shardID := id
+			shard := newStatsShardView(shardID, t.db, t.hasher, t.config, nil, root, t.pruning, func() byte {
+				if shardID < t.pruneShardIdx {
+					return t.globalEpochBit
+				}
+				return t.globalEpochBit ^ 1
+			})
+			shard.sampleArchiveFilterFP(stats, rng, samplesPerBucket)
+		}
+	}
+
+	if stats.Samples > 0 {
+		stats.Rate = float64(stats.FalsePositives) / float64(stats.Samples)
+	}
+	return stats
+}
+
+func (s *Shard) sampleArchiveFilterFPIsolated(stats *ArchiveFilterFPStats, rng *rand.Rand, samplesPerBucket int) {
+	s.sampleArchiveFilterFPWithCache(stats, rng, samplesPerBucket, nil)
+}
+
+func (s *Shard) sampleArchiveFilterFP(stats *ArchiveFilterFPStats, rng *rand.Rand, samplesPerBucket int) {
+	s.sampleArchiveFilterFPWithCache(stats, rng, samplesPerBucket, s.nodeCache)
+}
+
+func (s *Shard) sampleArchiveFilterFPWithCache(stats *ArchiveFilterFPStats, rng *rand.Rand, samplesPerBucket int, nodeCache *nodeBlobCache) {
+	if s == nil || stats == nil || rng == nil || samplesPerBucket <= 0 {
+		return
+	}
+	s.mu.RLock()
+	root := s.root
+	rootHash := append([]byte(nil), s.rootHash...)
+	s.mu.RUnlock()
+
+	if root == nil && len(rootHash) > 0 {
+		view := newStatsShardView(s.id, s.db, s.hasher, s.config, nodeCache, rootHash, s.pruning, s.globalEpochBit)
+		loaded, err := view.loadNodeAtPath(rootHash, nil, 0)
+		if err == nil && loaded != nil {
+			view.sampleArchiveFilterFPNode(loaded, nil, 0, stats, rng, samplesPerBucket)
+		}
+		return
+	}
+	s.sampleArchiveFilterFPNode(root, nil, 0, stats, rng, samplesPerBucket)
+}
+
+func (s *Shard) sampleArchiveFilterFPNode(node Node, path []byte, pathBits int, stats *ArchiveFilterFPStats, rng *rand.Rand, samplesPerBucket int) {
+	if node == nil {
+		return
+	}
+	switch n := node.(type) {
+	case *InternalNode:
+		for _, bucket := range n.StubList {
+			s.sampleArchiveFilterFPBucket(bucket, stats, rng, samplesPerBucket)
+		}
+		leftPath, leftBits := s.childStoragePath(path, pathBits, n, 0)
+		if n.Left != nil {
+			s.sampleArchiveFilterFPNode(n.Left, leftPath, leftBits, stats, rng, samplesPerBucket)
+		} else if len(n.LeftHash) > 0 {
+			loaded, _ := s.loadNodeAtPath(n.LeftHash, leftPath, leftBits)
+			if loaded != nil {
+				s.sampleArchiveFilterFPNode(loaded, leftPath, leftBits, stats, rng, samplesPerBucket)
+			}
+		}
+		rightPath, rightBits := s.childStoragePath(path, pathBits, n, 1)
+		if n.Right != nil {
+			s.sampleArchiveFilterFPNode(n.Right, rightPath, rightBits, stats, rng, samplesPerBucket)
+		} else if len(n.RightHash) > 0 {
+			loaded, _ := s.loadNodeAtPath(n.RightHash, rightPath, rightBits)
+			if loaded != nil {
+				s.sampleArchiveFilterFPNode(loaded, rightPath, rightBits, stats, rng, samplesPerBucket)
+			}
+		}
+	case *ArchiveBucketNode:
+		s.sampleArchiveFilterFPBucket(n, stats, rng, samplesPerBucket)
+	}
+}
+
+func (s *Shard) sampleArchiveFilterFPBucket(bucket *ArchiveBucketNode, stats *ArchiveFilterFPStats, rng *rand.Rand, samplesPerBucket int) {
+	if bucket == nil || bucket.Count == 0 {
+		return
+	}
+	stats.BucketCount++
+	filter := s.archiveBucketFilter(bucket)
+	if filter == nil {
+		return
+	}
+	keys, err := s.bucketKeys(bucket)
+	if err != nil || len(keys) == 0 {
+		return
+	}
+	existing := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		existing[string(archiveItemKey(key.SuffixBits, key.Suffix))] = struct{}{}
+	}
+
+	stats.SampledBuckets++
+	for i := 0; i < samplesPerBucket; i++ {
+		template := keys[rng.Intn(len(keys))]
+		keyWithLen, ok := randomNonMemberArchiveSuffix(rng, template.SuffixBits, existing)
+		if !ok {
+			continue
+		}
+		stats.Samples++
+		if filter.Lookup(keyWithLen) {
+			stats.FalsePositives++
+		}
+	}
+}
+
+func randomNonMemberArchiveSuffix(rng *rand.Rand, suffixBits int, existing map[string]struct{}) ([]byte, bool) {
+	if suffixBits < 0 {
+		return nil, false
+	}
+	byteLen := (suffixBits + 7) / 8
+	for attempt := 0; attempt < 32; attempt++ {
+		suffix := make([]byte, byteLen)
+		for i := range suffix {
+			suffix[i] = byte(rng.Intn(256))
+		}
+		if rem := suffixBits % 8; rem != 0 && len(suffix) > 0 {
+			suffix[len(suffix)-1] &= byte(0xff << (8 - rem))
+		}
+		keyWithLen := archiveItemKey(suffixBits, suffix)
+		if _, ok := existing[string(keyWithLen)]; !ok {
+			return keyWithLen, true
+		}
+	}
+	return nil, false
 }

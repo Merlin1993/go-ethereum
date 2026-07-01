@@ -14,7 +14,7 @@ import (
 const (
 	NodeTypeInternal      = 0x00
 	NodeTypeLeaf          = 0x01
-	NodeTypeArchiveBucket = 0x02 // [NEW] 归档桶节点类型
+	NodeTypeArchiveBucket = 0x02 // 归档桶节点。
 
 	epochTimeBit          = 0x01
 	epochSubtreeMaskBits  = 0x06
@@ -97,12 +97,11 @@ type InternalNode struct {
 	LeftHash  []byte
 	RightHash []byte
 
-	// [NEW] 缓存孩子节点的 epoch 信息，避免 Commit 时递归加载非脏节点
+	// 子节点 epoch 摘要，用来让剪枝/提交跳过无需加载的干净子树。
 	LeftEpoch  byte
 	RightEpoch byte
 
-	// StubList [NEW]：侧挂在该节点上的归档桶列表
-	// 归档桶不再作为左右孩子，而是作为一个侧挂的列表存在。
+	// StubList 保存侧挂归档桶。它用于短期聚合小冷桶，桶成熟后再下沉到 child edge。
 	StubList []*ArchiveBucketNode
 
 	hash         []byte
@@ -224,8 +223,7 @@ func (n *InternalNode) Serialize() ([]byte, error) {
 	buf = append(buf, n.RightHash...)
 	buf = append(buf, n.RightEpoch)
 
-	// [NEW] StubList 序列化
-	// 写入桶的数量
+	// 序列化 StubList：先写 bucket 数量，再逐个写入 bucket 内容。
 	nBits = binary.PutUvarint(scratch[:], uint64(len(n.StubList)))
 	buf = append(buf, scratch[:nBits]...)
 
@@ -395,10 +393,9 @@ type ArchiveBucketNode struct {
 	storageBits  int
 	// 归档桶不再需要 epoch，保持静态
 
-	// [CACHE] 缓存解码后的过滤器和数据项，避免重复解码/反序列化。
+	// [CACHE] 缓存解码后的过滤器和承诺点，避免重复解码。
 	// 这些字段不序列化到磁盘。
 	cachedFilter          *cuckoo.Filter
-	cachedItems           []ArchivedKV
 	cachedCommitmentPoint *ecmh.Point
 	cachedMeta            []byte
 	cacheMu               sync.RWMutex
@@ -527,7 +524,6 @@ func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 func (n *ArchiveBucketNode) ClearCaches() {
 	n.cacheMu.Lock()
 	n.cachedFilter = nil
-	n.cachedItems = nil
 	n.cachedCommitmentPoint = nil
 	n.cacheMu.Unlock()
 	n.invalidateMetaCache()
@@ -597,7 +593,7 @@ func DeserializeNode(data []byte) (Node, error) {
 			return nil, fmt.Errorf("read right epoch: %w", err)
 		}
 
-		// [NEW] 读取 StubList
+		// 读取侧挂归档桶。
 		stubCount, err := binary.ReadUvarint(reader)
 		var stubs []*ArchiveBucketNode
 		if err == nil && stubCount > 0 {

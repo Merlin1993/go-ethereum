@@ -7,36 +7,45 @@ import (
 	"time"
 )
 
-// Trie represents a Binary Merkle Patricia Trie that shards its key space.
+// Trie 是 ASCT 的分片协调器。
+//
+// 它负责 shard 表、TopTree root 汇总，以及剪枝、提交、懒加载 shard root 的生命周期。
+// 单个 key/value 的具体读写逻辑在 Shard 中完成。
 type Trie struct {
 	db     KVStore
 	hasher Hasher
 	config *Config
 
-	shards            []*Shard
-	shardsMu          sync.RWMutex
-	nodeCache         *nodeBlobCache
-	pointCache        *commitmentPointCache
+	shards   []*Shard
+	shardsMu sync.RWMutex
+
+	// nodeCache 缓存序列化节点；pointCache 缓存解码后的 ECMH 点。
+	// 这两个缓存被所有 shard 共享，用来降低剪枝和提交时的重复解码/分配。
+	nodeCache  *nodeBlobCache
+	pointCache *commitmentPointCache
+
+	// 预取下一个 path-storage shard，减少轮到该 shard 剪枝时的加载等待。
 	prunePrefetchMu   sync.Mutex
 	prunePrefetchIdx  int
 	prunePrefetchDone chan struct{}
-	asyncPruneMu      sync.Mutex
-	asyncPrune        *asyncPruneJob
+
+	// 同一时间只允许一个后台剪枝任务。任何依赖 root 的操作都必须先等待它完成。
+	asyncPruneMu sync.Mutex
+	asyncPrune   *asyncPruneJob
 
 	// TopTree handles the hierarchical root hash computation
 	topTree *TopTree
 
-	// Epoch management for pruning
+	// 分片轮转剪枝使用的 epoch 状态。
 	pruneShardIdx  int
 	globalEpochBit byte
 	pruning        bool
 
-	dirtyShards        map[int]struct{}
-	archiveDirtyShards map[int]struct{}
-	dirtyShardList     []int
-	archiveShardList   []int
+	dirtyShards    map[int]struct{}
+	dirtyShardList []int
 }
 
+// asyncPruneJob 记录一个后台 shard 剪枝任务，以及等待该任务完成时需要统计的诊断信息。
 type asyncPruneJob struct {
 	idx           int
 	epoch         byte
@@ -61,17 +70,16 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 		config = DefaultConfig()
 	}
 	t := &Trie{
-		db:                 db,
-		hasher:             hasher,
-		config:             config,
-		shards:             make([]*Shard, 1<<config.ShardDepth),
-		nodeCache:          newNodeBlobCacheWithBytesLimit(config.NodeCacheLimit, config.NodeCacheBytesLimit),
-		pointCache:         newCommitmentPointCache(config.CommitmentPointCacheLimit),
-		prunePrefetchIdx:   -1,
-		globalEpochBit:     0,
-		pruning:            pruning,
-		dirtyShards:        make(map[int]struct{}),
-		archiveDirtyShards: make(map[int]struct{}),
+		db:               db,
+		hasher:           hasher,
+		config:           config,
+		shards:           make([]*Shard, 1<<config.ShardDepth),
+		nodeCache:        newNodeBlobCacheWithBytesLimit(config.NodeCacheLimit, config.NodeCacheBytesLimit),
+		pointCache:       newCommitmentPointCache(config.CommitmentPointCacheLimit),
+		prunePrefetchIdx: -1,
+		globalEpochBit:   0,
+		pruning:          pruning,
+		dirtyShards:      make(map[int]struct{}),
 	}
 	t.topTree = NewTopTree(hasher, nil, config.ShardDepth, config.UsePathStorage())
 
@@ -160,26 +168,12 @@ func (t *Trie) markDirtyShard(id int) {
 	t.shardsMu.Unlock()
 }
 
-func (t *Trie) markArchiveDirtyShard(id int) {
-	t.shardsMu.Lock()
-	t.markArchiveDirtyShardLocked(id)
-	t.shardsMu.Unlock()
-}
-
 func (t *Trie) markDirtyShardLocked(id int) {
 	if _, ok := t.dirtyShards[id]; ok {
 		return
 	}
 	t.dirtyShards[id] = struct{}{}
 	t.dirtyShardList = append(t.dirtyShardList, id)
-}
-
-func (t *Trie) markArchiveDirtyShardLocked(id int) {
-	if _, ok := t.archiveDirtyShards[id]; ok {
-		return
-	}
-	t.archiveDirtyShards[id] = struct{}{}
-	t.archiveShardList = append(t.archiveShardList, id)
 }
 
 func (t *Trie) filterDirtyShardListLocked() {
@@ -190,16 +184,6 @@ func (t *Trie) filterDirtyShardListLocked() {
 		}
 	}
 	t.dirtyShardList = out
-}
-
-func (t *Trie) filterArchiveShardListLocked() {
-	out := t.archiveShardList[:0]
-	for _, id := range t.archiveShardList {
-		if _, ok := t.archiveDirtyShards[id]; ok {
-			out = append(out, id)
-		}
-	}
-	t.archiveShardList = out
 }
 
 func (t *Trie) finishAsyncPruneForShard(id int) error {
@@ -274,7 +258,7 @@ func (t *Trie) Load(rootHash []byte) error {
 		return err
 	}
 
-	// [FIX] Invalidate all loaded shards so they pick up new roots from TopTree on next access
+	// 重置已加载 shard，使它们下次访问时从新的 TopTree root 读取 shard root。
 	t.shardsMu.Lock()
 	defer t.shardsMu.Unlock()
 	for i, s := range t.shards {
@@ -320,7 +304,7 @@ func (t *Trie) getOrCreateShard(id int) (*Shard, error) {
 	return s, nil
 }
 
-// Get finds the value for a given key.
+// Get 根据 key 定位 shard，并沿该 shard 的热/冷路径读取。
 func (t *Trie) Get(key []byte) ([]byte, error) {
 	shardID := t.GetShardID(key)
 	if err := t.finishAsyncPruneForShard(shardID); err != nil {
@@ -331,14 +315,11 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 		return nil, err
 	}
 	val, err := shard.Get(key)
-	if err == nil && shard.HasPendingArchiveWrites() {
-		t.markDirtyShard(shardID)
-		t.markArchiveDirtyShard(shardID)
-	}
 	return val, err
 }
 
-// Put updates or inserts a value for a given key.
+// Put 把新 value 写成热 leaf。如果该 key 已经在冷桶中，先删除旧冷 entry，
+// 保证一个 key 只有一个有效位置。
 func (t *Trie) Put(key []byte, value []byte) error {
 	shardID := t.GetShardID(key)
 	if err := t.finishAsyncPruneForShard(shardID); err != nil {
@@ -351,9 +332,6 @@ func (t *Trie) Put(key []byte, value []byte) error {
 	t.markDirtyShard(shardID)
 	if err := shard.Put(key, value); err != nil {
 		return err
-	}
-	if shard.HasPendingArchiveWrites() {
-		t.markArchiveDirtyShard(shardID)
 	}
 	return nil
 }
@@ -403,9 +381,6 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 				if err == nil {
 					t.markDirtyShard(group.id)
 					err = shard.PutBatch(group.entries)
-					if err == nil && shard.HasPendingArchiveWrites() {
-						t.markArchiveDirtyShard(group.id)
-					}
 				}
 				errs[index] = err
 			}
@@ -424,7 +399,7 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 	return nil
 }
 
-// Delete removes a key and its value from the Trie.
+// Delete 同时删除 key 的热状态和冷状态。
 func (t *Trie) Delete(key []byte) error {
 	shardID := t.GetShardID(key)
 	if err := t.finishAsyncPruneForShard(shardID); err != nil {
@@ -435,7 +410,6 @@ func (t *Trie) Delete(key []byte) error {
 		return err
 	}
 	t.markDirtyShard(shardID)
-	t.markArchiveDirtyShard(shardID)
 	return shard.Delete(key)
 }
 
@@ -443,8 +417,6 @@ func (t *Trie) Delete(key []byte) error {
 func (t *Trie) BatchDelete(key []byte) error {
 	return t.Delete(key)
 }
-
-// Redundant GetShardID removed.
 
 // Hash returns the root hash of the Trie.
 func (t *Trie) Hash() ([]byte, error) {
@@ -482,51 +454,45 @@ func (t *Trie) Hash() ([]byte, error) {
 	return t.topTree.Compute(shardRoots, dirtyShards, nil)
 }
 
-// Commit persists any dirty shards to the database.
+// Commit 把 dirty shard metadata、pending value、stale delete 和 TopTree root
+// 一起写入数据库 batch。
 func (t *Trie) Commit() ([]byte, error) {
 	totalStart := time.Now()
 	if err := t.finishAsyncPrune(); err != nil {
-		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), 0, 0, 0, 0, 0, 0)
+		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), 0, 0, 0)
 		return nil, err
 	}
-	dirtyShards, archiveDirtyShards, flushShards := t.diagnosticCommitShardCounts()
+	dirtyShards := t.diagnosticCommitShardCounts()
 	batch := t.db.NewBatch()
 	defer batch.Reset()
-
-	// Flush archives FIRST before committing shards (which might clear dirty set)
-	flushStart := time.Now()
-	if err := t.FlushArchives(); err != nil {
-		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), time.Since(flushStart).Nanoseconds(), 0, 0, dirtyShards, archiveDirtyShards, flushShards)
-		return nil, err
-	}
-	flushDuration := time.Since(flushStart)
 
 	commitToBatchStart := time.Now()
 	rootHash, err := t.CommitToBatch(batch, true)
 	if err != nil {
-		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), flushDuration.Nanoseconds(), time.Since(commitToBatchStart).Nanoseconds(), 0, dirtyShards, archiveDirtyShards, flushShards)
+		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), time.Since(commitToBatchStart).Nanoseconds(), 0, dirtyShards)
 		return nil, err
 	}
 	commitToBatchDuration := time.Since(commitToBatchStart)
 
 	batchWriteStart := time.Now()
 	if err := batch.Write(); err != nil {
-		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), flushDuration.Nanoseconds(), commitToBatchDuration.Nanoseconds(), time.Since(batchWriteStart).Nanoseconds(), dirtyShards, archiveDirtyShards, flushShards)
+		recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), commitToBatchDuration.Nanoseconds(), time.Since(batchWriteStart).Nanoseconds(), dirtyShards)
 		return nil, err
 	}
 	batchWriteDuration := time.Since(batchWriteStart)
-	recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), flushDuration.Nanoseconds(), commitToBatchDuration.Nanoseconds(), batchWriteDuration.Nanoseconds(), dirtyShards, archiveDirtyShards, flushShards)
+	recordCommitDiagnostics(time.Since(totalStart).Nanoseconds(), commitToBatchDuration.Nanoseconds(), batchWriteDuration.Nanoseconds(), dirtyShards)
 
 	return rootHash, nil
 }
 
-func (t *Trie) diagnosticCommitShardCounts() (dirtyShards, archiveDirtyShards, flushShards int) {
+func (t *Trie) diagnosticCommitShardCounts() int {
 	t.shardsMu.RLock()
 	defer t.shardsMu.RUnlock()
-	return len(t.dirtyShards), len(t.archiveDirtyShards), len(t.archiveDirtyShards)
+	return len(t.dirtyShards)
 }
 
-// CommitToBatch commits the trie state to a given batcher.
+// CommitToBatch 并行提交 dirty shard 到 worker 私有缓冲，再串行合并到调用方 batch，
+// 最后重算 TopTree。
 func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	if err := t.finishAsyncPrune(); err != nil {
 		return nil, err
@@ -554,7 +520,8 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 		numWorkers = len(dirtyShardsList)
 	}
 
-	// Parallel commit shards
+	// 每个 worker 写入自己的 memBatcher，不并发共享调用方 batch。
+	// worker 缓冲会在同一把锁下回放，保证底层 batch 安全。
 	shardChan := make(chan int, len(dirtyShardsList))
 	for _, i := range dirtyShardsList {
 		shardChan <- i
@@ -682,7 +649,10 @@ func (t *Trie) startPrunePrefetch(idx int) {
 	}(append([]byte(nil), root...))
 }
 
-// PruneNextShard prunes the next shard in cycle.
+// PruneNextShard 推进轮转剪枝游标，处理下一个 shard。
+//
+// 启用 AsyncPrune 时，它会启动后台剪枝后返回；后续读取或提交 root 前会先调用
+// finishAsyncPrune 等待结果落定。
 func (t *Trie) PruneNextShard() error {
 	totalStart := time.Now()
 	if t.config != nil && t.config.AsyncPrune {
@@ -705,7 +675,6 @@ func (t *Trie) PruneNextShard() error {
 
 		t.shardsMu.Lock()
 		t.markDirtyShardLocked(idx)
-		t.markArchiveDirtyShardLocked(idx)
 		t.shardsMu.Unlock()
 
 		job := &asyncPruneJob{
@@ -749,7 +718,6 @@ func (t *Trie) PruneNextShard() error {
 
 	t.shardsMu.Lock()
 	t.markDirtyShardLocked(idx)
-	t.markArchiveDirtyShardLocked(idx)
 	t.shardsMu.Unlock()
 
 	pruneBefore := snapshotPruneCounters()
@@ -849,47 +817,6 @@ func (t *Trie) getShardPrefix(shardID int) []byte {
 	return prefix
 }
 
-// FlushArchives persists all pending archive data to ArchiveDB.
-func (t *Trie) FlushArchives() error {
-	if err := t.finishAsyncPrune(); err != nil {
-		return err
-	}
-
-	t.shardsMu.RLock()
-	dirtyShardsList := append([]int(nil), t.archiveShardList...)
-	t.shardsMu.RUnlock()
-
-	var wg sync.WaitGroup
-	errChan := make(chan error, len(dirtyShardsList))
-
-	for _, i := range dirtyShardsList {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			s := t.shards[idx]
-			if s != nil {
-				if err := s.FlushArchives(); err != nil {
-					errChan <- err
-				}
-			}
-		}(i)
-	}
-	wg.Wait()
-	close(errChan)
-
-	if len(errChan) > 0 {
-		return <-errChan
-	}
-
-	t.shardsMu.Lock()
-	for _, i := range dirtyShardsList {
-		delete(t.archiveDirtyShards, i)
-	}
-	t.filterArchiveShardListLocked()
-	t.shardsMu.Unlock()
-	return nil
-}
-
 // Activate moves an archived key back to the hot tree.
 func (t *Trie) Activate(key []byte, value []byte) error {
 	shardID := t.GetShardID(key)
@@ -902,7 +829,6 @@ func (t *Trie) Activate(key []byte, value []byte) error {
 	}
 	t.shardsMu.Lock()
 	t.markDirtyShardLocked(shardID)
-	t.markArchiveDirtyShardLocked(shardID)
 	t.shardsMu.Unlock()
 	return shard.Activate(key, value)
 }

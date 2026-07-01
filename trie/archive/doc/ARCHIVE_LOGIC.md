@@ -1,5 +1,7 @@
 # Archive Trie Archival 实现逻辑总结
 
+> 旧设计归档：本文记录早期 archive payload / `ArchiveDB` / `FlushArchives` 路径的设计与排查思路，不代表当前 ASCT Plus 实现。当前代码结构和流程以 `ARCHIVE_CODE_PLUS.md` 为准。
+
 本文档总结了 `trie/archive` 包中归档（Archival）的核心实现逻辑，旨在为测试用例排查和系统调试提供参考。
 
 ## 0. 近期性能优化说明（2026-04-22）
