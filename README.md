@@ -30,6 +30,227 @@ or, to build the full suite of utilities:
 make all
 ```
 
+## SWMT / cachetrie dual-root experiment
+
+This branch contains an experimental SWMT-backed cachetrie path for replaying
+mainnet blocks on top of go-ethereum 1.17. The goal is to keep recent global
+state writes in a live in-memory SWMT overlay, merge them into the backing MPT
+asynchronously, and disclose two roots during the experiment:
+
+* `Root`: the currently disclosed backing MPT global state root.
+* `SWMTRoot`: the live SWMT overlay commitment.
+
+This is an experiment mode. Normal geth execution remains single-root and keeps
+validating legacy block headers exactly as before.
+
+### What changed
+
+The cachetrie implementation now maintains a live SWMT overlay with low/high
+watermarks:
+
+* `--cachetrie.maxitems` is the high watermark.
+* `--cachetrie.lowwatermark` is the low watermark. A value of `0` means 80% of
+  the high watermark.
+* The low watermark starts the first pending merge only once.
+* After startup, the high watermark or a full window ring triggers the normal
+  pipeline step: disclose the completed merge root, prune the already merged
+  window bits from live SWMT, then select the next pending merge input set.
+
+The live SWMT entries are not removed when a merge starts. They continue serving
+reads and continue participating in `SWMTRoot` until the later disclose/prune
+step. If a key is rewritten after a pending merge is formed, the new leaf moves
+to the current window bit and is not pruned by the old pending bit set.
+
+The state read path now tries SWMT before the backing MPT. Account metadata can
+come from SWMT, while the backing MPT storage root is preserved so old storage
+tries are not polluted by SWMT logical roots. Storage values are shadowed by
+SWMT when present.
+
+The state commit path has a fast async mode used by the dual-root experiment.
+In this mode `StateDB` does not compute an MPT `IntermediateRoot`, does not
+update the foreground account/storage tries, and does not commit MPT trie nodes
+for the current block. Instead, it finalizes the block write set and publishes
+account/storage/code changes into SWMT. Contract code blobs are still written to
+the code database.
+
+The backing MPT receives SWMT writes through the asynchronous merge worker. The
+merge worker applies retained merge inputs to a no-cache `StateDB`, preserving
+backing storage roots for accounts and materializing dependency accounts when a
+storage input needs an owner account.
+
+The block validation path has two modes:
+
+* Normal mode: unchanged legacy validation, including `header.Root`.
+* Dual-root experiment mode: validates gas, receipts, requests and execution
+  results, but skips the legacy mainnet `header.Root` equality check because
+  the local root cursor follows dual-root semantics. If a header contains
+  `SWMTRoot`, it is checked against the local SWMT commitment.
+
+### Flags
+
+Enable the experiment with:
+
+```shell
+geth import \
+  --cachetrie \
+  --cachetrie.experiment.dualroot \
+  --cachetrie.maxitems 1000000 \
+  --cachetrie.lowwatermark 0 \
+  --debug.logslowblock=0 \
+  <block-files.rlp>
+```
+
+Important flags:
+
+* `--cachetrie`: enables the cachetrie/SWMT facility.
+* `--cachetrie.experiment.dualroot`: enables dual-root replay semantics.
+* `--cachetrie.maxitems`: high watermark for live SWMT entries.
+* `--cachetrie.lowwatermark`: low watermark; `0` selects the default 80% of
+  high watermark.
+* `--debug.logslowblock=0`: emits one slowlog JSON record per block, useful for
+  replay analysis.
+
+`--cachetrie.experiment.dualroot` requires `--cachetrie`.
+
+### Slowlog fields
+
+Each slowlog JSON record contains the usual block timing fields plus a
+`cachetrie` object. The main fields to inspect are:
+
+* `header_state_root`: the original block header state root.
+* `global_root`: the local disclosed backing MPT root.
+* `swmt_root`: the live SWMT commitment.
+* `accounts`, `storages`: live SWMT size.
+* `low_watermark`, `high_watermark`, `current_bit`, `start_bit`.
+* `pipeline_started`, `pending_bits`, `pending_inputs`.
+* `account_hits`, `account_misses`, `storage_hits`, `storage_misses`.
+* `updates`, `deletes`.
+* `merge_count`, `merge_inputs`, `merge_ms`, `merge_errors`.
+* `prune_count`, `prune_items`, `prune_ms`.
+* `write_wait_count`, `write_wait_ms`.
+* `swmt_root_count`, `swmt_root_ms`, `publish_count`, `publish_ms`.
+
+For the main performance question, use:
+
+* transaction processing time: `timing.process_wall_ms`
+* state read time: `timing.state_read_ms`
+* root/hash time: `timing.state_hash_ms`
+* state maintenance/commit time: `timing.commit_ms`
+
+`cachetrie.merge_ms` is background pipeline work. It is reported for pipeline
+health, but it should not be counted as foreground block execution time.
+`cachetrie.write_wait_ms` is replay pacing/backpressure; when comparing replay
+wall time, subtract only this wait from `timing.total_ms`.
+
+### Testing
+
+Run the focused test set:
+
+```shell
+go test ./cachetrie -count=1
+go test ./core/state -run CacheTrie -count=1
+go test ./core -run 'CacheTrie|DualRoot|Slow' -count=1
+go build ./cmd/geth
+```
+
+For a wider check after touching state commit or validation code:
+
+```shell
+go test ./core/state -count=1
+go test ./core -count=1
+go test ./cmd/utils ./cmd/geth -count=1
+```
+
+The important tests cover:
+
+* low watermark starts the first pending merge only once.
+* high watermark or ring-full discloses and prunes only after the previous
+  merge is complete.
+* rewriting a key after pending merge formation prevents the old pending bit
+  prune from deleting the new leaf.
+* async commit publishes writes to SWMT without foreground MPT root/trie commit.
+* dual-root validation skips legacy `header.Root` in experiment mode but keeps
+  normal single-root validation unchanged.
+* cachetrie reads preserve backing MPT storage roots.
+
+### Verification checklist
+
+For ordinary mode:
+
+1. Import without `--cachetrie.experiment.dualroot`.
+2. Confirm legacy `header.Root` validation still runs.
+3. Confirm no `cachetrie.dualroot_experiment` slowlog records are emitted.
+
+For dual-root experiment mode:
+
+1. Import with `--cachetrie --cachetrie.experiment.dualroot`.
+2. Confirm there are no `invalid block`, `nonce too low`, `invalid gas used`,
+   or `Unexpected trie node` errors.
+3. Confirm every slowlog row has a `cachetrie` field.
+4. Confirm `global_root` and `swmt_root` are recorded.
+5. Confirm `timing.state_hash_ms` is zero or near zero in the async path.
+6. Confirm foreground account/storage trie commit timers stay zero in the async
+   path.
+7. Confirm merge/prune counters advance only around watermark pipeline events.
+
+The final replay root is not a correctness target for this experiment. The run
+does not do a final drain of all live SWMT entries into the backing MPT.
+
+### Replay with an overlay datadir
+
+Never replay directly on a shared snapshot datadir. Use an overlay where the
+snapshot is the read-only lowerdir and all writes go into a run directory.
+
+Example:
+
+```shell
+run=/root/snz/runs/cachetrie_dualroot_example
+base=/root/snz/geth-chain
+geth=/root/snz/tools/geth-cachetrie/geth
+
+mkdir -p "$run/upper" "$run/work" "$run/merged" "$run/logs"
+mount -t overlay overlay \
+  -o "lowerdir=$base,upperdir=$run/upper,workdir=$run/work" \
+  "$run/merged"
+
+"$geth" --datadir "$run/merged" import \
+  --cachetrie \
+  --cachetrie.experiment.dualroot \
+  --cachetrie.maxitems 1000000 \
+  --cachetrie.lowwatermark 0 \
+  --nocompaction \
+  --debug.logslowblock=0 \
+  /path/to/block_*.rlp \
+  > "$run/logs/import.log" 2>&1
+
+umount "$run/merged"
+```
+
+In the `/root/snz` experiment environment, the existing replay helper can be
+used when installed:
+
+```shell
+SPIKE_RUN_ID=cachetrie_dualroot_spike_001 \
+CACHETRIE_MAXITEMS=1000000 \
+CACHETRIE_LOWWATERMARK=0 \
+/root/snz/scripts/run_cachetrie_dualroot_replay_param.sh spike
+
+FULL_RUN_ID=cachetrie_dualroot_31100_001 \
+CACHETRIE_MAXITEMS=1000000 \
+CACHETRIE_LOWWATERMARK=0 \
+/root/snz/scripts/run_cachetrie_dualroot_replay_param.sh full
+```
+
+Suggested replay flow:
+
+1. Run a short probe first, for example two blocks or a small window around a
+   previous correctness blocker.
+2. Run the targeted spike window.
+3. Run the full 31,100 block replay only after the probe and spike are clean.
+4. Compare `process_wall_ms`, `state_read_ms`, `state_hash_ms`, and `commit_ms`
+   against the baseline. Treat `merge_ms` as background pipeline time and
+   inspect it separately.
+
 ## Executables
 
 The go-ethereum project comes with several wrappers/executables found in the `cmd`
