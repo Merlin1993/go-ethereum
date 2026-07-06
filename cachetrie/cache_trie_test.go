@@ -18,11 +18,24 @@ package cachetrie
 
 import (
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/holiman/uint256"
 )
+
+func TestLowWatermarkDefaultAndOverride(t *testing.T) {
+	if got := NewCacheTrie(0, 16, 10).Stats().LowWatermark; got != 8 {
+		t.Fatalf("default low watermark mismatch: have %d want 8", got)
+	}
+	if got := NewCacheTrie(0, 16, 10, 3).Stats().LowWatermark; got != 3 {
+		t.Fatalf("custom low watermark mismatch: have %d want 3", got)
+	}
+	if got := NewCacheTrie(0, 16, 10, 20).Stats().LowWatermark; got != 10 {
+		t.Fatalf("capped low watermark mismatch: have %d want 10", got)
+	}
+}
 
 func TestApplyClearsOnOriginMismatch(t *testing.T) {
 	cache := NewCacheTrie(0, 16, 128)
@@ -72,6 +85,46 @@ func TestStagedWritesPublishOnlyAtNewRoot(t *testing.T) {
 	}
 }
 
+func TestIncrementalSWMTRootMatchesFullAggregation(t *testing.T) {
+	cache := NewCacheTrie(0, 16, 128)
+	addr := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	slotA := common.HexToHash("0x01")
+	slotB := common.HexToHash("0x02")
+	rootA := common.HexToHash("0x01")
+	rootB := common.HexToHash("0x02")
+	rootC := common.HexToHash("0x03")
+	acct := &types.StateAccount{Nonce: 1, Balance: uint256.NewInt(1), Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash.Bytes()}
+
+	cache.PublishRoots(1, common.Hash{}, rootA,
+		map[common.Address]*types.StateAccount{addr: acct},
+		map[common.Address]map[common.Hash]common.Hash{addr: {
+			slotA: common.HexToHash("0x0a"),
+			slotB: common.HexToHash("0x0b"),
+		}},
+	)
+	assertIncrementalRootConsistent(t, cache)
+	if stats := cache.Stats(); stats.Storages != 2 {
+		t.Fatalf("storage count mismatch after publish: have %d want 2", stats.Storages)
+	}
+
+	cache.PublishRoots(2, common.Hash{}, rootB,
+		nil,
+		map[common.Address]map[common.Hash]common.Hash{addr: {
+			slotA: common.HexToHash("0x0c"),
+		}},
+	)
+	assertIncrementalRootConsistent(t, cache)
+	if got, ok := cache.Storage(addr, slotA); !ok || got != common.HexToHash("0x0c") {
+		t.Fatalf("updated storage mismatch: have %x ok %v", got, ok)
+	}
+
+	cache.PublishRoots(3, common.Hash{}, rootC, map[common.Address]*types.StateAccount{addr: nil}, nil)
+	assertIncrementalRootConsistent(t, cache)
+	if stats := cache.Stats(); stats.Storages != 0 {
+		t.Fatalf("storage count mismatch after account tombstone: have %d want 0", stats.Storages)
+	}
+}
+
 func TestWatermarkPipelinePrunesOnlyPreviousCompleteBits(t *testing.T) {
 	cache := NewCacheTrie(0, 16, 4)
 	root := common.HexToHash("0x01")
@@ -114,5 +167,106 @@ func TestWatermarkPipelinePrunesOnlyPreviousCompleteBits(t *testing.T) {
 	}
 	if stats := cache.Stats(); stats.PendingBits == 0 || stats.PendingInputs == 0 {
 		t.Fatalf("high watermark did not start next pending merge: %+v", stats)
+	}
+}
+
+func TestStoragePendingInputCarriesAccountDependency(t *testing.T) {
+	cache := NewCacheTrie(0, 16, 128)
+	addr := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	slot := common.HexToHash("0x01")
+
+	accountAtStorageWrite := types.NewEmptyStateAccount()
+	accountAtStorageWrite.Nonce = 1
+	cache.PublishRoots(1, common.Hash{}, common.HexToHash("0x01"),
+		map[common.Address]*types.StateAccount{addr: accountAtStorageWrite},
+		map[common.Address]map[common.Hash]common.Hash{addr: {slot: common.HexToHash("0x02")}},
+	)
+
+	newerAccount := types.NewEmptyStateAccount()
+	newerAccount.Nonce = 2
+	cache.PublishRoots(2, common.Hash{}, common.HexToHash("0x02"),
+		map[common.Address]*types.StateAccount{addr: newerAccount},
+		nil,
+	)
+
+	inputs := cache.mergeInputsForBitLocked(bitForBlock(1))
+	var accountInput, storageInput bool
+	for _, input := range inputs {
+		switch input.Type {
+		case AccountState:
+			if input.Address == addr && input.Account != nil && input.Account.Nonce == accountAtStorageWrite.Nonce {
+				accountInput = true
+			}
+		case StorageState:
+			if input.Address == addr && input.StorageKey != nil && *input.StorageKey == slot {
+				storageInput = true
+			}
+		}
+	}
+	if !storageInput {
+		t.Fatal("missing storage input")
+	}
+	if !accountInput {
+		t.Fatal("storage input did not carry its account dependency")
+	}
+}
+
+func TestWriteWaitsWhenHighWatermarkPendingMergeIncomplete(t *testing.T) {
+	cache := NewCacheTrie(0, 16, 2, 1)
+	root := common.HexToHash("0x01")
+	release := make(chan struct{})
+	started := make(chan struct{})
+	cache.SetMergeFunc(func(root common.Hash, block uint64, inputs []MergeInput) (common.Hash, error) {
+		close(started)
+		<-release
+		return root, nil
+	})
+	acct := func(nonce uint64) *types.StateAccount {
+		return &types.StateAccount{Nonce: nonce, Balance: uint256.NewInt(nonce), Root: types.EmptyRootHash, CodeHash: types.EmptyCodeHash.Bytes()}
+	}
+	addr1 := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	addr2 := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	addr3 := common.HexToAddress("0x3333333333333333333333333333333333333333")
+
+	cache.Apply(1, common.Hash{}, root, map[common.Address]*types.StateAccount{addr1: acct(1)}, nil)
+	cache.Apply(2, root, root, map[common.Address]*types.StateAccount{addr2: acct(2)}, nil)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("pending merge did not start")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		cache.Begin(3, root)
+		cache.StageAccount(addr3, acct(3))
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("write passed high watermark while previous merge was incomplete")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("write did not resume after pending merge completed")
+	}
+	if stats := cache.Stats(); stats.WriteWaitCount == 0 || stats.WriteWaitElapsed == 0 {
+		t.Fatalf("write wait statistics were not recorded: %+v", stats)
+	}
+}
+
+func assertIncrementalRootConsistent(t *testing.T, cache *CacheTrie) {
+	t.Helper()
+
+	cache.mu.RLock()
+	accounts, storages := cache.copyLiveLocked()
+	want := swmtRootFromCopies(cache.root, accounts, storages)
+	have := cache.swmtRootLocked(cache.root)
+	cache.mu.RUnlock()
+	if have != want {
+		t.Fatalf("incremental SWMT root mismatch: have %x want %x", have, want)
 	}
 }

@@ -18,6 +18,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"math/big"
 	"testing"
 	"time"
@@ -28,9 +29,12 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/clique"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/triedb"
 )
 
 // Tests that simple header verification works, for both good and bad blocks.
@@ -270,5 +274,89 @@ func TestCalcGasLimit(t *testing.T) {
 		if have, want := CalcGasLimit(tc.pGasLimit, tc.pGasLimit), tc.pGasLimit; have != want {
 			t.Errorf("test %d: have %d want %d", i, have, want)
 		}
+	}
+}
+
+func TestValidateStateDualRootExperimentSkipsLegacyHeaderRoot(t *testing.T) {
+	disk := rawdb.NewMemoryDatabase()
+	tdb := triedb.NewDatabase(disk, &triedb.Config{
+		CacheTrie:         true,
+		CacheTrieWindow:   16,
+		CacheTrieMaxItems: 128,
+	})
+	db := state.NewDatabase(tdb, nil)
+	header := &types.Header{
+		Number:      big.NewInt(1),
+		Root:        common.HexToHash("0xdeadbeef"),
+		ReceiptHash: types.EmptyReceiptsHash,
+	}
+	block := types.NewBlockWithHeader(header)
+	res := &ProcessResult{Receipts: nil, GasUsed: 0}
+	validator := NewBlockValidator(params.TestChainConfig, nil)
+
+	legacyState, err := state.New(types.EmptyRootHash, db)
+	if err != nil {
+		t.Fatalf("failed to create legacy state: %v", err)
+	}
+	if err := validator.ValidateState(block, legacyState, res, false); err == nil {
+		t.Fatal("legacy validation accepted a mismatched header state root")
+	}
+
+	dualRootState, err := state.New(types.EmptyRootHash, db)
+	if err != nil {
+		t.Fatalf("failed to create dual-root state: %v", err)
+	}
+	dualRootState.SetCacheTrieAsync(true)
+	if err := validator.ValidateState(block, dualRootState, res, false); err != nil {
+		t.Fatalf("dual-root experiment should skip legacy header root validation: %v", err)
+	}
+	if stats := tdb.CacheTrie().Stats(); stats.Accounts != 0 || stats.PendingInputs != 0 {
+		t.Fatalf("dual-root experiment validation staged cachetrie writes before commit: %+v", stats)
+	}
+}
+
+func TestValidateBodyDualRootExperimentAllowsKnownParentWithoutHeaderState(t *testing.T) {
+	makeChain := func(t *testing.T, dualRoot bool) (*BlockChain, ethdb.Database) {
+		t.Helper()
+		disk := rawdb.NewMemoryDatabase()
+		cfg := DefaultConfig()
+		cfg.CacheTrieDualRootExperiment = dualRoot
+		chain, err := NewBlockChain(disk, &Genesis{Config: params.TestChainConfig}, ethash.NewFaker(), cfg)
+		if err != nil {
+			t.Fatalf("failed to create chain: %v", err)
+		}
+		return chain, disk
+	}
+	makeEmptyBlock := func(parent *types.Header, root common.Hash) *types.Block {
+		return types.NewBlockWithHeader(&types.Header{
+			ParentHash:  parent.Hash(),
+			UncleHash:   types.EmptyUncleHash,
+			Coinbase:    common.Address{},
+			Root:        root,
+			TxHash:      types.EmptyTxsHash,
+			ReceiptHash: types.EmptyReceiptsHash,
+			Difficulty:  big.NewInt(1),
+			Number:      new(big.Int).Add(parent.Number, common.Big1),
+			GasLimit:    30_000_000,
+			Time:        parent.Time + 1,
+		})
+	}
+
+	chain, disk := makeChain(t, false)
+	defer chain.Stop()
+	parent := makeEmptyBlock(chain.Genesis().Header(), common.HexToHash("0x01"))
+	rawdb.WriteBlock(disk, parent)
+	child := makeEmptyBlock(parent.Header(), common.HexToHash("0x02"))
+	if err := chain.validator.ValidateBody(child); !errors.Is(err, consensus.ErrPrunedAncestor) {
+		t.Fatalf("legacy validation error mismatch: have %v want %v", err, consensus.ErrPrunedAncestor)
+	}
+
+	dualChain, dualDisk := makeChain(t, true)
+	defer dualChain.Stop()
+	parent = makeEmptyBlock(dualChain.Genesis().Header(), common.HexToHash("0x01"))
+	rawdb.WriteBlock(dualDisk, parent)
+	child = makeEmptyBlock(parent.Header(), common.HexToHash("0x02"))
+	if err := dualChain.validator.ValidateBody(child); err != nil {
+		t.Fatalf("dual-root experiment should accept known parent without header state: %v", err)
 	}
 }

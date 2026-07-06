@@ -321,6 +321,18 @@ var (
 		Value:    ethconfig.Defaults.CacheTrieMaxItems,
 		Category: flags.StateCategory,
 	}
+	CacheTrieLowWatermarkFlag = &cli.IntFlag{
+		Name:     "cachetrie.lowwatermark",
+		Usage:    "Low watermark for starting SWMT merge pipeline (0 = 80% of cachetrie.maxitems)",
+		Value:    ethconfig.Defaults.CacheTrieLowWatermark,
+		Category: flags.StateCategory,
+	}
+	CacheTrieDualRootExperimentFlag = &cli.BoolFlag{
+		Name:     "cachetrie.experiment.dualroot",
+		Usage:    "Run cachetrie replay with local SWMT dual-root semantics instead of canonical header state-root validation",
+		Value:    ethconfig.Defaults.CacheTrieDualRootExperiment,
+		Category: flags.StateCategory,
+	}
 	StateHistoryFlag = &cli.Uint64Flag{
 		Name:     "history.state",
 		Usage:    "Number of recent blocks to retain state history for, only relevant in state.scheme=path (default = 90,000 blocks, 0 = entire chain)",
@@ -1853,6 +1865,15 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	if ctx.IsSet(CacheTrieMaxItemsFlag.Name) {
 		cfg.CacheTrieMaxItems = ctx.Int(CacheTrieMaxItemsFlag.Name)
 	}
+	if ctx.IsSet(CacheTrieLowWatermarkFlag.Name) {
+		cfg.CacheTrieLowWatermark = ctx.Int(CacheTrieLowWatermarkFlag.Name)
+	}
+	if ctx.IsSet(CacheTrieDualRootExperimentFlag.Name) {
+		cfg.CacheTrieDualRootExperiment = ctx.Bool(CacheTrieDualRootExperimentFlag.Name)
+	}
+	if cfg.CacheTrieDualRootExperiment && !cfg.CacheTrie {
+		Fatalf("--%s requires --%s", CacheTrieDualRootExperimentFlag.Name, CacheTrieStateFlag.Name)
+	}
 	if ctx.IsSet(StateSchemeFlag.Name) {
 		cfg.StateScheme = ctx.String(StateSchemeFlag.Name)
 	}
@@ -2458,21 +2479,23 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 		Fatalf("%v", err)
 	}
 	options := &core.BlockChainConfig{
-		TrieCleanLimit:          ethconfig.Defaults.TrieCleanCache,
-		NoPrefetch:              ctx.Bool(CacheNoPrefetchFlag.Name),
-		TrieDirtyLimit:          ethconfig.Defaults.TrieDirtyCache,
-		ArchiveMode:             ctx.String(GCModeFlag.Name) == "archive",
-		TrieTimeLimit:           ethconfig.Defaults.TrieTimeout,
-		SnapshotLimit:           ethconfig.Defaults.SnapshotCache,
-		Preimages:               ctx.Bool(CachePreimagesFlag.Name),
-		StateScheme:             scheme,
-		StateHistory:            ctx.Uint64(StateHistoryFlag.Name),
-		TrienodeHistory:         ctx.Int64(TrienodeHistoryFlag.Name),
-		NodeFullValueCheckpoint: uint32(ctx.Uint(TrienodeHistoryFullValueCheckpointFlag.Name)),
-		BinTrieGroupDepth:       ctx.Int(BinTrieGroupDepthFlag.Name),
-		CacheTrie:               ctx.Bool(CacheTrieStateFlag.Name),
-		CacheTrieWindow:         ctx.Uint64(CacheTrieWindowFlag.Name),
-		CacheTrieMaxItems:       ctx.Int(CacheTrieMaxItemsFlag.Name),
+		TrieCleanLimit:              ethconfig.Defaults.TrieCleanCache,
+		NoPrefetch:                  ctx.Bool(CacheNoPrefetchFlag.Name),
+		TrieDirtyLimit:              ethconfig.Defaults.TrieDirtyCache,
+		ArchiveMode:                 ctx.String(GCModeFlag.Name) == "archive",
+		TrieTimeLimit:               ethconfig.Defaults.TrieTimeout,
+		SnapshotLimit:               ethconfig.Defaults.SnapshotCache,
+		Preimages:                   ctx.Bool(CachePreimagesFlag.Name),
+		StateScheme:                 scheme,
+		StateHistory:                ctx.Uint64(StateHistoryFlag.Name),
+		TrienodeHistory:             ctx.Int64(TrienodeHistoryFlag.Name),
+		NodeFullValueCheckpoint:     uint32(ctx.Uint(TrienodeHistoryFullValueCheckpointFlag.Name)),
+		BinTrieGroupDepth:           ctx.Int(BinTrieGroupDepthFlag.Name),
+		CacheTrie:                   ctx.Bool(CacheTrieStateFlag.Name),
+		CacheTrieWindow:             ctx.Uint64(CacheTrieWindowFlag.Name),
+		CacheTrieMaxItems:           ctx.Int(CacheTrieMaxItemsFlag.Name),
+		CacheTrieLowWatermark:       ctx.Int(CacheTrieLowWatermarkFlag.Name),
+		CacheTrieDualRootExperiment: ctx.Bool(CacheTrieDualRootExperimentFlag.Name),
 
 		// Disable transaction indexing/unindexing.
 		TxLookupLimit: -1,
@@ -2496,6 +2519,9 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 	if options.ArchiveMode && !options.Preimages {
 		options.Preimages = true
 		log.Info("Enabling recording of key preimages since archive mode is used")
+	}
+	if options.CacheTrieDualRootExperiment && !options.CacheTrie {
+		Fatalf("--%s requires --%s", CacheTrieDualRootExperimentFlag.Name, CacheTrieStateFlag.Name)
 	}
 	if !ctx.Bool(SnapshotFlag.Name) {
 		options.SnapshotLimit = 0 // Disabled
@@ -2558,11 +2584,12 @@ func MakeConsolePreloads(ctx *cli.Context) []string {
 // MakeTrieDatabase constructs a trie database based on the configured scheme.
 func MakeTrieDatabase(ctx *cli.Context, stack *node.Node, disk ethdb.Database, preimage bool, readOnly bool, isUBT bool) *triedb.Database {
 	config := &triedb.Config{
-		Preimages:         preimage,
-		IsUBT:             isUBT,
-		CacheTrie:         ctx.Bool(CacheTrieStateFlag.Name),
-		CacheTrieWindow:   ctx.Uint64(CacheTrieWindowFlag.Name),
-		CacheTrieMaxItems: ctx.Int(CacheTrieMaxItemsFlag.Name),
+		Preimages:             preimage,
+		IsUBT:                 isUBT,
+		CacheTrie:             ctx.Bool(CacheTrieStateFlag.Name),
+		CacheTrieWindow:       ctx.Uint64(CacheTrieWindowFlag.Name),
+		CacheTrieMaxItems:     ctx.Int(CacheTrieMaxItemsFlag.Name),
+		CacheTrieLowWatermark: ctx.Int(CacheTrieLowWatermarkFlag.Name),
 	}
 	scheme, err := rawdb.ParseStateScheme(ctx.String(StateSchemeFlag.Name), disk)
 	if err != nil {

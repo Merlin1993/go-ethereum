@@ -116,6 +116,9 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 		if !v.bc.HasBlock(block.ParentHash(), block.NumberU64()-1) {
 			return consensus.ErrUnknownAncestor
 		}
+		if v.bc.cfg.CacheTrieDualRootExperiment {
+			return nil
+		}
 		return consensus.ErrPrunedAncestor
 	}
 	return nil
@@ -129,7 +132,8 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 	}
 	header := block.Header()
 	statedb.SetBlockNum(block.NumberU64())
-	statedb.SetCacheTrieAsync(header.SWMTRoot != nil)
+	dualRoot := statedb.CacheTrieAsync() || header.SWMTRoot != nil
+	statedb.SetCacheTrieAsync(dualRoot)
 	if block.GasUsed() != res.GasUsed {
 		return fmt.Errorf("invalid gas used (remote: %d local: %d)", block.GasUsed(), res.GasUsed)
 	}
@@ -164,11 +168,17 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 	}
 	// Validate the state root against the received state root and throw
 	// an error if they don't match.
-	if header.SWMTRoot != nil {
+	if dualRoot {
+		if header.SWMTRoot == nil {
+			return nil
+		}
 		statedb.IntermediateRoot(v.config.IsEIP158(header.Number))
 		globalRoot, swmtRoot, ok := statedb.CacheTrieRoots()
 		if !ok {
-			return errors.New("block has swmt root but state database has no cachetrie")
+			return errors.New("dual-root cachetrie mode requires a cachetrie-enabled state database")
+		}
+		if err := statedb.Error(); err != nil {
+			return fmt.Errorf("invalid local dual-root state: %w", err)
 		}
 		if header.Root != globalRoot {
 			return fmt.Errorf("invalid disclosed merkle root (remote: %x local: %x) dberr: %w", header.Root, globalRoot, statedb.Error())

@@ -111,7 +111,7 @@ type StateUpdate struct {
 
 // Empty returns a flag indicating the state transition is empty or not.
 func (sc *StateUpdate) Empty() bool {
-	return sc.OriginRoot == sc.Root
+	return sc.OriginRoot == sc.Root && len(sc.Codes) == 0
 }
 
 // NewStateUpdate constructs a state update object by identifying the differences

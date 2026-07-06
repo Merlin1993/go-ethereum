@@ -96,6 +96,8 @@ var (
 		utils.CacheTrieStateFlag,
 		utils.CacheTrieWindowFlag,
 		utils.CacheTrieMaxItemsFlag,
+		utils.CacheTrieLowWatermarkFlag,
+		utils.CacheTrieDualRootExperimentFlag,
 		utils.LightKDFFlag,
 		utils.EthRequiredBlocksFlag,
 		utils.LegacyWhitelistFlag, // deprecated

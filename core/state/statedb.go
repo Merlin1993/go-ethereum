@@ -66,6 +66,7 @@ func (m *mutation) isDelete() bool {
 
 type cacheTrieRecorder interface {
 	setCacheTrieBlock(block uint64)
+	waitCacheTrieMerge()
 	beginCacheTrieBlock(block uint64, origin common.Hash)
 	stageCacheTrieAccount(address common.Address, account *types.StateAccount)
 	stageCacheTrieStorage(address common.Address, slot common.Hash, value common.Hash)
@@ -469,6 +470,16 @@ func (s *StateDB) CacheTrieAsync() bool {
 	return s.cacheTrieAsync
 }
 
+// WaitCacheTrieMerge waits for any in-flight SWMT merge and records the delay
+// as cachetrie write wait. Dual-root replay uses it before block execution to
+// model the real inter-block interval without charging merge contention to
+// foreground reads.
+func (s *StateDB) WaitCacheTrieMerge() {
+	if recorder, ok := s.db.(cacheTrieRecorder); ok {
+		recorder.waitCacheTrieMerge()
+	}
+}
+
 // CacheTrieRoots returns the disclosed global state root and the live SWMT
 // commitment for the current staged block transition.
 func (s *StateDB) CacheTrieRoots() (common.Hash, common.Hash, bool) {
@@ -487,18 +498,27 @@ func (s *StateDB) cacheTrieBlockNum() uint64 {
 }
 
 func (s *StateDB) beginCacheTrieWrite() {
+	if !s.cacheTrieAsync {
+		return
+	}
 	if recorder, ok := s.db.(cacheTrieRecorder); ok {
 		recorder.beginCacheTrieBlock(s.cacheTrieBlockNum(), s.originalRoot)
 	}
 }
 
 func (s *StateDB) stageCacheTrieAccount(address common.Address, account *types.StateAccount) {
+	if !s.cacheTrieAsync {
+		return
+	}
 	if recorder, ok := s.db.(cacheTrieRecorder); ok {
 		recorder.stageCacheTrieAccount(address, account)
 	}
 }
 
 func (s *StateDB) stageCacheTrieStorage(address common.Address, slot common.Hash, value common.Hash) {
+	if !s.cacheTrieAsync {
+		return
+	}
 	if recorder, ok := s.db.(cacheTrieRecorder); ok {
 		recorder.stageCacheTrieStorage(address, slot, value)
 	}
@@ -672,7 +692,27 @@ func (s *StateDB) setCacheTrieMergeAccount(addr common.Address, account *types.S
 	if obj == nil {
 		obj = newObject(s, addr, nil)
 	}
-	obj.data = *account.Copy()
+	merged := account.Copy()
+	// SWMT account roots are logical commitments; backing MPT storage roots are rebuilt from storage inputs.
+	merged.Root = obj.data.Root
+	obj.data = *merged
+	s.setStateObject(obj)
+	s.markUpdate(addr)
+}
+
+func (s *StateDB) ensureCacheTrieMergeAccount(addr common.Address, account *types.StateAccount) {
+	if account == nil {
+		return
+	}
+	if s.getStateObject(addr) != nil {
+		return
+	}
+	obj := newObject(s, addr, nil)
+	merged := account.Copy()
+	// Dependency accounts only materialize a storage owner. They must not write
+	// an unmaterialized SWMT storage root into the backing MPT.
+	merged.Root = obj.data.Root
+	obj.data = *merged
 	s.setStateObject(obj)
 	s.markUpdate(addr)
 }
@@ -1433,10 +1473,140 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool, blockNum
 	return ret, nil
 }
 
+// commitCacheTrieAsync gathers the block write set for SWMT without updating or
+// committing the foreground MPT tries. The disclosed global root stays at the
+// current backing root; SWMT carries the fresh account/storage writes until a
+// later watermark merge advances the backing tree.
+func (s *StateDB) commitCacheTrieAsync(deleteEmptyObjects bool, blockNumber uint64) (*StateUpdate, error) {
+	// Short circuit in case any database failure occurred earlier.
+	if s.dbErr != nil {
+		return nil, fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
+	}
+	if !s.cacheTrieBlockSet || s.cacheTrieBlock != blockNumber {
+		s.SetBlockNum(blockNumber)
+	}
+	// Finalize pending tx-local changes, but keep them out of the MPT tries.
+	s.Finalise(deleteEmptyObjects)
+	if s.dbErr != nil {
+		return nil, fmt.Errorf("commit aborted due to database error: %v", s.dbErr)
+	}
+	// If something already pushed mutations into the tries, fall back to the
+	// canonical path so internal flags and trie state stay consistent.
+	for _, op := range s.mutations {
+		if op.applied {
+			return s.commit(deleteEmptyObjects, true, blockNumber)
+		}
+	}
+	s.beginCacheTrieWrite()
+
+	var (
+		start       = time.Now()
+		codes       map[common.Address]*ContractCode
+		originRoot  = s.originalRoot
+		storageTime time.Duration
+	)
+	for addr, op := range s.mutations {
+		op.applied = true
+
+		if op.isDelete() {
+			s.stageCacheTrieAccount(addr, nil)
+			s.AccountDeleted += 1
+			continue
+		}
+		obj := s.stateObjects[addr]
+		if obj == nil {
+			return nil, errors.New("missing state object")
+		}
+		s.stageCacheTrieAccount(addr, &obj.data)
+		s.AccountUpdated += 1
+
+		if obj.dirtyCode {
+			if codes == nil {
+				codes = make(map[common.Address]*ContractCode)
+			}
+			code := &ContractCode{
+				Hash: common.BytesToHash(obj.CodeHash()),
+				Blob: obj.code,
+			}
+			if obj.origin == nil {
+				code.OriginHash = types.EmptyCodeHash
+			} else {
+				code.OriginHash = common.BytesToHash(obj.origin.CodeHash)
+			}
+			codes[addr] = code
+			obj.dirtyCode = false
+			s.CodeUpdated += 1
+			s.CodeUpdateBytes += len(obj.code)
+		}
+
+		storageStart := time.Now()
+		for key, origin := range obj.uncommittedStorage {
+			value, exist := obj.pendingStorage[key]
+			if value == origin {
+				continue
+			}
+			if !exist {
+				return nil, fmt.Errorf("storage slot is not found in pending area: address %x slot %x", obj.address, key)
+			}
+			s.stageCacheTrieStorage(addr, key, value)
+			if value == (common.Hash{}) {
+				s.StorageDeleted.Add(1)
+			} else {
+				s.StorageUpdated.Add(1)
+			}
+			obj.originStorage[key] = value
+		}
+		storageTime += time.Since(storageStart)
+
+		obj.uncommittedStorage = make(Storage)
+		obj.pendingStorage = make(Storage)
+		obj.origin = obj.data.Copy()
+	}
+	s.AccountUpdates += time.Since(start) - storageTime
+	s.StorageUpdates += storageTime
+
+	accountReadMeters.Mark(int64(s.AccountLoaded))
+	storageReadMeters.Mark(int64(s.StorageLoaded))
+	accountUpdatedMeter.Mark(int64(s.AccountUpdated))
+	storageUpdatedMeter.Mark(s.StorageUpdated.Load())
+	accountDeletedMeter.Mark(int64(s.AccountDeleted))
+	storageDeletedMeter.Mark(s.StorageDeleted.Load())
+
+	// Clear the metric markers
+	s.AccountLoaded, s.AccountUpdated, s.AccountDeleted = 0, 0, 0
+	s.StorageLoaded = 0
+	s.StorageUpdated.Store(0)
+	s.StorageDeleted.Store(0)
+
+	// Clear all internal flags. The backing root is intentionally unchanged;
+	// cachetrie.PublishRoots will disclose a new global root only after a
+	// completed async merge/prune round.
+	s.mutations = make(map[common.Address]*mutation)
+	s.stateObjectsDestruct = make(map[common.Address]*stateObject)
+
+	ret := &StateUpdate{
+		OriginRoot:     originRoot,
+		Root:           originRoot,
+		BlockNumber:    blockNumber,
+		StorageKeyType: StorageKeyPlain,
+		Codes:          codes,
+		CacheTrieAsync: true,
+	}
+	return ret, nil
+}
+
 // commitAndFlush is a wrapper of commit which also commits the state mutations
 // to the configured data stores.
 func (s *StateDB) commitAndFlush(block uint64, deleteEmptyObjects bool, noStorageWiping bool, deriveCodeFields bool) (*StateUpdate, error) {
-	ret, err := s.commit(deleteEmptyObjects, noStorageWiping, block)
+	var (
+		ret *StateUpdate
+		err error
+	)
+	if s.cacheTrieAsync && noStorageWiping && !deriveCodeFields {
+		ret, err = s.commitCacheTrieAsync(deleteEmptyObjects, block)
+	} else {
+		ret, err = s.commit(deleteEmptyObjects, noStorageWiping, block)
+	}
 	if err != nil {
 		return nil, err
 	}

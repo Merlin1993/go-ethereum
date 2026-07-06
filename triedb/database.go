@@ -32,14 +32,15 @@ import (
 
 // Config defines all necessary options for database.
 type Config struct {
-	Preimages         bool           // Flag whether the preimage of node key is recorded
-	IsUBT             bool           // Flag whether the db is holding a unified binary tree
-	BinTrieGroupDepth int            // Number of levels per serialized group in binary trie (1-8, default 8)
-	CacheTrie         bool           // Flag whether the sliding cache trie is enabled
-	CacheTrieWindow   uint64         // Number of recent blocks retained by cache trie
-	CacheTrieMaxItems int            // Maximum number of cached account/storage entries
-	HashDB            *hashdb.Config // Configs for hash-based scheme
-	PathDB            *pathdb.Config // Configs for experimental path-based scheme
+	Preimages             bool           // Flag whether the preimage of node key is recorded
+	IsUBT                 bool           // Flag whether the db is holding a unified binary tree
+	BinTrieGroupDepth     int            // Number of levels per serialized group in binary trie (1-8, default 8)
+	CacheTrie             bool           // Flag whether the sliding cache trie is enabled
+	CacheTrieWindow       uint64         // Number of recent blocks retained by cache trie
+	CacheTrieMaxItems     int            // Maximum number of cached account/storage entries
+	CacheTrieLowWatermark int            // Low watermark for starting the SWMT merge pipeline
+	HashDB                *hashdb.Config // Configs for hash-based scheme
+	PathDB                *pathdb.Config // Configs for experimental path-based scheme
 }
 
 const DefaultBinTrieGroupDepth = 5
@@ -123,7 +124,7 @@ func NewDatabase(diskdb ethdb.Database, config *Config) *Database {
 		db.backend = hashdb.New(diskdb, config.HashDB)
 	}
 	if config.CacheTrie && !config.IsUBT {
-		db.cacheTrie = cachetrie.NewCacheTrie(0, config.CacheTrieWindow, config.CacheTrieMaxItems)
+		db.cacheTrie = cachetrie.NewCacheTrie(0, config.CacheTrieWindow, config.CacheTrieMaxItems, config.CacheTrieLowWatermark)
 	}
 	return db
 }

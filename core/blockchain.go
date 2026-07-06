@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ethereum/go-ethereum/cachetrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -170,13 +171,15 @@ type BlockChainConfig struct {
 	TrieNoAsyncFlush     bool          // Whether the asynchronous buffer flushing is disallowed
 	TrieJournalDirectory string        // Directory path to the journal used for persisting trie data across node restarts
 
-	Preimages         bool   // Whether to store preimage of trie key to the disk
-	StateScheme       string // Scheme used to store ethereum states and merkle tree nodes on top
-	ArchiveMode       bool   // Whether to enable the archive mode
-	BinTrieGroupDepth int    // Number of levels per serialized group in binary trie (1-8)
-	CacheTrie         bool   // Whether to enable the root-aware sliding state cache
-	CacheTrieWindow   uint64 // Number of recent blocks retained by cache trie
-	CacheTrieMaxItems int    // Maximum number of cached account/storage entries
+	Preimages                   bool   // Whether to store preimage of trie key to the disk
+	StateScheme                 string // Scheme used to store ethereum states and merkle tree nodes on top
+	ArchiveMode                 bool   // Whether to enable the archive mode
+	BinTrieGroupDepth           int    // Number of levels per serialized group in binary trie (1-8)
+	CacheTrie                   bool   // Whether to enable the root-aware sliding state cache
+	CacheTrieWindow             uint64 // Number of recent blocks retained by cache trie
+	CacheTrieMaxItems           int    // Maximum number of cached account/storage entries
+	CacheTrieLowWatermark       int    // Low watermark for starting SWMT merge pipeline
+	CacheTrieDualRootExperiment bool   // Whether to run imported blocks with local SWMT dual-root semantics
 
 	// Number of blocks from the chain head for which state histories are retained.
 	// If set to 0, all state histories across the entire chain will be retained;
@@ -264,12 +267,13 @@ func (cfg BlockChainConfig) WithNoAsyncFlush(on bool) *BlockChainConfig {
 // triedbConfig derives the configures for trie database.
 func (cfg *BlockChainConfig) triedbConfig(isUBT bool) *triedb.Config {
 	config := &triedb.Config{
-		Preimages:         cfg.Preimages,
-		IsUBT:             isUBT,
-		BinTrieGroupDepth: cfg.BinTrieGroupDepth,
-		CacheTrie:         cfg.CacheTrie,
-		CacheTrieWindow:   cfg.CacheTrieWindow,
-		CacheTrieMaxItems: cfg.CacheTrieMaxItems,
+		Preimages:             cfg.Preimages,
+		IsUBT:                 isUBT,
+		BinTrieGroupDepth:     cfg.BinTrieGroupDepth,
+		CacheTrie:             cfg.CacheTrie,
+		CacheTrieWindow:       cfg.CacheTrieWindow,
+		CacheTrieMaxItems:     cfg.CacheTrieMaxItems,
+		CacheTrieLowWatermark: cfg.CacheTrieLowWatermark,
 	}
 	if cfg.StateScheme == rawdb.HashScheme {
 		config.HashDB = &hashdb.Config{
@@ -297,6 +301,17 @@ func (cfg *BlockChainConfig) triedbConfig(isUBT bool) *triedb.Config {
 		}
 	}
 	return config
+}
+
+func (bc *BlockChain) cacheTrieStats() (cachetrie.Stats, bool) {
+	if bc.triedb == nil {
+		return cachetrie.Stats{}, false
+	}
+	cache := bc.triedb.CacheTrie()
+	if cache == nil {
+		return cachetrie.Stats{}, false
+	}
+	return cache.Stats(), true
 }
 
 // txLookup is wrapper over transaction lookup along with the corresponding
@@ -375,6 +390,9 @@ type BlockChain struct {
 
 	lastForkReadyAlert time.Time     // Last time there was a fork readiness print out
 	slowBlockThreshold time.Duration // Block execution time threshold beyond which detailed statistics will be logged
+
+	cacheTrieExperimentRoot    common.Hash
+	cacheTrieExperimentRootSet bool
 }
 
 // NewBlockChain returns a fully initialised block chain using information
@@ -1999,12 +2017,13 @@ func (bc *BlockChain) insertChain(ctx context.Context, chain types.Blocks, setHe
 		// The traced section of block import.
 		start := time.Now()
 		config := ExecuteConfig{
-			WriteState:              true,
-			WriteHead:               setHead,
-			EnableTracer:            true,
-			MakeWitness:             makeWitness && len(chain) == 1,
-			StatelessSelfValidation: bc.cfg.StatelessSelfValidation,
-			EnableWitnessStats:      bc.cfg.EnableWitnessStats,
+			WriteState:                  true,
+			WriteHead:                   setHead,
+			EnableTracer:                true,
+			MakeWitness:                 makeWitness && len(chain) == 1,
+			StatelessSelfValidation:     bc.cfg.StatelessSelfValidation,
+			EnableWitnessStats:          bc.cfg.EnableWitnessStats,
+			CacheTrieDualRootExperiment: bc.cfg.CacheTrieDualRootExperiment,
 		}
 		res, err := bc.ProcessBlock(ctx, parent.Root, block, config)
 		if err != nil {
@@ -2114,6 +2133,11 @@ type ExecuteConfig struct {
 	// EnableWitnessStats indicates whether to enable collection of witness trie
 	// access statistics
 	EnableWitnessStats bool
+
+	// CacheTrieDualRootExperiment executes blocks with local SWMT dual-root
+	// semantics, ignoring the imported header state root as a per-block
+	// consensus root.
+	CacheTrieDualRootExperiment bool
 }
 
 // ProcessBlock executes and validates the given block. If there was no error
@@ -2127,6 +2151,14 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 		sdb       state.Database
 	)
 	defer interrupt.Store(true) // terminate the prefetch at the end
+	if config.CacheTrieDualRootExperiment {
+		if !bc.cacheTrieExperimentRootSet {
+			bc.cacheTrieExperimentRoot = parentRoot
+			bc.cacheTrieExperimentRootSet = true
+		}
+		parentRoot = bc.cacheTrieExperimentRoot
+	}
+	cacheTrieBefore, cacheTrieBeforeOK := bc.cacheTrieStats()
 
 	if bc.chainConfig.IsUBT(block.Number(), block.Time()) {
 		sdb = state.NewUBTDatabase(bc.triedb, bc.codedb)
@@ -2191,6 +2223,10 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 				blockPrefetchInterruptMeter.Mark(1)
 			}
 		}(time.Now(), throwaway, block)
+	}
+	if config.CacheTrieDualRootExperiment {
+		statedb.SetCacheTrieAsync(true)
+		statedb.WaitCacheTrieMerge()
 	}
 
 	// If we are past Byzantium, enable prefetching to pull in trie node paths
@@ -2303,6 +2339,7 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 	stats.CodeUpdateBytes = statedb.CodeUpdateBytes
 
 	stats.Execution = ptime - (statedb.AccountReads + statedb.StorageReads + statedb.CodeReads)          // The time spent on EVM processing
+	stats.Processing = ptime                                                                             // The time spent in the block processor, including state reads
 	stats.Validation = vtime - (statedb.AccountHashes + statedb.AccountUpdates + statedb.StorageUpdates) // The time spent on block validation
 	stats.CrossValidation = xvtime                                                                       // The time spent on stateless cross validation
 
@@ -2325,6 +2362,14 @@ func (bc *BlockChain) ProcessBlock(ctx context.Context, parentRoot common.Hash, 
 		stats.DatabaseCommit = statedb.DatabaseCommits // Database commits are complete, we can mark them
 		stats.BlockWrite = time.Since(wstart) - max(statedb.AccountCommits, statedb.StorageCommits) /* concurrent */ - statedb.DatabaseCommits
 	}
+	if config.CacheTrieDualRootExperiment {
+		if root, _, ok := statedb.CacheTrieRoots(); ok {
+			bc.cacheTrieExperimentRoot = root
+			bc.cacheTrieExperimentRootSet = true
+		}
+	}
+	cacheTrieAfter, cacheTrieAfterOK := bc.cacheTrieStats()
+	stats.CacheTrie = newCacheTrieBlockStats(cacheTrieBeforeOK || cacheTrieAfterOK, config.CacheTrieDualRootExperiment, block.Root(), cacheTrieBefore, cacheTrieAfter)
 	// Report the collected witness statistics
 	if witness != nil {
 		witness.ReportMetrics(block.NumberU64())

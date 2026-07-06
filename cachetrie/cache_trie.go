@@ -25,8 +25,10 @@ package cachetrie
 import (
 	"bytes"
 	"encoding/binary"
+	"math/bits"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -66,6 +68,11 @@ type entry struct {
 	window     uint32
 }
 
+type storageIndexKey struct {
+	address common.Address
+	slot    common.Hash
+}
+
 // StateType identifies the kind of state leaf represented by a merge input.
 type StateType byte
 
@@ -83,6 +90,7 @@ type MergeInput struct {
 	Account    *types.StateAccount
 	Storage    common.Hash
 	Tombstone  bool
+	Dependency bool
 }
 
 // MergeFunc applies a pending merge round to the backing global state tree and
@@ -100,7 +108,8 @@ type mergeRound struct {
 
 // Stats is a point-in-time snapshot of cachetrie activity.
 type Stats struct {
-	Root common.Hash
+	Root     common.Hash
+	SWMTRoot common.Hash
 
 	Accounts      int
 	Storages      int
@@ -120,9 +129,24 @@ type Stats struct {
 	Deletes       uint64
 
 	CleanupCount       uint64
+	CleanupItems       uint64
 	CleanupElapsed     time.Duration
 	CleanupMaxElapsed  time.Duration
 	LastCleanupRemoved int
+
+	MergeCount   uint64
+	MergeInputs  uint64
+	MergeElapsed time.Duration
+	MergeErrors  uint64
+
+	WriteWaitCount   uint64
+	WriteWaitElapsed time.Duration
+
+	RootCount   uint64
+	RootElapsed time.Duration
+
+	PublishCount   uint64
+	PublishElapsed time.Duration
 }
 
 // CacheTrie stores recently committed account and storage values keyed by their
@@ -144,6 +168,15 @@ type CacheTrie struct {
 
 	accounts map[common.Address]entry
 	storages map[common.Address]map[common.Hash]entry
+	// Window indexes keep watermark publish/prune work proportional to the
+	// selected complete windows instead of the entire live SWMT.
+	accountWindows [windowBitCount]map[common.Address]struct{}
+	storageWindows [windowBitCount]map[storageIndexKey]struct{}
+	// liveDigest is an order-independent aggregate of all live SWMT leaves.
+	// It makes per-block SWMT root reporting proportional to the block delta
+	// instead of sorting and hashing the entire live overlay.
+	liveDigest  common.Hash
+	storageSize int
 
 	pendingOrigin   common.Hash
 	pendingBlock    uint64
@@ -155,33 +188,55 @@ type CacheTrie struct {
 	lastMergeRoot   common.Hash
 	mergeFn         MergeFunc
 
-	accountHits   uint64
-	accountMisses uint64
-	storageHits   uint64
-	storageMisses uint64
+	accountHits   atomic.Uint64
+	accountMisses atomic.Uint64
+	storageHits   atomic.Uint64
+	storageMisses atomic.Uint64
 	updates       uint64
 	deletes       uint64
 
 	cleanupCount       uint64
+	cleanupItems       uint64
 	cleanupElapsed     time.Duration
 	cleanupMaxElapsed  time.Duration
 	lastCleanupRemoved int
+
+	mergeCount   uint64
+	mergeInputs  uint64
+	mergeElapsed time.Duration
+	mergeErrors  uint64
+
+	writeWaitCount   uint64
+	writeWaitElapsed time.Duration
+
+	rootCount   uint64
+	rootElapsed time.Duration
+
+	publishCount   uint64
+	publishElapsed time.Duration
 }
 
 // NewCacheTrie creates a sliding state cache. The window is measured in blocks;
 // maxItems limits the total number of account and storage entries retained.
-func NewCacheTrie(startBlock, window uint64, maxItems int) *CacheTrie {
+func NewCacheTrie(startBlock, window uint64, maxItems int, lowWatermarks ...int) *CacheTrie {
 	if window == 0 {
 		window = defaultWindow
 	}
 	if maxItems <= 0 {
 		maxItems = defaultMaxItems
 	}
+	low := lowWatermark(maxItems)
+	if len(lowWatermarks) > 0 && lowWatermarks[0] > 0 {
+		low = lowWatermarks[0]
+		if low > maxItems {
+			low = maxItems
+		}
+	}
 	return &CacheTrie{
 		block:      startBlock,
 		window:     window,
 		max:        maxItems,
-		low:        lowWatermark(maxItems),
+		low:        low,
 		high:       maxItems,
 		currentBit: bitForBlock(startBlock),
 		startBit:   bitForBlock(startBlock),
@@ -200,7 +255,9 @@ func (c *CacheTrie) Begin(block uint64, origin common.Hash) {
 		c.currentBit = bitForBlock(block)
 		if wait := c.mergeWaitLocked(); wait != nil {
 			c.mu.Unlock()
+			start := time.Now()
 			<-wait
+			c.recordWriteWait(start)
 			continue
 		}
 		if c.hasPending && c.pendingBlock == block && c.pendingOrigin == origin {
@@ -260,6 +317,26 @@ func (c *CacheTrie) SetMergeFunc(fn MergeFunc) {
 	c.mergeFn = fn
 }
 
+// WaitForMerge waits for the currently running merge round, if any, and records
+// the delay as replay backpressure. It is used by dual-root replay to model the
+// idle time between real blocks, so background merge does not pollute foreground
+// read timings.
+func (c *CacheTrie) WaitForMerge() {
+	for {
+		c.mu.Lock()
+		if c.pendingMerge == nil || c.pendingMerge.complete {
+			c.mu.Unlock()
+			return
+		}
+		wait := c.pendingMerge.done
+		c.mu.Unlock()
+
+		start := time.Now()
+		<-wait
+		c.recordWriteWait(start)
+	}
+}
+
 // StageAccount records an account write in the in-flight block transition. The
 // staged value is not served until Publish binds it to the resulting root.
 func (c *CacheTrie) StageAccount(address common.Address, account *types.StateAccount) {
@@ -274,7 +351,9 @@ func (c *CacheTrie) StageAccount(address common.Address, account *types.StateAcc
 		}
 		if wait := c.writeWaitLocked(delta); wait != nil {
 			c.mu.Unlock()
+			start := time.Now()
 			<-wait
+			c.recordWriteWait(start)
 			continue
 		}
 		c.pendingAccounts[address] = copyAccount(account)
@@ -302,7 +381,9 @@ func (c *CacheTrie) StageStorage(address common.Address, slot common.Hash, value
 		}
 		if wait := c.writeWaitLocked(delta); wait != nil {
 			c.mu.Unlock()
+			start := time.Now()
 			<-wait
+			c.recordWriteWait(start)
 			continue
 		}
 		if c.pendingStorages[address] == nil {
@@ -320,12 +401,12 @@ func (c *CacheTrie) UpdateAccount(block uint64, address common.Address, account 
 	defer c.mu.Unlock()
 
 	c.block = block
-	c.accounts[address] = entry{
+	c.putAccountLocked(address, entry{
 		account:    copyAccount(account),
 		block:      block,
 		lastAccess: block,
 		window:     bitMask(bitForBlock(block)),
-	}
+	})
 	c.updates++
 	updateMeter.Mark(1)
 	c.maintainPipelineLocked()
@@ -338,13 +419,13 @@ func (c *CacheTrie) DeleteAccount(block uint64, address common.Address) {
 	defer c.mu.Unlock()
 
 	c.block = block
-	c.accounts[address] = entry{
+	c.putAccountLocked(address, entry{
 		deleted:    true,
 		block:      block,
 		lastAccess: block,
 		window:     bitMask(bitForBlock(block)),
-	}
-	delete(c.storages, address)
+	})
+	c.removeStorageBucketLocked(address)
 	c.deletes++
 	deleteMeter.Mark(1)
 	c.maintainPipelineLocked()
@@ -354,23 +435,25 @@ func (c *CacheTrie) DeleteAccount(block uint64, address common.Address) {
 // Account retrieves an account from the cache. A hit with a nil account means
 // the account is known to be absent at the cached root.
 func (c *CacheTrie) Account(address common.Address) (*types.StateAccount, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.mu.RLock()
 	item, ok := c.accounts[address]
 	if !ok {
-		c.accountMisses++
+		c.mu.RUnlock()
+		c.accountMisses.Add(1)
 		accountMissMeter.Mark(1)
 		return nil, false
 	}
-	item.lastAccess = c.block
-	c.accounts[address] = item
-	c.accountHits++
+	var account *types.StateAccount
+	if !item.deleted {
+		account = copyAccount(item.account)
+	}
+	c.mu.RUnlock()
+	c.accountHits.Add(1)
 	accountHitMeter.Mark(1)
 	if item.deleted {
 		return nil, true
 	}
-	return copyAccount(item.account), true
+	return account, true
 }
 
 // UpdateStorage records the committed value of a storage slot.
@@ -379,17 +462,14 @@ func (c *CacheTrie) UpdateStorage(block uint64, address common.Address, slot com
 	defer c.mu.Unlock()
 
 	c.block = block
-	slots := c.storages[address]
-	if slots == nil {
-		slots = make(map[common.Hash]entry)
-		c.storages[address] = slots
-	}
-	slots[slot] = entry{
+	account := c.storageAccountSnapshotLocked(address, nil)
+	c.putStorageLocked(address, slot, entry{
+		account:    account,
 		storage:    value,
 		block:      block,
 		lastAccess: block,
 		window:     bitMask(bitForBlock(block)),
-	}
+	})
 	c.updates++
 	updateMeter.Mark(1)
 	c.maintainPipelineLocked()
@@ -402,17 +482,14 @@ func (c *CacheTrie) DeleteStorage(block uint64, address common.Address, slot com
 	defer c.mu.Unlock()
 
 	c.block = block
-	slots := c.storages[address]
-	if slots == nil {
-		slots = make(map[common.Hash]entry)
-		c.storages[address] = slots
-	}
-	slots[slot] = entry{
+	account := c.storageAccountSnapshotLocked(address, nil)
+	c.putStorageLocked(address, slot, entry{
+		account:    account,
 		deleted:    true,
 		block:      block,
 		lastAccess: block,
 		window:     bitMask(bitForBlock(block)),
-	}
+	})
 	c.deletes++
 	deleteMeter.Mark(1)
 	c.maintainPipelineLocked()
@@ -423,24 +500,23 @@ func (c *CacheTrie) DeleteStorage(block uint64, address common.Address, slot com
 // either mean an actual zero value or a cached deletion, both equivalent for
 // StateDB's committed storage reads.
 func (c *CacheTrie) Storage(address common.Address, slot common.Hash) (common.Hash, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
+	c.mu.RLock()
 	slots := c.storages[address]
 	if slots == nil {
-		c.storageMisses++
+		c.mu.RUnlock()
+		c.storageMisses.Add(1)
 		storageMissMeter.Mark(1)
 		return common.Hash{}, false
 	}
 	item, ok := slots[slot]
 	if !ok {
-		c.storageMisses++
+		c.mu.RUnlock()
+		c.storageMisses.Add(1)
 		storageMissMeter.Mark(1)
 		return common.Hash{}, false
 	}
-	item.lastAccess = c.block
-	slots[slot] = item
-	c.storageHits++
+	c.mu.RUnlock()
+	c.storageHits.Add(1)
 	storageHitMeter.Mark(1)
 	if item.deleted {
 		return common.Hash{}, true
@@ -464,11 +540,16 @@ func (c *CacheTrie) PublishRoots(block uint64, origin common.Hash, root common.H
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	start := time.Now()
+	defer func() {
+		c.publishCount++
+		c.publishElapsed += time.Since(start)
+	}()
+
 	c.block = block
 	c.currentBit = bitForBlock(block)
 	if c.hasRoot && c.root != origin {
-		c.accounts = make(map[common.Address]entry)
-		c.storages = make(map[common.Address]map[common.Hash]entry)
+		c.clearLiveLocked()
 		c.pipelineStarted = false
 		c.pendingMerge = nil
 		c.startBit = c.currentBit
@@ -509,29 +590,25 @@ func (c *CacheTrie) PublishRoots(block uint64, origin common.Hash, root common.H
 	}
 	for address, account := range accounts {
 		if account == nil {
-			c.accounts[address] = entry{deleted: true, block: block, lastAccess: block, window: bitMask(c.currentBit)}
-			delete(c.storages, address)
+			c.putAccountLocked(address, entry{deleted: true, block: block, lastAccess: block, window: bitMask(c.currentBit)})
+			c.removeStorageBucketLocked(address)
 			c.deletes++
 			deleteMeter.Mark(1)
 		} else {
-			c.accounts[address] = entry{account: copyAccount(account), block: block, lastAccess: block, window: bitMask(c.currentBit)}
+			c.putAccountLocked(address, entry{account: copyAccount(account), block: block, lastAccess: block, window: bitMask(c.currentBit)})
 			c.updates++
 			updateMeter.Mark(1)
 		}
 	}
 	for address, slots := range storages {
-		bucket := c.storages[address]
-		if bucket == nil {
-			bucket = make(map[common.Hash]entry)
-			c.storages[address] = bucket
-		}
+		account := c.storageAccountSnapshotLocked(address, accounts)
 		for slot, value := range slots {
 			if value == (common.Hash{}) {
-				bucket[slot] = entry{deleted: true, block: block, lastAccess: block, window: bitMask(c.currentBit)}
+				c.putStorageLocked(address, slot, entry{account: account, deleted: true, block: block, lastAccess: block, window: bitMask(c.currentBit)})
 				c.deletes++
 				deleteMeter.Mark(1)
 			} else {
-				bucket[slot] = entry{storage: value, block: block, lastAccess: block, window: bitMask(c.currentBit)}
+				c.putStorageLocked(address, slot, entry{account: account, storage: value, block: block, lastAccess: block, window: bitMask(c.currentBit)})
 				c.updates++
 				updateMeter.Mark(1)
 			}
@@ -539,13 +616,145 @@ func (c *CacheTrie) PublishRoots(block uint64, origin common.Hash, root common.H
 	}
 	c.maintainPipelineLocked()
 	c.updateSizeMetricsLocked()
-	return c.root, c.hashLocked(c.root, c.accounts, c.storages)
+	rootStart := time.Now()
+	swmtRoot := c.swmtRootLocked(c.root)
+	c.rootCount++
+	c.rootElapsed += time.Since(rootStart)
+	return c.root, swmtRoot
 }
 
 // Apply is kept as the direct committed-update API used by tests and callers
 // that do not participate in staged StateDB writes.
 func (c *CacheTrie) Apply(block uint64, origin common.Hash, root common.Hash, accounts map[common.Address]*types.StateAccount, storages map[common.Address]map[common.Hash]common.Hash) {
 	c.Publish(block, origin, root, accounts, storages)
+}
+
+func (c *CacheTrie) clearLiveLocked() {
+	c.accounts = make(map[common.Address]entry)
+	c.storages = make(map[common.Address]map[common.Hash]entry)
+	c.accountWindows = [windowBitCount]map[common.Address]struct{}{}
+	c.storageWindows = [windowBitCount]map[storageIndexKey]struct{}{}
+	c.liveDigest = common.Hash{}
+	c.storageSize = 0
+}
+
+func (c *CacheTrie) putAccountLocked(address common.Address, item entry) {
+	if old, ok := c.accounts[address]; ok {
+		c.removeLeafDigestLocked(accountEntryKind, address, common.Hash{}, old)
+		c.removeAccountWindowLocked(address, old)
+	}
+	c.accounts[address] = item
+	c.addAccountWindowLocked(address, item)
+	c.addLeafDigestLocked(accountEntryKind, address, common.Hash{}, item)
+}
+
+func (c *CacheTrie) removeAccountLocked(address common.Address) bool {
+	old, ok := c.accounts[address]
+	if !ok {
+		return false
+	}
+	c.removeLeafDigestLocked(accountEntryKind, address, common.Hash{}, old)
+	c.removeAccountWindowLocked(address, old)
+	delete(c.accounts, address)
+	return true
+}
+
+func (c *CacheTrie) putStorageLocked(address common.Address, slot common.Hash, item entry) {
+	slots := c.storages[address]
+	if slots == nil {
+		slots = make(map[common.Hash]entry)
+		c.storages[address] = slots
+	}
+	if old, ok := slots[slot]; ok {
+		c.removeLeafDigestLocked(storageEntryKind, address, slot, old)
+		c.removeStorageWindowLocked(address, slot, old)
+	} else {
+		c.storageSize++
+	}
+	slots[slot] = item
+	c.addStorageWindowLocked(address, slot, item)
+	c.addLeafDigestLocked(storageEntryKind, address, slot, item)
+}
+
+func (c *CacheTrie) removeStorageLocked(address common.Address, slot common.Hash) bool {
+	slots := c.storages[address]
+	if slots == nil {
+		return false
+	}
+	old, ok := slots[slot]
+	if !ok {
+		return false
+	}
+	c.removeLeafDigestLocked(storageEntryKind, address, slot, old)
+	c.removeStorageWindowLocked(address, slot, old)
+	delete(slots, slot)
+	c.storageSize--
+	if len(slots) == 0 {
+		delete(c.storages, address)
+	}
+	return true
+}
+
+func (c *CacheTrie) removeStorageBucketLocked(address common.Address) int {
+	slots := c.storages[address]
+	if slots == nil {
+		return 0
+	}
+	removed := 0
+	for slot, item := range slots {
+		c.removeLeafDigestLocked(storageEntryKind, address, slot, item)
+		c.removeStorageWindowLocked(address, slot, item)
+		removed++
+	}
+	delete(c.storages, address)
+	c.storageSize -= removed
+	return removed
+}
+
+func (c *CacheTrie) addAccountWindowLocked(address common.Address, item entry) {
+	bit, ok := windowIndex(item.window)
+	if !ok {
+		return
+	}
+	if c.accountWindows[bit] == nil {
+		c.accountWindows[bit] = make(map[common.Address]struct{})
+	}
+	c.accountWindows[bit][address] = struct{}{}
+}
+
+func (c *CacheTrie) removeAccountWindowLocked(address common.Address, item entry) {
+	bit, ok := windowIndex(item.window)
+	if !ok || c.accountWindows[bit] == nil {
+		return
+	}
+	delete(c.accountWindows[bit], address)
+}
+
+func (c *CacheTrie) addStorageWindowLocked(address common.Address, slot common.Hash, item entry) {
+	bit, ok := windowIndex(item.window)
+	if !ok {
+		return
+	}
+	if c.storageWindows[bit] == nil {
+		c.storageWindows[bit] = make(map[storageIndexKey]struct{})
+	}
+	c.storageWindows[bit][storageIndexKey{address: address, slot: slot}] = struct{}{}
+}
+
+func (c *CacheTrie) removeStorageWindowLocked(address common.Address, slot common.Hash, item entry) {
+	bit, ok := windowIndex(item.window)
+	if !ok || c.storageWindows[bit] == nil {
+		return
+	}
+	delete(c.storageWindows[bit], storageIndexKey{address: address, slot: slot})
+}
+
+func (c *CacheTrie) addLeafDigestLocked(kind byte, address common.Address, slot common.Hash, item entry) {
+	xorHash(&c.liveDigest, leafDigest(kind, address, slot, item))
+}
+
+func (c *CacheTrie) removeLeafDigestLocked(kind byte, address common.Address, slot common.Hash, item entry) {
+	xorHash(&c.liveDigest, leafDigest(kind, address, slot, item))
 }
 
 // PreviewRoots returns the roots that would be disclosed if the current staged
@@ -561,6 +770,9 @@ func (c *CacheTrie) PreviewRoots() (common.Hash, common.Hash, bool) {
 	if !c.hasRoot {
 		root = c.pendingOrigin
 	}
+	if !c.hasPending {
+		return root, c.swmtRootLocked(root), true
+	}
 	accounts, storages := c.copyLiveLocked()
 	c.applyPendingToCopiesLocked(accounts, storages)
 	count := countCopies(accounts, storages)
@@ -568,7 +780,7 @@ func (c *CacheTrie) PreviewRoots() (common.Hash, common.Hash, bool) {
 		root = c.pendingMerge.resultRoot
 		pruneCopies(accounts, storages, c.pendingMerge.bits)
 	}
-	return root, c.hashLocked(root, accounts, storages), true
+	return root, swmtRootFromCopies(root, accounts, storages), true
 }
 
 // Hash returns a deterministic digest of the cache contents. It is diagnostic
@@ -577,61 +789,74 @@ func (c *CacheTrie) Hash() common.Hash {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	return c.hashLocked(c.root, c.accounts, c.storages)
+	return c.swmtRootLocked(c.root)
 }
 
-func (c *CacheTrie) hashLocked(root common.Hash, accounts map[common.Address]entry, storages map[common.Address]map[common.Hash]entry) common.Hash {
-	type item struct {
-		kind    byte
-		address common.Address
-		slot    common.Hash
-		entry   entry
-	}
-	items := make([]item, 0, countCopies(accounts, storages))
-	for address, entry := range accounts {
-		items = append(items, item{kind: accountEntryKind, address: address, entry: entry})
-	}
-	for address, slots := range storages {
-		for slot, entry := range slots {
-			items = append(items, item{kind: storageEntryKind, address: address, slot: slot, entry: entry})
-		}
-	}
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].kind != items[j].kind {
-			return items[i].kind < items[j].kind
-		}
-		if cmp := bytes.Compare(items[i].address[:], items[j].address[:]); cmp != 0 {
-			return cmp < 0
-		}
-		return bytes.Compare(items[i].slot[:], items[j].slot[:]) < 0
-	})
+func (c *CacheTrie) swmtRootLocked(root common.Hash) common.Hash {
+	return swmtRootFromDigest(root, c.liveDigest, len(c.accounts), c.storageSize)
+}
+
+func swmtRootFromDigest(root common.Hash, digest common.Hash, accounts int, storages int) common.Hash {
 	hasher := crypto.NewKeccakState()
+	hasher.Write([]byte("cachetrie-swmt-v2"))
 	hasher.Write(root[:])
+	hasher.Write(digest[:])
 	var scratch [8]byte
-	for _, item := range items {
-		hasher.Write([]byte{item.kind})
-		hasher.Write(item.address[:])
-		if item.kind == storageEntryKind {
-			hasher.Write(item.slot[:])
+	binary.BigEndian.PutUint64(scratch[:], uint64(accounts))
+	hasher.Write(scratch[:])
+	binary.BigEndian.PutUint64(scratch[:], uint64(storages))
+	hasher.Write(scratch[:])
+	var out common.Hash
+	hasher.Read(out[:])
+	return out
+}
+
+func leafDigest(kind byte, address common.Address, slot common.Hash, item entry) common.Hash {
+	hasher := crypto.NewKeccakState()
+	hasher.Write([]byte{kind})
+	hasher.Write(address[:])
+	if kind == storageEntryKind {
+		hasher.Write(slot[:])
+	}
+	if item.deleted {
+		hasher.Write([]byte{1})
+	} else {
+		hasher.Write([]byte{0})
+	}
+	var scratch [8]byte
+	binary.BigEndian.PutUint64(scratch[:], item.block)
+	hasher.Write(scratch[:])
+	if kind == accountEntryKind {
+		if item.account != nil {
+			hasher.Write(types.SlimAccountRLP(*item.account))
 		}
-		if item.entry.deleted {
-			hasher.Write([]byte{1})
-		} else {
-			hasher.Write([]byte{0})
-		}
-		binary.BigEndian.PutUint64(scratch[:], item.entry.block)
-		hasher.Write(scratch[:])
-		if item.kind == accountEntryKind {
-			if item.entry.account != nil {
-				hasher.Write(types.SlimAccountRLP(*item.entry.account))
-			}
-		} else {
-			hasher.Write(item.entry.storage[:])
-		}
+	} else {
+		hasher.Write(item.storage[:])
 	}
 	var out common.Hash
 	hasher.Read(out[:])
 	return out
+}
+
+func xorHash(dst *common.Hash, value common.Hash) {
+	for i := range dst {
+		dst[i] ^= value[i]
+	}
+}
+
+func swmtRootFromCopies(root common.Hash, accounts map[common.Address]entry, storages map[common.Address]map[common.Hash]entry) common.Hash {
+	var digest common.Hash
+	for address, item := range accounts {
+		xorHash(&digest, leafDigest(accountEntryKind, address, common.Hash{}, item))
+	}
+	storageCount := 0
+	for address, slots := range storages {
+		for slot, item := range slots {
+			xorHash(&digest, leafDigest(storageEntryKind, address, slot, item))
+			storageCount++
+		}
+	}
+	return swmtRootFromDigest(root, digest, len(accounts), storageCount)
 }
 
 // Stats returns a snapshot of cache counters and sizes.
@@ -641,6 +866,7 @@ func (c *CacheTrie) Stats() Stats {
 
 	return Stats{
 		Root:               c.root,
+		SWMTRoot:           c.swmtRootLocked(c.root),
 		Accounts:           len(c.accounts),
 		Storages:           c.storageCountLocked(),
 		LowWatermark:       c.low,
@@ -650,17 +876,36 @@ func (c *CacheTrie) Stats() Stats {
 		Pipeline:           c.pipelineStarted,
 		PendingBits:        c.pendingBitsLocked(),
 		PendingInputs:      c.pendingInputsLocked(),
-		AccountHits:        c.accountHits,
-		AccountMisses:      c.accountMisses,
-		StorageHits:        c.storageHits,
-		StorageMisses:      c.storageMisses,
+		AccountHits:        c.accountHits.Load(),
+		AccountMisses:      c.accountMisses.Load(),
+		StorageHits:        c.storageHits.Load(),
+		StorageMisses:      c.storageMisses.Load(),
 		Updates:            c.updates,
 		Deletes:            c.deletes,
 		CleanupCount:       c.cleanupCount,
+		CleanupItems:       c.cleanupItems,
 		CleanupElapsed:     c.cleanupElapsed,
 		CleanupMaxElapsed:  c.cleanupMaxElapsed,
 		LastCleanupRemoved: c.lastCleanupRemoved,
+		MergeCount:         c.mergeCount,
+		MergeInputs:        c.mergeInputs,
+		MergeElapsed:       c.mergeElapsed,
+		MergeErrors:        c.mergeErrors,
+		WriteWaitCount:     c.writeWaitCount,
+		WriteWaitElapsed:   c.writeWaitElapsed,
+		RootCount:          c.rootCount,
+		RootElapsed:        c.rootElapsed,
+		PublishCount:       c.publishCount,
+		PublishElapsed:     c.publishElapsed,
 	}
+}
+
+func (c *CacheTrie) recordWriteWait(start time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.writeWaitCount++
+	c.writeWaitElapsed += time.Since(start)
 }
 
 func (c *CacheTrie) mergeWaitLocked() chan struct{} {
@@ -767,10 +1012,16 @@ func (c *CacheTrie) selectPendingLocked(forceOne bool) (uint32, []MergeInput) {
 func (c *CacheTrie) mergeInputsForBitLocked(bit uint8) []MergeInput {
 	var inputs []MergeInput
 	mask := bitMask(bit)
-	for address, item := range c.accounts {
+	accountInputs := make(map[common.Address]struct{})
+	for address := range c.accountWindows[bit] {
+		item, ok := c.accounts[address]
+		if !ok {
+			continue
+		}
 		if item.window != mask {
 			continue
 		}
+		accountInputs[address] = struct{}{}
 		inputs = append(inputs, MergeInput{
 			Type:      AccountState,
 			Address:   address,
@@ -779,21 +1030,37 @@ func (c *CacheTrie) mergeInputsForBitLocked(bit uint8) []MergeInput {
 			Tombstone: item.deleted,
 		})
 	}
-	for address, slots := range c.storages {
-		for slot, item := range slots {
-			if item.window != mask {
-				continue
-			}
-			key := slot
-			inputs = append(inputs, MergeInput{
-				Type:       StorageState,
-				Address:    address,
-				StorageKey: &key,
-				SWMTKey:    swmtStorageKey(address, slot),
-				Storage:    item.storage,
-				Tombstone:  item.deleted,
-			})
+	for key := range c.storageWindows[bit] {
+		slots := c.storages[key.address]
+		if slots == nil {
+			continue
 		}
+		item, ok := slots[key.slot]
+		if !ok || item.window != mask {
+			continue
+		}
+		if item.account != nil {
+			if _, ok := accountInputs[key.address]; !ok {
+				accountInputs[key.address] = struct{}{}
+				inputs = append(inputs, MergeInput{
+					Type:       AccountState,
+					Address:    key.address,
+					SWMTKey:    swmtAccountKey(key.address),
+					Account:    copyAccount(item.account),
+					Tombstone:  false,
+					Dependency: true,
+				})
+			}
+		}
+		slot := key.slot
+		inputs = append(inputs, MergeInput{
+			Type:       StorageState,
+			Address:    key.address,
+			StorageKey: &slot,
+			SWMTKey:    swmtStorageKey(key.address, slot),
+			Storage:    item.storage,
+			Tombstone:  item.deleted,
+		})
 	}
 	sort.Slice(inputs, func(i, j int) bool {
 		return bytes.Compare(inputs[i].SWMTKey, inputs[j].SWMTKey) < 0
@@ -813,6 +1080,7 @@ func (c *CacheTrie) startMergeLocked(bits uint32, inputs []MergeInput) {
 	block := c.block
 	mergeFn := c.mergeFn
 	go func() {
+		start := time.Now()
 		resultRoot := root
 		var err error
 		if mergeFn != nil {
@@ -823,6 +1091,12 @@ func (c *CacheTrie) startMergeLocked(bits uint32, inputs []MergeInput) {
 			round.resultRoot = resultRoot
 			round.err = err
 			round.complete = true
+			c.mergeCount++
+			c.mergeInputs += uint64(len(copied))
+			c.mergeElapsed += time.Since(start)
+			if err != nil {
+				c.mergeErrors++
+			}
 		}
 		c.mu.Unlock()
 		close(round.done)
@@ -832,21 +1106,35 @@ func (c *CacheTrie) startMergeLocked(bits uint32, inputs []MergeInput) {
 func (c *CacheTrie) pruneMergedLocked(bits uint32) {
 	start := time.Now()
 	removed := 0
-	for address, item := range c.accounts {
-		if item.window != 0 && item.window&bits != 0 && item.window&^bits == 0 {
-			delete(c.accounts, address)
-			removed++
+	for bit := uint8(0); bit < windowBitCount; bit++ {
+		if bits&bitMask(bit) == 0 {
+			continue
 		}
-	}
-	for address, slots := range c.storages {
-		for slot, item := range slots {
+		for address := range c.accountWindows[bit] {
+			item, ok := c.accounts[address]
+			if !ok {
+				continue
+			}
 			if item.window != 0 && item.window&bits != 0 && item.window&^bits == 0 {
-				delete(slots, slot)
-				removed++
+				if c.removeAccountLocked(address) {
+					removed++
+				}
 			}
 		}
-		if len(slots) == 0 {
-			delete(c.storages, address)
+		for key := range c.storageWindows[bit] {
+			slots := c.storages[key.address]
+			if slots == nil {
+				continue
+			}
+			item, ok := slots[key.slot]
+			if !ok {
+				continue
+			}
+			if item.window != 0 && item.window&bits != 0 && item.window&^bits == 0 {
+				if c.removeStorageLocked(key.address, key.slot) {
+					removed++
+				}
+			}
 		}
 	}
 	c.advanceStartBitLocked(bits)
@@ -856,6 +1144,7 @@ func (c *CacheTrie) pruneMergedLocked(bits uint32) {
 	}
 	elapsed := time.Since(start)
 	c.cleanupCount++
+	c.cleanupItems += uint64(removed)
 	c.cleanupElapsed += elapsed
 	if elapsed > c.cleanupMaxElapsed {
 		c.cleanupMaxElapsed = elapsed
@@ -871,6 +1160,18 @@ func (c *CacheTrie) advanceStartBitLocked(bits uint32) {
 	}
 }
 
+func (c *CacheTrie) storageAccountSnapshotLocked(address common.Address, accounts map[common.Address]*types.StateAccount) *types.StateAccount {
+	if accounts != nil {
+		if account, ok := accounts[address]; ok {
+			return copyAccount(account)
+		}
+	}
+	if item, ok := c.accounts[address]; ok && !item.deleted {
+		return copyAccount(item.account)
+	}
+	return nil
+}
+
 func (c *CacheTrie) copyLiveLocked() (map[common.Address]entry, map[common.Address]map[common.Hash]entry) {
 	accounts := make(map[common.Address]entry, len(c.accounts))
 	for address, item := range c.accounts {
@@ -881,6 +1182,7 @@ func (c *CacheTrie) copyLiveLocked() (map[common.Address]entry, map[common.Addre
 	for address, slots := range c.storages {
 		copied := make(map[common.Hash]entry, len(slots))
 		for slot, item := range slots {
+			item.account = copyAccount(item.account)
 			copied[slot] = item
 		}
 		storages[address] = copied
@@ -908,11 +1210,17 @@ func (c *CacheTrie) applyPendingToCopiesLocked(accounts map[common.Address]entry
 			bucket = make(map[common.Hash]entry, len(slots))
 			storages[address] = bucket
 		}
+		var account *types.StateAccount
+		if pending, ok := c.pendingAccounts[address]; ok {
+			account = copyAccount(pending)
+		} else if item, ok := accounts[address]; ok && !item.deleted {
+			account = copyAccount(item.account)
+		}
 		for slot, value := range slots {
 			if value == (common.Hash{}) {
-				bucket[slot] = entry{deleted: true, block: block, lastAccess: block, window: mask}
+				bucket[slot] = entry{account: account, deleted: true, block: block, lastAccess: block, window: mask}
 			} else {
-				bucket[slot] = entry{storage: value, block: block, lastAccess: block, window: mask}
+				bucket[slot] = entry{account: account, storage: value, block: block, lastAccess: block, window: mask}
 			}
 		}
 	}
@@ -952,15 +1260,11 @@ func (c *CacheTrie) updateSizeMetricsLocked() {
 }
 
 func (c *CacheTrie) countLocked() int {
-	return len(c.accounts) + c.storageCountLocked()
+	return len(c.accounts) + c.storageSize
 }
 
 func (c *CacheTrie) storageCountLocked() int {
-	count := 0
-	for _, slots := range c.storages {
-		count += len(slots)
-	}
-	return count
+	return c.storageSize
 }
 
 func (c *CacheTrie) pendingBitsLocked() uint32 {
@@ -1044,6 +1348,13 @@ func bitForBlock(block uint64) uint8 {
 
 func bitMask(bit uint8) uint32 {
 	return 1 << bit
+}
+
+func windowIndex(mask uint32) (uint8, bool) {
+	if mask == 0 || mask&(mask-1) != 0 {
+		return 0, false
+	}
+	return uint8(bits.TrailingZeros32(mask)), true
 }
 
 func nextBit(bit uint8) uint8 {

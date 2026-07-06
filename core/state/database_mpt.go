@@ -156,6 +156,12 @@ func (db *MPTDatabase) setCacheTrieBlock(block uint64) {
 	}
 }
 
+func (db *MPTDatabase) waitCacheTrieMerge() {
+	if cache := db.triedb.CacheTrie(); cache != nil {
+		cache.WaitForMerge()
+	}
+}
+
 func (db *MPTDatabase) beginCacheTrieBlock(block uint64, origin common.Hash) {
 	if cache := db.triedb.CacheTrie(); cache != nil {
 		cache.Begin(block, origin)
@@ -293,6 +299,16 @@ func (db *MPTDatabase) mergeCacheTrieInputs(root common.Hash, block uint64, inpu
 	}
 	statedb.SetBlockNum(block)
 	for _, input := range inputs {
+		if input.Type != cachetrie.AccountState {
+			continue
+		}
+		if input.Dependency {
+			statedb.ensureCacheTrieMergeAccount(input.Address, input.Account)
+		} else {
+			statedb.setCacheTrieMergeAccount(input.Address, input.Account, input.Tombstone)
+		}
+	}
+	for _, input := range inputs {
 		if input.Type != cachetrie.StorageState || input.StorageKey == nil {
 			continue
 		}
@@ -301,12 +317,6 @@ func (db *MPTDatabase) mergeCacheTrieInputs(root common.Hash, block uint64, inpu
 			value = input.Storage
 		}
 		statedb.SetState(input.Address, *input.StorageKey, value)
-	}
-	for _, input := range inputs {
-		if input.Type != cachetrie.AccountState {
-			continue
-		}
-		statedb.setCacheTrieMergeAccount(input.Address, input.Account, input.Tombstone)
 	}
 	return statedb.Commit(block, true, false)
 }

@@ -222,25 +222,30 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if err != nil {
 		return nil, err
 	}
+	if config.CacheTrieDualRootExperiment && !config.CacheTrie {
+		return nil, fmt.Errorf("cachetrie dual-root experiment requires cachetrie to be enabled")
+	}
 	var (
 		options = &core.BlockChainConfig{
-			TrieCleanLimit:          config.TrieCleanCache,
-			NoPrefetch:              config.NoPrefetch,
-			TrieDirtyLimit:          config.TrieDirtyCache,
-			ArchiveMode:             config.NoPruning,
-			TrieTimeLimit:           config.TrieTimeout,
-			SnapshotLimit:           config.SnapshotCache,
-			Preimages:               config.Preimages,
-			StateHistory:            config.StateHistory,
-			TrienodeHistory:         config.TrienodeHistory,
-			NodeFullValueCheckpoint: config.NodeFullValueCheckpoint,
-			BinTrieGroupDepth:       config.BinTrieGroupDepth,
-			CacheTrie:               config.CacheTrie,
-			CacheTrieWindow:         config.CacheTrieWindow,
-			CacheTrieMaxItems:       config.CacheTrieMaxItems,
-			StateScheme:             scheme,
-			HistoryPolicy:           histPolicy,
-			TxLookupLimit:           int64(min(config.TransactionHistory, math.MaxInt64)),
+			TrieCleanLimit:              config.TrieCleanCache,
+			NoPrefetch:                  config.NoPrefetch,
+			TrieDirtyLimit:              config.TrieDirtyCache,
+			ArchiveMode:                 config.NoPruning,
+			TrieTimeLimit:               config.TrieTimeout,
+			SnapshotLimit:               config.SnapshotCache,
+			Preimages:                   config.Preimages,
+			StateHistory:                config.StateHistory,
+			TrienodeHistory:             config.TrienodeHistory,
+			NodeFullValueCheckpoint:     config.NodeFullValueCheckpoint,
+			BinTrieGroupDepth:           config.BinTrieGroupDepth,
+			CacheTrie:                   config.CacheTrie,
+			CacheTrieWindow:             config.CacheTrieWindow,
+			CacheTrieMaxItems:           config.CacheTrieMaxItems,
+			CacheTrieLowWatermark:       config.CacheTrieLowWatermark,
+			CacheTrieDualRootExperiment: config.CacheTrieDualRootExperiment,
+			StateScheme:                 scheme,
+			HistoryPolicy:               histPolicy,
+			TxLookupLimit:               int64(min(config.TransactionHistory, math.MaxInt64)),
 			VmConfig: vm.Config{
 				EnablePreimageRecording: config.EnablePreimageRecording,
 			},

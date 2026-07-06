@@ -19,12 +19,14 @@ package state
 import (
 	"testing"
 
+	"github.com/ethereum/go-ethereum/cachetrie"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/holiman/uint256"
 )
 
 func TestCacheTrieStateDBCommitRead(t *testing.T) {
@@ -108,6 +110,85 @@ func TestCacheTrieStateDBCommitRead(t *testing.T) {
 	}
 }
 
+func TestCacheTrieAsyncCommitReadWithoutForegroundMPT(t *testing.T) {
+	disk := rawdb.NewMemoryDatabase()
+	tdb := triedb.NewDatabase(disk, &triedb.Config{
+		CacheTrie:         true,
+		CacheTrieWindow:   16,
+		CacheTrieMaxItems: 128,
+	})
+	db := NewDatabase(tdb, nil)
+
+	addr := common.HexToAddress("0x1212121212121212121212121212121212121212")
+	key := common.HexToHash("0x01")
+	value := common.HexToHash("0x02")
+
+	state, err := New(types.EmptyRootHash, db)
+	if err != nil {
+		t.Fatalf("failed to create state: %v", err)
+	}
+	state.SetBlockNum(1)
+	state.SetCacheTrieAsync(true)
+	state.CreateAccount(addr)
+	state.SetNonce(addr, 1, tracing.NonceChangeUnspecified)
+	state.SetState(addr, key, value)
+
+	root, err := state.Commit(1, true, true)
+	if err != nil {
+		t.Fatalf("failed to commit async state: %v", err)
+	}
+	if root != types.EmptyRootHash {
+		t.Fatalf("async commit should not advance backing MPT root before merge: have %x", root)
+	}
+	if state.AccountCommits != 0 || state.StorageCommits != 0 || state.AccountHashes != 0 {
+		t.Fatalf("async commit unexpectedly used foreground MPT path: accountCommit=%s storageCommit=%s accountHash=%s", state.AccountCommits, state.StorageCommits, state.AccountHashes)
+	}
+
+	next, err := New(root, db)
+	if err != nil {
+		t.Fatalf("failed to create next state: %v", err)
+	}
+	if got := next.GetNonce(addr); got != 1 {
+		t.Fatalf("nonce mismatch: have %d, want 1", got)
+	}
+	if got := next.GetState(addr, key); got != value {
+		t.Fatalf("storage mismatch: have %x, want %x", got, value)
+	}
+
+	noCache := readNoCacheAccount(t, db.(*MPTDatabase), root, addr)
+	if noCache != nil {
+		t.Fatal("foreground async commit unexpectedly wrote account into backing MPT")
+	}
+	stats := tdb.CacheTrie().Stats()
+	if stats.Accounts != 1 || stats.Storages != 1 {
+		t.Fatalf("cachetrie write set mismatch: accounts=%d storages=%d", stats.Accounts, stats.Storages)
+	}
+}
+
+func TestCacheTrieIntermediateRootDoesNotStageWithoutAsync(t *testing.T) {
+	disk := rawdb.NewMemoryDatabase()
+	tdb := triedb.NewDatabase(disk, &triedb.Config{
+		CacheTrie:         true,
+		CacheTrieWindow:   16,
+		CacheTrieMaxItems: 128,
+	})
+	db := NewDatabase(tdb, nil)
+	addr := common.HexToAddress("0x1111111111111111111111111111111111111111")
+
+	state, err := New(types.EmptyRootHash, db)
+	if err != nil {
+		t.Fatalf("failed to create state: %v", err)
+	}
+	state.SetBlockNum(1)
+	state.CreateAccount(addr)
+	state.SetNonce(addr, 1, tracing.NonceChangeUnspecified)
+	state.IntermediateRoot(true)
+
+	if stats := tdb.CacheTrie().Stats(); stats.PendingInputs != 0 || stats.Accounts != 0 {
+		t.Fatalf("non-async intermediate root staged cachetrie writes: %+v", stats)
+	}
+}
+
 func TestCacheTrieAsyncCommitMergesBackingMPTOnWatermark(t *testing.T) {
 	disk := rawdb.NewMemoryDatabase()
 	tdb := triedb.NewDatabase(disk, &triedb.Config{
@@ -155,6 +236,128 @@ func TestCacheTrieAsyncCommitMergesBackingMPTOnWatermark(t *testing.T) {
 	}
 	if nonce := readNonce(t, db, root, addr3); nonce != 3 {
 		t.Fatalf("live SWMT account 3 not readable after prune: have nonce %d", nonce)
+	}
+}
+
+func TestCacheTrieMergePreservesBackingStorageRoot(t *testing.T) {
+	disk := rawdb.NewMemoryDatabase()
+	tdb := triedb.NewDatabase(disk, &triedb.Config{CacheTrie: true})
+	db := NewMPTDatabase(tdb, nil)
+
+	addr := common.HexToAddress("0x4444444444444444444444444444444444444444")
+	slot := common.HexToHash("0x01")
+	value := common.HexToHash("0x02")
+	unmaterializedRoot := common.HexToHash("0x1234")
+	account := types.NewEmptyStateAccount()
+	account.Nonce = 7
+	account.Root = unmaterializedRoot
+
+	root, err := db.mergeCacheTrieInputs(types.EmptyRootHash, 1, []cachetrie.MergeInput{
+		{
+			Type:       cachetrie.StorageState,
+			Address:    addr,
+			StorageKey: &slot,
+			Storage:    value,
+		},
+		{
+			Type:    cachetrie.AccountState,
+			Address: addr,
+			Account: account,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to merge cachetrie inputs: %v", err)
+	}
+	reader, err := (&mptNoCacheDatabase{db: db}).Reader(root)
+	if err != nil {
+		t.Fatalf("failed to create no-cache reader: %v", err)
+	}
+	mergedAccount, err := reader.Account(addr)
+	if err != nil {
+		t.Fatalf("failed to read merged account: %v", err)
+	}
+	if mergedAccount == nil {
+		t.Fatal("merged account missing")
+	}
+	if mergedAccount.Nonce != account.Nonce {
+		t.Fatalf("merged nonce mismatch: have %d, want %d", mergedAccount.Nonce, account.Nonce)
+	}
+	if mergedAccount.Root == unmaterializedRoot {
+		t.Fatalf("merge wrote unmaterialized SWMT storage root %x into backing MPT", unmaterializedRoot)
+	}
+	mergedStorage, err := reader.Storage(addr, slot)
+	if err != nil {
+		t.Fatalf("failed to read merged storage: %v", err)
+	}
+	if mergedStorage != value {
+		t.Fatalf("merged storage mismatch: have %x, want %x", mergedStorage, value)
+	}
+}
+
+func TestCacheTrieStorageDependencyDoesNotOverwriteBackingAccount(t *testing.T) {
+	disk := rawdb.NewMemoryDatabase()
+	tdb := triedb.NewDatabase(disk, &triedb.Config{CacheTrie: true})
+	db := NewMPTDatabase(tdb, nil)
+
+	addr := common.HexToAddress("0x5555555555555555555555555555555555555555")
+	slot := common.HexToHash("0x01")
+	value := common.HexToHash("0x02")
+
+	state, err := New(types.EmptyRootHash, db)
+	if err != nil {
+		t.Fatalf("failed to create state: %v", err)
+	}
+	state.CreateAccount(addr)
+	state.SetNonce(addr, 2, tracing.NonceChangeUnspecified)
+	state.SetBalance(addr, uint256.NewInt(10), tracing.BalanceChangeUnspecified)
+	root, err := state.Commit(1, true, false)
+	if err != nil {
+		t.Fatalf("failed to commit seed account: %v", err)
+	}
+
+	staleAccount := types.NewEmptyStateAccount()
+	staleAccount.Nonce = 1
+	staleAccount.Balance = uint256.NewInt(1)
+	root, err = db.mergeCacheTrieInputs(root, 2, []cachetrie.MergeInput{
+		{
+			Type:       cachetrie.AccountState,
+			Address:    addr,
+			Account:    staleAccount,
+			Dependency: true,
+		},
+		{
+			Type:       cachetrie.StorageState,
+			Address:    addr,
+			StorageKey: &slot,
+			Storage:    value,
+		},
+	})
+	if err != nil {
+		t.Fatalf("failed to merge dependency input: %v", err)
+	}
+	reader, err := (&mptNoCacheDatabase{db: db}).Reader(root)
+	if err != nil {
+		t.Fatalf("failed to create no-cache reader: %v", err)
+	}
+	account, err := reader.Account(addr)
+	if err != nil {
+		t.Fatalf("failed to read merged account: %v", err)
+	}
+	if account == nil {
+		t.Fatal("merged account missing")
+	}
+	if account.Nonce != 2 {
+		t.Fatalf("dependency overwrote nonce: have %d want 2", account.Nonce)
+	}
+	if account.Balance.Cmp(uint256.NewInt(10)) != 0 {
+		t.Fatalf("dependency overwrote balance: have %s want 10", account.Balance)
+	}
+	mergedStorage, err := reader.Storage(addr, slot)
+	if err != nil {
+		t.Fatalf("failed to read merged storage: %v", err)
+	}
+	if mergedStorage != value {
+		t.Fatalf("merged storage mismatch: have %x, want %x", mergedStorage, value)
 	}
 }
 

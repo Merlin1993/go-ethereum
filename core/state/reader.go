@@ -384,14 +384,33 @@ func newMultiStateReader(readers ...StateReader) (*multiStateReader, error) {
 // - The returned account is safe to modify after the call
 func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, error) {
 	var errs []error
-	for _, reader := range r.readers {
+	for i, reader := range r.readers {
 		acct, err := reader.Account(addr)
 		if err == nil {
+			if acct != nil {
+				if _, ok := reader.(*cacheTrieReader); ok {
+					acct.Root = r.backingAccountRoot(addr, i+1)
+				}
+			}
 			return acct, nil
 		}
 		errs = append(errs, err)
 	}
 	return nil, errors.Join(errs...)
+}
+
+func (r *multiStateReader) backingAccountRoot(addr common.Address, start int) common.Hash {
+	for _, reader := range r.readers[start:] {
+		acct, err := reader.Account(addr)
+		if err != nil {
+			continue
+		}
+		if acct == nil {
+			return types.EmptyRootHash
+		}
+		return acct.Root
+	}
+	return types.EmptyRootHash
 }
 
 // Storage implementing StateReader interface, retrieving the storage slot
@@ -403,9 +422,9 @@ func (r *multiStateReader) Account(addr common.Address) (*types.StateAccount, er
 func (r *multiStateReader) Storage(addr common.Address, slot common.Hash) (common.Hash, error) {
 	var errs []error
 	for _, reader := range r.readers {
-		slot, err := reader.Storage(addr, slot)
+		value, err := reader.Storage(addr, slot)
 		if err == nil {
-			return slot, nil
+			return value, nil
 		}
 		errs = append(errs, err)
 	}
@@ -454,17 +473,25 @@ func (r *stateReaderWithCache) account(addr common.Address) (*types.StateAccount
 	acct, ok := r.accounts[addr]
 	r.accountLock.RUnlock()
 	if ok {
-		return acct, true, nil
+		return copyCachedAccount(acct), true, nil
 	}
 	// Try to resolve the requested account from the underlying reader
 	acct, err := r.StateReader.Account(addr)
 	if err != nil {
 		return nil, false, err
 	}
+	acct = copyCachedAccount(acct)
 	r.accountLock.Lock()
 	r.accounts[addr] = acct
 	r.accountLock.Unlock()
-	return acct, false, nil
+	return copyCachedAccount(acct), false, nil
+}
+
+func copyCachedAccount(acct *types.StateAccount) *types.StateAccount {
+	if acct == nil {
+		return nil
+	}
+	return acct.Copy()
 }
 
 // Account implements StateReader, retrieving the account specified by the address.
