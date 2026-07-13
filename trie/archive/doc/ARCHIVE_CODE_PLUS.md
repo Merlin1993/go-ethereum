@@ -79,12 +79,12 @@ Trie.PruneNextShard
      2. 当前 epoch leaf 保持热状态
      3. 过期 leaf 转成 ArchivedKV{absolutePath,valueRef}
      4. cold items 沿路径向上查找可吸收 bucket
-     5. 如果路径上有相邻 bucket 或未满 leaf bucket，直接合入该 bucket
+     5. 如果路径上有相邻 bucket 或未满 leaf bucket，且合并后不超 cap，直接合入该 bucket
      6. 否则先放入 shard archive root 的聚合池
      7. shard archive 完成后，统一处理 root 聚合池:
         a. item 数不足 bucket cap，形成一个 root 小 bucket
-        b. item 数超过 bucket cap，按 key 排序切成多个尽量满的 bucket
-        c. 满 bucket 按各自公共前缀下放，成为 archive leaf bucket / subtree
+        b. item 数超过 bucket cap，按 key 排序后下放
+        c. 下放过程按公共前缀形成不超 cap 的 archive leaf bucket / subtree
 ```
 
 这个策略把小桶聚合推迟到 shard archive 结束时统一处理，避免沿路径长期累积大量
@@ -144,6 +144,11 @@ Trie.Commit
 | `EnablePathDiagnostics` | 是否记录 path/cache 诊断 |
 | `PhysicalDelete` | 是否物理删除过期节点 |
 
+当前没有为“路径吸收 / root 聚合 / 满桶下放”新增开关；它们属于归档语义。
+实验只需要调 `ArchiveBucketSize`、`AsyncPrune`、缓存和诊断开关。
+bucket 放置的 20% / 70% / 80% / 95% 阈值同样属于归档语义，按
+`ResolveArchiveBucketSize()` 派生，不作为实验数据可调旋钮。
+
 ## 不变量
 
 * 一个 key 只能在一个位置：热 leaf 或冷 bucket。
@@ -178,6 +183,10 @@ Trie.Commit
 * 冷读命中条件是：bucket path 匹配、filter 未排除、entry suffix 精确匹配。
 * 返回真实 value 前必须从 flat value store / snapshot reader 取值，并校验 `valueRef == H(key,value)`。
 * Cuckoo false positive 只能增加一次精确匹配成本，不能变成真实命中。
+* Cuckoo filter 不能产生 false negative；如果构建、合并或增量 append 时 filter 插入失败，必须丢弃该 bucket 的 filter，
+  让读写路径退化为扫描 `Keys` 做精确匹配，不能保存半成品 filter。
+* 同一个完整 key 在 archive bucket 中只能有一个 membership。重建 bucket、合并 stub、吸收新归档 item 时如果发现重复 key，
+  优先保留与当前 flat value 的 `valueRef` 匹配的条目；没有可读 flat value 时才保留后到条目作为保守兜底。
 * 完整 ECMH 重算属于 proof / diagnostics 层；普通执行读可以只做目标 entry 的 `valueRef` 校验。
 
 ### Archive Build
@@ -187,18 +196,79 @@ Trie.Commit
 * `ArchiveBucketSize` 是硬上限；构建、合并、追加后都不能持久化超限 bucket。
 * shard archive 期间，归档 item 优先沿路径向上合入相邻 bucket 或未满 leaf bucket。
 * 找不到可吸收 bucket 的 item，先进入 shard archive root 聚合池。
-* root 聚合池不足 `ArchiveBucketSize` 时，保留为一个 root 小 bucket。
-* root 聚合池超过 `ArchiveBucketSize` 时，必须按 key 排序，切成多个尽量满且前缀最聚合的 bucket，再下放为 archive leaf bucket / subtree。
+* root 聚合池不足 `ArchiveBucketSize` 时，先按 root 聚合阈值判断：低于 70% cap 可保留为 root leaf bucket；达到 70% cap 后进入 root/internal 的单一 root stub。
+* shard root 上的 `StubList` 不是普通 list 语义；它最多只能保留一个聚合 stub bucket。多个 sibling root stub bucket 说明 root 聚合没有合并，是实现问题。
+* root stub 合并应优先走 bucket 级盲合并：只重写 bucket key/filter/ECMH 元数据，不读取真实 value，也不先把所有 bucket 展开成 root pool items。
+* root 聚合池或 root stub 总量超过 `ArchiveBucketSize` 时，必须按 key 重新分裂：达到 95% cap 或为了让 root 余量不超 cap 的分支下沉到 child edge，剩余小分支最多合成一个 root stub。
+* 只有当 root stub 溢出且无法按 bucket path 直接下沉时，才退回到 key 级分裂；这是纠正跨分支 root bucket 的必要成本，不应成为普通 root 合并路径。
+* promotion、redeem/delete、普通写入把 archive bucket 撞开、sparse child 上升等路径把 bucket 返回 root 时，也必须走同一套 root 单 stub 聚合/分裂逻辑；不能只调用廉价的 `attachStubs`，否则历史 tiny root stub 会绕开合并。
 
 ### Bucket Placement
 
-* bucket 优先作为 archive leaf bucket 存在；不要让大量小 bucket 长期侧挂在路径上。
-* 路径上已有相邻 bucket 或未满 leaf bucket 时，新归档 item 应直接合入，减少 root 聚合池压力。
-* root 聚合池只作为本 shard 本轮 archive 的临时聚合位置。
-* 已下放的 archive bucket / subtree，不因 item 数偏小回流到 root 聚合池或路径侧挂池。
-* root 聚合池满桶切分后，必须按绝对 path 下放到普通 child edge。
+Archive bucket 在 ASCT Plus 中按三段式状态机移动：
+
+```text
+root leaf bucket
+  -- count >= 70% cap --> root single stub
+
+root single stub
+  -- count <= cap --> 留在 shard root 作为唯一 root stub
+  -- count > cap --> 按 key split；成熟分支或为控制 root 余量必须下沉的分支进入 child-edge
+
+internal non-root StubList bucket
+  -- count >= 95% cap 且 bucket.PathBits > nodePathBits --> child-edge archive bucket
+  -- count >= 95% cap 但公共前缀与当前 internal node 重合 --> 继续留在 StubList
+
+child-edge archive bucket
+  -- promotion/delete 后 count < 80% cap --> 回到父 internal node 的 StubList
+
+internal StubList bucket
+  -- promotion/delete 后 count < 20% cap --> 回流到 root 聚合
+```
+
+这些阈值用 `ResolveArchiveBucketSize()` 计算。当前实验参数 `CuckooBuckets=16, CuckooSlots=4`
+时有效 cap 为 60，因此 20%/70%/80%/95% 分别是 12/42/48/57。
+
+* 路径上已有相邻 bucket 或未满 bucket 时，新归档 item 应优先合入，减少 root 聚合池压力。
+* root 聚合池是小冷数据的最终兜底聚合点，但它在 shard root 上只能表现为一个 root leaf bucket 或一个 root single stub，不能表现为多个 root sibling stub。
+* root single stub 在 cap 内继续盲合并；超过 cap 后才触发 split/downsink，不应每次 normalize 都拆成 items 重包。
+* 非 root `StubList` 是中间聚合层；达到 95% cap 且存在合法 child bit 时，才能下沉为普通 child edge archive bucket。
+* child edge 上的 bucket 是稳定形态；赎回或删除导致低于 80% cap 时，回到父节点 `StubList`，等待继续合并。
+* internal `StubList` 中的 bucket 继续变小并低于 20% cap 时，回流到 root 聚合，避免在深路径形成个位数 bucket 下挂。
+* root 聚合池满桶切分后，必须按绝对 path 切分；第一层产生的低载分支可以回到 root，但只能合成一个 root stub。如果低载分支合计仍超过 cap，就必须继续选择分支下沉，不能形成 root stub list。
+* root `StubList` 的整体重打包只处理当前 shard root 上的侧挂 bucket，不遍历整棵 archive tree；它的目标是把历史遗留或局部回流造成的大量 tiny root stub 合成一个 root 余量，并把溢出部分下沉。
+* root internal node 自身存在压缩 `Path` 时，root 重打包和 promoted-stub 回流都必须按 `shardPrefix + root.Path` 作为当前 node path 判断下沉；不能只用 shard prefix。
+* 如果待重打包的归档 key 在压缩 `root.Path` 中途分叉，必须先把 root 扩展到两者的共同祖先，再从该祖先按 key 分组；不匹配当前压缩 path 的 item 不能作为 fallback 原样保留成超 cap 的 root stub。
 * 如果目标 child 同时包含热节点和冷 bucket，必须重建在同一棵 child subtree 内，不能把冷桶挂到热 leaf 上。
-* bucket 下沉只改变物理放置，不改变 `valueRef`、filter、ECMH 或 flat value 语义。
+* bucket 上升/下沉只改变物理放置，不改变 `valueRef`、filter、ECMH 或 flat value 语义。
+* 放置判断只发生在本次 prune/promotion/delete 触达的局部路径上；不能为了判断迁移而全局遍历所有 bucket。对 archive-only child 的计数必须有界，达到阈值即可停止。
+
+#### Shard root 聚合边界
+
+当前实现里的 `root leaf bucket` 和 `root StubList` 都是 shard root 级别，不是全局 ASCT root 级别。`ShardDepth=20`
+时全局 key 空间先被切成 1,048,576 个 shard，每个 shard 独立执行 root 聚合、StubList 聚合和 child-edge 下沉。
+
+因此如果某个统计窗口只有少量归档 item，并且这些 item 分散在大量 shard 中，即使 `MaxBucketsPath=1`，也可能出现
+`BucketItemsAvg/P95` 接近 1 的结果。这类结果可能是 per-shard 聚合边界造成的结构性下限，也可能是 root `StubList`
+缺少整体重打包造成的代码问题，必须结合 root leaf/root stub 的拆分统计判断，不能只看全局平均。
+
+这类情况必须用拆分后的统计判断：
+
+```text
+RootBuckets = RootLeafBuckets + RootStubBuckets
+```
+
+如果 `RootLeafBuckets/RootLeafItems` 占主导，说明主要问题更可能是 shard 粒度过细或缺少跨 shard/浅层 archive 聚合层。
+如果 `MaxRootStubBuckets > 1` 或 `RootStubBuckets` 长期大量 tiny bucket，则这是 root 聚合实现错误的强信号；root 侧应优先排查单 stub 聚合、溢出 split/downsink、赎回回流和普通写入 normalize。
+如果 `DeepStubBuckets` 长期大量 tiny bucket，则优先排查非 root StubList 的整体重打包、下沉/上升状态机或赎回回流逻辑。
+
+统计口径上，`MaxBucketsPath` 只表示一条顺序 lookup path 上经过多少个带 archive bucket 的节点；
+同一个 `InternalNode.StubList` 里的多个并列 bucket 只算作这个 path 上的一站。`MaxStubListBuckets`、
+`MaxRootStubBuckets` 和 `MaxDeepStubBuckets` 单独表示同一个节点上的侧挂 fanout 压力。修正后的目标是：
+root 上不应出现 64 个 sibling stub bucket；如果统计出现 `MaxRootStubBuckets > 1`，优先按实现 bug 处理。
+
+要让 `BucketItemsAvg/P95` 在 depth20、全局稀疏归档场景下稳定接近 bucket cap，仅靠 shard 内 placement 不够；需要引入
+更浅的 archive routing 层、全局 archive 聚合层，或把 archive 聚合深度和热状态 shard 深度解耦。
 
 ### Path Storage
 
@@ -213,11 +283,19 @@ Trie.Commit
 * `Hash` / `Commit` 必须先等待 pending prune 完成。
 * `Get` / `Put` / `Delete` 作为交易执行读写路径，也必须先等待 pending prune 完成。
 * 异步剪枝只隐藏交易执行前的归档计算耗时，不改变 root 语义或剪枝顺序。
+* replay 统计里，后台归档等待可以按区块时间预算扣减：8s 以内的 async wait 不计入 charged root compute；
+  超过预算的部分必须记录为 `Archive_Wait_Over_Budget` 并打印告警。async archive compute 超过 `MaxPruningMs`
+  时只告警不中断 replay；同步 prune 仍可使用 `MaxPruningMs` 作为硬失败阈值。
+* replay 统计必须把交易执行、`StateDB.PreCommit`、`StateDB.PostCommit`、DB write 和 charged root compute 分开。
+  `PreCommit` 对应 `IntermediateRoot`，属于交易后的状态合入 / trie root 更新阶段，不属于交易执行；
+  因此最大时间异常时优先看 `Max_State_PreCommit_Time_ms`、`Max_Root_DB_Write_Time_ms`
+  和 `Max_Archive_Wait_Over_Budget_ms` 的归因，不能只看总 `State Commit`。
 
 ### Diagnostics
 
 * `Stats`、filter FP sampling、path/cache diagnostics 不能改变 root、bucket placement、promotion 或 prune 结果。
 * 精确统计如果需要遍历持久化冷节点，应使用隔离读取视图，避免污染执行热路径缓存。
+* prune 诊断必须区分：路径吸收 item 数、root pool item 数、root pool 估算 bucket 数。
 
 ## 实验目标
 
@@ -250,7 +328,9 @@ Trie.Commit
 
 * 长尾 commit：`LastCommitDiagnostics().ShardCommitNanos`、`BatchWriteNanos`、`TopTreeNanos`
 * 分片不均：per-shard commit/prune metrics、dirty shard 分布
-* 路径增长：`Stats().MaxBucketsPath`
+* 路径增长：`Stats().MaxBucketsPath`；同节点侧挂压力看 `MaxStubListBuckets/MaxRootStubBuckets/MaxDeepStubBuckets`
 * bucket 聚合：`BucketItemsAvg/P95/P99/Max`
+* root 聚合：`PrunePathAbsorbedItems`、`PruneRootPoolItems`、`PruneRootPoolBuckets`
+* per-prune CSV：`Path_Absorbed_Items`、`Root_Pool_Items`、`Root_Pool_Buckets`
 * 误报：`FalsePositiveCount` 和 filter FP sampling
 * 内存：node cache、commitment point cache、bucket `cachedFilter`、`stagedFlatValues`

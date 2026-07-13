@@ -1,9 +1,12 @@
 package tree
 
 import (
+	"crypto/sha256"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -23,6 +26,10 @@ import (
 // Test configuration
 const (
 	verkleDir = "F:\\trie_stress_data\\verkle"
+
+	verkleRawKeyModeSparse    = "sparse"
+	verkleRawKeyModeStemLocal = "stem-local"
+	verkleRawKeyModeMixed     = "mixed"
 )
 
 var (
@@ -30,7 +37,62 @@ var (
 	verkleStressBatchSize  = flag.Int("verkleStressBatchSize", method1BatchSize, "Items per commit batch in TestTrieStressVerkle")
 	verkleStressEpochItems = flag.Int("verkleStressEpochItems", 1000000, "Items per metrics window in TestTrieStressVerkle")
 	verkleStressBaseDir    = flag.String("verkleStressBaseDir", verkleDir, "Base directory for TestTrieStressVerkle")
+
+	verkleRawStressItems       = flag.Int("verkleRawStressItems", method1TotalData, "Total items to inject in TestTrieStressVerkleRawKV")
+	verkleRawStressBatchSize   = flag.Int("verkleRawStressBatchSize", method1BatchSize, "Items per commit batch in TestTrieStressVerkleRawKV")
+	verkleRawStressEpochItems  = flag.Int("verkleRawStressEpochItems", 1000000, "Items per metrics window in TestTrieStressVerkleRawKV")
+	verkleRawStressBaseDir     = flag.String("verkleRawStressBaseDir", verkleDir, "Base directory for TestTrieStressVerkleRawKV")
+	verkleRawStressKeyMode     = flag.String("verkleRawStressKeyMode", verkleRawKeyModeSparse, "Raw Verkle key mode: sparse, stem-local, or mixed")
+	verkleRawStressUpdateRatio = flag.Int("verkleRawStressUpdateRatio", 100, "Random old-key updates per batch as a percentage of verkleRawStressBatchSize")
 )
+
+func validateVerkleRawKeyMode(mode string) error {
+	switch mode {
+	case verkleRawKeyModeSparse, verkleRawKeyModeStemLocal, verkleRawKeyModeMixed:
+		return nil
+	default:
+		return fmt.Errorf("unsupported raw Verkle key mode %q", mode)
+	}
+}
+
+func generateVerkleRawKey(index int, mode string) []byte {
+	switch mode {
+	case verkleRawKeyModeSparse:
+		key := indexKey(index)
+		return common.CopyBytes(key[:])
+	case verkleRawKeyModeStemLocal:
+		return generateVerkleStemLocalKey("stem-local:", index)
+	case verkleRawKeyModeMixed:
+		if index%5 == 0 {
+			return generateVerkleSparseDomainKey("mixed-sparse:", index/5)
+		}
+		return generateVerkleStemLocalKey("mixed-local:", index-index/5-1)
+	default:
+		panic(fmt.Sprintf("unsupported raw Verkle key mode %q", mode))
+	}
+}
+
+func generateVerkleStemLocalKey(domain string, index int) []byte {
+	stemIndex := index / 256
+	suffix := byte(index % 256)
+	stem := hashDomainIndex(domain, stemIndex)
+	key := make([]byte, 32)
+	copy(key[:31], stem[:31])
+	key[31] = suffix
+	return key
+}
+
+func generateVerkleSparseDomainKey(domain string, index int) []byte {
+	key := hashDomainIndex(domain, index)
+	return common.CopyBytes(key[:])
+}
+
+func hashDomainIndex(domain string, index int) [32]byte {
+	buf := make([]byte, 0, len(domain)+20)
+	buf = append(buf, domain...)
+	buf = strconv.AppendInt(buf, int64(index), 10)
+	return sha256.Sum256(buf)
+}
 
 // TestTrieStressVerkle: batch writes and commit with sliding window updates
 func TestTrieStressVerkle(t *testing.T) {
@@ -154,6 +216,154 @@ func TestTrieStressVerkle(t *testing.T) {
 
 	totalTime := time.Since(totalStart)
 	t.Logf("method 1 completed, total elapsed: %v, final root: %x", totalTime, finalRoot)
+}
+
+// TestTrieStressVerkleRawKV writes raw 32-byte Verkle keys directly. This keeps
+// the benchmark at the KV structure layer instead of the Ethereum storage layout.
+func TestTrieStressVerkleRawKV(t *testing.T) {
+	totalData := *verkleRawStressItems
+	batchPerCommit := *verkleRawStressBatchSize
+	epochItems := *verkleRawStressEpochItems
+	baseDir := *verkleRawStressBaseDir
+	keyMode := *verkleRawStressKeyMode
+	updateRatio := *verkleRawStressUpdateRatio
+	if totalData <= 0 || batchPerCommit <= 0 || epochItems <= 0 {
+		t.Fatalf("verkleRawStressItems, verkleRawStressBatchSize and verkleRawStressEpochItems must all be positive")
+	}
+	if updateRatio < 0 {
+		t.Fatalf("verkleRawStressUpdateRatio must be non-negative")
+	}
+	if err := validateVerkleRawKeyMode(keyMode); err != nil {
+		t.Fatal(err)
+	}
+
+	os.RemoveAll(baseDir)
+	os.MkdirAll(baseDir, os.ModePerm)
+
+	ldb, err := leveldb.New(baseDir, 128, 128, "verkle-raw-kv-test", false)
+	if err != nil {
+		t.Fatalf("failed to create database: %v", err)
+	}
+	defer ldb.Close()
+
+	cacheConfig := core.DefaultCacheConfigWithScheme(rawdb.PathScheme)
+	cacheConfig.SnapshotLimit = 0
+	mdb := ethdb.WrapWithStats(ldb)
+	diskDB := rawdb.NewDatabase(mdb)
+	trieDB := triedb.NewDatabase(diskDB, cacheConfig.TriedbConfig(true))
+
+	lastRoot, err := loadLastRoot(diskDB)
+	if err != nil {
+		t.Fatalf("failed to read last root hash: %v", err)
+	}
+	t.Logf("read last root hash: %v", lastRoot.String())
+
+	pointCache := trieutils.NewPointCache(1024)
+	vt, err := trie.NewVerkleTrie(lastRoot, trieDB, pointCache)
+	if err != nil {
+		t.Fatalf("failed to create Verkle trie: %v", err)
+	}
+
+	var finalRoot common.Hash = lastRoot
+	totalStart := time.Now()
+
+	collector := NewMetricsCollector(epochItems, baseDir, "verkle_raw_stress.csv")
+	defer collector.Close()
+
+	detailFile, err := os.Create(filepath.Join(baseDir, "results", "verkle_raw_stress_detail.csv"))
+	if err != nil {
+		t.Fatalf("failed to create detail metrics file: %v", err)
+	}
+	defer detailFile.Close()
+	detailWriter := csv.NewWriter(detailFile)
+	defer detailWriter.Flush()
+	detailWriter.Write([]string{
+		"Total_Injected", "Key_Mode", "Disk_Bytes", "Diff_Bytes", "Node_Buffer_Bytes",
+		"Preimage_Bytes", "Total_With_Cache_Bytes",
+	})
+
+	for i := 0; i < totalData; i += batchPerCommit {
+		batchSize := batchPerCommit
+		if i+batchPerCommit > totalData {
+			batchSize = totalData - i
+		}
+
+		newKeys := make([][]byte, batchSize)
+		for j := 0; j < batchSize; j++ {
+			key := generateVerkleRawKey(i+j, keyMode)
+			_, value := generateRandomData()
+			if err := vt.UpdateRaw(key, value); err != nil {
+				t.Fatalf("failed to update raw Verkle key: %v", err)
+			}
+			newKeys[j] = key
+		}
+
+		updateCount := batchSize * updateRatio / 100
+		updateKeys := collector.GetRandomKeys(updateCount)
+		if len(updateKeys) > 0 {
+			for _, key := range updateKeys {
+				_, val := generateRandomData()
+				if err := vt.UpdateRaw(key, val); err != nil {
+					t.Fatalf("failed to update old raw Verkle key: %v", err)
+				}
+			}
+			collector.AddUpdated(updateKeys)
+		}
+
+		collector.AddInjected(batchSize, newKeys)
+
+		rootStart := time.Now()
+		root, nodes := vt.Commit(false)
+		collector.AddRootTime(time.Since(rootStart))
+
+		mergedNodeset := trienode.NewWithNodeSet(nodes)
+		stateSet := triedb.NewStateSet()
+		if err := trieDB.Update(root, finalRoot, uint64(i), mergedNodeset, stateSet); err != nil {
+			t.Fatalf("failed to update database: %v", err)
+		}
+		if err := trieDB.Commit(root, false); err != nil {
+			t.Fatalf("failed to commit database: %v", err)
+		}
+
+		trieDB.Cap(0)
+
+		finalRoot = root
+		if err := saveLastRoot(diskDB, root); err != nil {
+			t.Fatalf("failed to save last root hash: %v", err)
+		}
+
+		vt, err = trie.NewVerkleTrie(root, trieDB, pointCache)
+		if err != nil {
+			t.Fatalf("failed to create new Verkle trie: %v", err)
+		}
+		if collector.ShouldReport() {
+			diffs, nodes, preimages := trieDB.Size()
+			diskSize, _ := GetDirSize(baseDir)
+			totalWithCache := uint64(diskSize) + uint64(diffs) + uint64(nodes) + uint64(preimages)
+			detailWriter.Write([]string{
+				strconv.FormatInt(collector.totalInjected, 10),
+				keyMode,
+				strconv.FormatInt(diskSize, 10),
+				strconv.FormatUint(uint64(diffs), 10),
+				strconv.FormatUint(uint64(nodes), 10),
+				strconv.FormatUint(uint64(preimages), 10),
+				strconv.FormatUint(totalWithCache, 10),
+			})
+			detailWriter.Flush()
+			t.Logf("Raw KV Period Summary (Mode: %s, Total Items: %d), metrics: %s, TrieDBCache[Diffs: %s, Nodes: %s, Preimages: %s], TotalWithCache: %s",
+				keyMode,
+				collector.totalInjected,
+				collector.GetMetricsString(),
+				bytesToReadable(uint64(diffs)),
+				bytesToReadable(uint64(nodes)),
+				bytesToReadable(uint64(preimages)),
+				bytesToReadable(totalWithCache))
+			collector.ResetWindow()
+		}
+	}
+
+	totalTime := time.Since(totalStart)
+	t.Logf("raw KV test completed, mode: %s, total elapsed: %v, final root: %x", keyMode, totalTime, finalRoot)
 }
 
 // Method 2: multiple small batches based on existing root

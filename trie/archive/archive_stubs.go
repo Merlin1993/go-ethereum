@@ -2,7 +2,6 @@ package archive
 
 import (
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/trie/archive/cuckoo"
 )
 
 // StubList 是小归档桶的短期侧挂缓冲。
@@ -30,7 +29,7 @@ func (s *Shard) attachStubsInternal(parent *InternalNode, stubs []*ArchiveBucket
 		s.detachArchiveStub(stub)
 		var target *ArchiveBucketNode
 		if s.config != nil && s.config.CompactArchiveStubs {
-			target = s.mergeStubIntoList(parent, stub)
+			target = s.mergeStubIntoList(parent, stub, nodePath, nodeBits, sinkMature)
 		} else {
 			parent.StubList = append(parent.StubList, stub)
 			target = stub
@@ -71,7 +70,7 @@ func (s *Shard) detachArchiveStub(bucket *ArchiveBucketNode) {
 
 // mergeStubIntoList 把新 bucket 和最合适的现有侧挂 bucket 反复合并，
 // 前提是合并后仍不超过 bucket 容量上限。
-func (s *Shard) mergeStubIntoList(parent *InternalNode, stub *ArchiveBucketNode) *ArchiveBucketNode {
+func (s *Shard) mergeStubIntoList(parent *InternalNode, stub *ArchiveBucketNode, nodePath []byte, nodeBits int, sinkMature bool) *ArchiveBucketNode {
 	if parent == nil || stub == nil {
 		return nil
 	}
@@ -85,7 +84,7 @@ func (s *Shard) mergeStubIntoList(parent *InternalNode, stub *ArchiveBucketNode)
 
 	current := stub
 	for {
-		if s.shouldSinkSideMountedBucket(current) {
+		if sinkMature && s.shouldSinkSideMountedBucket(current) && s.canSinkStubAtPath(current, nodePath, nodeBits) {
 			parent.StubList = append(parent.StubList, current)
 			return current
 		}
@@ -130,10 +129,8 @@ func (s *Shard) mergeArchiveBuckets(a, b *ArchiveBucketNode, path []byte, bits i
 		return nil, false
 	}
 	group := []*ArchiveBucketNode{a, b}
-	keys := make([]ArchivedKey, 0, int(a.Count+b.Count))
+	items := make([]ArchivedKV, 0, int(a.Count+b.Count))
 	oldHashes := make([][]byte, 0, len(group))
-	filter := cuckoo.New(s.config.CuckooBuckets, s.config.CuckooSlots)
-	var keyBuf []byte
 	for _, bucket := range group {
 		hash := s.ensureBucketHash(bucket)
 		bucketKeys, err := s.bucketKeys(bucket)
@@ -143,45 +140,20 @@ func (s *Shard) mergeArchiveBuckets(a, b *ArchiveBucketNode, path []byte, bits i
 		for _, key := range bucketKeys {
 			absPath, absBits := s.prependPath(key.Suffix, key.SuffixBits, bucket.Path, bucket.PathBits)
 			suffix, suffixBits := s.stripPrefix(absPath, absBits, 0, path, bits)
-			mergedKey := ArchivedKey{
+			items = append(items, ArchivedKV{
 				Suffix:     suffix,
 				SuffixBits: suffixBits,
-				ValueRef:   common.CopyBytes(key.ValueRef),
-			}
-			keys = append(keys, mergedKey)
-			keyWithLen := appendArchiveItemKey(keyBuf, suffixBits, suffix)
-			filter.Insert(keyWithLen)
-			keyBuf = keyWithLen
+				Value:      common.CopyBytes(key.ValueRef),
+			})
 		}
 		oldHashes = append(oldHashes, common.CopyBytes(hash))
 	}
-	aPoint, err := s.bucketCommitmentPoint(a)
-	if err != nil {
-		return nil, false
-	}
-	bPoint, err := s.bucketCommitmentPoint(b)
-	if err != nil {
-		return nil, false
-	}
-	commitment, point, err := s.ecmh.MergePoints(aPoint, bPoint)
-	if err != nil {
-		return nil, false
-	}
-
 	merged := &ArchiveBucketNode{
-		Path:       common.CopyBytes(path),
-		PathBits:   bits,
-		Filter:     filter.Encode(),
-		Commitment: commitment,
-		Keys:       keys,
-		Count:      uint64(len(keys)),
-		dirty:      true,
+		Path:     common.CopyBytes(path),
+		PathBits: bits,
+		dirty:    true,
 	}
-	merged.cachedFilter = filter
-	s.setBucketCommitmentPoint(merged, point)
-	merged.invalidateMetaCache()
-	meta, _ := merged.Serialize()
-	merged.SetHash(append([]byte{}, s.hasher.Hash(meta)...))
+	s.recomputeBucket(merged, items)
 	for _, hash := range oldHashes {
 		if s.pruning && (s.config == nil || (s.config.PhysicalDelete && !s.config.UsePathStorage())) && len(hash) > 0 {
 			s.staleSet[string(hash)] = struct{}{}

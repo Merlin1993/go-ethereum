@@ -13,6 +13,10 @@ func (s *Shard) buildArchiveSubtreeFast(items []ArchivedKV, path []byte, bits in
 	if len(items) == 0 {
 		return nil
 	}
+	items = s.deduplicateArchiveItems(items, nil, 0)
+	if len(items) == 0 {
+		return nil
+	}
 
 	bucketSize := s.config.ResolveArchiveBucketSize()
 	if len(items) <= bucketSize || bucketSize <= 0 || bits >= MaxPathBits {
@@ -87,6 +91,10 @@ func (s *Shard) buildArchiveSubtreeFast(items []ArchivedKV, path []byte, bits in
 // buildArchiveSubtreeForce 用在冷子树必须展开到至少 forceBits 的场景。
 // 典型情况是冷子树要和已有热 child 并列，需要在同一条边深度上对齐。
 func (s *Shard) buildArchiveSubtreeForce(items []ArchivedKV, path []byte, bits int, forceBits int) Node {
+	if len(items) == 0 {
+		return nil
+	}
+	items = s.deduplicateArchiveItems(items, nil, 0)
 	if len(items) == 0 {
 		return nil
 	}
@@ -218,7 +226,7 @@ func (s *Shard) collectAndAttachToStubListAtPath(parent *InternalNode, items []A
 
 	archNode := s.buildArchiveSubtreeFast(items, absPath, absBits)
 	if bucket, ok := archNode.(*ArchiveBucketNode); ok {
-		if s.canSinkStubAtPath(bucket, nodePath, nodeBits) {
+		if s.shouldSinkSideMountedBucket(bucket) && s.canSinkStubAtPath(bucket, nodePath, nodeBits) {
 			return s.attachArchiveItemsToChildEdges(parent, items, nodePath, nodeBits)
 		}
 		if changed, err := s.attachStubsAtPath(parent, []*ArchiveBucketNode{bucket}, nodePath, nodeBits); err != nil {

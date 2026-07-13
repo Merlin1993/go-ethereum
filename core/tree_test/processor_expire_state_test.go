@@ -78,6 +78,7 @@ var (
 	binaryCommitWatchdog        = flag.Int("binaryCommitWatchdogSec", 0, "Dump goroutines if one binary wrapper commit exceeds this many seconds; 0 disables")
 	binaryPhysicalDelete        = flag.Bool("binaryPhysicalDelete", false, "Physically delete obsolete binary trie state nodes from stateDB")
 	binaryNodeStorage           = flag.String("binaryNodeStorage", "path", "Binary trie node storage scheme: hash or path")
+	archiveOverlapBudgetMs      = flag.Int("archiveOverlapBudgetMs", 8000, "Async archive wait budget that can overlap block interval and is not charged to root compute")
 	maxRootPipelineMs           = flag.Int("maxRootPipelineMs", 0, "Abort if any block root pipeline exceeds this many milliseconds; 0 disables")
 	maxHandleDestructMs         = flag.Int("maxHandleDestructionMs", 0, "Abort if any block handleDestruction exceeds this many milliseconds; 0 disables")
 	maxPruningMs                = flag.Int("maxPruningMs", 0, "Abort if any binary pruning step exceeds this many milliseconds; 0 disables")
@@ -120,6 +121,7 @@ type ProcessorConfig struct {
 	BinaryCommitWatchdog        int
 	BinaryPhysicalDelete        bool
 	BinaryNodeStorage           string
+	ArchiveOverlapBudgetMs      int
 	MaxRootPipelineMs           int
 	MaxHandleDestructMs         int
 	MaxPruningMs                int
@@ -257,6 +259,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		BinaryCommitWatchdog:        *binaryCommitWatchdog,
 		BinaryPhysicalDelete:        *binaryPhysicalDelete,
 		BinaryNodeStorage:           *binaryNodeStorage,
+		ArchiveOverlapBudgetMs:      *archiveOverlapBudgetMs,
 		MaxRootPipelineMs:           *maxRootPipelineMs,
 		MaxHandleDestructMs:         *maxHandleDestructMs,
 		MaxPruningMs:                *maxPruningMs,
@@ -303,11 +306,21 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalCommitTime        time.Duration
 		maxCommitTime          time.Duration
 		maxCommitBlock         uint64
+		totalStatePreCommit    time.Duration
+		maxStatePreCommit      time.Duration
+		maxStatePreCommitBlock uint64
+		totalPostCommit        time.Duration
+		maxPostCommit          time.Duration
+		maxPostCommitBlock     uint64
 		totalRootPipelineTime  time.Duration
 		maxRootPipelineTime    time.Duration
 		maxRootPipelineBlock   uint64
 		totalRootComputeTime   time.Duration
 		maxRootComputeTime     time.Duration
+		maxRootComputeBlock    uint64
+		totalRootDBWriteTime   time.Duration
+		maxRootDBWriteTime     time.Duration
+		maxRootDBWriteBlock    uint64
 		totalHandleDestruct    time.Duration
 		maxHandleDestruct      time.Duration
 		maxHandleDestructBlock uint64
@@ -318,6 +331,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		maxArchiveCompute      time.Duration
 		totalArchiveWait       time.Duration
 		maxArchiveWait         time.Duration
+		totalArchiveWaitExcess time.Duration
+		maxArchiveWaitExcess   time.Duration
+		maxArchiveWaitBlock    uint64
 		maxProofSizeBlockBlock uint64
 		pruneCount             uint64
 		totalStorageSize       int64 // Cumulative storage size
@@ -327,6 +343,10 @@ func TestExpireStateProcessor(t *testing.T) {
 		globalSuccessTxCount   uint64
 	)
 	slowCommitDiagThreshold := 400 * time.Millisecond
+	archiveOverlapBudget := time.Duration(cfg.ArchiveOverlapBudgetMs) * time.Millisecond
+	if archiveOverlapBudget < 0 {
+		archiveOverlapBudget = 0
+	}
 
 	outputDir := cfg.MetricsDir
 	if outputDir == "" {
@@ -368,10 +388,12 @@ func TestExpireStateProcessor(t *testing.T) {
 			"Total_us", "Wait_us", "Shard_us", "Prefetch_us",
 			"Internal_Visits", "Hot_Skips", "Child_Hits", "Child_Skips", "Bulk_Collects",
 			"Collected_Leaves", "Collected_Stubs", "Build_Items", "Build_Buckets", "ArchiveBuild_Parallel",
+			"Path_Absorbed_Items", "Root_Pool_Items", "Root_Pool_Buckets",
 		})
 	}
 	if cfg.UseBinaryTrie {
 		archivetrie.ResetPrunePressureDiagnostics()
+		archivetrie.ResetArchiveCumulativeDiagnostics()
 	}
 
 	// Write CSV Header
@@ -384,12 +406,23 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Heap_Alloc_MB", "Heap_Sys_MB", "Runtime_Sys_MB", "NodeCache_MB", "NodeCache_Entries",
 		"Archive_Bytes_Per_Item", "State_Bytes_Per_Active_Leaf",
 		"Trie_Child_Node_Count", "Total_Archived_Items", "Total_Bucket_Count",
+		"Root_Bucket_Count", "Root_Archived_Items", "Root_Leaf_Bucket_Count", "Root_Leaf_Archived_Items",
+		"Stub_Bucket_Count", "Stub_Archived_Items", "Child_Bucket_Count", "Child_Archived_Items",
+		"Root_Stub_Bucket_Count", "Root_Stub_Archived_Items", "Deep_Stub_Bucket_Count", "Deep_Stub_Archived_Items",
+		"Max_StubList_Buckets", "Max_StubList_Items", "Max_Root_StubList_Buckets", "Max_Root_StubList_Items",
+		"Max_Deep_StubList_Buckets", "Max_Deep_StubList_Items",
 		"Max_Buckets_On_Single_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max",
 		"Avg_Finalise_Time_ms", "Max_Finalise_Time_ms",
 		"Avg_State_Commit_Time_ms", "Max_State_Commit_Time_ms",
-		"Avg_Root_Pipeline_Time_ms", "Max_Root_Pipeline_Time_ms",
-		"Avg_Root_Compute_Excl_Archive_Wait_ms", "Max_Root_Compute_Excl_Archive_Wait_ms",
-		"Max_State_Commit_Block", "Max_Root_Pipeline_Block",
+		"Avg_State_PreCommit_Time_ms", "Max_State_PreCommit_Time_ms",
+		"Avg_State_PostCommit_Time_ms", "Max_State_PostCommit_Time_ms",
+		"Avg_Root_Pipeline_Wall_Time_ms", "Max_Root_Pipeline_Wall_Time_ms",
+		"Avg_Root_Compute_Charged_Time_ms", "Max_Root_Compute_Charged_Time_ms",
+		"Avg_Root_DB_Write_Time_ms", "Max_Root_DB_Write_Time_ms",
+		"Avg_Archive_Wait_Over_Budget_ms", "Max_Archive_Wait_Over_Budget_ms", "Archive_Overlap_Budget_ms",
+		"Max_State_Commit_Block", "Max_State_PreCommit_Block", "Max_State_PostCommit_Block",
+		"Max_Root_Pipeline_Block", "Max_Root_Compute_Block",
+		"Max_Root_DB_Write_Block", "Max_Archive_Wait_Over_Budget_Block",
 		"Avg_Handle_Destruction_Time_ms", "Max_Handle_Destruction_Time_ms", "Max_Handle_Destruction_Block",
 		"Avg_Pruning_Time_us", "Max_Pruning_Time_us",
 		"Avg_Archive_Compute_Time_us", "Max_Archive_Compute_Time_us",
@@ -401,6 +434,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Max_Pruning_Shard_Bulk_Collects", "Max_Pruning_Shard_Collected_Leaves",
 		"Max_Pruning_Shard_Collected_Stubs", "Max_Pruning_Shard_Build_Items",
 		"Max_Pruning_Shard_Build_Buckets", "Max_Pruning_Shard_ArchiveBuild_Parallel",
+		"Max_Pruning_Shard_Path_Absorbed_Items", "Max_Pruning_Shard_Root_Pool_Items",
+		"Max_Pruning_Shard_Root_Pool_Buckets",
 		"Hit_Count", "Miss_NonExistent_Count", "Miss_Existent_Count",
 		"Avg_Proof_Gen_Time_ms", "Max_Proof_Gen_Time_ms", "Avg_Proof_Verify_Time_ms", "Max_Proof_Verify_Time_ms",
 		"Avg_Proof_Size_Byte", "Max_Proof_Size_Byte",
@@ -408,6 +443,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Block_Start", "Block_End",
 		"Item_Proof_Min", "Item_Proof_P25", "Item_Proof_Med", "Item_Proof_P75", "Item_Proof_Max",
 		"Cycle_FP_Count", "Max_FP_In_Single_Block",
+		"Cumulative_Archived_Leaves", "Cumulative_Flat_Value_Puts", "Cumulative_Flat_Value_Deletes",
+		"Cumulative_Flat_Value_Put_Bytes", "Cumulative_Archive_Event_Rate_Pct", "Cumulative_Archived_vs_Active_Pct",
 	})
 	kvStatsWriter.Write([]string{
 		"Block",
@@ -436,15 +473,33 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalStorageSize = stateStorageSize + archiveStorageSize
 
 		var (
-			trieChildNodeCount int64
-			totalArchivedItems int64
-			totalBucketCount   int
-			maxBucketsPath     int
-			bucketItemsAvg     float64
-			bucketItemsP50     int
-			bucketItemsP95     int
-			bucketItemsP99     int
-			bucketItemsMax     int
+			trieChildNodeCount  int64
+			totalArchivedItems  int64
+			totalBucketCount    int
+			rootBucketCount     int
+			rootArchivedItems   int64
+			rootLeafBucketCount int
+			rootLeafItems       int64
+			stubBucketCount     int
+			stubArchivedItems   int64
+			rootStubBucketCount int
+			rootStubItems       int64
+			deepStubBucketCount int
+			deepStubItems       int64
+			childBucketCount    int
+			childArchivedItems  int64
+			maxStubListBuckets  int
+			maxStubListItems    int64
+			maxRootStubBuckets  int
+			maxRootStubItems    int64
+			maxDeepStubBuckets  int
+			maxDeepStubItems    int64
+			maxBucketsPath      int
+			bucketItemsAvg      float64
+			bucketItemsP50      int
+			bucketItemsP95      int
+			bucketItemsP99      int
+			bucketItemsMax      int
 		)
 		if cfg.UseBinaryTrie {
 			if active := host.trieDB.GetArchiveTrie(); active != nil {
@@ -453,6 +508,24 @@ func TestExpireStateProcessor(t *testing.T) {
 					trieChildNodeCount = stats.LeafCount
 					totalArchivedItems = stats.ArchivedDataSize
 					totalBucketCount = stats.BucketCount
+					rootBucketCount = stats.RootBucketCount
+					rootArchivedItems = stats.RootArchivedSize
+					rootLeafBucketCount = stats.RootLeafBucketCount
+					rootLeafItems = stats.RootLeafArchivedSize
+					stubBucketCount = stats.StubBucketCount
+					stubArchivedItems = stats.StubArchivedSize
+					rootStubBucketCount = stats.RootStubBucketCount
+					rootStubItems = stats.RootStubArchivedSize
+					deepStubBucketCount = stats.DeepStubBucketCount
+					deepStubItems = stats.DeepStubArchivedSize
+					childBucketCount = stats.ChildBucketCount
+					childArchivedItems = stats.ChildArchivedSize
+					maxStubListBuckets = stats.MaxStubListBuckets
+					maxStubListItems = stats.MaxStubListItems
+					maxRootStubBuckets = stats.MaxRootStubBuckets
+					maxRootStubItems = stats.MaxRootStubItems
+					maxDeepStubBuckets = stats.MaxDeepStubBuckets
+					maxDeepStubItems = stats.MaxDeepStubItems
 					maxBucketsPath = stats.MaxBucketsPath
 					bucketItemsAvg = stats.BucketItemsAvg
 					bucketItemsP50 = stats.BucketItemsP50
@@ -491,8 +564,13 @@ func TestExpireStateProcessor(t *testing.T) {
 		}
 		fmt.Printf("  Finalise - Avg: %.2f ms, Max: %v\n", float64(totalFinaliseTime.Milliseconds())/float64(intervalBlocks), maxFinaliseTime)
 		fmt.Printf("  State Commit - Avg: %.2f ms, Max: %v\n", float64(totalCommitTime.Milliseconds())/float64(intervalBlocks), maxCommitTime)
-		fmt.Printf("  Root Pipeline - Avg: %.2f ms, Max: %v\n", float64(totalRootPipelineTime.Milliseconds())/float64(intervalBlocks), maxRootPipelineTime)
-		fmt.Printf("  Root Compute excl archive wait - Avg: %.2f ms, Max: %v\n", float64(totalRootComputeTime.Milliseconds())/float64(intervalBlocks), maxRootComputeTime)
+		fmt.Printf("  State PreCommit - Avg: %.2f ms, Max: %v\n", float64(totalStatePreCommit.Milliseconds())/float64(intervalBlocks), maxStatePreCommit)
+		fmt.Printf("  State PostCommit - Avg: %.2f ms, Max: %v\n", float64(totalPostCommit.Milliseconds())/float64(intervalBlocks), maxPostCommit)
+		fmt.Printf("  Root Pipeline wall - Avg: %.2f ms, Max: %v\n", float64(totalRootPipelineTime.Milliseconds())/float64(intervalBlocks), maxRootPipelineTime)
+		fmt.Printf("  Root Compute charged - Avg: %.2f ms, Max: %v (excludes DB write and first %v async archive wait)\n",
+			float64(totalRootComputeTime.Milliseconds())/float64(intervalBlocks), maxRootComputeTime, archiveOverlapBudget)
+		fmt.Printf("  Root DB write - Avg: %.2f ms, Max: %v\n", float64(totalRootDBWriteTime.Milliseconds())/float64(intervalBlocks), maxRootDBWriteTime)
+		fmt.Printf("  Archive wait over budget - Avg: %.2f ms, Max: %v\n", float64(totalArchiveWaitExcess.Milliseconds())/float64(intervalBlocks), maxArchiveWaitExcess)
 		fmt.Printf("  Storage bytes: total=%d, state=%d, archive=%d\n", totalStorageSize, stateStorageSize, archiveStorageSize)
 		fmt.Printf("  Storage shares: state=%.2f%%, archive=%.2f%%, archiveBytesPerItem=%.2f, stateBytesPerActiveLeaf=%.2f\n",
 			stateStorageSharePct, archiveStorageSharePct, archiveBytesPerItem, stateBytesPerActiveLeaf)
@@ -504,8 +582,17 @@ func TestExpireStateProcessor(t *testing.T) {
 			commitDiag.NodeCacheEntries,
 		)
 		if cfg.UseBinaryTrie {
-			fmt.Printf("  ASCT Struct - Leaves=%d, ArchiveItems=%d, Buckets=%d, MaxBucketsPath=%d\n",
-				trieChildNodeCount, totalArchivedItems, totalBucketCount, maxBucketsPath)
+			fmt.Printf("  ASCT Struct - Leaves=%d, ArchiveItems=%d, Buckets=%d, RootBuckets=%d/%d items (leaf=%d/%d, stub=%d/%d), StubBuckets=%d/%d items (deep=%d/%d), ChildBuckets=%d/%d items, MaxBucketsPath=%d, MaxStubList=%d/%d items (root=%d/%d, deep=%d/%d)\n",
+				trieChildNodeCount, totalArchivedItems, totalBucketCount,
+				rootBucketCount, rootArchivedItems,
+				rootLeafBucketCount, rootLeafItems, rootStubBucketCount, rootStubItems,
+				stubBucketCount, stubArchivedItems,
+				deepStubBucketCount, deepStubItems,
+				childBucketCount, childArchivedItems,
+				maxBucketsPath,
+				maxStubListBuckets, maxStubListItems,
+				maxRootStubBuckets, maxRootStubItems,
+				maxDeepStubBuckets, maxDeepStubItems)
 		}
 
 		avgBinaryPruneTime := 0.0
@@ -517,8 +604,18 @@ func TestExpireStateProcessor(t *testing.T) {
 			avgArchiveWait = float64(totalArchiveWait) / float64(pruneCount) / float64(time.Microsecond)
 		}
 		var prunePressure archivetrie.PrunePressureDiagnostics
+		var cumulativeArchive archivetrie.ArchiveCumulativeDiagnostics
+		cumulativeArchiveEventRatePct := 0.0
+		cumulativeArchivedVsActivePct := 0.0
 		if cfg.UseBinaryTrie {
 			prunePressure = archivetrie.LastPrunePressureDiagnostics()
+			cumulativeArchive = archivetrie.LastArchiveCumulativeDiagnostics()
+			if cumulativeArchive.FlatValuePuts > 0 {
+				cumulativeArchiveEventRatePct = float64(cumulativeArchive.ArchivedLeaves) * 100 / float64(cumulativeArchive.FlatValuePuts)
+			}
+			if cumulativeArchive.ArchivedLeaves+trieChildNodeCount > 0 {
+				cumulativeArchivedVsActivePct = float64(cumulativeArchive.ArchivedLeaves) * 100 / float64(cumulativeArchive.ArchivedLeaves+trieChildNodeCount)
+			}
 		}
 		if pruneCount > 0 {
 			fmt.Printf("  ASCT archive compute - Avg: %.2f us, Max: %v, WaitAvg: %.2f us, WaitMax: %v\n",
@@ -544,6 +641,14 @@ func TestExpireStateProcessor(t *testing.T) {
 				prunePressure.MaxBuildItems,
 				prunePressure.MaxBuildBuckets,
 				prunePressure.MaxInternalVisits,
+			)
+			fmt.Printf("  ASCT cumulative archive - ArchivedLeaves=%d FlatPuts=%d FlatDeletes=%d FlatPutBytes=%d EventRate=%.4f%% ArchivedVsActive=%.4f%%\n",
+				cumulativeArchive.ArchivedLeaves,
+				cumulativeArchive.FlatValuePuts,
+				cumulativeArchive.FlatValueDeletes,
+				cumulativeArchive.FlatValuePutBytes,
+				cumulativeArchiveEventRatePct,
+				cumulativeArchivedVsActivePct,
 			)
 		}
 
@@ -626,6 +731,24 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(trieChildNodeCount, 10),
 			strconv.FormatInt(totalArchivedItems, 10),
 			strconv.Itoa(totalBucketCount),
+			strconv.Itoa(rootBucketCount),
+			strconv.FormatInt(rootArchivedItems, 10),
+			strconv.Itoa(rootLeafBucketCount),
+			strconv.FormatInt(rootLeafItems, 10),
+			strconv.Itoa(stubBucketCount),
+			strconv.FormatInt(stubArchivedItems, 10),
+			strconv.Itoa(childBucketCount),
+			strconv.FormatInt(childArchivedItems, 10),
+			strconv.Itoa(rootStubBucketCount),
+			strconv.FormatInt(rootStubItems, 10),
+			strconv.Itoa(deepStubBucketCount),
+			strconv.FormatInt(deepStubItems, 10),
+			strconv.Itoa(maxStubListBuckets),
+			strconv.FormatInt(maxStubListItems, 10),
+			strconv.Itoa(maxRootStubBuckets),
+			strconv.FormatInt(maxRootStubItems, 10),
+			strconv.Itoa(maxDeepStubBuckets),
+			strconv.FormatInt(maxDeepStubItems, 10),
 			strconv.Itoa(maxBucketsPath),
 			fmt.Sprintf("%.2f", bucketItemsAvg),
 			strconv.Itoa(bucketItemsP50),
@@ -636,12 +759,26 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(maxFinaliseTime.Milliseconds(), 10),
 			fmt.Sprintf("%.2f", float64(totalCommitTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxCommitTime.Milliseconds(), 10),
+			fmt.Sprintf("%.2f", float64(totalStatePreCommit.Milliseconds())/float64(intervalBlocks)),
+			strconv.FormatInt(maxStatePreCommit.Milliseconds(), 10),
+			fmt.Sprintf("%.2f", float64(totalPostCommit.Milliseconds())/float64(intervalBlocks)),
+			strconv.FormatInt(maxPostCommit.Milliseconds(), 10),
 			fmt.Sprintf("%.2f", float64(totalRootPipelineTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxRootPipelineTime.Milliseconds(), 10),
 			fmt.Sprintf("%.2f", float64(totalRootComputeTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxRootComputeTime.Milliseconds(), 10),
+			fmt.Sprintf("%.2f", float64(totalRootDBWriteTime.Milliseconds())/float64(intervalBlocks)),
+			strconv.FormatInt(maxRootDBWriteTime.Milliseconds(), 10),
+			fmt.Sprintf("%.2f", float64(totalArchiveWaitExcess.Milliseconds())/float64(intervalBlocks)),
+			strconv.FormatInt(maxArchiveWaitExcess.Milliseconds(), 10),
+			strconv.FormatInt(archiveOverlapBudget.Milliseconds(), 10),
 			strconv.FormatUint(maxCommitBlock, 10),
+			strconv.FormatUint(maxStatePreCommitBlock, 10),
+			strconv.FormatUint(maxPostCommitBlock, 10),
 			strconv.FormatUint(maxRootPipelineBlock, 10),
+			strconv.FormatUint(maxRootComputeBlock, 10),
+			strconv.FormatUint(maxRootDBWriteBlock, 10),
+			strconv.FormatUint(maxArchiveWaitBlock, 10),
 			fmt.Sprintf("%.2f", float64(totalHandleDestruct.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxHandleDestruct.Milliseconds(), 10),
 			strconv.FormatUint(maxHandleDestructBlock, 10),
@@ -666,6 +803,9 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(prunePressure.MaxBuildItems, 10),
 			strconv.FormatInt(prunePressure.MaxBuildBuckets, 10),
 			strconv.FormatInt(prunePressure.MaxParallelBuilds, 10),
+			strconv.FormatInt(prunePressure.MaxPathAbsorbed, 10),
+			strconv.FormatInt(prunePressure.MaxRootPoolItems, 10),
+			strconv.FormatInt(prunePressure.MaxRootPoolBuckets, 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryHitCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissNonExistentCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMissExistentCount), 10),
@@ -686,6 +826,12 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(maxS, 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryCycleFPCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock), 10),
+			strconv.FormatInt(cumulativeArchive.ArchivedLeaves, 10),
+			strconv.FormatInt(cumulativeArchive.FlatValuePuts, 10),
+			strconv.FormatInt(cumulativeArchive.FlatValueDeletes, 10),
+			strconv.FormatInt(cumulativeArchive.FlatValuePutBytes, 10),
+			fmt.Sprintf("%.4f", cumulativeArchiveEventRatePct),
+			fmt.Sprintf("%.4f", cumulativeArchivedVsActivePct),
 		}
 		writer.Write(record)
 		writer.Flush()
@@ -697,11 +843,21 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalCommitTime = 0
 		maxCommitTime = 0
 		maxCommitBlock = 0
+		totalStatePreCommit = 0
+		maxStatePreCommit = 0
+		maxStatePreCommitBlock = 0
+		totalPostCommit = 0
+		maxPostCommit = 0
+		maxPostCommitBlock = 0
 		totalRootPipelineTime = 0
 		maxRootPipelineTime = 0
 		maxRootPipelineBlock = 0
 		totalRootComputeTime = 0
 		maxRootComputeTime = 0
+		maxRootComputeBlock = 0
+		totalRootDBWriteTime = 0
+		maxRootDBWriteTime = 0
+		maxRootDBWriteBlock = 0
 		totalHandleDestruct = 0
 		maxHandleDestruct = 0
 		maxHandleDestructBlock = 0
@@ -712,6 +868,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		maxArchiveCompute = 0
 		totalArchiveWait = 0
 		maxArchiveWait = 0
+		totalArchiveWaitExcess = 0
+		maxArchiveWaitExcess = 0
+		maxArchiveWaitBlock = 0
 		maxProofSizeBlockBlock = 0
 		pruneCount = 0
 		totalTxTime = 0 // Reset Tx Execution stats
@@ -797,15 +956,37 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(p.LastBuildItems, 10),
 			strconv.FormatInt(p.LastBuildBuckets, 10),
 			strconv.FormatInt(p.LastParallelBuilds, 10),
+			strconv.FormatInt(p.LastPathAbsorbed, 10),
+			strconv.FormatInt(p.LastRootPoolItems, 10),
+			strconv.FormatInt(p.LastRootPoolBuckets, 10),
 		})
 		if block%1000 == 0 {
 			pruneShardWriter.Flush()
 		}
 	}
-	recordArchiveAfterCommit := func(block uint64, pruned bool, rootDuration time.Duration) time.Duration {
-		rootComputeDuration := rootDuration
+	type rootTimingBreakdown struct {
+		computeCharged        time.Duration
+		dbWrite               time.Duration
+		archiveWaitOverBudget time.Duration
+	}
+	recordArchiveAfterCommit := func(block uint64, pruned bool, rootDuration time.Duration, codeWriteDuration time.Duration) rootTimingBreakdown {
+		commitDiag := archivetrie.LastCommitDiagnostics()
+		breakdown := rootTimingBreakdown{
+			computeCharged: rootDuration,
+			dbWrite:        codeWriteDuration,
+		}
+		if cfg.UseBinaryTrie {
+			breakdown.dbWrite += time.Duration(commitDiag.BatchWriteNanos)
+		}
+		if breakdown.dbWrite > 0 {
+			if breakdown.dbWrite >= breakdown.computeCharged {
+				breakdown.computeCharged = 0
+			} else {
+				breakdown.computeCharged -= breakdown.dbWrite
+			}
+		}
 		if !pruned || !cfg.UseBinaryTrie {
-			return rootComputeDuration
+			return breakdown
 		}
 		p := archivetrie.LastPrunePressureDiagnostics()
 		archiveCompute := time.Duration(p.LastShardNanos)
@@ -818,14 +999,34 @@ func TestExpireStateProcessor(t *testing.T) {
 		if archiveWait > maxArchiveWait {
 			maxArchiveWait = archiveWait
 		}
-		if cfg.BinaryAsyncPrune && archiveWait > 0 && archiveWait < rootComputeDuration {
-			rootComputeDuration -= archiveWait
+		if cfg.BinaryAsyncPrune {
+			freeWait := archiveWait
+			if freeWait > archiveOverlapBudget {
+				freeWait = archiveOverlapBudget
+				breakdown.archiveWaitOverBudget = archiveWait - archiveOverlapBudget
+			}
+			if freeWait > 0 {
+				if freeWait >= breakdown.computeCharged {
+					breakdown.computeCharged = 0
+				} else {
+					breakdown.computeCharged -= freeWait
+				}
+			}
+			if breakdown.archiveWaitOverBudget > 0 {
+				fmt.Printf("[ASCT_ARCHIVE_WAIT_BUDGET] block=%d wait=%v budget=%v over=%v archiveCompute=%v\n",
+					block, archiveWait, archiveOverlapBudget, breakdown.archiveWaitOverBudget, archiveCompute)
+			}
 		}
 		recordPruneShardMetrics(block)
 		if cfg.BinaryAsyncPrune {
+			if cfg.MaxPruningMs > 0 && archiveCompute > time.Duration(cfg.MaxPruningMs)*time.Millisecond {
+				fmt.Printf("[ASCT_ARCHIVE_COMPUTE_LIMIT] block=%d compute=%v limit=%v mode=async action=warn\n",
+					block, archiveCompute, time.Duration(cfg.MaxPruningMs)*time.Millisecond)
+			}
+		} else {
 			checkDurationLimit(t, "binary archive compute", block, archiveCompute, cfg.MaxPruningMs)
 		}
-		return rootComputeDuration
+		return breakdown
 	}
 
 	var (
@@ -957,9 +1158,9 @@ processFiles:
 					fmt.Printf("[%s_COMMIT_DIAG] block=%d empty=true commit=%v pre=%v post=%v commitInternal=%v handleDestruction=%v deleteMerge=%v workers=%v afterWorkers=%v buildUpdate=%v codeWrite=%v accountCommit=%v storageCommit=%v snapshotCommit=%v trieDBCommit=%v readerReset=%v root_pipeline=%v%s\n",
 						treeLabel, b, commitDuration, preCommitDuration, postCommitDuration, statedb.CommitInternal, statedb.CommitHandleDestruction, statedb.CommitDeleteMerge, statedb.CommitWorkers, statedb.CommitAfterWorkers, statedb.CommitBuildUpdate, statedb.CommitCodeWrite, statedb.AccountCommits, statedb.StorageCommits, statedb.SnapshotCommits, statedb.TrieDBCommits, statedb.CommitReaderReset, rootDuration, extra)
 				}
-				checkDurationLimit(t, "root pipeline", b, rootDuration, cfg.MaxRootPipelineMs)
 				checkDurationLimit(t, "handleDestruction", b, statedb.CommitHandleDestruction, cfg.MaxHandleDestructMs)
-				rootComputeDuration := recordArchiveAfterCommit(b, prunedThisBlock, rootDuration)
+				rootTiming := recordArchiveAfterCommit(b, prunedThisBlock, rootDuration, statedb.CommitCodeWrite)
+				checkDurationLimit(t, "root compute charged", b, rootTiming.computeCharged, cfg.MaxRootPipelineMs)
 				lastStateRoot = h
 
 				totalFinaliseTime += finaliseDuration
@@ -971,6 +1172,16 @@ processFiles:
 					maxCommitTime = commitDuration
 					maxCommitBlock = b
 				}
+				totalStatePreCommit += preCommitDuration
+				if preCommitDuration > maxStatePreCommit {
+					maxStatePreCommit = preCommitDuration
+					maxStatePreCommitBlock = b
+				}
+				totalPostCommit += postCommitDuration
+				if postCommitDuration > maxPostCommit {
+					maxPostCommit = postCommitDuration
+					maxPostCommitBlock = b
+				}
 				totalHandleDestruct += statedb.CommitHandleDestruction
 				if statedb.CommitHandleDestruction > maxHandleDestruct {
 					maxHandleDestruct = statedb.CommitHandleDestruction
@@ -981,9 +1192,20 @@ processFiles:
 					maxRootPipelineTime = rootDuration
 					maxRootPipelineBlock = b
 				}
-				totalRootComputeTime += rootComputeDuration
-				if rootComputeDuration > maxRootComputeTime {
-					maxRootComputeTime = rootComputeDuration
+				totalRootComputeTime += rootTiming.computeCharged
+				if rootTiming.computeCharged > maxRootComputeTime {
+					maxRootComputeTime = rootTiming.computeCharged
+					maxRootComputeBlock = b
+				}
+				totalRootDBWriteTime += rootTiming.dbWrite
+				if rootTiming.dbWrite > maxRootDBWriteTime {
+					maxRootDBWriteTime = rootTiming.dbWrite
+					maxRootDBWriteBlock = b
+				}
+				totalArchiveWaitExcess += rootTiming.archiveWaitOverBudget
+				if rootTiming.archiveWaitOverBudget > maxArchiveWaitExcess {
+					maxArchiveWaitExcess = rootTiming.archiveWaitOverBudget
+					maxArchiveWaitBlock = b
 				}
 				if b%1000 == 0 {
 					host.trieDB.Commit(h, false)
@@ -1131,13 +1353,13 @@ processFiles:
 				fmt.Printf("[%s_COMMIT_DIAG] block=%d empty=false commit=%v pre=%v post=%v commitInternal=%v handleDestruction=%v deleteMerge=%v workers=%v afterWorkers=%v buildUpdate=%v codeWrite=%v accountCommit=%v storageCommit=%v snapshotCommit=%v trieDBCommit=%v readerReset=%v root_pipeline=%v%s\n",
 					treeLabel, b, commitDuration, preCommitDuration, postCommitDuration, statedb.CommitInternal, statedb.CommitHandleDestruction, statedb.CommitDeleteMerge, statedb.CommitWorkers, statedb.CommitAfterWorkers, statedb.CommitBuildUpdate, statedb.CommitCodeWrite, statedb.AccountCommits, statedb.StorageCommits, statedb.SnapshotCommits, statedb.TrieDBCommits, statedb.CommitReaderReset, rootDuration, extra)
 			}
-			checkDurationLimit(t, "root pipeline", b, rootDuration, cfg.MaxRootPipelineMs)
 			checkDurationLimit(t, "handleDestruction", b, statedb.CommitHandleDestruction, cfg.MaxHandleDestructMs)
-			rootComputeDuration := recordArchiveAfterCommit(b, prunedThisBlock, rootDuration)
+			rootTiming := recordArchiveAfterCommit(b, prunedThisBlock, rootDuration, statedb.CommitCodeWrite)
+			checkDurationLimit(t, "root compute charged", b, rootTiming.computeCharged, cfg.MaxRootPipelineMs)
 
 			if b%100000 == 0 {
-				fmt.Printf("[测试] block %d: finalise=%v, commit=%v, root_pipeline=%v\n",
-					b, finaliseDuration, commitDuration, rootDuration)
+				fmt.Printf("[测试] block %d: finalise=%v, pre=%v, post=%v, commit=%v, root_pipeline=%v\n",
+					b, finaliseDuration, preCommitDuration, postCommitDuration, commitDuration, rootDuration)
 			}
 			lastStateRoot = h
 
@@ -1180,6 +1402,16 @@ processFiles:
 				maxCommitTime = commitDuration
 				maxCommitBlock = b
 			}
+			totalStatePreCommit += preCommitDuration
+			if preCommitDuration > maxStatePreCommit {
+				maxStatePreCommit = preCommitDuration
+				maxStatePreCommitBlock = b
+			}
+			totalPostCommit += postCommitDuration
+			if postCommitDuration > maxPostCommit {
+				maxPostCommit = postCommitDuration
+				maxPostCommitBlock = b
+			}
 			totalHandleDestruct += statedb.CommitHandleDestruction
 			if statedb.CommitHandleDestruction > maxHandleDestruct {
 				maxHandleDestruct = statedb.CommitHandleDestruction
@@ -1190,9 +1422,20 @@ processFiles:
 				maxRootPipelineTime = rootDuration
 				maxRootPipelineBlock = b
 			}
-			totalRootComputeTime += rootComputeDuration
-			if rootComputeDuration > maxRootComputeTime {
-				maxRootComputeTime = rootComputeDuration
+			totalRootComputeTime += rootTiming.computeCharged
+			if rootTiming.computeCharged > maxRootComputeTime {
+				maxRootComputeTime = rootTiming.computeCharged
+				maxRootComputeBlock = b
+			}
+			totalRootDBWriteTime += rootTiming.dbWrite
+			if rootTiming.dbWrite > maxRootDBWriteTime {
+				maxRootDBWriteTime = rootTiming.dbWrite
+				maxRootDBWriteBlock = b
+			}
+			totalArchiveWaitExcess += rootTiming.archiveWaitOverBudget
+			if rootTiming.archiveWaitOverBudget > maxArchiveWaitExcess {
+				maxArchiveWaitExcess = rootTiming.archiveWaitOverBudget
+				maxArchiveWaitBlock = b
 			}
 
 			intervalBlocks++

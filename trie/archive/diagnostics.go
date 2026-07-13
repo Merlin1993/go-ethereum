@@ -42,6 +42,9 @@ type CommitDiagnostics struct {
 	PruneBuildItems            int64
 	PruneBuildBuckets          int64
 	PruneArchiveBuildParallels int64
+	PrunePathAbsorbedItems     int64
+	PruneRootPoolItems         int64
+	PruneRootPoolBuckets       int64
 
 	ShardMaxID                int64
 	ShardMaxCommitNanos       int64
@@ -93,42 +96,57 @@ type CommitDiagnostics struct {
 // shard and the heaviest shard seen since the last reset. The detailed count
 // fields are populated when path diagnostics are enabled.
 type PrunePressureDiagnostics struct {
-	LastShardID        int64
-	LastTotalNanos     int64
-	LastWaitNanos      int64
-	LastShardNanos     int64
-	LastPrefetchNanos  int64
-	LastInternalVisits int64
-	LastHotSkips       int64
-	LastChildHits      int64
-	LastChildSkips     int64
-	LastBulkCollects   int64
-	LastLeaves         int64
-	LastStubs          int64
-	LastBuildItems     int64
-	LastBuildBuckets   int64
-	LastParallelBuilds int64
+	LastShardID         int64
+	LastTotalNanos      int64
+	LastWaitNanos       int64
+	LastShardNanos      int64
+	LastPrefetchNanos   int64
+	LastInternalVisits  int64
+	LastHotSkips        int64
+	LastChildHits       int64
+	LastChildSkips      int64
+	LastBulkCollects    int64
+	LastLeaves          int64
+	LastStubs           int64
+	LastBuildItems      int64
+	LastBuildBuckets    int64
+	LastParallelBuilds  int64
+	LastPathAbsorbed    int64
+	LastRootPoolItems   int64
+	LastRootPoolBuckets int64
 
-	MaxShardID        int64
-	MaxTotalNanos     int64
-	MaxWaitNanos      int64
-	MaxShardNanos     int64
-	MaxPrefetchNanos  int64
-	MaxInternalVisits int64
-	MaxHotSkips       int64
-	MaxChildHits      int64
-	MaxChildSkips     int64
-	MaxBulkCollects   int64
-	MaxLeaves         int64
-	MaxStubs          int64
-	MaxBuildItems     int64
-	MaxBuildBuckets   int64
-	MaxParallelBuilds int64
+	MaxShardID         int64
+	MaxTotalNanos      int64
+	MaxWaitNanos       int64
+	MaxShardNanos      int64
+	MaxPrefetchNanos   int64
+	MaxInternalVisits  int64
+	MaxHotSkips        int64
+	MaxChildHits       int64
+	MaxChildSkips      int64
+	MaxBulkCollects    int64
+	MaxLeaves          int64
+	MaxStubs           int64
+	MaxBuildItems      int64
+	MaxBuildBuckets    int64
+	MaxParallelBuilds  int64
+	MaxPathAbsorbed    int64
+	MaxRootPoolItems   int64
+	MaxRootPoolBuckets int64
+}
+
+// ArchiveCumulativeDiagnostics captures run-wide counters that are cheap enough
+// to keep enabled during hot replay runs.
+type ArchiveCumulativeDiagnostics struct {
+	ArchivedLeaves    int64
+	FlatValuePuts     int64
+	FlatValueDeletes  int64
+	FlatValuePutBytes int64
 }
 
 func (d PrunePressureDiagnostics) String() string {
 	return fmt.Sprintf(
-		"pruneLastShardID=%d pruneLastTotal=%v pruneLastShard=%v pruneLastLeaves=%d pruneLastStubs=%d pruneLastBuildItems=%d pruneLastBuildBuckets=%d pruneLastInternalVisits=%d pruneMaxShardID=%d pruneMaxTotal=%v pruneMaxShard=%v pruneMaxLeaves=%d pruneMaxStubs=%d pruneMaxBuildItems=%d pruneMaxBuildBuckets=%d pruneMaxInternalVisits=%d",
+		"pruneLastShardID=%d pruneLastTotal=%v pruneLastShard=%v pruneLastLeaves=%d pruneLastStubs=%d pruneLastBuildItems=%d pruneLastBuildBuckets=%d pruneLastPathAbsorbed=%d pruneLastRootPoolItems=%d pruneLastRootPoolBuckets=%d pruneLastInternalVisits=%d pruneMaxShardID=%d pruneMaxTotal=%v pruneMaxShard=%v pruneMaxLeaves=%d pruneMaxStubs=%d pruneMaxBuildItems=%d pruneMaxBuildBuckets=%d pruneMaxPathAbsorbed=%d pruneMaxRootPoolItems=%d pruneMaxRootPoolBuckets=%d pruneMaxInternalVisits=%d",
 		d.LastShardID,
 		time.Duration(d.LastTotalNanos),
 		time.Duration(d.LastShardNanos),
@@ -136,6 +154,9 @@ func (d PrunePressureDiagnostics) String() string {
 		d.LastStubs,
 		d.LastBuildItems,
 		d.LastBuildBuckets,
+		d.LastPathAbsorbed,
+		d.LastRootPoolItems,
+		d.LastRootPoolBuckets,
 		d.LastInternalVisits,
 		d.MaxShardID,
 		time.Duration(d.MaxTotalNanos),
@@ -144,8 +165,48 @@ func (d PrunePressureDiagnostics) String() string {
 		d.MaxStubs,
 		d.MaxBuildItems,
 		d.MaxBuildBuckets,
+		d.MaxPathAbsorbed,
+		d.MaxRootPoolItems,
+		d.MaxRootPoolBuckets,
 		d.MaxInternalVisits,
 	)
+}
+
+var (
+	archiveCumulativeArchivedLeaves    int64
+	archiveCumulativeFlatValuePuts     int64
+	archiveCumulativeFlatValueDeletes  int64
+	archiveCumulativeFlatValuePutBytes int64
+)
+
+// ResetArchiveCumulativeDiagnostics clears run-wide archive counters. Replay
+// tests call this once at startup; normal operation may leave them accumulating.
+func ResetArchiveCumulativeDiagnostics() {
+	atomic.StoreInt64(&archiveCumulativeArchivedLeaves, 0)
+	atomic.StoreInt64(&archiveCumulativeFlatValuePuts, 0)
+	atomic.StoreInt64(&archiveCumulativeFlatValueDeletes, 0)
+	atomic.StoreInt64(&archiveCumulativeFlatValuePutBytes, 0)
+}
+
+// LastArchiveCumulativeDiagnostics returns the current run-wide archive counters.
+func LastArchiveCumulativeDiagnostics() ArchiveCumulativeDiagnostics {
+	return ArchiveCumulativeDiagnostics{
+		ArchivedLeaves:    atomic.LoadInt64(&archiveCumulativeArchivedLeaves),
+		FlatValuePuts:     atomic.LoadInt64(&archiveCumulativeFlatValuePuts),
+		FlatValueDeletes:  atomic.LoadInt64(&archiveCumulativeFlatValueDeletes),
+		FlatValuePutBytes: atomic.LoadInt64(&archiveCumulativeFlatValuePutBytes),
+	}
+}
+
+func recordFlatValuePut(byteLen int) {
+	atomic.AddInt64(&archiveCumulativeFlatValuePuts, 1)
+	if byteLen > 0 {
+		atomic.AddInt64(&archiveCumulativeFlatValuePutBytes, int64(byteLen))
+	}
+}
+
+func recordFlatValueDelete() {
+	atomic.AddInt64(&archiveCumulativeFlatValueDeletes, 1)
 }
 
 // ShardCommitDiagnostics captures the inside of one shard commit.
@@ -245,16 +306,19 @@ func (s *commitWorkStats) applyTo(diag *ShardCommitDiagnostics) {
 }
 
 type pruneCounterSnapshot struct {
-	internalVisits int64
-	hotSkips       int64
-	childHits      int64
-	childSkips     int64
-	bulkCollects   int64
-	leaves         int64
-	stubs          int64
-	buildItems     int64
-	buildBuckets   int64
-	parallelBuilds int64
+	internalVisits  int64
+	hotSkips        int64
+	childHits       int64
+	childSkips      int64
+	bulkCollects    int64
+	leaves          int64
+	stubs           int64
+	buildItems      int64
+	buildBuckets    int64
+	parallelBuilds  int64
+	pathAbsorbed    int64
+	rootPoolItems   int64
+	rootPoolBuckets int64
 }
 
 var (
@@ -288,6 +352,9 @@ var (
 	commitDiagPruneBuildItems            int64
 	commitDiagPruneBuildBuckets          int64
 	commitDiagPruneArchiveBuildParallels int64
+	commitDiagPrunePathAbsorbedItems     int64
+	commitDiagPruneRootPoolItems         int64
+	commitDiagPruneRootPoolBuckets       int64
 	commitDiagShardMaxID                 int64
 	commitDiagShardMaxCommitNanos        int64
 	commitDiagShardMaxLockWaitNanos      int64
@@ -368,6 +435,9 @@ func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagPruneBuildItems, 0)
 	atomic.StoreInt64(&commitDiagPruneBuildBuckets, 0)
 	atomic.StoreInt64(&commitDiagPruneArchiveBuildParallels, 0)
+	atomic.StoreInt64(&commitDiagPrunePathAbsorbedItems, 0)
+	atomic.StoreInt64(&commitDiagPruneRootPoolItems, 0)
+	atomic.StoreInt64(&commitDiagPruneRootPoolBuckets, 0)
 	atomic.StoreInt64(&commitDiagShardMaxID, 0)
 	atomic.StoreInt64(&commitDiagShardMaxCommitNanos, 0)
 	atomic.StoreInt64(&commitDiagShardMaxLockWaitNanos, 0)
@@ -443,26 +513,34 @@ func snapshotPruneCounters() pruneCounterSnapshot {
 		buildItems:     atomic.LoadInt64(&commitDiagPruneBuildItems),
 		buildBuckets:   atomic.LoadInt64(&commitDiagPruneBuildBuckets),
 		parallelBuilds: atomic.LoadInt64(&commitDiagPruneArchiveBuildParallels),
+		pathAbsorbed:   atomic.LoadInt64(&commitDiagPrunePathAbsorbedItems),
+		rootPoolItems:  atomic.LoadInt64(&commitDiagPruneRootPoolItems),
+		rootPoolBuckets: atomic.LoadInt64(
+			&commitDiagPruneRootPoolBuckets,
+		),
 	}
 }
 
 func recordPruneShardPressure(shardID int, total, wait, shard, prefetch int64, before, after pruneCounterSnapshot) {
 	current := PrunePressureDiagnostics{
-		LastShardID:        int64(shardID),
-		LastTotalNanos:     total,
-		LastWaitNanos:      wait,
-		LastShardNanos:     shard,
-		LastPrefetchNanos:  prefetch,
-		LastInternalVisits: after.internalVisits - before.internalVisits,
-		LastHotSkips:       after.hotSkips - before.hotSkips,
-		LastChildHits:      after.childHits - before.childHits,
-		LastChildSkips:     after.childSkips - before.childSkips,
-		LastBulkCollects:   after.bulkCollects - before.bulkCollects,
-		LastLeaves:         after.leaves - before.leaves,
-		LastStubs:          after.stubs - before.stubs,
-		LastBuildItems:     after.buildItems - before.buildItems,
-		LastBuildBuckets:   after.buildBuckets - before.buildBuckets,
-		LastParallelBuilds: after.parallelBuilds - before.parallelBuilds,
+		LastShardID:         int64(shardID),
+		LastTotalNanos:      total,
+		LastWaitNanos:       wait,
+		LastShardNanos:      shard,
+		LastPrefetchNanos:   prefetch,
+		LastInternalVisits:  after.internalVisits - before.internalVisits,
+		LastHotSkips:        after.hotSkips - before.hotSkips,
+		LastChildHits:       after.childHits - before.childHits,
+		LastChildSkips:      after.childSkips - before.childSkips,
+		LastBulkCollects:    after.bulkCollects - before.bulkCollects,
+		LastLeaves:          after.leaves - before.leaves,
+		LastStubs:           after.stubs - before.stubs,
+		LastBuildItems:      after.buildItems - before.buildItems,
+		LastBuildBuckets:    after.buildBuckets - before.buildBuckets,
+		LastParallelBuilds:  after.parallelBuilds - before.parallelBuilds,
+		LastPathAbsorbed:    after.pathAbsorbed - before.pathAbsorbed,
+		LastRootPoolItems:   after.rootPoolItems - before.rootPoolItems,
+		LastRootPoolBuckets: after.rootPoolBuckets - before.rootPoolBuckets,
 	}
 
 	prunePressureMu.Lock()
@@ -482,6 +560,9 @@ func recordPruneShardPressure(shardID int, total, wait, shard, prefetch int64, b
 	prunePressureDiag.LastBuildItems = current.LastBuildItems
 	prunePressureDiag.LastBuildBuckets = current.LastBuildBuckets
 	prunePressureDiag.LastParallelBuilds = current.LastParallelBuilds
+	prunePressureDiag.LastPathAbsorbed = current.LastPathAbsorbed
+	prunePressureDiag.LastRootPoolItems = current.LastRootPoolItems
+	prunePressureDiag.LastRootPoolBuckets = current.LastRootPoolBuckets
 	if prunePressureMaxSet && current.LastShardNanos <= prunePressureDiag.MaxShardNanos {
 		return
 	}
@@ -501,6 +582,9 @@ func recordPruneShardPressure(shardID int, total, wait, shard, prefetch int64, b
 	prunePressureDiag.MaxBuildItems = current.LastBuildItems
 	prunePressureDiag.MaxBuildBuckets = current.LastBuildBuckets
 	prunePressureDiag.MaxParallelBuilds = current.LastParallelBuilds
+	prunePressureDiag.MaxPathAbsorbed = current.LastPathAbsorbed
+	prunePressureDiag.MaxRootPoolItems = current.LastRootPoolItems
+	prunePressureDiag.MaxRootPoolBuckets = current.LastRootPoolBuckets
 }
 
 // ResetPrunePressureDiagnostics clears the per-window prune pressure snapshot.
@@ -655,6 +739,7 @@ func recordPruneBulkCollectIfEnabled(config *Config) {
 }
 
 func recordPruneCollectedLeafIfEnabled(config *Config) {
+	atomic.AddInt64(&archiveCumulativeArchivedLeaves, 1)
 	if config != nil && config.EnablePathDiagnostics {
 		atomic.AddInt64(&commitDiagPruneCollectedLeaves, 1)
 	}
@@ -677,6 +762,22 @@ func recordPruneBuildBucketIfEnabled(config *Config, items int) {
 func recordPruneArchiveBuildParallelIfEnabled(config *Config) {
 	if config != nil && config.EnablePathDiagnostics {
 		atomic.AddInt64(&commitDiagPruneArchiveBuildParallels, 1)
+	}
+}
+
+func recordPrunePathAbsorbedIfEnabled(config *Config, items int) {
+	if config != nil && config.EnablePathDiagnostics && items > 0 {
+		atomic.AddInt64(&commitDiagPrunePathAbsorbedItems, int64(items))
+	}
+}
+
+func recordPruneRootPoolIfEnabled(config *Config, items, buckets int) {
+	if config == nil || !config.EnablePathDiagnostics || items <= 0 {
+		return
+	}
+	atomic.AddInt64(&commitDiagPruneRootPoolItems, int64(items))
+	if buckets > 0 {
+		atomic.AddInt64(&commitDiagPruneRootPoolBuckets, int64(buckets))
 	}
 }
 
@@ -713,6 +814,9 @@ func LastCommitDiagnostics() CommitDiagnostics {
 		PruneBuildItems:            atomic.LoadInt64(&commitDiagPruneBuildItems),
 		PruneBuildBuckets:          atomic.LoadInt64(&commitDiagPruneBuildBuckets),
 		PruneArchiveBuildParallels: atomic.LoadInt64(&commitDiagPruneArchiveBuildParallels),
+		PrunePathAbsorbedItems:     atomic.LoadInt64(&commitDiagPrunePathAbsorbedItems),
+		PruneRootPoolItems:         atomic.LoadInt64(&commitDiagPruneRootPoolItems),
+		PruneRootPoolBuckets:       atomic.LoadInt64(&commitDiagPruneRootPoolBuckets),
 		ShardMaxID:                 atomic.LoadInt64(&commitDiagShardMaxID),
 		ShardMaxCommitNanos:        atomic.LoadInt64(&commitDiagShardMaxCommitNanos),
 		ShardMaxLockWaitNanos:      atomic.LoadInt64(&commitDiagShardMaxLockWaitNanos),
@@ -762,7 +866,7 @@ func LastCommitDiagnostics() CommitDiagnostics {
 
 func (d CommitDiagnostics) String() string {
 	return fmt.Sprintf(
-		"total=%v commitToBatch=%v shardCommit=%v topTree=%v batchWrite=%v adapterMerge=%v trieDBUpdate=%v pruneTotal=%v pruneWait=%v pruneShard=%v prunePrefetchStart=%v dirtyShards=%d nodeCacheHits=%d nodeCacheMisses=%d pathNodeDBGets=%d archivePromotionChecks=%d archivePromotionHits=%d bucketRecomputes=%d commitmentPointCacheHits=%d commitmentPointCacheMisses=%d pruneInternalVisits=%d pruneHotSkips=%d pruneChildHits=%d pruneChildSkips=%d pruneBulkCollects=%d pruneCollectedLeaves=%d pruneCollectedStubs=%d pruneBuildItems=%d pruneBuildBuckets=%d pruneArchiveBuildParallels=%d shardMaxID=%d shardMaxCommit=%v shardMaxLockWait=%v shardMaxRootCommit=%v shardMaxSerialize=%v shardMaxHash=%v shardMaxPersist=%v shardMaxBatchPut=%v shardMaxCache=%v shardMaxBookkeep=%v shardMaxNode=%v shardMaxNodeType=%d shardMaxNodeBytes=%d shardMaxStaleDeletes=%v shardMaxPendingValues=%v shardMaxNodeCount=%d shardMaxStaleSetLen=%d shardMaxPendingValuesCount=%d shardMaxPendingFlatValuesCount=%d topTreeDirtyChildren=%d topTreeMaxChildPrefix=%d topTreeMaxChildCompute=%v topTreeMaxChildOps=%d topTreeMaxChildBytes=%d topTreeMaxApplyPrefix=%d topTreeMaxApply=%v topTreeOps=%d topTreeBytes=%d rawBatchOps=%d rawBatchBytes=%d rawShardMaxID=%d rawShardMaxOps=%d rawShardMaxBytes=%d nodeCacheEntries=%d nodeCacheBytes=%d heapAlloc=%d heapSys=%d heapInuse=%d runtimeSys=%d numGC=%d pauseTotal=%v lastPause=%v",
+		"total=%v commitToBatch=%v shardCommit=%v topTree=%v batchWrite=%v adapterMerge=%v trieDBUpdate=%v pruneTotal=%v pruneWait=%v pruneShard=%v prunePrefetchStart=%v dirtyShards=%d nodeCacheHits=%d nodeCacheMisses=%d pathNodeDBGets=%d archivePromotionChecks=%d archivePromotionHits=%d bucketRecomputes=%d commitmentPointCacheHits=%d commitmentPointCacheMisses=%d pruneInternalVisits=%d pruneHotSkips=%d pruneChildHits=%d pruneChildSkips=%d pruneBulkCollects=%d pruneCollectedLeaves=%d pruneCollectedStubs=%d pruneBuildItems=%d pruneBuildBuckets=%d pruneArchiveBuildParallels=%d prunePathAbsorbedItems=%d pruneRootPoolItems=%d pruneRootPoolBuckets=%d shardMaxID=%d shardMaxCommit=%v shardMaxLockWait=%v shardMaxRootCommit=%v shardMaxSerialize=%v shardMaxHash=%v shardMaxPersist=%v shardMaxBatchPut=%v shardMaxCache=%v shardMaxBookkeep=%v shardMaxNode=%v shardMaxNodeType=%d shardMaxNodeBytes=%d shardMaxStaleDeletes=%v shardMaxPendingValues=%v shardMaxNodeCount=%d shardMaxStaleSetLen=%d shardMaxPendingValuesCount=%d shardMaxPendingFlatValuesCount=%d topTreeDirtyChildren=%d topTreeMaxChildPrefix=%d topTreeMaxChildCompute=%v topTreeMaxChildOps=%d topTreeMaxChildBytes=%d topTreeMaxApplyPrefix=%d topTreeMaxApply=%v topTreeOps=%d topTreeBytes=%d rawBatchOps=%d rawBatchBytes=%d rawShardMaxID=%d rawShardMaxOps=%d rawShardMaxBytes=%d nodeCacheEntries=%d nodeCacheBytes=%d heapAlloc=%d heapSys=%d heapInuse=%d runtimeSys=%d numGC=%d pauseTotal=%v lastPause=%v",
 		time.Duration(d.TotalNanos),
 		time.Duration(d.CommitToBatchNanos),
 		time.Duration(d.ShardCommitNanos),
@@ -793,6 +897,9 @@ func (d CommitDiagnostics) String() string {
 		d.PruneBuildItems,
 		d.PruneBuildBuckets,
 		d.PruneArchiveBuildParallels,
+		d.PrunePathAbsorbedItems,
+		d.PruneRootPoolItems,
+		d.PruneRootPoolBuckets,
 		d.ShardMaxID,
 		time.Duration(d.ShardMaxCommitNanos),
 		time.Duration(d.ShardMaxLockWaitNanos),

@@ -86,6 +86,27 @@ type Node interface {
 	Serialize() ([]byte, error)
 }
 
+func serializePathBytes(path []byte, bits int, label string) ([]byte, error) {
+	if bits < 0 {
+		return nil, fmt.Errorf("%s bits negative: %d", label, bits)
+	}
+	if bits > MaxPathBits {
+		return nil, fmt.Errorf("%s bits %d exceeds max %d", label, bits, MaxPathBits)
+	}
+	pathLen := (bits + 7) / 8
+	if len(path) < pathLen {
+		return nil, fmt.Errorf("%s length %d shorter than %d bits", label, len(path), bits)
+	}
+	if pathLen == 0 {
+		return nil, nil
+	}
+	out := append([]byte(nil), path[:pathLen]...)
+	if rem := bits % 8; rem != 0 {
+		out[len(out)-1] &= byte(0xff << (8 - rem))
+	}
+	return out, nil
+}
+
 type InternalNode struct {
 	Path     []byte
 	PathBits int
@@ -187,6 +208,10 @@ func (n *InternalNode) SetStoragePath(path []byte, bits int) {
 
 func (n *InternalNode) Serialize() ([]byte, error) {
 	var scratch [binary.MaxVarintLen64]byte
+	path, err := serializePathBytes(n.Path, n.PathBits, "internal path")
+	if err != nil {
+		return nil, err
+	}
 	stubData := make([][]byte, len(n.StubList))
 	stubBytes := 0
 	for i, bucket := range n.StubList {
@@ -198,7 +223,7 @@ func (n *InternalNode) Serialize() ([]byte, error) {
 		stubBytes += uvarintLen(uint64(len(bData))) + len(bData)
 	}
 
-	size := 1 + uvarintLen(uint64(n.PathBits)) + len(n.Path) +
+	size := 1 + uvarintLen(uint64(n.PathBits)) + len(path) +
 		1 + len(n.LeftHash) + 1 +
 		1 + len(n.RightHash) + 1 +
 		uvarintLen(uint64(len(n.StubList))) + stubBytes
@@ -212,7 +237,7 @@ func (n *InternalNode) Serialize() ([]byte, error) {
 	buf = append(buf, scratch[:nBits]...)
 
 	// Path: Raw bytes
-	buf = append(buf, n.Path...)
+	buf = append(buf, path...)
 
 	// Children hashes & epochs
 	buf = append(buf, byte(len(n.LeftHash)))
@@ -346,8 +371,12 @@ func (n *LeafNode) SetStoragePath(path []byte, bits int) {
 // 格式（按顺序）：
 // [Header(1): Type(1)|Epoch(7)] [PathBits(Uvarint)] [Path] [ValueHashLen(1)] [ValueHash]
 func (n *LeafNode) Serialize() ([]byte, error) {
+	path, err := serializePathBytes(n.Path, n.PathBits, "leaf path")
+	if err != nil {
+		return nil, err
+	}
 	// 估算大小: Header(1) + PathBits(Uvarint) + Path + ValueHashLen(1) + ValueHash
-	estSize := 1 + binary.MaxVarintLen64 + len(n.Path) + 1 + len(n.ValueHash)
+	estSize := 1 + binary.MaxVarintLen64 + len(path) + 1 + len(n.ValueHash)
 	buf := make([]byte, 0, estSize)
 
 	// Header: [Type(1bit) | Epoch(7bits)]
@@ -360,10 +389,7 @@ func (n *LeafNode) Serialize() ([]byte, error) {
 	buf = append(buf, scratch[:nBits]...)
 
 	// Path 路径后缀
-	if len(n.Path) > 255 {
-		return nil, errors.New("path length exceeds 255 bytes")
-	}
-	buf = append(buf, n.Path...)
+	buf = append(buf, path...)
 
 	// ValueHash 值的哈希
 	if len(n.ValueHash) > 255 {
@@ -475,14 +501,24 @@ func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 	n.metaMu.RUnlock()
 
 	var scratch [binary.MaxVarintLen64]byte
+	path, err := serializePathBytes(n.Path, n.PathBits, "bucket path")
+	if err != nil {
+		return nil, err
+	}
 	pathBitsLen := uvarintLen(uint64(n.PathBits))
 	countLen := uvarintLen(n.Count)
 	filterLen := uvarintLen(uint64(len(n.Filter)))
 	keysLen := uvarintLen(uint64(len(n.Keys)))
-	for _, key := range n.Keys {
-		keysLen += uvarintLen(uint64(key.SuffixBits)) + len(key.Suffix) + uvarintLen(uint64(len(key.ValueRef))) + len(key.ValueRef)
+	keySuffixes := make([][]byte, len(n.Keys))
+	for i, key := range n.Keys {
+		suffix, err := serializePathBytes(key.Suffix, key.SuffixBits, "bucket key suffix")
+		if err != nil {
+			return nil, err
+		}
+		keySuffixes[i] = suffix
+		keysLen += uvarintLen(uint64(key.SuffixBits)) + len(suffix) + uvarintLen(uint64(len(key.ValueRef))) + len(key.ValueRef)
 	}
-	size := 1 + pathBitsLen + len(n.Path) + countLen + 1 + len(n.Commitment) + filterLen + len(n.Filter) + keysLen
+	size := 1 + pathBitsLen + len(path) + countLen + 1 + len(n.Commitment) + filterLen + len(n.Filter) + keysLen
 	buf := make([]byte, 0, size)
 
 	buf = append(buf, 0xC0)
@@ -490,7 +526,7 @@ func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 	nBits := binary.PutUvarint(scratch[:], uint64(n.PathBits))
 	buf = append(buf, scratch[:nBits]...)
 
-	buf = append(buf, n.Path...)
+	buf = append(buf, path...)
 
 	nBits = binary.PutUvarint(scratch[:], n.Count)
 	buf = append(buf, scratch[:nBits]...)
@@ -504,10 +540,10 @@ func (n *ArchiveBucketNode) Serialize() ([]byte, error) {
 
 	nBits = binary.PutUvarint(scratch[:], uint64(len(n.Keys)))
 	buf = append(buf, scratch[:nBits]...)
-	for _, key := range n.Keys {
+	for i, key := range n.Keys {
 		nBits = binary.PutUvarint(scratch[:], uint64(key.SuffixBits))
 		buf = append(buf, scratch[:nBits]...)
-		buf = append(buf, key.Suffix...)
+		buf = append(buf, keySuffixes[i]...)
 		nBits = binary.PutUvarint(scratch[:], uint64(len(key.ValueRef)))
 		buf = append(buf, scratch[:nBits]...)
 		buf = append(buf, key.ValueRef...)
@@ -554,8 +590,14 @@ func DeserializeNode(data []byte) (Node, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read internal path bits: %w", err)
 		}
+		if pathBits > uint64(MaxPathBits) {
+			return nil, fmt.Errorf("internal path bits %d exceeds max %d", pathBits, MaxPathBits)
+		}
 
 		pathLen := (int(pathBits) + 7) / 8
+		if pathLen > reader.Len() {
+			return nil, fmt.Errorf("read internal path: length %d exceeds remaining %d", pathLen, reader.Len())
+		}
 		path := make([]byte, pathLen)
 		if pathLen > 0 {
 			if _, err := reader.Read(path); err != nil {
@@ -597,11 +639,17 @@ func DeserializeNode(data []byte) (Node, error) {
 		stubCount, err := binary.ReadUvarint(reader)
 		var stubs []*ArchiveBucketNode
 		if err == nil && stubCount > 0 {
+			if stubCount > uint64(reader.Len()) {
+				return nil, fmt.Errorf("stub count %d exceeds remaining bytes %d", stubCount, reader.Len())
+			}
 			stubs = make([]*ArchiveBucketNode, stubCount)
 			for i := uint64(0); i < stubCount; i++ {
 				bLen, err := binary.ReadUvarint(reader)
 				if err != nil {
 					return nil, fmt.Errorf("read stub %d len: %w", i, err)
+				}
+				if bLen > uint64(reader.Len()) {
+					return nil, fmt.Errorf("read stub %d data: length %d exceeds remaining %d", i, bLen, reader.Len())
 				}
 				bData := make([]byte, bLen)
 				if _, err := reader.Read(bData); err != nil {
@@ -634,8 +682,14 @@ func DeserializeNode(data []byte) (Node, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read path bits: %w", err)
 		}
+		if pathBits > uint64(MaxPathBits) {
+			return nil, fmt.Errorf("leaf path bits %d exceeds max %d", pathBits, MaxPathBits)
+		}
 
 		pathLen := (int(pathBits) + 7) / 8
+		if pathLen > reader.Len() {
+			return nil, fmt.Errorf("read path: length %d exceeds remaining %d", pathLen, reader.Len())
+		}
 		path := make([]byte, pathLen)
 		if pathLen > 0 {
 			if _, err := reader.Read(path); err != nil {
@@ -646,6 +700,9 @@ func DeserializeNode(data []byte) (Node, error) {
 		valHashLenByte, err := reader.ReadByte()
 		if err != nil {
 			return nil, fmt.Errorf("read val hash len: %w", err)
+		}
+		if int(valHashLenByte) > reader.Len() {
+			return nil, fmt.Errorf("read val hash: length %d exceeds remaining %d", valHashLenByte, reader.Len())
 		}
 		valHash := make([]byte, int(valHashLenByte))
 		if _, err := reader.Read(valHash); err != nil {
@@ -666,8 +723,14 @@ func DeserializeNode(data []byte) (Node, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read bucket path bits: %w", err)
 		}
+		if pathBits > uint64(MaxPathBits) {
+			return nil, fmt.Errorf("bucket path bits %d exceeds max %d", pathBits, MaxPathBits)
+		}
 
 		pathLen := (int(pathBits) + 7) / 8
+		if pathLen > reader.Len() {
+			return nil, fmt.Errorf("read bucket path: length %d exceeds remaining %d", pathLen, reader.Len())
+		}
 		path := make([]byte, pathLen)
 		if pathLen > 0 {
 			if _, err := reader.Read(path); err != nil {
@@ -684,6 +747,9 @@ func DeserializeNode(data []byte) (Node, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read bucket commitment len: %w", err)
 		}
+		if int(commitLen) > reader.Len() {
+			return nil, fmt.Errorf("read bucket commitment: length %d exceeds remaining %d", commitLen, reader.Len())
+		}
 		commitment := make([]byte, int(commitLen))
 		if commitLen > 0 {
 			if _, err := reader.Read(commitment); err != nil {
@@ -694,6 +760,9 @@ func DeserializeNode(data []byte) (Node, error) {
 		filterLen, err := binary.ReadUvarint(reader)
 		if err != nil {
 			return nil, fmt.Errorf("read bucket filter len: %w", err)
+		}
+		if filterLen > uint64(reader.Len()) {
+			return nil, fmt.Errorf("read bucket filter: length %d exceeds remaining %d", filterLen, reader.Len())
 		}
 		filter := make([]byte, filterLen)
 		if filterLen > 0 {
@@ -709,13 +778,22 @@ func DeserializeNode(data []byte) (Node, error) {
 				return nil, fmt.Errorf("read bucket key count: %w", err)
 			}
 			if keyCount > 0 {
+				if keyCount > uint64(reader.Len()) {
+					return nil, fmt.Errorf("bucket key count %d exceeds remaining bytes %d", keyCount, reader.Len())
+				}
 				keys = make([]ArchivedKey, keyCount)
 				for i := uint64(0); i < keyCount; i++ {
 					suffixBits, err := binary.ReadUvarint(reader)
 					if err != nil {
 						return nil, fmt.Errorf("read bucket key %d suffix bits: %w", i, err)
 					}
+					if suffixBits > uint64(MaxPathBits) {
+						return nil, fmt.Errorf("bucket key %d suffix bits %d exceeds max %d", i, suffixBits, MaxPathBits)
+					}
 					suffixLen := (int(suffixBits) + 7) / 8
+					if suffixLen > reader.Len() {
+						return nil, fmt.Errorf("read bucket key %d suffix: length %d exceeds remaining %d", i, suffixLen, reader.Len())
+					}
 					suffix := make([]byte, suffixLen)
 					if suffixLen > 0 {
 						if _, err := reader.Read(suffix); err != nil {

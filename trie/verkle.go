@@ -175,6 +175,21 @@ func (t *VerkleTrie) UpdateStorage(address common.Address, key, value []byte) er
 	return t.root.Insert(k, v[:], t.nodeResolver)
 }
 
+// UpdateRaw writes a raw 32-byte Verkle tree key without applying the Ethereum
+// account/storage key layout. It is intended for structure-level KV benchmarks.
+func (t *VerkleTrie) UpdateRaw(key, value []byte) error {
+	if len(key) != verkle.KeySize {
+		return fmt.Errorf("UpdateRaw expects %d-byte key, got %d", verkle.KeySize, len(key))
+	}
+	var v [verkle.LeafValueSize]byte
+	if len(value) >= verkle.LeafValueSize {
+		copy(v[:], value[:verkle.LeafValueSize])
+	} else {
+		copy(v[verkle.LeafValueSize-len(value):], value)
+	}
+	return t.root.Insert(key, v[:], t.nodeResolver)
+}
+
 // DeleteAccount leaves the account untouched, as no account deletion can happen
 // in verkle.
 // There is a special corner case, in which an account that is prefunded, CREATE2-d

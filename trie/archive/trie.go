@@ -109,7 +109,7 @@ func (t *Trie) GetShardRoot(id int) []byte {
 }
 
 func (t *Trie) CommitShardToBatch(id int, batch Batcher, destructive bool) ([]byte, error) {
-	if err := t.finishAsyncPruneForShard(id); err != nil {
+	if err := t.finishAsyncPrune(); err != nil {
 		return nil, err
 	}
 	shard, err := t.getOrCreateShard(id)
@@ -120,7 +120,7 @@ func (t *Trie) CommitShardToBatch(id int, batch Batcher, destructive bool) ([]by
 }
 
 func (t *Trie) CommitShardToBatchWithDiagnostics(id int, batch Batcher, destructive bool) ([]byte, ShardCommitDiagnostics, error) {
-	if err := t.finishAsyncPruneForShard(id); err != nil {
+	if err := t.finishAsyncPrune(); err != nil {
 		return nil, ShardCommitDiagnostics{}, err
 	}
 	shard, err := t.getOrCreateShard(id)
@@ -184,17 +184,6 @@ func (t *Trie) filterDirtyShardListLocked() {
 		}
 	}
 	t.dirtyShardList = out
-}
-
-func (t *Trie) finishAsyncPruneForShard(id int) error {
-	t.asyncPruneMu.Lock()
-	job := t.asyncPrune
-	pending := job != nil && job.idx == id
-	t.asyncPruneMu.Unlock()
-	if !pending {
-		return nil
-	}
-	return t.finishAsyncPrune()
 }
 
 // FinishAsyncPrune applies a pending asynchronous prune before callers read or
@@ -307,7 +296,7 @@ func (t *Trie) getOrCreateShard(id int) (*Shard, error) {
 // Get 根据 key 定位 shard，并沿该 shard 的热/冷路径读取。
 func (t *Trie) Get(key []byte) ([]byte, error) {
 	shardID := t.GetShardID(key)
-	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+	if err := t.finishAsyncPrune(); err != nil {
 		return nil, err
 	}
 	shard, err := t.getOrCreateShard(shardID)
@@ -322,7 +311,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 // 保证一个 key 只有一个有效位置。
 func (t *Trie) Put(key []byte, value []byte) error {
 	shardID := t.GetShardID(key)
-	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+	if err := t.finishAsyncPrune(); err != nil {
 		return err
 	}
 	shard, err := t.getOrCreateShard(shardID)
@@ -342,6 +331,9 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 	if len(entries) == 0 {
 		return nil
 	}
+	if err := t.finishAsyncPrune(); err != nil {
+		return err
+	}
 	type shardWrites struct {
 		id      int
 		entries []KeyValue
@@ -358,12 +350,6 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 		}
 		groups[index].entries = append(groups[index].entries, entry)
 	}
-	for _, group := range groups {
-		if err := t.finishAsyncPruneForShard(group.id); err != nil {
-			return err
-		}
-	}
-
 	workers := runtime.GOMAXPROCS(0)
 	if workers > len(groups) {
 		workers = len(groups)
@@ -402,7 +388,7 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 // Delete 同时删除 key 的热状态和冷状态。
 func (t *Trie) Delete(key []byte) error {
 	shardID := t.GetShardID(key)
-	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+	if err := t.finishAsyncPrune(); err != nil {
 		return err
 	}
 	shard, err := t.getOrCreateShard(shardID)
@@ -820,7 +806,7 @@ func (t *Trie) getShardPrefix(shardID int) []byte {
 // Activate moves an archived key back to the hot tree.
 func (t *Trie) Activate(key []byte, value []byte) error {
 	shardID := t.GetShardID(key)
-	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+	if err := t.finishAsyncPrune(); err != nil {
 		return err
 	}
 	shard, err := t.getOrCreateShard(shardID)

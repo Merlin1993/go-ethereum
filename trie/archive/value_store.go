@@ -68,31 +68,6 @@ func (s *Shard) getFlatValue(key []byte) ([]byte, error) {
 	return nil, ErrNodeNotFound
 }
 
-func (s *Shard) hasFlatValue(key []byte) bool {
-	if len(key) == 0 {
-		return false
-	}
-	id := string(key)
-	if _, ok := s.pendingFlatValues[id]; ok {
-		return true
-	}
-	if _, ok := s.pendingFlatValueDeletes[id]; ok {
-		return false
-	}
-	for i := len(s.stagedFlatValues) - 1; i >= 0; i-- {
-		if _, ok := s.stagedFlatValues[i][id]; ok {
-			return true
-		}
-	}
-	if s.config != nil && s.config.FlatReader != nil {
-		if value, err := s.config.FlatReader.GetFlatValue(key); err == nil && value != nil {
-			return true
-		}
-	}
-	value, err := s.db.Get(flatValueDataKey(key))
-	return err == nil && value != nil
-}
-
 // commitPendingValues 刷新 pending flat value，并只保留很小的 staged 窗口。
 // 这样 commit 后、外层数据库视图完全追上前，读路径仍能看到刚提交的数据。
 func (s *Shard) commitPendingValues(batch Batcher) error {
@@ -118,11 +93,13 @@ func (s *Shard) commitFlatValueStore(batch Batcher, values map[string][]byte, de
 			if err := s.db.Delete(flatValueDataKey([]byte(key))); err != nil {
 				return err
 			}
+			recordFlatValueDelete()
 		}
 		for key, value := range values {
 			if err := s.db.Put(flatValueDataKey([]byte(key)), value); err != nil {
 				return err
 			}
+			recordFlatValuePut(len(value))
 		}
 		return nil
 	}
@@ -130,11 +107,13 @@ func (s *Shard) commitFlatValueStore(batch Batcher, values map[string][]byte, de
 		if err := batch.Delete(flatValueDataKey([]byte(key))); err != nil {
 			return err
 		}
+		recordFlatValueDelete()
 	}
 	for key, value := range values {
 		if err := batch.Put(flatValueDataKey([]byte(key)), value); err != nil {
 			return err
 		}
+		recordFlatValuePut(len(value))
 	}
 	return nil
 }

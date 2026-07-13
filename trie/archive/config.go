@@ -79,15 +79,33 @@ func (c *Config) ResolveArchiveBucketSize() int {
 
 // TrieStats holds statistics about the Trie.
 type TrieStats struct {
-	BucketCount      int     // Total number of archive buckets
-	LeafCount        int64   // Total number of reachable leaf nodes
-	ArchivedDataSize int64   // Total number of archived KV pairs
-	MaxBucketsPath   int     // Max number of buckets on a single path
-	BucketItemsAvg   float64 // Average number of archived KV pairs per bucket
-	BucketItemsP50   int     // P50 archived KV pairs per bucket
-	BucketItemsP95   int     // P95 archived KV pairs per bucket
-	BucketItemsP99   int     // P99 archived KV pairs per bucket
-	BucketItemsMax   int     // Max archived KV pairs in a bucket
+	BucketCount          int     // Total number of archive buckets
+	LeafCount            int64   // Total number of reachable leaf nodes
+	ArchivedDataSize     int64   // Total number of archived KV pairs
+	RootBucketCount      int     // Buckets held directly at the shard root
+	RootArchivedSize     int64   // Archived KV pairs held directly at the shard root
+	RootLeafBucketCount  int     // Shard roots that are standalone archive buckets
+	RootLeafArchivedSize int64   // Archived KV pairs in standalone shard-root buckets
+	MaxBucketsPath       int     // Max bucket-bearing nodes on a sequential lookup path; StubList fanout is tracked separately
+	StubBucketCount      int     // Buckets held in InternalNode.StubList
+	StubArchivedSize     int64   // Archived KV pairs held in StubList buckets
+	RootStubBucketCount  int     // StubList buckets held directly on the shard root
+	RootStubArchivedSize int64   // Archived KV pairs in root StubList buckets
+	DeepStubBucketCount  int     // StubList buckets held below the shard root
+	DeepStubArchivedSize int64   // Archived KV pairs in non-root StubList buckets
+	ChildBucketCount     int     // Buckets placed on ordinary child edges
+	ChildArchivedSize    int64   // Archived KV pairs held in ordinary child-edge buckets
+	MaxStubListBuckets   int     // Max StubList bucket count on one internal node
+	MaxStubListItems     int64   // Archived KV pairs in the max-bucket StubList
+	MaxRootStubBuckets   int     // Max root StubList bucket count on one shard root
+	MaxRootStubItems     int64   // Archived KV pairs in the max root StubList
+	MaxDeepStubBuckets   int     // Max non-root StubList bucket count on one internal node
+	MaxDeepStubItems     int64   // Archived KV pairs in the max non-root StubList
+	BucketItemsAvg       float64 // Average number of archived KV pairs per bucket
+	BucketItemsP50       int     // P50 archived KV pairs per bucket
+	BucketItemsP95       int     // P95 archived KV pairs per bucket
+	BucketItemsP99       int     // P99 archived KV pairs per bucket
+	BucketItemsMax       int     // Max archived KV pairs in a bucket
 
 	bucketItemHist map[int]int
 
@@ -112,8 +130,9 @@ func (t *Trie) Stats() *TrieStats {
 		if shard == nil {
 			continue
 		}
-		seen[i] = struct{}{}
-		shard.accumulateStatsIsolated(stats)
+		if shard.accumulateStatsIsolated(stats) {
+			seen[i] = struct{}{}
+		}
 	}
 
 	if t.topTree != nil {
@@ -215,15 +234,15 @@ func percentileRank(total int, p float64) int {
 	return rank
 }
 
-func (s *Shard) accumulateStats(stats *TrieStats) {
-	s.accumulateStatsWithCache(stats, s.nodeCache)
+func (s *Shard) accumulateStats(stats *TrieStats) bool {
+	return s.accumulateStatsWithCache(stats, s.nodeCache)
 }
 
-func (s *Shard) accumulateStatsIsolated(stats *TrieStats) {
-	s.accumulateStatsWithCache(stats, nil)
+func (s *Shard) accumulateStatsIsolated(stats *TrieStats) bool {
+	return s.accumulateStatsWithCache(stats, nil)
 }
 
-func (s *Shard) accumulateStatsWithCache(stats *TrieStats, nodeCache *nodeBlobCache) {
+func (s *Shard) accumulateStatsWithCache(stats *TrieStats, nodeCache *nodeBlobCache) bool {
 	s.mu.RLock()
 	root := s.root
 	rootHash := append([]byte(nil), s.rootHash...)
@@ -241,14 +260,15 @@ func (s *Shard) accumulateStatsWithCache(stats *TrieStats, nodeCache *nodeBlobCa
 		if err == nil {
 			root = loaded
 			view.nodeStatsAtPath(root, nil, 0, 0, stats)
-			return
+			return true
 		}
 	}
 
 	if root == nil {
-		return
+		return false
 	}
 	s.nodeStatsAtPath(root, nil, 0, 0, stats)
+	return true
 }
 
 func (s *Shard) nodeStats(node Node, currentPathBuckets int, stats *TrieStats) {
@@ -264,13 +284,49 @@ func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPat
 	case *InternalNode:
 		// Process buckets at this node
 		numBuckets := len(n.StubList)
+		atShardRoot := pathBits == 0 && currentPathBuckets == 0
 		stats.BucketCount += numBuckets
+		stats.StubBucketCount += numBuckets
+		var stubItems int64
+		if atShardRoot {
+			stats.RootBucketCount += numBuckets
+			stats.RootStubBucketCount += numBuckets
+		} else {
+			stats.DeepStubBucketCount += numBuckets
+		}
 		for _, bucket := range n.StubList {
 			stats.ArchivedDataSize += int64(bucket.Count)
+			stats.StubArchivedSize += int64(bucket.Count)
+			stubItems += int64(bucket.Count)
+			if atShardRoot {
+				stats.RootArchivedSize += int64(bucket.Count)
+				stats.RootStubArchivedSize += int64(bucket.Count)
+			} else {
+				stats.DeepStubArchivedSize += int64(bucket.Count)
+			}
 			stats.addBucketItemCount(bucket.Count)
 		}
+		if numBuckets > stats.MaxStubListBuckets || (numBuckets == stats.MaxStubListBuckets && stubItems > stats.MaxStubListItems) {
+			stats.MaxStubListBuckets = numBuckets
+			stats.MaxStubListItems = stubItems
+		}
+		if atShardRoot {
+			if numBuckets > stats.MaxRootStubBuckets || (numBuckets == stats.MaxRootStubBuckets && stubItems > stats.MaxRootStubItems) {
+				stats.MaxRootStubBuckets = numBuckets
+				stats.MaxRootStubItems = stubItems
+			}
+		} else if numBuckets > stats.MaxDeepStubBuckets || (numBuckets == stats.MaxDeepStubBuckets && stubItems > stats.MaxDeepStubItems) {
+			stats.MaxDeepStubBuckets = numBuckets
+			stats.MaxDeepStubItems = stubItems
+		}
 
-		newPathBuckets := currentPathBuckets + numBuckets
+		// A StubList is a side-mounted bucket set at one trie node. A key path can
+		// encounter this archive stop once; sibling fanout pressure is reported by
+		// MaxStubListBuckets instead of being folded into MaxBucketsPath.
+		newPathBuckets := currentPathBuckets
+		if numBuckets > 0 {
+			newPathBuckets++
+		}
 		if newPathBuckets > stats.MaxBucketsPath {
 			stats.MaxBucketsPath = newPathBuckets
 		}
@@ -301,6 +357,15 @@ func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPat
 		stats.BucketCount++
 		stats.ArchivedDataSize += int64(n.Count)
 		stats.addBucketItemCount(n.Count)
+		if pathBits == 0 && currentPathBuckets == 0 {
+			stats.RootBucketCount++
+			stats.RootArchivedSize += int64(n.Count)
+			stats.RootLeafBucketCount++
+			stats.RootLeafArchivedSize += int64(n.Count)
+		} else {
+			stats.ChildBucketCount++
+			stats.ChildArchivedSize += int64(n.Count)
+		}
 		if currentPathBuckets+1 > stats.MaxBucketsPath {
 			stats.MaxBucketsPath = currentPathBuckets + 1
 		}
