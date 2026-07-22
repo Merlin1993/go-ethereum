@@ -58,6 +58,59 @@ type mutation struct {
 	applied bool
 }
 
+type unifiedAccountStateWiper interface {
+	WipeAccountState(common.Address) (trie.AccountStateWipeResult, error)
+}
+
+type unifiedAccountWipe struct {
+	storages       map[common.Hash][]byte
+	storageOrigins map[common.Hash][]byte
+	codeChunks     int
+}
+
+func buildUnifiedAccountWipe(result trie.AccountStateWipeResult, original Storage) (*unifiedAccountWipe, error) {
+	wipe := &unifiedAccountWipe{
+		storages:       make(map[common.Hash][]byte, len(result.Storage)),
+		storageOrigins: make(map[common.Hash][]byte, len(result.Storage)),
+		codeChunks:     result.CodeChunks,
+	}
+	hasher := crypto.NewKeccakState()
+	for _, item := range result.Storage {
+		if len(item.Key) != common.HashLength {
+			return nil, fmt.Errorf("invalid slot length %d", len(item.Key))
+		}
+		slotHash := crypto.HashData(hasher, item.Key)
+		origin, err := rlp.EncodeToBytes(item.Value)
+		if err != nil {
+			return nil, fmt.Errorf("encode storage origin %x: %w", item.Key, err)
+		}
+		wipe.storages[slotHash] = nil
+		wipe.storageOrigins[slotHash] = origin
+	}
+	// A pre-Byzantium intermediate root may already contain changes made earlier
+	// in the block. stateObject keeps the true block-start value for every slot
+	// that was touched; use it both to restore the correct history origin and to
+	// include slots that were deleted before the account itself was destroyed.
+	for slot, value := range original {
+		slotHash := crypto.HashData(hasher, slot[:])
+		if value == (common.Hash{}) {
+			// The slot did not exist at block start. Whether it was merely read or
+			// created and removed through an earlier intermediate root, it is not
+			// part of the block-level deletion history.
+			delete(wipe.storages, slotHash)
+			delete(wipe.storageOrigins, slotHash)
+			continue
+		}
+		wipe.storages[slotHash] = nil
+		origin, err := rlp.EncodeToBytes(common.TrimLeftZeroes(value[:]))
+		if err != nil {
+			return nil, fmt.Errorf("encode original storage value %x: %w", slot, err)
+		}
+		wipe.storageOrigins[slotHash] = origin
+	}
+	return wipe, nil
+}
+
 func (m *mutation) copy() *mutation {
 	return &mutation{typ: m.typ, applied: m.applied}
 }
@@ -97,6 +150,7 @@ type StateDB struct {
 	// before the transition. This map is populated at the transaction
 	// boundaries.
 	stateObjectsDestruct map[common.Address]*stateObject
+	unifiedAccountWipes  map[common.Address]*unifiedAccountWipe
 
 	// This map tracks the account mutations that occurred during the
 	// transition. Uncommitted mutations belonging to the same account
@@ -161,6 +215,17 @@ type StateDB struct {
 	CommitBuildUpdate       time.Duration
 	CommitCodeWrite         time.Duration
 	CommitReaderReset       time.Duration
+	CommitAccountStateWipe  time.Duration
+	CommitWipeIndexScan     time.Duration
+	CommitWipeStemDelete    time.Duration
+	CommitWipeIndexStage    time.Duration
+	CommitWipeOriginBuild   time.Duration
+
+	CommitDestroyedAccounts int
+	CommitWipedAccounts     int
+	CommitWipedStorageSlots int
+	CommitWipedCodeChunks   int
+	CommitWipedStemRecords  int
 
 	AccountLoaded  int          // Number of accounts retrieved from the database during the state transition
 	AccountUpdated int          // Number of accounts updated during the state transition
@@ -190,6 +255,7 @@ func New(root common.Hash, db Database) (*StateDB, error) {
 		reader:               reader,
 		stateObjects:         make(map[common.Address]*stateObject),
 		stateObjectsDestruct: make(map[common.Address]*stateObject),
+		unifiedAccountWipes:  make(map[common.Address]*unifiedAccountWipe),
 		mutations:            make(map[common.Address]*mutation),
 		logs:                 make(map[common.Hash][]*types.Log),
 		preimages:            make(map[common.Hash][]byte),
@@ -212,6 +278,15 @@ func (s *StateDB) StartPrefetcher(namespace string, witness *stateless.Witness) 
 
 	// Enable witness collection if requested
 	s.witness = witness
+	// ArchiveTrie stores accounts, storage and code in one shared binary tree.
+	// The legacy prefetcher assumes a separate account trie and one storage trie
+	// per account; using it here can return an independent tree rooted at the
+	// pre-state and later overwrite in-memory storage wipes or updates. ArchiveTrie
+	// already has its own shared node cache, so leave this incompatible prefetcher
+	// disabled until it can operate on one unified tree instance.
+	if s.db.TrieDB().IsBinary() {
+		return
+	}
 
 	// With the switch to the Proof-of-Stake consensus algorithm, block production
 	// rewards are now handled at the consensus layer. Consequently, a block may
@@ -750,6 +825,7 @@ func (s *StateDB) Copy() *StateDB {
 		originalRoot:         s.originalRoot,
 		stateObjects:         make(map[common.Address]*stateObject, len(s.stateObjects)),
 		stateObjectsDestruct: make(map[common.Address]*stateObject, len(s.stateObjectsDestruct)),
+		unifiedAccountWipes:  make(map[common.Address]*unifiedAccountWipe, len(s.unifiedAccountWipes)),
 		mutations:            make(map[common.Address]*mutation, len(s.mutations)),
 		dbErr:                s.dbErr,
 		refund:               s.refund,
@@ -782,6 +858,20 @@ func (s *StateDB) Copy() *StateDB {
 	// Deep copy destructed state objects.
 	for addr, obj := range s.stateObjectsDestruct {
 		state.stateObjectsDestruct[addr] = obj.deepCopy(state)
+	}
+	for addr, wipe := range s.unifiedAccountWipes {
+		copyWipe := &unifiedAccountWipe{
+			storages:       make(map[common.Hash][]byte, len(wipe.storages)),
+			storageOrigins: make(map[common.Hash][]byte, len(wipe.storageOrigins)),
+			codeChunks:     wipe.codeChunks,
+		}
+		for key, value := range wipe.storages {
+			copyWipe.storages[key] = common.CopyBytes(value)
+		}
+		for key, value := range wipe.storageOrigins {
+			copyWipe.storageOrigins[key] = common.CopyBytes(value)
+		}
+		state.unifiedAccountWipes[addr] = copyWipe
 	}
 	// Deep copy the object state markers.
 	for addr, op := range s.mutations {
@@ -861,12 +951,80 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 	s.clearJournalAndRefund()
 }
 
+// wipeUnifiedDestructedState removes address-owned storage and code leaves
+// before applying any resurrection updates. Traditional MPT storage is a
+// separate subtrie and is handled later by deleteStorage; a unified binary trie
+// must delete these leaves explicitly from the shared tree.
+func (s *StateDB) wipeUnifiedDestructedState() {
+	if !s.db.TrieDB().IsBinary() || s.dbErr != nil {
+		return
+	}
+	wiper, ok := s.trie.(unifiedAccountStateWiper)
+	if !ok {
+		s.setError(errors.New("binary state trie does not support indexed account wiping"))
+		return
+	}
+	start := time.Now()
+	defer func() { s.CommitAccountStateWipe += time.Since(start) }()
+	for addr, prevObj := range s.stateObjectsDestruct {
+		previous, done := s.unifiedAccountWipes[addr]
+		if !done {
+			s.CommitDestroyedAccounts++
+		}
+		accountStart := time.Now()
+		result, err := wiper.WipeAccountState(addr)
+		if err != nil {
+			s.setError(fmt.Errorf("wipe unified account state %x: %w", addr, err))
+			return
+		}
+		s.CommitWipeIndexScan += time.Duration(result.IndexScanNanos)
+		s.CommitWipeStemDelete += time.Duration(result.StemDeleteNanos)
+		s.CommitWipeIndexStage += time.Duration(result.IndexStageNanos)
+		originBuildStart := time.Now()
+		wipe, err := buildUnifiedAccountWipe(result, prevObj.originStorage)
+		if err != nil {
+			s.setError(fmt.Errorf("build wiped storage origins for %x: %w", addr, err))
+			return
+		}
+		originBuildDuration := time.Since(originBuildStart)
+		s.CommitWipeOriginBuild += originBuildDuration
+		if done {
+			// The first wipe already captured the complete block-start storage.
+			// Later roots only remove post-origin values created by a recreation;
+			// they affect the tree root but not the block-level deletion history.
+			previous.codeChunks += wipe.codeChunks
+		} else {
+			s.unifiedAccountWipes[addr] = wipe
+			s.CommitWipedAccounts++
+		}
+		s.CommitWipedStorageSlots += len(result.Storage)
+		s.CommitWipedCodeChunks += result.CodeChunks
+		s.CommitWipedStemRecords += result.StemRecords
+		if elapsed := time.Since(accountStart); elapsed >= 8*time.Second {
+			log.Warn("Slow unified account state wipe",
+				"accountHash", crypto.Keccak256Hash(addr[:]),
+				"elapsed", elapsed,
+				"slots", len(result.Storage),
+				"stems", result.StemRecords,
+				"codeChunks", result.CodeChunks,
+				"indexScan", time.Duration(result.IndexScanNanos),
+				"stemDelete", time.Duration(result.StemDeleteNanos),
+				"indexStage", time.Duration(result.IndexStageNanos),
+				"originBuild", originBuildDuration)
+		}
+	}
+}
+
 // IntermediateRoot computes the current root hash of the state trie.
 // It is called in between transactions to get the root hash that
 // goes into transaction receipts.
 func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common.Hash) {
 	// Finalise all the dirty storage states and write them into the tries
 	s.Finalise(deleteEmptyObjects)
+	s.wipeUnifiedDestructedState()
+	if s.dbErr != nil {
+		return common.Hash{}, common.Hash{}
+	}
 
 	// If there was a trie prefetcher operating, terminate it async so that the
 	// individual storage tries can be updated as soon as the disk load finishes.
@@ -1185,6 +1343,15 @@ func (s *StateDB) handleDestruction(noStorageWiping bool) (map[common.Hash]*acco
 			origin:  types.SlimAccountRLP(*prev),
 		}
 		deletes[addrHash] = op
+		if s.db.TrieDB().IsBinary() {
+			wipe, ok := s.unifiedAccountWipes[addr]
+			if !ok {
+				return nil, nil, fmt.Errorf("binary account state was not wiped before destruction, %x", addr)
+			}
+			op.storages = wipe.storages
+			op.storagesOrigin = wipe.storageOrigins
+			continue
+		}
 
 		// Short circuit if the origin storage was empty.
 		if prev.Root == types.EmptyRootHash || s.db.TrieDB().IsVerkle() {
@@ -1362,6 +1529,7 @@ func (s *StateDB) commit(deleteEmptyObjects bool, noStorageWiping bool) (*stateU
 	// Clear all internal flags and update state root at the end.
 	s.mutations = make(map[common.Address]*mutation)
 	s.stateObjectsDestruct = make(map[common.Address]*stateObject)
+	s.unifiedAccountWipes = make(map[common.Address]*unifiedAccountWipe)
 
 	origin := s.originalRoot
 	s.originalRoot = root
@@ -1458,6 +1626,9 @@ func (s *StateDB) PreCommit(deleteEmptyObjects bool) (common.Hash, common.Hash, 
 	}
 	// Finalize any pending changes and merge everything into the tries
 	cHash, hash := s.IntermediateRoot(deleteEmptyObjects)
+	if s.dbErr != nil {
+		return common.Hash{}, common.Hash{}, fmt.Errorf("pre-commit failed: %w", s.dbErr)
+	}
 	return cHash, hash, nil
 }
 

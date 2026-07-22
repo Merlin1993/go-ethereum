@@ -18,11 +18,13 @@ package trie
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	archivetrie "github.com/ethereum/go-ethereum/trie/archive"
 	"github.com/ethereum/go-ethereum/trie/trienode"
+	trieutils "github.com/ethereum/go-ethereum/trie/utils"
 	"github.com/ethereum/go-ethereum/triedb/database"
 )
 
@@ -42,10 +45,13 @@ import (
 // 它负责把账户、storage、code 三类以太坊状态映射到底层 archivetrie.Trie 的归档键空间。
 type ArchiveTrie struct {
 	trie       *archivetrie.Trie
+	stem       *archivetrie.StemTrie
 	db         database.NodeDatabase
 	originRoot common.Hash
 	block      uint64
 	flat       ArchiveFlatSnapshotResolver
+	indexMu    sync.Mutex
+	indexOps   map[string]bool
 }
 
 // ArchiveFlatSnapshotResolver 按 state root 返回可读的 flat snapshot。
@@ -110,6 +116,22 @@ func (t *ArchiveTrie) installFlatReader() {
 	})
 }
 
+func wrapArchiveTrie(active *archivetrie.Trie, db database.NodeDatabase, root common.Hash, flat ArchiveFlatSnapshotResolver) (*ArchiveTrie, error) {
+	bt := &ArchiveTrie{trie: active, db: db, originRoot: root, flat: flat, indexOps: make(map[string]bool)}
+	if active != nil && active.Config() != nil && active.Config().StemMode {
+		stem, err := archivetrie.NewStemTrie(active)
+		if err != nil {
+			return nil, err
+		}
+		bt.stem = stem
+		if err := bt.prepareArchiveStemIndex(); err != nil {
+			return nil, err
+		}
+	}
+	bt.installFlatReader()
+	return bt, nil
+}
+
 var (
 	// globalArchiveNodeCache 缓存 hash-mode 节点 blob，主要解决 wrapper 每个区块重建 adapter
 	// 时看不到上一轮尚未完全落盘节点的问题。它是跨 block 的长期缓存，因此必须同时
@@ -134,6 +156,9 @@ type archiveNodeBlobCache struct {
 	limit      int
 	bytesLimit int64
 	bytes      int64
+	hits       int64
+	misses     int64
+	evictions  int64
 }
 
 // newArchiveNodeBlobCache 创建带 entry 上限和字节上限的全局节点缓存。
@@ -192,8 +217,10 @@ func (c *archiveNodeBlobCache) get(hash common.Hash) ([]byte, bool) {
 	defer c.mu.Unlock()
 	value, ok := c.cache.Get(hash)
 	if !ok {
+		c.misses++
 		return nil, false
 	}
+	c.hits++
 	return common.CopyBytes(value), true
 }
 
@@ -225,6 +252,7 @@ func (c *archiveNodeBlobCache) removeOldestLocked() {
 		return
 	}
 	c.bytes -= int64(common.HashLength + len(value))
+	c.evictions++
 	if c.bytes < 0 {
 		c.bytes = 0
 	}
@@ -232,12 +260,23 @@ func (c *archiveNodeBlobCache) removeOldestLocked() {
 
 // stats 返回当前缓存体量，用于实验 CSV 的 NodeCache_* 统计。
 func (c *archiveNodeBlobCache) stats() (entries int64, bytes int64) {
+	diag := c.diagnostics()
+	return diag.Entries, diag.Bytes
+}
+
+func (c *archiveNodeBlobCache) diagnostics() archivetrie.NodeCacheDiagnostics {
 	if c == nil {
-		return 0, 0
+		return archivetrie.NodeCacheDiagnostics{}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return int64(c.cache.Len()), c.bytes
+	return archivetrie.NodeCacheDiagnostics{
+		Entries:   int64(c.cache.Len()),
+		Bytes:     c.bytes,
+		Hits:      c.hits,
+		Misses:    c.misses,
+		Evictions: c.evictions,
+	}
 }
 
 // configureArchiveNodeCache 根据 triedb 配置重建进程级归档节点缓存。
@@ -294,13 +333,18 @@ func archiveNodeCacheRemove(hash common.Hash) {
 
 // archiveNodeCacheStats 返回进程级缓存统计。
 func archiveNodeCacheStats() (entries int64, bytes int64) {
+	diag := archiveNodeCacheDiagnostics()
+	return diag.Entries, diag.Bytes
+}
+
+func archiveNodeCacheDiagnostics() archivetrie.NodeCacheDiagnostics {
 	globalArchiveNodeCacheMu.RLock()
 	cache := globalArchiveNodeCache
 	globalArchiveNodeCacheMu.RUnlock()
 	if cache == nil {
-		return 0, 0
+		return archivetrie.NodeCacheDiagnostics{}
 	}
-	return cache.stats()
+	return cache.diagnostics()
 }
 
 // NewArchiveTrie 创建 ArchiveTrie，并尽量复用 triedb 中的 active archivetrie.Trie。
@@ -330,9 +374,7 @@ func NewArchiveTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Da
 			if adapter, ok := active.Database().(*archiveDBAdapter); ok {
 				adapter.root = root
 			}
-			bt := &ArchiveTrie{trie: active, db: db, originRoot: root, flat: flat}
-			bt.installFlatReader()
-			return bt, nil
+			return wrapArchiveTrie(active, db, root, flat)
 		}
 
 		if err := active.Load(root.Bytes()); err == nil {
@@ -341,9 +383,7 @@ func NewArchiveTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Da
 				adapter.root = root
 				adapter.reader = nil // Clear stale reader
 			}
-			bt := &ArchiveTrie{trie: active, db: db, originRoot: root, flat: flat}
-			bt.installFlatReader()
-			return bt, nil
+			return wrapArchiveTrie(active, db, root, flat)
 		}
 	}
 
@@ -397,6 +437,7 @@ func NewArchiveTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Da
 			}
 			config.EnablePathDiagnostics = dbConf.EnablePathDiagnostics
 			config.PhysicalDelete = dbConf.PhysicalDelete
+			config.StemMode = dbConf.StemMode
 			if dbConf.NodeStorageScheme == archivetrie.NodeStorageHash || dbConf.NodeStorageScheme == archivetrie.NodeStoragePath {
 				config.NodeStorageScheme = dbConf.NodeStorageScheme
 			}
@@ -415,13 +456,10 @@ func NewArchiveTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Da
 
 	// pruning=true 表示下层 trie 以归档裁剪模式运行。
 	t := archivetrie.NewTrie(root.Bytes(), kvAdapter, archivetrie.NewPooledKeccakHasher(), config, true)
-	bt := &ArchiveTrie{
-		trie:       t,
-		db:         db,
-		originRoot: root,
-		flat:       flat,
+	bt, err := wrapArchiveTrie(t, db, root, flat)
+	if err != nil {
+		return nil, err
 	}
-	bt.installFlatReader()
 	// 把 active trie 放回 triedb，下一次 NewArchiveTrie 可以继续复用。
 	type trieSetter interface {
 		SetArchiveTrie(interface{})
@@ -513,7 +551,7 @@ func (a *archiveDBAdapter) Get(key []byte) ([]byte, error) {
 	}
 	// ... rest of the code
 
-	// Try Disk first for potentially uncommitted/standalone nodes (like TopTree container)
+	// Try disk first for standalone binary root branches and uncommitted nodes.
 	if db := a.diskDB(); db != nil {
 		data, err := db.Get(key)
 		if err == nil && data != nil {
@@ -756,6 +794,11 @@ func (t *ArchiveTrie) trieDB() database.NodeDatabase {
 	return nil
 }
 
+// StemMode reports whether this wrapper groups binary-tree keys by stem.
+func (t *ArchiveTrie) StemMode() bool {
+	return t != nil && t.stem != nil
+}
+
 // GetKey 对 ArchiveTrie 没有实际意义；归档键已经是下层 trie 的原始键。
 func (t *ArchiveTrie) GetKey(key []byte) []byte { return nil }
 
@@ -767,6 +810,258 @@ func (t *ArchiveTrie) flatSnapshot() ArchiveFlatSnapshot {
 	return t.flat(t.originRoot)
 }
 
+var (
+	archiveStemStorageMagic       = [5]byte{'A', 'S', 'S', 'V', 1}
+	archiveStemStorageIndexPrefix = []byte{'A', 'S', 'I', 'S', 1}
+	archiveStemCodeIndexPrefix    = []byte{'A', 'S', 'I', 'C', 1}
+	archiveStemIndexSchemaKey     = []byte{'A', 'S', 'I', 'M', 1}
+	archiveFlatValuePrefix        = []byte{'B', 'F', 'V', '1'}
+)
+
+type archiveIndexIteratorStore interface {
+	Has(key []byte) (bool, error)
+	NewIterator(prefix []byte, start []byte) ethdb.Iterator
+}
+
+type archiveIndexOp struct {
+	key []byte
+	put bool
+}
+
+func archiveStemStorageIndexAccountPrefix(addr common.Address) []byte {
+	prefix := make([]byte, 0, len(archiveStemStorageIndexPrefix)+common.AddressLength)
+	prefix = append(prefix, archiveStemStorageIndexPrefix...)
+	prefix = append(prefix, addr[:]...)
+	return prefix
+}
+
+func archiveStemStorageIndexKey(addr common.Address, slot []byte) []byte {
+	slotHash := common.BytesToHash(slot)
+	key := archiveStemStorageIndexAccountPrefix(addr)
+	return append(key, slotHash[:]...)
+}
+
+func archiveStemCodeIndexAccountPrefix(addr common.Address) []byte {
+	prefix := make([]byte, 0, len(archiveStemCodeIndexPrefix)+common.AddressLength)
+	prefix = append(prefix, archiveStemCodeIndexPrefix...)
+	prefix = append(prefix, addr[:]...)
+	return prefix
+}
+
+func archiveStemCodeIndexKey(addr common.Address, chunk uint64) []byte {
+	key := archiveStemCodeIndexAccountPrefix(addr)
+	var suffix [8]byte
+	binary.BigEndian.PutUint64(suffix[:], chunk)
+	return append(key, suffix[:]...)
+}
+
+func (t *ArchiveTrie) archiveIndexStore() archiveIndexIteratorStore {
+	if t == nil || t.trie == nil {
+		return nil
+	}
+	if adapter, ok := t.trie.Database().(*archiveDBAdapter); ok {
+		if disk := adapter.diskDB(); disk != nil {
+			return disk
+		}
+	}
+	store, _ := t.trie.Database().(archiveIndexIteratorStore)
+	return store
+}
+
+func (t *ArchiveTrie) prepareArchiveStemIndex() error {
+	store := t.archiveIndexStore()
+	if store == nil {
+		return errors.New("archive stem index store is unavailable")
+	}
+	ready, err := store.Has(archiveStemIndexSchemaKey)
+	if err != nil {
+		return fmt.Errorf("check archive stem index schema: %w", err)
+	}
+	if ready {
+		return nil
+	}
+	it := store.NewIterator(archiveFlatValuePrefix, nil)
+	hasStemData := it.Next()
+	iterErr := it.Error()
+	it.Release()
+	if iterErr != nil {
+		return fmt.Errorf("check existing archive stem data: %w", iterErr)
+	}
+	if hasStemData {
+		return errors.New("archive stem account index is missing; start with a fresh database")
+	}
+	t.stageArchiveIndex(archiveStemIndexSchemaKey, true)
+	return nil
+}
+
+func (t *ArchiveTrie) archiveStemIndexReady() (bool, error) {
+	store := t.archiveIndexStore()
+	if store == nil {
+		return false, errors.New("archive stem index store is unavailable")
+	}
+	ready, err := store.Has(archiveStemIndexSchemaKey)
+	if err != nil {
+		return false, err
+	}
+	if ready {
+		return true, nil
+	}
+	t.indexMu.Lock()
+	pending := t.indexOps[string(archiveStemIndexSchemaKey)]
+	t.indexMu.Unlock()
+	return pending, nil
+}
+
+func (t *ArchiveTrie) listArchiveIndexKeys(prefix []byte) ([][]byte, error) {
+	store := t.archiveIndexStore()
+	if store == nil {
+		return nil, errors.New("archive stem index store is unavailable")
+	}
+	// Snapshot only the uncommitted changes for this account. The database
+	// iterator is already ordered, so avoid copying every persisted key into a
+	// map and sorting the full (potentially 100K+) account index again.
+	pending := make(map[string]bool)
+	t.indexMu.Lock()
+	for key, put := range t.indexOps {
+		if bytes.HasPrefix([]byte(key), prefix) {
+			pending[key] = put
+		}
+	}
+	t.indexMu.Unlock()
+	it := store.NewIterator(prefix, nil)
+	defer it.Release()
+	var keys [][]byte
+	for it.Next() {
+		key := common.CopyBytes(it.Key())
+		keyString := string(key)
+		if put, changed := pending[keyString]; changed {
+			delete(pending, keyString)
+			if !put {
+				continue
+			}
+		}
+		keys = append(keys, key)
+	}
+	if err := it.Error(); err != nil {
+		return nil, err
+	}
+	// New keys that do not yet exist in the database can be appended. Sort only
+	// this usually tiny tail to keep repeated runs deterministic.
+	added := make([]string, 0, len(pending))
+	for key, put := range pending {
+		if put {
+			added = append(added, key)
+		}
+	}
+	sort.Strings(added)
+	for _, key := range added {
+		keys = append(keys, []byte(key))
+	}
+	return keys, nil
+}
+
+func (t *ArchiveTrie) stageArchiveIndex(key []byte, put bool) {
+	if t == nil || len(key) == 0 {
+		return
+	}
+	t.indexMu.Lock()
+	if t.indexOps == nil {
+		t.indexOps = make(map[string]bool)
+	}
+	t.indexOps[string(key)] = put
+	t.indexMu.Unlock()
+}
+
+func (t *ArchiveTrie) stageArchiveIndexes(keys [][]byte, put bool) {
+	if t == nil || len(keys) == 0 {
+		return
+	}
+	t.indexMu.Lock()
+	if t.indexOps == nil {
+		t.indexOps = make(map[string]bool)
+	}
+	for _, key := range keys {
+		if len(key) > 0 {
+			t.indexOps[string(key)] = put
+		}
+	}
+	t.indexMu.Unlock()
+}
+
+func (t *ArchiveTrie) snapshotArchiveIndexOps() []archiveIndexOp {
+	t.indexMu.Lock()
+	defer t.indexMu.Unlock()
+	ops := make([]archiveIndexOp, 0, len(t.indexOps))
+	for key, put := range t.indexOps {
+		ops = append(ops, archiveIndexOp{key: []byte(key), put: put})
+	}
+	return ops
+}
+
+func applyArchiveIndexOps(batch archivetrie.Batcher, ops []archiveIndexOp) error {
+	for _, op := range ops {
+		if op.put {
+			if err := batch.Put(op.key, []byte{1}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := batch.Delete(op.key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *ArchiveTrie) clearArchiveIndexOps(ops []archiveIndexOp) {
+	t.indexMu.Lock()
+	defer t.indexMu.Unlock()
+	for _, op := range ops {
+		if current, ok := t.indexOps[string(op.key)]; ok && current == op.put {
+			delete(t.indexOps, string(op.key))
+		}
+	}
+}
+
+func encodeArchiveStemStorageValue(addr common.Address, slot, value []byte) []byte {
+	slotHash := common.BytesToHash(slot)
+	encoded := make([]byte, 0, len(archiveStemStorageMagic)+common.AddressLength+common.HashLength+len(value))
+	encoded = append(encoded, archiveStemStorageMagic[:]...)
+	encoded = append(encoded, addr[:]...)
+	encoded = append(encoded, slotHash[:]...)
+	encoded = append(encoded, value...)
+	return encoded
+}
+
+func decodeArchiveStemStorageValue(addr common.Address, slot, encoded []byte) ([]byte, error) {
+	header := len(archiveStemStorageMagic) + common.AddressLength + common.HashLength
+	if len(encoded) < header || !bytes.Equal(encoded[:len(archiveStemStorageMagic)], archiveStemStorageMagic[:]) {
+		return nil, errors.New("invalid ASCT stem storage value")
+	}
+	offset := len(archiveStemStorageMagic)
+	if !bytes.Equal(encoded[offset:offset+common.AddressLength], addr[:]) {
+		return nil, errors.New("ASCT stem storage address mismatch")
+	}
+	offset += common.AddressLength
+	slotHash := common.BytesToHash(slot)
+	if !bytes.Equal(encoded[offset:offset+common.HashLength], slotHash[:]) {
+		return nil, errors.New("ASCT stem storage slot mismatch")
+	}
+	return common.CopyBytes(encoded[header:]), nil
+}
+
+func decodeArchiveStemStorageRecord(encoded []byte) (common.Address, common.Hash, []byte, bool) {
+	header := len(archiveStemStorageMagic) + common.AddressLength + common.HashLength
+	if len(encoded) < header || !bytes.Equal(encoded[:len(archiveStemStorageMagic)], archiveStemStorageMagic[:]) {
+		return common.Address{}, common.Hash{}, nil, false
+	}
+	offset := len(archiveStemStorageMagic)
+	addr := common.BytesToAddress(encoded[offset : offset+common.AddressLength])
+	offset += common.AddressLength
+	slot := common.BytesToHash(encoded[offset : offset+common.HashLength])
+	return addr, slot, common.CopyBytes(encoded[header:]), true
+}
+
 // GetAccount 先查 flat snapshot，再回退到归档 trie。
 // 下层保存的是 slim/full account RLP，这里兼容两种解码方式。
 func (t *ArchiveTrie) GetAccount(address common.Address) (*types.StateAccount, error) {
@@ -775,8 +1070,15 @@ func (t *ArchiveTrie) GetAccount(address common.Address) (*types.StateAccount, e
 			return types.FullAccount(blob)
 		}
 	}
-	key := address.Bytes()
-	data, err := t.trie.Get(key)
+	var (
+		data []byte
+		err  error
+	)
+	if t.stem != nil {
+		data, err = t.stem.Get(trieutils.BinaryTreeBasicDataKey(address))
+	} else {
+		data, err = t.trie.Get(address.Bytes())
+	}
 	if err != nil {
 		if err == archivetrie.ErrNodeNotFound {
 			return nil, nil
@@ -807,6 +1109,16 @@ func (t *ArchiveTrie) GetStorage(addr common.Address, key []byte) ([]byte, error
 			return content, nil
 		}
 	}
+	if t.stem != nil {
+		val, err := t.stem.Get(trieutils.BinaryTreeStorageSlotKey(addr, key))
+		if err == archivetrie.ErrNodeNotFound {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		return decodeArchiveStemStorageValue(addr, key, val)
+	}
 	compositeKey := make([]byte, 20+len(key))
 	copy(compositeKey, addr.Bytes())
 	compositeKey[0] ^= 0x01 // XOR domain 1 for storage
@@ -820,16 +1132,26 @@ func (t *ArchiveTrie) GetStorage(addr common.Address, key []byte) ([]byte, error
 
 // UpdateAccount 写入账户 RLP。codeLen 在 ArchiveTrie 中不参与键值编码。
 func (t *ArchiveTrie) UpdateAccount(address common.Address, acc *types.StateAccount, codeLen int) error {
-	return t.trie.Put(address.Bytes(), types.SlimAccountRLP(*acc))
+	value := types.SlimAccountRLP(*acc)
+	if t.stem != nil {
+		return t.stem.Put(trieutils.BinaryTreeBasicDataKey(address), value)
+	}
+	return t.trie.Put(address.Bytes(), value)
 }
 
 // UpdateAccountRLP 直接写入上层已经编码好的账户 RLP。
 func (t *ArchiveTrie) UpdateAccountRLP(address common.Address, account []byte, codeLen int) error {
+	if t.stem != nil {
+		return t.stem.Put(trieutils.BinaryTreeBasicDataKey(address), account)
+	}
 	return t.trie.Put(address.Bytes(), account)
 }
 
 // UpdateStorage 写入单个 storage slot；空值表示删除。
 func (t *ArchiveTrie) UpdateStorage(addr common.Address, key, value []byte) error {
+	if t.stem != nil {
+		return t.UpdateStorageBatch(addr, []StorageUpdate{{Key: common.CopyBytes(key), Value: common.CopyBytes(value), Delete: len(value) == 0}})
+	}
 	compositeKey := make([]byte, 20+len(key))
 	copy(compositeKey, addr.Bytes())
 	compositeKey[0] ^= 0x01
@@ -840,13 +1162,61 @@ func (t *ArchiveTrie) UpdateStorage(addr common.Address, key, value []byte) erro
 	return t.trie.Put(compositeKey, value)
 }
 
+// UpdateStorageBatch groups all mutations by stem so each 256-value payload is
+// decoded, rehashed, and encoded only once.
+func (t *ArchiveTrie) UpdateStorageBatch(addr common.Address, updates []StorageUpdate) error {
+	if t.stem == nil {
+		for _, update := range updates {
+			if update.Delete || len(update.Value) == 0 {
+				if err := t.DeleteStorage(addr, update.Key); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := t.UpdateStorage(addr, update.Key, update.Value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	stemUpdates := make([]archivetrie.StemUpdate, 0, len(updates))
+	for _, update := range updates {
+		if len(update.Key) != common.HashLength {
+			return fmt.Errorf("invalid storage slot length %d", len(update.Key))
+		}
+		deleteValue := update.Delete || len(update.Value) == 0
+		item := archivetrie.StemUpdate{
+			Key:    trieutils.BinaryTreeStorageSlotKey(addr, update.Key),
+			Delete: deleteValue,
+		}
+		if !deleteValue {
+			item.Value = encodeArchiveStemStorageValue(addr, update.Key, update.Value)
+		}
+		stemUpdates = append(stemUpdates, item)
+	}
+	if err := t.stem.ApplyBatch(stemUpdates); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		deleteValue := update.Delete || len(update.Value) == 0
+		t.stageArchiveIndex(archiveStemStorageIndexKey(addr, update.Key), !deleteValue)
+	}
+	return nil
+}
+
 // DeleteAccount 删除账户键。
 func (t *ArchiveTrie) DeleteAccount(address common.Address) error {
+	if t.stem != nil {
+		return t.stem.Delete(trieutils.BinaryTreeBasicDataKey(address))
+	}
 	return t.trie.BatchDelete(address.Bytes())
 }
 
 // DeleteStorage 删除指定账户的 storage slot。
 func (t *ArchiveTrie) DeleteStorage(addr common.Address, key []byte) error {
+	if t.stem != nil {
+		return t.UpdateStorageBatch(addr, []StorageUpdate{{Key: common.CopyBytes(key), Delete: true}})
+	}
 	compositeKey := make([]byte, 20+len(key))
 	copy(compositeKey, addr.Bytes())
 	compositeKey[0] ^= 0x01
@@ -854,9 +1224,147 @@ func (t *ArchiveTrie) DeleteStorage(addr common.Address, key []byte) error {
 	return t.trie.BatchDelete(compositeKey)
 }
 
+func (t *ArchiveTrie) archiveStemCodeChunks(addr common.Address) ([]uint64, error) {
+	prefix := archiveStemCodeIndexAccountPrefix(addr)
+	keys, err := t.listArchiveIndexKeys(prefix)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[uint64]struct{}, len(keys))
+	for _, key := range keys {
+		if len(key) != len(prefix)+8 || !bytes.HasPrefix(key, prefix) {
+			return nil, errors.New("invalid archive stem code index key")
+		}
+		seen[binary.BigEndian.Uint64(key[len(prefix):])] = struct{}{}
+	}
+	chunks := make([]uint64, 0, len(seen))
+	for chunk := range seen {
+		chunks = append(chunks, chunk)
+	}
+	return chunks, nil
+}
+
+// WipeAccountState removes all storage slots and address-owned code chunks of
+// one account from the unified ASCT. Stem mode uses the persisted address
+// index, so the work is proportional to this account rather than the global
+// trie. The returned storage values are used by StateDB's snapshot/history
+// bookkeeping.
+func (t *ArchiveTrie) WipeAccountState(address common.Address) (AccountStateWipeResult, error) {
+	result := AccountStateWipeResult{Address: address}
+	if t == nil || t.trie == nil {
+		return result, errors.New("nil archive trie")
+	}
+	if t.stem == nil {
+		prefix := make([]byte, common.AddressLength)
+		copy(prefix, address[:])
+		prefix[0] ^= 0x01
+		var keys [][]byte
+		t.trie.ForEachPrefix(prefix, len(prefix)*8, func(key, value []byte) bool {
+			if len(key) == common.AddressLength+common.HashLength {
+				keys = append(keys, common.CopyBytes(key))
+				result.Storage = append(result.Storage, StorageWipeItem{
+					Key:   common.CopyBytes(key[common.AddressLength:]),
+					Value: common.CopyBytes(value),
+				})
+			}
+			return true
+		})
+		for _, key := range keys {
+			if err := t.trie.BatchDelete(key); err != nil {
+				return AccountStateWipeResult{Address: address}, err
+			}
+		}
+		return result, nil
+	}
+	ready, err := t.archiveStemIndexReady()
+	if err != nil {
+		return result, fmt.Errorf("check archive stem account index: %w", err)
+	}
+	if !ready {
+		return result, errors.New("archive stem account index is not initialized; start with a fresh database")
+	}
+	indexScanStart := time.Now()
+	storagePrefix := archiveStemStorageIndexAccountPrefix(address)
+	storageKeys, err := t.listArchiveIndexKeys(storagePrefix)
+	if err != nil {
+		return result, err
+	}
+	codeChunks, err := t.archiveStemCodeChunks(address)
+	if err != nil {
+		return AccountStateWipeResult{Address: address}, err
+	}
+	result.IndexScanNanos = time.Since(indexScanStart).Nanoseconds()
+
+	treeKeys := make([][]byte, 0, len(storageKeys)+len(codeChunks))
+	slots := make([][]byte, 0, len(storageKeys))
+	for _, indexKey := range storageKeys {
+		if len(indexKey) != len(storagePrefix)+common.HashLength || !bytes.HasPrefix(indexKey, storagePrefix) {
+			return AccountStateWipeResult{Address: address}, errors.New("invalid archive stem storage index key")
+		}
+		slot := common.CopyBytes(indexKey[len(storagePrefix):])
+		slots = append(slots, slot)
+		treeKeys = append(treeKeys, trieutils.BinaryTreeStorageSlotKey(address, slot))
+	}
+	for _, chunk := range codeChunks {
+		treeKeys = append(treeKeys, trieutils.BinaryTreeCodeChunkKey(address, chunk))
+	}
+	stemDeleteStart := time.Now()
+	deleted, err := t.stem.DeleteBatchWithValues(treeKeys)
+	result.StemDeleteNanos = time.Since(stemDeleteStart).Nanoseconds()
+	if err != nil {
+		return AccountStateWipeResult{Address: address}, fmt.Errorf("delete indexed account state: %w", err)
+	}
+	result.Storage = make([]StorageWipeItem, 0, len(slots))
+	for i, slot := range slots {
+		value, err := decodeArchiveStemStorageValue(address, slot, deleted.Values[i])
+		if err != nil {
+			return AccountStateWipeResult{Address: address}, err
+		}
+		result.Storage = append(result.Storage, StorageWipeItem{Key: slot, Value: value})
+	}
+	indexStageStart := time.Now()
+	t.stageArchiveIndexes(storageKeys, false)
+	codeIndexKeys := make([][]byte, 0, len(codeChunks))
+	for _, chunk := range codeChunks {
+		codeIndexKeys = append(codeIndexKeys, archiveStemCodeIndexKey(address, chunk))
+	}
+	t.stageArchiveIndexes(codeIndexKeys, false)
+	result.IndexStageNanos = time.Since(indexStageStart).Nanoseconds()
+	result.CodeChunks = len(codeChunks)
+	result.StemRecords = deleted.StemCount
+	return result, nil
+}
+
 // UpdateContractCode 使用 code hash 作为 code 域键。
 // 首字节 xor 0x02 是 code 域分隔，避免与账户和 storage 键冲突。
 func (t *ArchiveTrie) UpdateContractCode(address common.Address, codeHash common.Hash, code []byte) error {
+	if t.stem != nil {
+		chunks := trieutils.ChunkifyBinaryCode(code)
+		oldChunks, err := t.archiveStemCodeChunks(address)
+		if err != nil {
+			return err
+		}
+		updates := make([]archivetrie.StemUpdate, 0, len(oldChunks)+len(chunks)/common.HashLength)
+		for _, chunk := range oldChunks {
+			updates = append(updates, archivetrie.StemUpdate{Key: trieutils.BinaryTreeCodeChunkKey(address, chunk), Delete: true})
+		}
+		for offset, chunk := 0, uint64(0); offset < len(chunks); offset, chunk = offset+common.HashLength, chunk+1 {
+			updates = append(updates, archivetrie.StemUpdate{
+				Key:   trieutils.BinaryTreeCodeChunkKey(address, chunk),
+				Value: common.CopyBytes(chunks[offset : offset+common.HashLength]),
+			})
+		}
+		if err := t.stem.ApplyBatch(updates); err != nil {
+			return err
+		}
+		for _, chunk := range oldChunks {
+			t.stageArchiveIndex(archiveStemCodeIndexKey(address, chunk), false)
+		}
+		for chunk := uint64(0); chunk < uint64(len(chunks)/common.HashLength); chunk++ {
+			t.stageArchiveIndex(archiveStemCodeIndexKey(address, chunk), true)
+		}
+		return nil
+	}
 	key := codeHash.Bytes()
 	key[0] ^= 0x02 // XOR domain 2 for code
 	return t.trie.Put(key, code)
@@ -892,7 +1400,8 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 		stopWatchdog = func() { close(done) }
 		defer stopWatchdog()
 	}
-	// shard-aware commit：先并行提交 dirty shards，再提交 top tree，最后统一更新 triedb。
+	// Shard-aware commit: persist changed subtrees, hash their binary paths to
+	// the root, then update triedb once.
 	if adapter, ok := t.trie.Database().(*archiveDBAdapter); ok {
 		if err := t.trie.FinishAsyncPrune(); err != nil {
 			return common.Hash{}, nil
@@ -902,6 +1411,7 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 			rawBatch = disk.NewBatch()
 			defer rawBatch.Reset()
 		}
+		indexOps := t.snapshotArchiveIndexOps()
 		// 1. 为多 owner 的原子更新准备 MergedNodeSet。
 		merged := trienode.NewMergedNodeSet()
 		dirtyShards := t.trie.GetDirtyShards()
@@ -1028,18 +1538,18 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 		shardCommitDuration := time.Since(shardCommitStart)
 		archivetrie.RecordWrapperShardCommitMax(maxShardID, maxShardDiag)
 
-		// 3. 提交 top tree 容器节点；这些节点归属 zero owner。
-		topNodes := trienode.NewNodeSet(common.Hash{})
-		topBatch := &nodeSetBatcher{adapter: adapter, nodes: topNodes, rawBatch: rawBatch}
-		topTreeStart := time.Now()
-		h, err := t.trie.CommitTopTreeToBatch(shardRoots, dirtyShards, topBatch)
+		// 3. Persist the binary branches from changed shards to the global root.
+		rootNodes := trienode.NewNodeSet(common.Hash{})
+		rootBatch := &nodeSetBatcher{adapter: adapter, nodes: rootNodes, rawBatch: rawBatch}
+		rootHashStart := time.Now()
+		h, err := t.trie.CommitRootToBatch(shardRoots, dirtyShards, rootBatch)
 		if err != nil {
 			return common.Hash{}, nil
 		}
-		topTreeDuration := time.Since(topTreeStart)
+		rootHashDuration := time.Since(rootHashStart)
 		root := common.BytesToHash(h)
-		if len(topNodes.Nodes) > 0 {
-			if err := merged.Merge(topNodes); err != nil {
+		if len(rootNodes.Nodes) > 0 {
+			if err := merged.Merge(rootNodes); err != nil {
 				return common.Hash{}, nil
 			}
 		}
@@ -1083,12 +1593,26 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 		var batchWriteDuration time.Duration
 		var batchOps, batchBytes int
 		if rawBatch != nil {
+			if err := applyArchiveIndexOps(rawBatch, indexOps); err != nil {
+				return common.Hash{}, nil
+			}
 			batchOps, batchBytes = rawBatchStats(rawBatch)
 			batchWriteStart := time.Now()
 			if err := rawBatch.Write(); err != nil {
 				return common.Hash{}, nil
 			}
 			batchWriteDuration = time.Since(batchWriteStart)
+			t.clearArchiveIndexOps(indexOps)
+		} else if len(indexOps) > 0 {
+			batch := t.trie.Database().NewBatch()
+			if err := applyArchiveIndexOps(batch, indexOps); err != nil {
+				return common.Hash{}, nil
+			}
+			if err := batch.Write(); err != nil {
+				return common.Hash{}, nil
+			}
+			batch.Reset()
+			t.clearArchiveIndexOps(indexOps)
 		}
 
 		// 6. 保存 active trie，下一块继续复用。
@@ -1101,15 +1625,16 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 
 		t.originRoot = root
 		totalDuration := time.Since(commitStart)
-		archivetrie.RecordWrapperCommitDiagnostics(totalDuration, shardCommitDuration, topTreeDuration, adapterMergeDuration, updateDuration, batchWriteDuration, len(dirtyShards))
+		archivetrie.RecordWrapperCommitDiagnostics(totalDuration, shardCommitDuration, rootHashDuration, adapterMergeDuration, updateDuration, batchWriteDuration, len(dirtyShards))
 		// 每次 commit 都记录缓存体量，主 CSV 可以持续观察 NodeCache_MB 是否顶到上限。
 		// 慢提交时下面还会额外记录完整 runtime.MemStats。
-		nodeCacheEntries, nodeCacheBytes := t.trie.NodeCacheStats()
-		globalCacheEntries, globalCacheBytes := archiveNodeCacheStats()
-		nodeCacheEntries += globalCacheEntries
-		nodeCacheBytes += globalCacheBytes
+		cacheDiag := t.trie.NodeCacheDiagnostics()
+		globalCacheDiag := archiveNodeCacheDiagnostics()
+		nodeCacheEntries := cacheDiag.Entries + globalCacheDiag.Entries
+		nodeCacheBytes := cacheDiag.Bytes + globalCacheDiag.Bytes
+		archivetrie.RecordNodeCacheDiagnostics(cacheDiag.Hits+globalCacheDiag.Hits, cacheDiag.Misses+globalCacheDiag.Misses, cacheDiag.Evictions+globalCacheDiag.Evictions)
 		archivetrie.RecordWrapperResourceDiagnostics(rawTotalOps, rawTotalBytes, rawMaxShardID, rawMaxOps, rawMaxBytes, nodeCacheEntries, nodeCacheBytes, 0, 0, 0, 0, 0, 0, 0)
-		if totalDuration > 5*time.Second || shardCommitDuration > 5*time.Second || topTreeDuration > 5*time.Second || batchWriteDuration > 5*time.Second {
+		if totalDuration > 5*time.Second || shardCommitDuration > 5*time.Second || rootHashDuration > 5*time.Second || batchWriteDuration > 5*time.Second {
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
 			var lastPause uint64
@@ -1117,15 +1642,28 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 				lastPause = mem.PauseNs[(mem.NumGC+255)%256]
 			}
 			archivetrie.RecordWrapperResourceDiagnostics(rawTotalOps, rawTotalBytes, rawMaxShardID, rawMaxOps, rawMaxBytes, nodeCacheEntries, nodeCacheBytes, mem.HeapAlloc, mem.HeapSys, mem.HeapInuse, mem.Sys, uint64(mem.NumGC), mem.PauseTotalNs, lastPause)
-			fmt.Printf("[ASCT_WRAPPER_COMMIT_DIAG] block=%d total=%v shardCommit=%v topTree=%v adapterMerge=%v trieDBUpdate=%v batchWrite=%v dirtyShards=%d mergedOwners=%d rawBatchOps=%d rawBatchBytes=%d\n",
-				block, totalDuration, shardCommitDuration, topTreeDuration, adapterMergeDuration, updateDuration, batchWriteDuration, len(dirtyShards), len(merged.Sets), batchOps, batchBytes)
+			fmt.Printf("[ASCT_WRAPPER_COMMIT_DIAG] block=%d total=%v shardCommit=%v rootHash=%v adapterMerge=%v trieDBUpdate=%v batchWrite=%v dirtyShards=%d mergedOwners=%d rawBatchOps=%d rawBatchBytes=%d\n",
+				block, totalDuration, shardCommitDuration, rootHashDuration, adapterMergeDuration, updateDuration, batchWriteDuration, len(dirtyShards), len(merged.Sets), batchOps, batchBytes)
 		}
 		// NodeSet 已经在内部写入 triedb，这里返回 nil 避免上层重复处理。
 		return root, nil
 	}
 
 	fallbackStart := time.Now()
-	h, _ := t.trie.CommitToBatch(nil, true)
+	batch := t.trie.Database().NewBatch()
+	defer batch.Reset()
+	h, err := t.trie.CommitToBatch(batch, true)
+	if err != nil {
+		return common.Hash{}, nil
+	}
+	indexOps := t.snapshotArchiveIndexOps()
+	if err := applyArchiveIndexOps(batch, indexOps); err != nil {
+		return common.Hash{}, nil
+	}
+	if err := batch.Write(); err != nil {
+		return common.Hash{}, nil
+	}
+	t.clearArchiveIndexOps(indexOps)
 	archivetrie.RecordWrapperCommitDiagnostics(time.Since(commitStart), time.Since(fallbackStart), 0, 0, 0, 0, 0)
 	return common.BytesToHash(h), nil
 }
@@ -1137,6 +1675,9 @@ func (t *ArchiveTrie) Witness() map[string]struct{} { return nil }
 func (t *ArchiveTrie) NodeIterator(startKey []byte) (NodeIterator, error) {
 	// For now, we only support a simple leaf-only iterator if startKey is nil.
 	// This is primarily for debugging or tools that need to dump the trie.
+	if t.stem != nil {
+		return newArchiveStemStorageIterator(common.Address{}, t.stem, true), nil
+	}
 	return newArchiveStorageIterator(common.Address{}, t.trie, true), nil
 }
 
@@ -1204,6 +1745,11 @@ func (s *ArchiveStorageTrie) UpdateStorage(addr common.Address, key, value []byt
 	return s.bt.UpdateStorage(s.address, key, value)
 }
 
+// UpdateStorageBatch applies one state object's storage changes by stem.
+func (s *ArchiveStorageTrie) UpdateStorageBatch(addr common.Address, updates []StorageUpdate) error {
+	return s.bt.UpdateStorageBatch(s.address, updates)
+}
+
 // DeleteAccount 不属于 storage 子 trie 能力范围。
 func (s *ArchiveStorageTrie) DeleteAccount(address common.Address) error {
 	return errors.New("not supported")
@@ -1234,6 +1780,9 @@ func (s *ArchiveStorageTrie) Witness() map[string]struct{} { return nil }
 
 // NodeIterator 只遍历当前账户 storage 前缀下的叶子。
 func (s *ArchiveStorageTrie) NodeIterator(startKey []byte) (NodeIterator, error) {
+	if s.bt.stem != nil {
+		return newArchiveStemStorageIterator(s.address, s.bt.stem, false), nil
+	}
 	return newArchiveStorageIterator(s.address, s.bt.trie, false), nil
 }
 
@@ -1290,6 +1839,29 @@ func newArchiveStorageIterator(address common.Address, bt *archivetrie.Trie, isG
 	} else {
 		bt.ForEachPrefix(it.prefix, len(it.prefix)*8, visit)
 	}
+	return it
+}
+
+func newArchiveStemStorageIterator(address common.Address, stem *archivetrie.StemTrie, isGlobal bool) *archiveStorageIterator {
+	it := &archiveStorageIterator{index: -1}
+	if stem == nil {
+		return it
+	}
+	it.err = stem.ForEach(func(treeKey, encoded []byte) bool {
+		if isGlobal {
+			value := encoded
+			if _, _, storageValue, ok := decodeArchiveStemStorageRecord(encoded); ok {
+				value = storageValue
+			}
+			it.leaves = append(it.leaves, leafKV{key: common.CopyBytes(treeKey), value: common.CopyBytes(value)})
+			return true
+		}
+		recordAddr, slot, value, ok := decodeArchiveStemStorageRecord(encoded)
+		if ok && recordAddr == address {
+			it.leaves = append(it.leaves, leafKV{key: slot.Bytes(), value: value})
+		}
+		return true
+	})
 	return it
 }
 

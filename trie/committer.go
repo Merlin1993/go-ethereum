@@ -184,21 +184,22 @@ func ForGatherChildren(node []byte, onChild func(common.Hash)) {
 	forGatherChildren(mustDecodeNodeUnsafe(nil, node), onChild)
 }
 
-// ForGatherBinaryChildren extracts child hashes from a binary trie node or top tree node.
+// ForGatherBinaryChildren extracts child hashes from an ASCT node or from a
+// binary branch above the shard boundary.
 func ForGatherBinaryChildren(node []byte, onChild func(common.Hash)) {
 	if len(node) == 0 {
 		return
 	}
 	header := node[0]
 
-	// 1. TopTree Node (Header: 0xD0 - 0xD3)
-	if header >= 0xD0 && header <= 0xD3 {
-		if len(node) < 1+16*32 {
+	// 1. Binary root branch: exactly a left and a right child.
+	if header == 0xD4 {
+		if len(node) != 2+2*32 {
 			return
 		}
-		for i := 0; i < 16; i++ {
+		for i := 0; i < 2; i++ {
 			var h common.Hash
-			copy(h[:], node[1+i*32:1+i*32+32])
+			copy(h[:], node[2+i*32:2+i*32+32])
 			if h != (common.Hash{}) {
 				onChild(h)
 			}

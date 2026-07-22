@@ -1,23 +1,31 @@
 package archive
 
 import (
-	"bytes"
+	"fmt"
 	"runtime"
 	"sync"
 	"time"
 )
 
-// Trie 是 ASCT 的分片协调器。
-//
-// 它负责 shard 表、TopTree root 汇总，以及剪枝、提交、懒加载 shard root 的生命周期。
-// 单个 key/value 的具体读写逻辑在 Shard 中完成。
+// Trie coordinates the shard views of one binary tree. Shards are only fixed
+// depth subtrees; their roots are connected by the same binary paths and are
+// hashed directly back to one global root.
 type Trie struct {
 	db     KVStore
 	hasher Hasher
 	config *Config
 
+	stemViewMu sync.Mutex
+	stemView   *StemTrie
+
 	shards   []*Shard
 	shardsMu sync.RWMutex
+	rootMu   sync.Mutex
+
+	// rootBranch is the lazily loaded binary path above the shard boundary.
+	// With ShardDepth zero, rootHash is directly the only shard root.
+	rootBranch *rootBranch
+	rootHash   []byte
 
 	// nodeCache 缓存序列化节点；pointCache 缓存解码后的 ECMH 点。
 	// 这两个缓存被所有 shard 共享，用来降低剪枝和提交时的重复解码/分配。
@@ -32,9 +40,6 @@ type Trie struct {
 	// 同一时间只允许一个后台剪枝任务。任何依赖 root 的操作都必须先等待它完成。
 	asyncPruneMu sync.Mutex
 	asyncPrune   *asyncPruneJob
-
-	// TopTree handles the hierarchical root hash computation
-	topTree *TopTree
 
 	// 分片轮转剪枝使用的 epoch 状态。
 	pruneShardIdx  int
@@ -52,6 +57,7 @@ type asyncPruneJob struct {
 	done          chan struct{}
 	err           error
 	pruneNanos    int64
+	prunePhases   ShardPruneDiagnostics
 	before        pruneCounterSnapshot
 	after         pruneCounterSnapshot
 	launchNanos   int64
@@ -81,8 +87,6 @@ func NewTrie(root []byte, db KVStore, hasher Hasher, config *Config, pruning boo
 		pruning:          pruning,
 		dirtyShards:      make(map[int]struct{}),
 	}
-	t.topTree = NewTopTree(hasher, nil, config.ShardDepth, config.UsePathStorage())
-
 	if len(root) > 0 {
 		t.Load(root)
 	}
@@ -104,7 +108,7 @@ func (t *Trie) GetDirtyShards() []int {
 }
 
 func (t *Trie) GetShardRoot(id int) []byte {
-	shardRoot, _ := t.topTree.GetShardRoot(id, t.db)
+	shardRoot, _ := t.shardRoot(id)
 	return shardRoot
 }
 
@@ -130,8 +134,8 @@ func (t *Trie) CommitShardToBatchWithDiagnostics(id int, batch Batcher, destruct
 	return shard.CommitToBatchWithDiagnostics(batch, destructive)
 }
 
-func (t *Trie) CommitTopTreeToBatch(shardRoots map[int][]byte, dirtyShards []int, batch Batcher) ([]byte, error) {
-	rootHash, err := t.topTree.Compute(shardRoots, dirtyShards, batch)
+func (t *Trie) CommitRootToBatch(shardRoots map[int][]byte, dirtyShards []int, batch Batcher) ([]byte, error) {
+	rootHash, err := t.computeBinaryRoot(shardRoots, dirtyShards, batch)
 	if err != nil {
 		return nil, err
 	}
@@ -223,8 +227,21 @@ func (t *Trie) finishAsyncPrune() error {
 	}
 	totalNanos := job.launchNanos + waitNanos
 	recordPruneDiagnostics(totalNanos, waitNanos, job.pruneNanos, prefetchNanos)
-	recordPruneShardPressure(job.idx, totalNanos, waitNanos, job.pruneNanos, prefetchNanos, job.before, job.after)
+	recordPruneShardPressure(job.idx, totalNanos, waitNanos, job.pruneNanos, prefetchNanos, job.prunePhases, job.before, job.after)
 	return job.err
+}
+
+// finishAsyncPruneForShard waits only when the pending cleanup owns the shard
+// about to be accessed. Unrelated shards remain available while cleanup runs;
+// root reads and commits still use finishAsyncPrune as a global barrier.
+func (t *Trie) finishAsyncPruneForShard(shardID int) error {
+	t.asyncPruneMu.Lock()
+	job := t.asyncPrune
+	t.asyncPruneMu.Unlock()
+	if job == nil || job.idx != shardID {
+		return nil
+	}
+	return t.finishAsyncPrune()
 }
 
 // Load loads the Trie state from the database using a given root hash.
@@ -232,30 +249,37 @@ func (t *Trie) Load(rootHash []byte) error {
 	if len(rootHash) == 0 {
 		return nil
 	}
+	if len(rootHash) != 32 {
+		return fmt.Errorf("archive: root hash must be 32 bytes, got %d", len(rootHash))
+	}
 	if err := t.finishAsyncPrune(); err != nil {
 		return err
 	}
 
 	// If current root is already what we're loading, skip reset
 	current, _ := t.Hash()
-	if bytes.Equal(current, rootHash) {
+	if rootHashesEqual(current, rootHash) {
 		return nil
 	}
 
-	// Load the TopTree from DB
-	if err := t.topTree.Load(rootHash, t.db); err != nil {
+	if err := t.loadBinaryRoot(rootHash); err != nil {
 		return err
 	}
 
-	// 重置已加载 shard，使它们下次访问时从新的 TopTree root 读取 shard root。
+	// 重置已加载 shard，使它们下次访问时从新 root 的二叉路径读取分片 root。
 	t.shardsMu.Lock()
 	defer t.shardsMu.Unlock()
 	for i, s := range t.shards {
 		if s != nil {
-			shardRoot, _ := t.topTree.GetShardRoot(i, t.db)
+			shardRoot, err := t.shardRoot(i)
+			if err != nil {
+				return err
+			}
 			s.Reset(shardRoot)
 		}
 	}
+	t.dirtyShards = make(map[int]struct{})
+	t.dirtyShardList = nil
 	return nil
 }
 
@@ -275,8 +299,11 @@ func (t *Trie) getOrCreateShard(id int) (*Shard, error) {
 		return t.shards[id], nil
 	}
 
-	// Try to get existing shard root from TopTree
-	shardRoot, _ := t.topTree.GetShardRoot(id, t.db)
+	// Follow the key prefix directly to the committed shard root.
+	shardRoot, rootErr := t.shardRoot(id)
+	if rootErr != nil {
+		return nil, rootErr
+	}
 
 	s, err := newShard(id, t.db, t.hasher, t.config, shardRoot, t.pruning, func() byte {
 		// [Rolling Epoch] 为了防止“提前加热”导致无法归档，每个分片只有在正式被剪枝后才切换到新的 GlobalBit。
@@ -296,7 +323,7 @@ func (t *Trie) getOrCreateShard(id int) (*Shard, error) {
 // Get 根据 key 定位 shard，并沿该 shard 的热/冷路径读取。
 func (t *Trie) Get(key []byte) ([]byte, error) {
 	shardID := t.GetShardID(key)
-	if err := t.finishAsyncPrune(); err != nil {
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
 		return nil, err
 	}
 	shard, err := t.getOrCreateShard(shardID)
@@ -311,7 +338,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 // 保证一个 key 只有一个有效位置。
 func (t *Trie) Put(key []byte, value []byte) error {
 	shardID := t.GetShardID(key)
-	if err := t.finishAsyncPrune(); err != nil {
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
 		return err
 	}
 	shard, err := t.getOrCreateShard(shardID)
@@ -331,9 +358,6 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	if err := t.finishAsyncPrune(); err != nil {
-		return err
-	}
 	type shardWrites struct {
 		id      int
 		entries []KeyValue
@@ -349,6 +373,11 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 			groups = append(groups, shardWrites{id: id})
 		}
 		groups[index].entries = append(groups[index].entries, entry)
+	}
+	for _, group := range groups {
+		if err := t.finishAsyncPruneForShard(group.id); err != nil {
+			return err
+		}
 	}
 	workers := runtime.GOMAXPROCS(0)
 	if workers > len(groups) {
@@ -388,7 +417,7 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 // Delete 同时删除 key 的热状态和冷状态。
 func (t *Trie) Delete(key []byte) error {
 	shardID := t.GetShardID(key)
-	if err := t.finishAsyncPrune(); err != nil {
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
 		return err
 	}
 	shard, err := t.getOrCreateShard(shardID)
@@ -406,41 +435,110 @@ func (t *Trie) BatchDelete(key []byte) error {
 
 // Hash returns the root hash of the Trie.
 func (t *Trie) Hash() ([]byte, error) {
+	totalStart := time.Now()
 	if err := t.finishAsyncPrune(); err != nil {
+		recordHashDiagnostics(HashDiagnostics{TotalNanos: time.Since(totalStart).Nanoseconds()})
 		return nil, err
 	}
-	shardRoots := make(map[int][]byte)
-	dirtyShards := make([]int, 0)
+	type shardHashResult struct {
+		id   int
+		root []byte
+		diag ShardCommitDiagnostics
+		err  error
+	}
 
-	// We only need to compute roots for shards that have changed
-	// or were previously loaded but not committed.
-	// For simplicity, we can use dirtyShards here too, but Hash() doesn't clear them.
+	// Snapshot both ids and pointers so shard creation never needs to contend
+	// with the comparatively expensive hashing work below.
 	t.shardsMu.RLock()
-	for _, i := range t.dirtyShardList {
-		shardRoots[i] = make([]byte, 32) // Default to empty
-		s := t.shards[i]
-		if s != nil {
-			h, err := s.Hash()
-			if err != nil {
-				t.shardsMu.RUnlock()
-				return nil, err
-			}
-			if len(h) > 0 {
-				shardRoots[i] = h
-				dirtyShards = append(dirtyShards, i)
-			} else {
-				dirtyShards = append(dirtyShards, i)
-			}
-		} else {
-			dirtyShards = append(dirtyShards, i)
-		}
+	dirtyShards := append([]int(nil), t.dirtyShardList...)
+	shards := make([]*Shard, len(dirtyShards))
+	for index, id := range dirtyShards {
+		shards[index] = t.shards[id]
 	}
 	t.shardsMu.RUnlock()
 
-	return t.topTree.Compute(shardRoots, dirtyShards, nil)
+	workers := t.parallelWorkerCount(len(dirtyShards))
+	results := make([]shardHashResult, len(dirtyShards))
+	shardStart := time.Now()
+	if workers > 0 {
+		jobs := make(chan int, len(dirtyShards))
+		var wg sync.WaitGroup
+		for worker := 0; worker < workers; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for index := range jobs {
+					id := dirtyShards[index]
+					result := shardHashResult{id: id, root: make([]byte, 32)}
+					if shards[index] != nil {
+						result.root, result.diag, result.err = shards[index].HashWithDiagnostics()
+						if len(result.root) == 0 {
+							result.root = make([]byte, 32)
+						}
+					}
+					results[index] = result
+				}
+			}()
+		}
+		for index := range dirtyShards {
+			jobs <- index
+		}
+		close(jobs)
+		wg.Wait()
+	}
+	shardWall := time.Since(shardStart)
+
+	diag := HashDiagnostics{
+		ShardWallNanos: shardWall.Nanoseconds(),
+		DirtyShards:    int64(len(dirtyShards)),
+		Workers:        int64(workers),
+	}
+	shardRoots := make(map[int][]byte, len(dirtyShards))
+	for _, result := range results {
+		diag.ShardWorkNanos += result.diag.TotalNanos
+		diag.NodeCount += result.diag.NodeCount
+		diag.DirtyNodes += result.diag.DirtyNodeCount
+		diag.CleanNodes += result.diag.CleanNodeCount
+		diag.SerializeNanos += result.diag.CommitSerializeNanos
+		diag.HashNanos += result.diag.CommitHashNanos
+		if result.diag.TotalNanos > diag.MaxShardNanos {
+			diag.MaxShardID = int64(result.id)
+			diag.MaxShardNanos = result.diag.TotalNanos
+		}
+		if result.err != nil {
+			diag.TotalNanos = time.Since(totalStart).Nanoseconds()
+			recordHashDiagnostics(diag)
+			return nil, result.err
+		}
+		shardRoots[result.id] = result.root
+	}
+
+	rootStart := time.Now()
+	root, err := t.computeBinaryRoot(shardRoots, dirtyShards, nil)
+	diag.RootNanos = time.Since(rootStart).Nanoseconds()
+	diag.TotalNanos = time.Since(totalStart).Nanoseconds()
+	recordHashDiagnostics(diag)
+	return root, err
 }
 
-// Commit 把 dirty shard metadata、pending value、stale delete 和 TopTree root
+func (t *Trie) parallelWorkerCount(items int) int {
+	if items <= 0 {
+		return 0
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if t != nil && t.config != nil && t.config.CommitWorkers > 0 && t.config.CommitWorkers < workers {
+		workers = t.config.CommitWorkers
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > items {
+		workers = items
+	}
+	return workers
+}
+
+// Commit 把 dirty shard metadata、pending value、stale delete 和全局 root
 // 一起写入数据库 batch。
 func (t *Trie) Commit() ([]byte, error) {
 	totalStart := time.Now()
@@ -478,7 +576,7 @@ func (t *Trie) diagnosticCommitShardCounts() int {
 }
 
 // CommitToBatch 并行提交 dirty shard 到 worker 私有缓冲，再串行合并到调用方 batch，
-// 最后重算 TopTree。
+// 最后沿变更分片的二叉路径重算全局 root。
 func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	if err := t.finishAsyncPrune(); err != nil {
 		return nil, err
@@ -498,13 +596,7 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	dirtyShardsList := append([]int(nil), t.dirtyShardList...)
 	t.shardsMu.RUnlock()
 
-	numWorkers := runtime.GOMAXPROCS(0)
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
-	if numWorkers > len(dirtyShardsList) {
-		numWorkers = len(dirtyShardsList)
-	}
+	numWorkers := t.parallelWorkerCount(len(dirtyShardsList))
 
 	// 每个 worker 写入自己的 memBatcher，不并发共享调用方 batch。
 	// worker 缓冲会在同一把锁下回放，保证底层 batch 安全。
@@ -578,14 +670,14 @@ func (t *Trie) CommitToBatch(batch Batcher, destructive bool) ([]byte, error) {
 	}
 	shardCommitDuration := time.Since(shardCommitStart)
 
-	topTreeStart := time.Now()
-	rootHash, err := t.topTree.Compute(shardRoots, dirtyShards, batch)
+	rootStart := time.Now()
+	rootHash, err := t.computeBinaryRoot(shardRoots, dirtyShards, batch)
 	if err != nil {
-		recordCommitToBatchDiagnostics(shardCommitDuration.Nanoseconds(), time.Since(topTreeStart).Nanoseconds())
+		recordCommitToBatchDiagnostics(shardCommitDuration.Nanoseconds(), time.Since(rootStart).Nanoseconds())
 		return nil, err
 	}
-	topTreeDuration := time.Since(topTreeStart)
-	recordCommitToBatchDiagnostics(shardCommitDuration.Nanoseconds(), topTreeDuration.Nanoseconds())
+	rootDuration := time.Since(rootStart)
+	recordCommitToBatchDiagnostics(shardCommitDuration.Nanoseconds(), rootDuration.Nanoseconds())
 
 	t.shardsMu.Lock()
 	t.dirtyShards = make(map[int]struct{})
@@ -614,7 +706,7 @@ func (t *Trie) startPrunePrefetch(idx int) {
 	if t.config == nil || !t.config.UsePathStorage() || t.nodeCache == nil {
 		return
 	}
-	root, _ := t.topTree.GetShardRoot(idx, t.db)
+	root, _ := t.shardRoot(idx)
 	if len(root) == 0 {
 		return
 	}
@@ -680,7 +772,7 @@ func (t *Trie) PruneNextShard() error {
 
 		go func() {
 			pruneStart := time.Now()
-			job.err = shard.Prune(job.epoch)
+			job.prunePhases, job.err = shard.PruneWithDiagnostics(job.epoch)
 			job.pruneNanos = time.Since(pruneStart).Nanoseconds()
 			job.after = snapshotPruneCounters()
 			close(job.done)
@@ -708,13 +800,13 @@ func (t *Trie) PruneNextShard() error {
 
 	pruneBefore := snapshotPruneCounters()
 	shardPruneStart := time.Now()
-	err = shard.Prune(t.globalEpochBit)
+	prunePhases, err := shard.PruneWithDiagnostics(t.globalEpochBit)
 	shardPruneDur := time.Since(shardPruneStart)
 	pruneAfter := snapshotPruneCounters()
 	if err != nil {
 		totalDur := time.Since(totalStart)
 		recordPruneDiagnostics(totalDur.Nanoseconds(), waitDur.Nanoseconds(), shardPruneDur.Nanoseconds(), 0)
-		recordPruneShardPressure(idx, totalDur.Nanoseconds(), waitDur.Nanoseconds(), shardPruneDur.Nanoseconds(), 0, pruneBefore, pruneAfter)
+		recordPruneShardPressure(idx, totalDur.Nanoseconds(), waitDur.Nanoseconds(), shardPruneDur.Nanoseconds(), 0, prunePhases, pruneBefore, pruneAfter)
 		return err
 	}
 
@@ -724,7 +816,7 @@ func (t *Trie) PruneNextShard() error {
 	prefetchDur := time.Since(prefetchStart)
 	totalDur := time.Since(totalStart)
 	recordPruneDiagnostics(totalDur.Nanoseconds(), waitDur.Nanoseconds(), shardPruneDur.Nanoseconds(), prefetchDur.Nanoseconds())
-	recordPruneShardPressure(idx, totalDur.Nanoseconds(), waitDur.Nanoseconds(), shardPruneDur.Nanoseconds(), prefetchDur.Nanoseconds(), pruneBefore, pruneAfter)
+	recordPruneShardPressure(idx, totalDur.Nanoseconds(), waitDur.Nanoseconds(), shardPruneDur.Nanoseconds(), prefetchDur.Nanoseconds(), prunePhases, pruneBefore, pruneAfter)
 	return nil
 }
 
@@ -755,6 +847,84 @@ func (t *Trie) ForEach(fn func(key, value []byte) bool) {
 			s.ForEach(prefix, t.config.ShardDepth, fn)
 		}
 	}
+}
+
+// ForEachAll iterates both loaded shards and persisted shards reachable from
+// the binary root. Unlike ForEach, it is suitable for recovery and tooling after
+// a trie reload, when most shards have not been opened in memory yet.
+func (t *Trie) ForEachAll(fn func(key, value []byte) bool) error {
+	if err := t.finishAsyncPrune(); err != nil {
+		return err
+	}
+	t.shardsMu.RLock()
+	loaded := make([]*Shard, len(t.shards))
+	copy(loaded, t.shards)
+	t.shardsMu.RUnlock()
+
+	roots, err := t.allShardRoots()
+	if err != nil {
+		return err
+	}
+	stopped := false
+	visit := func(key, value []byte) bool {
+		if stopped {
+			return false
+		}
+		if !fn(key, value) {
+			stopped = true
+			return false
+		}
+		return true
+	}
+	for id, shard := range loaded {
+		if shard == nil {
+			continue
+		}
+		delete(roots, id)
+		prefix := t.getShardPrefix(id)
+		shard.mu.RLock()
+		if shard.root != nil {
+			shard.forEach(shard.root, prefix, t.config.ShardDepth, visit)
+			shard.mu.RUnlock()
+			if stopped {
+				return nil
+			}
+			continue
+		}
+		root := append([]byte(nil), shard.rootHash...)
+		shard.mu.RUnlock()
+		if len(root) == 0 {
+			continue
+		}
+		view := newStatsShardView(id, t.db, t.hasher, t.config, t.nodeCache, root, t.pruning, shard.globalEpochBit)
+		loadedRoot, err := view.loadNodeAtPath(root, nil, 0)
+		if err != nil {
+			return err
+		}
+		view.forEach(loadedRoot, prefix, t.config.ShardDepth, visit)
+		if stopped {
+			return nil
+		}
+	}
+	for id, root := range roots {
+		prefix := t.getShardPrefix(id)
+		shardID := id
+		view := newStatsShardView(id, t.db, t.hasher, t.config, t.nodeCache, root, t.pruning, func() byte {
+			if shardID < t.pruneShardIdx {
+				return t.globalEpochBit
+			}
+			return t.globalEpochBit ^ 1
+		})
+		loadedRoot, err := view.loadNodeAtPath(root, nil, 0)
+		if err != nil {
+			return err
+		}
+		view.forEach(loadedRoot, prefix, t.config.ShardDepth, visit)
+		if stopped {
+			return nil
+		}
+	}
+	return nil
 }
 
 // ForEachPrefix iterates over keys matching the given bit prefix. It avoids
@@ -806,7 +976,7 @@ func (t *Trie) getShardPrefix(shardID int) []byte {
 // Activate moves an archived key back to the hot tree.
 func (t *Trie) Activate(key []byte, value []byte) error {
 	shardID := t.GetShardID(key)
-	if err := t.finishAsyncPrune(); err != nil {
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
 		return err
 	}
 	shard, err := t.getOrCreateShard(shardID)
@@ -852,6 +1022,13 @@ func (t *Trie) NodeCacheStats() (entries int64, bytes int64) {
 		return 0, 0
 	}
 	return t.nodeCache.stats()
+}
+
+func (t *Trie) NodeCacheDiagnostics() NodeCacheDiagnostics {
+	if t == nil || t.nodeCache == nil {
+		return NodeCacheDiagnostics{}
+	}
+	return t.nodeCache.diagnostics()
 }
 
 type memBatchOp struct {

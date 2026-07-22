@@ -38,6 +38,7 @@ type BinaryConfig struct {
 	CommitWatchdogSeconds     int   // Dump goroutines if one binary wrapper commit exceeds this many seconds; 0 disables
 	EnablePathDiagnostics     bool  // Record path/cache diagnostics during binary trie experiments
 	PhysicalDelete            bool  // Physically delete obsolete binary trie state nodes when requested
+	StemMode                  bool  // Archive unified binary-tree state by 31-byte stem instead of individual wrapper keys
 	NodeStorageScheme         string
 }
 

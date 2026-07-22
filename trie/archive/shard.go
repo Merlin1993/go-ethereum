@@ -1456,13 +1456,36 @@ func (s *Shard) delete(node Node, key []byte, depth int) (Node, bool, error) {
 
 // Hash 计算分片根哈希。
 func (s *Shard) Hash() ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	root, _, err := s.HashWithDiagnostics()
+	return root, err
+}
+
+// HashWithDiagnostics computes the shard root without persisting it and also
+// returns the amount of hashing work performed inside this shard.
+func (s *Shard) HashWithDiagnostics() ([]byte, ShardCommitDiagnostics, error) {
+	totalStart := time.Now()
+	lockStart := time.Now()
+	// commit caches hashes on nodes, so Hash is a write operation even though
+	// it does not persist anything. Parallelism is across shards; serialize
+	// access inside one shard to keep those cache writes race-free.
+	s.mu.Lock()
+	lockWait := time.Since(lockStart)
+	defer s.mu.Unlock()
+	diag := ShardCommitDiagnostics{LockWaitNanos: lockWait.Nanoseconds()}
 	if s.root == nil {
-		return s.rootHash, nil
+		diag.RootWasNil = true
+		diag.TotalNanos = time.Since(totalStart).Nanoseconds()
+		return s.rootHash, diag, nil
 	}
 	count := 0
-	return s.commit(s.root, nil, &count, false, nil, 0, nil)
+	workStats := new(commitWorkStats)
+	rootStart := time.Now()
+	root, err := s.commit(s.root, nil, &count, false, nil, 0, workStats)
+	diag.RootCommitNanos = time.Since(rootStart).Nanoseconds()
+	diag.NodeCount = int64(count)
+	workStats.applyTo(&diag)
+	diag.TotalNanos = time.Since(totalStart).Nanoseconds()
+	return root, diag, err
 }
 
 type dummyBatcher struct{}
@@ -1836,14 +1859,28 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		*nodeCount++
 	}
 
-	if s.config != nil && s.config.UsePathStorage() && !node.IsDirty() {
+	// Hash-only commits must not turn a physical path relocation into a content
+	// mutation. The content hash is independent of the path-storage key, and a
+	// later persist commit will relocate the node before it is written.
+	if batch != nil && s.config != nil && s.config.UsePathStorage() {
 		oldPath, oldBits := node.StoragePath()
 		if oldBits != pathBits || !bytes.Equal(oldPath, path) {
-			node.SetDirty(true)
+			if stats != nil {
+				stats.pathRelocations++
+			}
+			if !node.IsDirty() {
+				node.SetDirty(true)
+			}
 		}
 	}
 	if !node.IsDirty() {
+		if stats != nil {
+			stats.cleanNodes++
+		}
 		return node.Hash(), nil
+	}
+	if stats != nil {
+		stats.dirtyNodes++
 	}
 
 	switch n := node.(type) {
@@ -1890,6 +1927,11 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 				return nil, fmt.Errorf("internal path exceeds max at shard %d: storage=%d local=%d", s.id, pathBits, n.PathBits)
 			}
 		}
+		leftHashBefore := bytes.Clone(n.LeftHash)
+		rightHashBefore := bytes.Clone(n.RightHash)
+		leftEpochBefore := n.LeftEpoch
+		rightEpochBefore := n.RightEpoch
+		epochBefore := n.Epoch()
 		if n.Left != nil {
 			childPath, childBits := s.childStoragePath(path, pathBits, n, 0)
 			h, err := s.commit(n.Left, batch, nodeCount, destructive, childPath, childBits, stats)
@@ -1922,6 +1964,13 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		// Do not update epoch during commit; epoch reflects access pattern, not persistence.
 		// Updating it here would cause Prune to skip nodes that have not been accessed.
 		s.refreshInternalEpochMask(n)
+		// Hash() runs without path-storage normalization. If persisting a child
+		// relocates it and changes its content hash, the parent's precomputed hash
+		// is no longer valid even though the parent itself was not relocated.
+		if !bytes.Equal(leftHashBefore, n.LeftHash) || !bytes.Equal(rightHashBefore, n.RightHash) ||
+			leftEpochBefore != n.LeftEpoch || rightEpochBefore != n.RightEpoch || epochBefore != n.Epoch() {
+			n.SetHash(nil)
+		}
 
 		serializeStart := time.Now()
 		data, err := n.Serialize()
@@ -1933,12 +1982,15 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 		}
 		nodeBytes = len(data)
 
-		hashStart := time.Now()
-		h := append([]byte{}, s.hasher.Hash(data)...)
-		if stats != nil {
-			stats.hashNanos += time.Since(hashStart).Nanoseconds()
+		h := n.Hash()
+		if len(h) == 0 {
+			hashStart := time.Now()
+			h = append([]byte{}, s.hasher.Hash(data)...)
+			if stats != nil {
+				stats.hashNanos += time.Since(hashStart).Nanoseconds()
+			}
+			n.SetHash(h)
 		}
-		n.SetHash(h)
 
 		if batch != nil {
 			persistStart := time.Now()
@@ -1965,12 +2017,15 @@ func (s *Shard) commit(node Node, batch Batcher, nodeCount *int, destructive boo
 			return nil, err
 		}
 		nodeBytes = len(data)
-		hashStart := time.Now()
-		h := append([]byte{}, s.hasher.Hash(data)...)
-		if stats != nil {
-			stats.hashNanos += time.Since(hashStart).Nanoseconds()
+		h := n.Hash()
+		if len(h) == 0 {
+			hashStart := time.Now()
+			h = append([]byte{}, s.hasher.Hash(data)...)
+			if stats != nil {
+				stats.hashNanos += time.Since(hashStart).Nanoseconds()
+			}
+			n.SetHash(h)
 		}
-		n.SetHash(h)
 
 		if batch != nil {
 			persistStart := time.Now()
@@ -2020,6 +2075,7 @@ func (s *Shard) persistNode(batch Batcher, node Node, hash, data, path []byte, p
 	}
 	if stats != nil {
 		stats.batchPutNanos += time.Since(batchPutStart).Nanoseconds()
+		stats.persistedNodes++
 	}
 	cacheStart := time.Now()
 	if s.shouldWarmPersistedNodeCache(node, pathBits) {

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	gethcrypto "github.com/ethereum/go-ethereum/crypto"
@@ -152,6 +153,205 @@ func TestShardHashDoesNotClearDirtyBeforeCommit(t *testing.T) {
 	}
 	if !foundRootPut {
 		t.Fatalf("Hash cleared dirty state before commit; root node %x was not written", rootHash)
+	}
+}
+
+func TestPathMoveIsDeferredUntilPersistCommit(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.NodeStorageScheme = NodeStoragePath
+	shard, err := NewShard(0, db, NewPooledKeccakHasher(), config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatalf("new shard: %v", err)
+	}
+
+	leaf := NewLeafNode([]byte{0x80}, 1, []byte("value-ref"))
+	data, err := leaf.Serialize()
+	if err != nil {
+		t.Fatalf("serialize leaf: %v", err)
+	}
+	hash := shard.hasher.Hash(data)
+	oldPath, oldBits := []byte{0x40}, 2
+	newPath, newBits := []byte{0x60}, 3
+	leaf.SetHash(hash)
+	leaf.SetOriginalHash(hash)
+	leaf.SetStoragePath(oldPath, oldBits)
+	leaf.SetDirty(false)
+
+	count := 0
+	gotHash, err := shard.commit(leaf, nil, &count, false, newPath, newBits, nil)
+	if err != nil {
+		t.Fatalf("hash-only commit: %v", err)
+	}
+	if !bytes.Equal(gotHash, hash) {
+		t.Fatalf("hash-only commit changed content hash: got %x want %x", gotHash, hash)
+	}
+	if leaf.IsDirty() {
+		t.Fatal("hash-only commit marked a path-only move dirty")
+	}
+	if path, bits := leaf.StoragePath(); bits != oldBits || !bytes.Equal(path, oldPath) {
+		t.Fatalf("hash-only commit changed persisted path: got %x/%d want %x/%d", path, bits, oldPath, oldBits)
+	}
+
+	batch := &MemoryBatchAdapter{db: db}
+	count = 0
+	gotHash, err = shard.commit(leaf, batch, &count, false, newPath, newBits, nil)
+	if err != nil {
+		t.Fatalf("persist commit: %v", err)
+	}
+	if !bytes.Equal(gotHash, hash) {
+		t.Fatalf("persist commit changed content hash: got %x want %x", gotHash, hash)
+	}
+	if leaf.IsDirty() {
+		t.Fatal("persist commit left relocated node dirty")
+	}
+	if path, bits := leaf.StoragePath(); bits != newBits || !bytes.Equal(path, newPath) {
+		t.Fatalf("persist commit did not move node: got %x/%d want %x/%d", path, bits, newPath, newBits)
+	}
+	if len(batch.ops) != 1 || batch.ops[0].isDel || !bytes.Equal(batch.ops[0].key, pathNodeKey(shard.id, newPath, newBits)) {
+		t.Fatalf("persist commit wrote unexpected operations: %+v", batch.ops)
+	}
+}
+
+func TestLoadedPathSubtreeRootExpansionKeepsWritesBounded(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 0
+	config.NodeStorageScheme = NodeStoragePath
+	hasher := NewPooledKeccakHasher()
+	shard, err := NewShard(0, db, hasher, config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatalf("new shard: %v", err)
+	}
+
+	const keyCount = 256
+	keys := make([][]byte, keyCount)
+	for i := range keys {
+		key := make([]byte, 32)
+		key[0] = 0x80
+		key[30] = byte(i >> 8)
+		key[31] = byte(i)
+		keys[i] = key
+		if err := shard.Put(key, []byte{byte(i), byte(i >> 8)}); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	initialBatch := &MemoryBatchAdapter{db: db}
+	if _, err := shard.CommitToBatch(initialBatch, true); err != nil {
+		t.Fatalf("initial commit: %v", err)
+	}
+	if err := initialBatch.Write(); err != nil {
+		t.Fatalf("write initial batch: %v", err)
+	}
+
+	// Reload every branch to model a cleanup pass that leaves the whole shard in
+	// memory. A later root expansion must not rewrite all of these clean nodes.
+	for i, key := range keys {
+		got, err := shard.Get(key)
+		if err != nil || !bytes.Equal(got, []byte{byte(i), byte(i >> 8)}) {
+			t.Fatalf("reload %d: got %x err %v", i, got, err)
+		}
+	}
+
+	newKey := make([]byte, 32)
+	newKey[0] = 0x00
+	newValue := []byte("outside-old-root")
+	if err := shard.Put(newKey, newValue); err != nil {
+		t.Fatalf("expanding put: %v", err)
+	}
+	if _, err := shard.Hash(); err != nil {
+		t.Fatalf("hash expanded shard: %v", err)
+	}
+
+	batch := &MemoryBatchAdapter{db: db}
+	rootHash, diag, err := shard.CommitToBatchWithDiagnostics(batch, true)
+	if err != nil {
+		t.Fatalf("expanded commit: %v", err)
+	}
+	treePuts := 0
+	for _, op := range batch.ops {
+		if !op.isDel && !bytes.HasPrefix(op.key, flatValuePrefix) {
+			treePuts++
+		}
+	}
+	if treePuts > 16 {
+		t.Fatalf("one root expansion rewrote %d tree nodes for %d existing keys", treePuts, keyCount)
+	}
+	if diag.PersistedNodeCount != int64(treePuts) {
+		t.Fatalf("persisted-node diagnostics mismatch: got %d want %d", diag.PersistedNodeCount, treePuts)
+	}
+	if diag.PathRelocationCount == 0 {
+		t.Fatal("root expansion did not report its path relocation")
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatalf("write expanded batch: %v", err)
+	}
+
+	reloaded, err := NewShard(0, db, hasher, config, rootHash, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatalf("reload expanded shard: %v", err)
+	}
+	for i, key := range keys {
+		got, err := reloaded.Get(key)
+		if err != nil || !bytes.Equal(got, []byte{byte(i), byte(i >> 8)}) {
+			t.Fatalf("expanded reload old key %d: got %x err %v", i, got, err)
+		}
+	}
+	got, err := reloaded.Get(newKey)
+	if err != nil || !bytes.Equal(got, newValue) {
+		t.Fatalf("expanded reload new key: got %x err %v", got, err)
+	}
+}
+
+func TestPruneDiagnosticsSeparateLockWait(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	shard, err := NewShard(0, db, NewPooledKeccakHasher(), config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatalf("new shard: %v", err)
+	}
+	key := bytes.Repeat([]byte{0x31}, 32)
+	if err := shard.Put(key, []byte("value")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	batch := &MemoryBatchAdapter{db: db}
+	if _, err := shard.CommitToBatch(batch, true); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatalf("write batch: %v", err)
+	}
+	if len(shard.rootHash) == 0 {
+		t.Fatal("destructive commit did not retain the shard root")
+	}
+
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		shard.mu.Lock()
+		close(locked)
+		<-release
+		shard.mu.Unlock()
+	}()
+	<-locked
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		close(release)
+	}()
+
+	diag, err := shard.PruneWithDiagnostics(1)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if diag.LockWaitNanos < int64(10*time.Millisecond) {
+		t.Fatalf("lock wait was not separated: %v", time.Duration(diag.LockWaitNanos))
+	}
+	measured := diag.LockWaitNanos + diag.RootLoadNanos + diag.WalkNanos + diag.FinishNanos
+	if diag.TotalNanos < measured {
+		t.Fatalf("prune phases exceed total: total=%v phases=%v", time.Duration(diag.TotalNanos), time.Duration(measured))
+	}
+	if diag.DetailedCountersEnabled {
+		t.Fatal("detailed counter flag should be false for default config")
 	}
 }
 
@@ -2507,6 +2707,13 @@ func TestPrunePressureDiagnosticsTracksShard(t *testing.T) {
 	if diag.MaxBuildItems != diag.LastBuildItems || diag.MaxBuildBuckets != diag.LastBuildBuckets {
 		t.Fatalf("expected first prune to also be max pressure, diag=%s", diag)
 	}
+	if !diag.DetailedCountersEnabled || !diag.MaxDetailedCountersEnabled {
+		t.Fatalf("expected detailed-counter state to be explicit, diag=%s", diag)
+	}
+	phases := diag.LastLockWaitNanos + diag.LastRootLoadNanos + diag.LastWalkNanos + diag.LastFinishNanos
+	if diag.LastShardNanos < phases {
+		t.Fatalf("prune phases exceed shard total, diag=%s", diag)
+	}
 }
 
 func TestPruneAbsorbUsesPreNodePrefixForLongPath(t *testing.T) {
@@ -2619,6 +2826,10 @@ func TestNodeBlobCacheHonorsByteLimit(t *testing.T) {
 	}
 	if _, ok := cache.get([]byte("c")); !ok {
 		t.Fatalf("newest entry missing after byte-pressure insert")
+	}
+	diag := cache.diagnostics()
+	if diag.Hits != 1 || diag.Misses != 1 || diag.Evictions != 1 {
+		t.Fatalf("unexpected cache diagnostics: %+v", diag)
 	}
 }
 
@@ -3261,7 +3472,7 @@ func TestFlatStoreKeepsExecutionValues(t *testing.T) {
 	}
 }
 
-func TestTopTreeDeletesSupersededRootNode(t *testing.T) {
+func TestBinaryRootDeletesSupersededRootNode(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
@@ -3409,7 +3620,7 @@ func TestAsyncPruneAppliesBeforeHash(t *testing.T) {
 	}
 }
 
-func TestAsyncPruneAppliesBeforePutOnDifferentShard(t *testing.T) {
+func TestAsyncPruneOnlyBlocksWritesToSameShard(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	config := DefaultConfig()
 	config.ShardDepth = 2
@@ -3425,6 +3636,17 @@ func TestAsyncPruneAppliesBeforePutOnDifferentShard(t *testing.T) {
 	if _, err := trie.Commit(); err != nil {
 		t.Fatalf("commit failed: %v", err)
 	}
+	pruningShard := trie.shards[1]
+	if pruningShard == nil {
+		t.Fatal("expected shard 1 to be loaded")
+	}
+	pruningShard.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			pruningShard.mu.Unlock()
+		}
+	}()
 
 	ResetPrunePressureDiagnostics()
 	trie.pruneShardIdx = 1
@@ -3435,16 +3657,45 @@ func TestAsyncPruneAppliesBeforePutOnDifferentShard(t *testing.T) {
 
 	otherShardKey := make([]byte, 32)
 	otherShardKey[0] = 0x80 // first two bits 10 => shard 2
-	if err := trie.Put(otherShardKey, []byte("value-after-async-prune")); err != nil {
-		t.Fatalf("put should wait for async prune: %v", err)
+	otherDone := make(chan error, 1)
+	go func() {
+		otherDone <- trie.Put(otherShardKey, []byte("value-during-async-prune"))
+	}()
+	select {
+	case err := <-otherDone:
+		if err != nil {
+			t.Fatalf("different-shard put failed: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		pruningShard.mu.Unlock()
+		locked = false
+		<-otherDone
+		t.Fatal("different-shard put was blocked by unrelated async prune")
+	}
+
+	sameShardKey := make([]byte, 32)
+	sameShardKey[0] = 0x41 // still first two bits 01 => shard 1
+	sameDone := make(chan error, 1)
+	go func() {
+		sameDone <- trie.Put(sameShardKey, []byte("value-after-same-shard-prune"))
+	}()
+	select {
+	case err := <-sameDone:
+		t.Fatalf("same-shard put completed before prune lock was released: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	pruningShard.mu.Unlock()
+	locked = false
+	if err := <-sameDone; err != nil {
+		t.Fatalf("same-shard put failed after prune: %v", err)
 	}
 
 	p := LastPrunePressureDiagnostics()
 	if p.LastShardID != 1 {
-		t.Fatalf("put did not finish pending async prune first: %+v", p)
+		t.Fatalf("same-shard put did not finish pending async prune first: %+v", p)
 	}
 	stats := trie.Stats()
-	if stats.ArchivedDataSize != 1 || stats.LeafCount != 1 {
+	if stats.ArchivedDataSize != 1 || stats.LeafCount != 2 {
 		t.Fatalf("unexpected stats after cross-shard put: archived=%d leaves=%d", stats.ArchivedDataSize, stats.LeafCount)
 	}
 }

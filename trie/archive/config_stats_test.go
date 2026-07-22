@@ -86,7 +86,7 @@ func TestStatsDoesNotCreateEmptyShards(t *testing.T) {
 	}
 }
 
-func TestStatsFallsBackToTopTreeForEmptyLoadedShard(t *testing.T) {
+func TestStatsFallsBackToCommittedShardRoot(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := &Config{
@@ -115,7 +115,7 @@ func TestStatsFallsBackToTopTreeForEmptyLoadedShard(t *testing.T) {
 
 	stats := trie.Stats()
 	if stats.LeafCount != 1 {
-		t.Fatalf("expected Stats to fall back to topTree root, got %d leaves", stats.LeafCount)
+		t.Fatalf("expected Stats to fall back to the committed shard root, got %d leaves", stats.LeafCount)
 	}
 }
 

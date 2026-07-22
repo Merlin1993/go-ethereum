@@ -28,11 +28,16 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rlp"
+	triepkg "github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/holiman/uint256"
 )
 
 type Storage map[common.Hash]common.Hash
+
+type storageBatchUpdater interface {
+	UpdateStorageBatch(common.Address, []triepkg.StorageUpdate) error
+}
 
 func (s Storage) Copy() Storage {
 	return maps.Clone(s)
@@ -321,8 +326,11 @@ func (s *stateObject) updateTrie() (Trie, error) {
 	// into a shortnode. This requires `B` to be resolved from disk.
 	// Whereas if the created node is handled first, then the collapse is avoided, and `B` is not resolved.
 	var (
-		deletions []common.Hash
-		used      = make([]common.Hash, 0, len(s.uncommittedStorage))
+		deletions        []common.Hash
+		used             = make([]common.Hash, 0, len(s.uncommittedStorage))
+		batcher, batched = tr.(storageBatchUpdater)
+		batchUpdates     = make([]triepkg.StorageUpdate, 0, len(s.uncommittedStorage))
+		batchPutCount    int
 	)
 	for key, origin := range s.uncommittedStorage {
 		// Skip noop changes, persist actual changes
@@ -336,16 +344,34 @@ func (s *stateObject) updateTrie() (Trie, error) {
 			continue
 		}
 		if (value != common.Hash{}) {
-			if err := tr.UpdateStorage(s.address, key[:], common.TrimLeftZeroes(value[:])); err != nil {
-				s.db.setError(err)
-				return nil, err
+			trimmed := common.TrimLeftZeroes(value[:])
+			if batched {
+				batchUpdates = append(batchUpdates, triepkg.StorageUpdate{Key: key.Bytes(), Value: common.CopyBytes(trimmed)})
+				batchPutCount++
+			} else {
+				if err := tr.UpdateStorage(s.address, key[:], trimmed); err != nil {
+					s.db.setError(err)
+					return nil, err
+				}
+				s.db.StorageUpdated.Add(1)
 			}
-			s.db.StorageUpdated.Add(1)
 		} else {
 			deletions = append(deletions, key)
 		}
 		// Cache the items for preloading
 		used = append(used, key) // Copy needed for closure
+	}
+	if batched {
+		for _, key := range deletions {
+			batchUpdates = append(batchUpdates, triepkg.StorageUpdate{Key: key.Bytes(), Delete: true})
+		}
+		if err := batcher.UpdateStorageBatch(s.address, batchUpdates); err != nil {
+			s.db.setError(err)
+			return nil, err
+		}
+		s.db.StorageUpdated.Add(int64(batchPutCount))
+		s.db.StorageDeleted.Add(int64(len(deletions)))
+		deletions = nil
 	}
 	for _, key := range deletions {
 		if err := tr.DeleteStorage(s.address, key[:]); err != nil {

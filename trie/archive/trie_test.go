@@ -62,7 +62,7 @@ type stressTiming struct {
 	get           time.Duration
 	commit        time.Duration
 	shard         time.Duration
-	topTree       time.Duration
+	rootHash      time.Duration
 	write         time.Duration
 	rawWrite      time.Duration
 	batch         stressBatchStats
@@ -271,7 +271,7 @@ func TestArchiveTrieStress(t *testing.T) {
 		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Avg_LoopWall_ms", "Prune_ms", "Commit_ms", "Write_ms", "Raw_Write_ms", "Max_Root_ms",
 		"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
 		"State_MB", "Leaf_Count", "Archive_Items", "Bucket_Count", "Max_Buckets_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max", "RSS_MB", "Heap_MB",
-		"Insert_ms", "Update_ms", "Get_ms", "ShardCommit_ms", "TopTree_ms", "Untracked_ms",
+		"Insert_ms", "Update_ms", "Get_ms", "ShardCommit_ms", "RootHash_ms", "Untracked_ms",
 		"Batch_KB", "Batch_Puts", "Batch_Deletes", "Flat_Puts", "Flat_Deletes", "Tree_Puts", "Tree_Deletes",
 		"FalsePositive_Count", "FalsePositive_Rate",
 		"Stats_ms", "Stats_Mode", "NodeCache_Hits", "NodeCache_Misses", "PathNode_DBGets", "Promotion_Checks", "Promotion_Hits", "Bucket_Recomputes",
@@ -386,7 +386,7 @@ func TestArchiveTrieStress(t *testing.T) {
 			commitDur := time.Since(startCommit)
 			diag := LastCommitDiagnostics()
 			shardCommitDur := time.Duration(diag.ShardCommitNanos)
-			topTreeDur := time.Duration(diag.TopTreeNanos)
+			rootHashDur := time.Duration(diag.RootHashNanos)
 
 			var rawWriteDur, writeDur time.Duration
 			batchStats := batch.snapshot()
@@ -432,7 +432,7 @@ func TestArchiveTrieStress(t *testing.T) {
 				get:           getDur,
 				commit:        commitDur,
 				shard:         shardCommitDur,
-				topTree:       topTreeDur,
+				rootHash:      rootHashDur,
 				write:         writeDur,
 				rawWrite:      rawWriteDur,
 				batch:         batchStats,
@@ -448,7 +448,7 @@ func TestArchiveTrieStress(t *testing.T) {
 
 		fTimes := make([]float64, len(calcTimes))
 		var sumRoot, sumPrune, sumPruneWait, sumPruneShard, sumPrunePrefetch float64
-		var sumInsert, sumUpdate, sumGet, sumCommit, sumShard, sumTopTree float64
+		var sumInsert, sumUpdate, sumGet, sumCommit, sumShard, sumRootHash float64
 		var sumWall, sumWrite, sumRawWrite float64
 		var sumBatchBytes, sumBatchPuts, sumBatchDeletes, sumFlatPuts, sumFlatDeletes, sumTreePuts, sumTreeDeletes int64
 		for idx, d := range calcTimes {
@@ -465,7 +465,7 @@ func TestArchiveTrieStress(t *testing.T) {
 			sumGet += float64(d.get.Nanoseconds()) / 1000000.0
 			sumCommit += float64(d.commit.Nanoseconds()) / 1000000.0
 			sumShard += float64(d.shard.Nanoseconds()) / 1000000.0
-			sumTopTree += float64(d.topTree.Nanoseconds()) / 1000000.0
+			sumRootHash += float64(d.rootHash.Nanoseconds()) / 1000000.0
 			sumWrite += float64(d.write.Nanoseconds()) / 1000000.0
 			sumRawWrite += float64(d.rawWrite.Nanoseconds()) / 1000000.0
 			sumBatchBytes += int64(d.batch.bytes)
@@ -498,7 +498,7 @@ func TestArchiveTrieStress(t *testing.T) {
 		avgGet := sumGet / float64(n)
 		avgCommit := sumCommit / float64(n)
 		avgShard := sumShard / float64(n)
-		avgTopTree := sumTopTree / float64(n)
+		avgRootHash := sumRootHash / float64(n)
 		avgWrite := sumWrite / float64(n)
 		avgRawWrite := sumRawWrite / float64(n)
 		avgBatchKB := float64(sumBatchBytes) / float64(n) / 1024.0
@@ -629,7 +629,7 @@ func TestArchiveTrieStress(t *testing.T) {
 			fmt.Sprintf("%.2f", avgUpdate),
 			fmt.Sprintf("%.2f", avgGet),
 			fmt.Sprintf("%.2f", avgShard),
-			fmt.Sprintf("%.2f", avgTopTree),
+			fmt.Sprintf("%.2f", avgRootHash),
 			fmt.Sprintf("%.2f", avgUntracked),
 			fmt.Sprintf("%.2f", avgBatchKB),
 			fmt.Sprintf("%.2f", avgBatchPuts),

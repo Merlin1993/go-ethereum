@@ -31,6 +31,7 @@ type Config struct {
 	CommitWorkers             int   // Max parallel shard commit workers; 0 uses default
 	CommitWatchdogSeconds     int   // Dump goroutines if one wrapper commit exceeds this many seconds; 0 disables
 	PhysicalDelete            bool  // Physically delete obsolete trie nodes; false leaves unreachable path nodes for offline cleanup
+	StemMode                  bool  // Group 32-byte binary-tree keys by their 31-byte stem for whole-stem archiving
 	FlatReader                FlatValueReader
 	CuckooBuckets             int // Number of buckets in cuckoo filter (default 32)
 	CuckooSlots               int // Slots per bucket in cuckoo filter (default 4)
@@ -79,33 +80,37 @@ func (c *Config) ResolveArchiveBucketSize() int {
 
 // TrieStats holds statistics about the Trie.
 type TrieStats struct {
-	BucketCount          int     // Total number of archive buckets
-	LeafCount            int64   // Total number of reachable leaf nodes
-	ArchivedDataSize     int64   // Total number of archived KV pairs
-	RootBucketCount      int     // Buckets held directly at the shard root
-	RootArchivedSize     int64   // Archived KV pairs held directly at the shard root
-	RootLeafBucketCount  int     // Shard roots that are standalone archive buckets
-	RootLeafArchivedSize int64   // Archived KV pairs in standalone shard-root buckets
-	MaxBucketsPath       int     // Max bucket-bearing nodes on a sequential lookup path; StubList fanout is tracked separately
-	StubBucketCount      int     // Buckets held in InternalNode.StubList
-	StubArchivedSize     int64   // Archived KV pairs held in StubList buckets
-	RootStubBucketCount  int     // StubList buckets held directly on the shard root
-	RootStubArchivedSize int64   // Archived KV pairs in root StubList buckets
-	DeepStubBucketCount  int     // StubList buckets held below the shard root
-	DeepStubArchivedSize int64   // Archived KV pairs in non-root StubList buckets
-	ChildBucketCount     int     // Buckets placed on ordinary child edges
-	ChildArchivedSize    int64   // Archived KV pairs held in ordinary child-edge buckets
-	MaxStubListBuckets   int     // Max StubList bucket count on one internal node
-	MaxStubListItems     int64   // Archived KV pairs in the max-bucket StubList
-	MaxRootStubBuckets   int     // Max root StubList bucket count on one shard root
-	MaxRootStubItems     int64   // Archived KV pairs in the max root StubList
-	MaxDeepStubBuckets   int     // Max non-root StubList bucket count on one internal node
-	MaxDeepStubItems     int64   // Archived KV pairs in the max non-root StubList
-	BucketItemsAvg       float64 // Average number of archived KV pairs per bucket
-	BucketItemsP50       int     // P50 archived KV pairs per bucket
-	BucketItemsP95       int     // P95 archived KV pairs per bucket
-	BucketItemsP99       int     // P99 archived KV pairs per bucket
-	BucketItemsMax       int     // Max archived KV pairs in a bucket
+	BucketCount                      int     // Total number of archive buckets
+	LeafCount                        int64   // Total number of reachable leaf nodes
+	ArchivedDataSize                 int64   // Total number of archived KV pairs
+	ActiveLogicalValues              int64   // Active suffix values (equals LeafCount outside stem mode)
+	ArchivedLogicalValues            int64   // Archived suffix values (equals ArchivedDataSize outside stem mode)
+	ActiveLogicalValueReadFailures   int64   // Active stem payloads that could not be read or decoded
+	ArchivedLogicalValueReadFailures int64   // Archived stem payloads that could not be read or decoded
+	RootBucketCount                  int     // Buckets held directly at the shard root
+	RootArchivedSize                 int64   // Archived KV pairs held directly at the shard root
+	RootLeafBucketCount              int     // Shard roots that are standalone archive buckets
+	RootLeafArchivedSize             int64   // Archived KV pairs in standalone shard-root buckets
+	MaxBucketsPath                   int     // Max bucket-bearing nodes on a sequential lookup path; StubList fanout is tracked separately
+	StubBucketCount                  int     // Buckets held in InternalNode.StubList
+	StubArchivedSize                 int64   // Archived KV pairs held in StubList buckets
+	RootStubBucketCount              int     // StubList buckets held directly on the shard root
+	RootStubArchivedSize             int64   // Archived KV pairs in root StubList buckets
+	DeepStubBucketCount              int     // StubList buckets held below the shard root
+	DeepStubArchivedSize             int64   // Archived KV pairs in non-root StubList buckets
+	ChildBucketCount                 int     // Buckets placed on ordinary child edges
+	ChildArchivedSize                int64   // Archived KV pairs held in ordinary child-edge buckets
+	MaxStubListBuckets               int     // Max StubList bucket count on one internal node
+	MaxStubListItems                 int64   // Archived KV pairs in the max-bucket StubList
+	MaxRootStubBuckets               int     // Max root StubList bucket count on one shard root
+	MaxRootStubItems                 int64   // Archived KV pairs in the max root StubList
+	MaxDeepStubBuckets               int     // Max non-root StubList bucket count on one internal node
+	MaxDeepStubItems                 int64   // Archived KV pairs in the max non-root StubList
+	BucketItemsAvg                   float64 // Average number of archived KV pairs per bucket
+	BucketItemsP50                   int     // P50 archived KV pairs per bucket
+	BucketItemsP95                   int     // P95 archived KV pairs per bucket
+	BucketItemsP99                   int     // P99 archived KV pairs per bucket
+	BucketItemsMax                   int     // Max archived KV pairs in a bucket
 
 	bucketItemHist map[int]int
 
@@ -135,19 +140,14 @@ func (t *Trie) Stats() *TrieStats {
 		}
 	}
 
-	if t.topTree != nil {
-		roots := make(map[int][]byte)
-		t.topTree.ForEachShardRoot(func(id int, hash []byte) {
+	if roots, err := t.allShardRoots(); err == nil {
+		for id, root := range roots {
 			if id < 0 || id >= len(shards) {
-				return
+				continue
 			}
 			if _, ok := seen[id]; ok {
-				return
+				continue
 			}
-			roots[id] = hash
-		})
-
-		for id, root := range roots {
 			shardID := id
 			shard := newStatsShardView(shardID, t.db, t.hasher, t.config, nil, root, t.pruning, func() byte {
 				if shardID < t.pruneShardIdx {
@@ -296,6 +296,9 @@ func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPat
 		}
 		for _, bucket := range n.StubList {
 			stats.ArchivedDataSize += int64(bucket.Count)
+			logicalValues, failures := s.archiveLogicalValueCount(bucket)
+			stats.ArchivedLogicalValues += logicalValues
+			stats.ArchivedLogicalValueReadFailures += failures
 			stats.StubArchivedSize += int64(bucket.Count)
 			stubItems += int64(bucket.Count)
 			if atShardRoot {
@@ -353,9 +356,34 @@ func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPat
 		}
 	case *LeafNode:
 		stats.LeafCount++
+		if s.config == nil || !s.config.StemMode {
+			stats.ActiveLogicalValues++
+		} else {
+			localKey, localBits := s.prependPath(n.Path, n.PathBits, path, pathBits)
+			shardPrefix, shardBits := s.getShardPrefix()
+			fullKey, fullBits := s.prependPath(localKey, localBits, shardPrefix, shardBits)
+			if fullBits != StemSize*8 {
+				stats.ActiveLogicalValueReadFailures++
+				break
+			}
+			payload, err := s.getFlatValue(fullKey)
+			if err != nil {
+				stats.ActiveLogicalValueReadFailures++
+				break
+			}
+			count, err := stemEncodedValueCount(payload)
+			if err != nil {
+				stats.ActiveLogicalValueReadFailures++
+				break
+			}
+			stats.ActiveLogicalValues += int64(count)
+		}
 	case *ArchiveBucketNode:
 		stats.BucketCount++
 		stats.ArchivedDataSize += int64(n.Count)
+		logicalValues, failures := s.archiveLogicalValueCount(n)
+		stats.ArchivedLogicalValues += logicalValues
+		stats.ArchivedLogicalValueReadFailures += failures
 		stats.addBucketItemCount(n.Count)
 		if pathBits == 0 && currentPathBuckets == 0 {
 			stats.RootBucketCount++
@@ -370,4 +398,28 @@ func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPat
 			stats.MaxBucketsPath = currentPathBuckets + 1
 		}
 	}
+}
+
+func (s *Shard) archiveLogicalValueCount(bucket *ArchiveBucketNode) (int64, int64) {
+	if bucket == nil {
+		return 0, 0
+	}
+	if s.config == nil || !s.config.StemMode {
+		return int64(bucket.Count), 0
+	}
+	items, err := s.bucketItemsWithValueRefs(bucket)
+	if err != nil {
+		return 0, int64(bucket.Count)
+	}
+	var count, failures int64
+	for _, item := range items {
+		_, payload := s.archiveItemFlatValue(bucket, item)
+		values, err := stemEncodedValueCount(payload)
+		if err == nil {
+			count += int64(values)
+		} else {
+			failures++
+		}
+	}
+	return count, failures
 }

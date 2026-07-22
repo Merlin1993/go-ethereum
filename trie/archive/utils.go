@@ -8,7 +8,7 @@ import (
 
 var (
 	pathNodePrefix = []byte{'B', 'P', 'N', '1'}
-	pathTopPrefix  = []byte{'B', 'P', 'T', '1'}
+	pathRootPrefix = []byte{'B', 'P', 'R', '1'}
 )
 
 type persistedNodePath struct {
@@ -29,16 +29,16 @@ func pathNodeKey(shardID int, path []byte, bits int) []byte {
 	return key
 }
 
-func pathTopNodeKey(level, prefix int) []byte {
-	key := make([]byte, len(pathTopPrefix)+1+4)
-	copy(key, pathTopPrefix)
-	key[len(pathTopPrefix)] = byte(level)
-	stdbinary.BigEndian.PutUint32(key[len(pathTopPrefix)+1:], uint32(prefix))
+func pathRootBranchKey(depth, prefix int) []byte {
+	key := make([]byte, len(pathRootPrefix)+1+4)
+	copy(key, pathRootPrefix)
+	key[len(pathRootPrefix)] = byte(depth)
+	stdbinary.BigEndian.PutUint32(key[len(pathRootPrefix)+1:], uint32(prefix))
 	return key
 }
 
 func IsPathStorageKey(key []byte) bool {
-	return bytes.HasPrefix(key, pathNodePrefix) || bytes.HasPrefix(key, pathTopPrefix)
+	return bytes.HasPrefix(key, pathNodePrefix) || bytes.HasPrefix(key, pathRootPrefix)
 }
 
 func (s *Shard) setBitInBytes(data []byte, bitIdx int, val byte) {

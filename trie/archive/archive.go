@@ -3,6 +3,7 @@ package archive
 import (
 	"bytes"
 	"sort"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 )
@@ -10,19 +11,37 @@ import (
 // Prune converts expired hot leaves in one shard into archive buckets.
 // Unabsorbed items are aggregated at the shard root before overflow sinks.
 func (s *Shard) Prune(global byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	_, err := s.PruneWithDiagnostics(global)
+	return err
+}
 
+// PruneWithDiagnostics performs the same cleanup as Prune and reports where
+// the time was spent. These phase timers remain available even when the more
+// expensive per-node diagnostics are disabled.
+func (s *Shard) PruneWithDiagnostics(global byte) (diag ShardPruneDiagnostics, err error) {
+	totalStart := time.Now()
+	lockStart := time.Now()
+	s.mu.Lock()
+	diag.LockWaitNanos = time.Since(lockStart).Nanoseconds()
+	diag.DetailedCountersEnabled = s.config != nil && s.config.EnablePathDiagnostics
+	defer func() {
+		diag.TotalNanos = time.Since(totalStart).Nanoseconds()
+		s.mu.Unlock()
+	}()
+
+	loadStart := time.Now()
 	if s.root == nil && len(s.rootHash) > 0 {
-		var err error
 		s.root, err = s.loadNode(s.rootHash)
+		diag.RootLoadNanos = time.Since(loadStart).Nanoseconds()
 		if err != nil {
-			return err
+			return diag, err
 		}
+	} else {
+		diag.RootLoadNanos = time.Since(loadStart).Nanoseconds()
 	}
 
 	if s.root == nil {
-		return nil
+		return diag, nil
 	}
 
 	// 涓嶈兘鍙湅 root epoch 鏉ヨ烦杩囧壀鏋濄€傚啓鍏ヤ細鍒锋柊鎻掑叆璺緞涓婄殑绁栧厛鑺傜偣锛?	// 浣嗘湭瑙︾鐨勫瓙鏍戜粛鍙兘淇濈暀鏃?epoch锛屾墍浠ュ繀椤荤户缁悜涓嬫鏌ャ€?
@@ -30,22 +49,28 @@ func (s *Shard) Prune(global byte) error {
 	prefix, prefixBits := s.getShardPrefix()
 
 	// 2. 閫掑綊鍓灊骞舵敹闆?MaxPathBits 鑼冨洿鍐呯殑缁濆鍏ㄨ矾寰勯」
+	walkStart := time.Now()
 	newRoot, items, promotedStubs, err := s.pruneAndArchive(s.root, prefix, prefixBits, global)
+	diag.WalkNanos = time.Since(walkStart).Nanoseconds()
 	if err != nil {
-		return err
+		return diag, err
 	}
 
+	finishStart := time.Now()
 	s.root, err = s.finishRootArchivePool(newRoot, items, prefix, prefixBits)
 	if err != nil {
-		return err
+		diag.FinishNanos = time.Since(finishStart).Nanoseconds()
+		return diag, err
 	}
 	if len(promotedStubs) > 0 {
 		s.root, err = s.attachPromotedStubsToRoot(s.root, promotedStubs)
 		if err != nil {
-			return err
+			diag.FinishNanos = time.Since(finishStart).Nanoseconds()
+			return diag, err
 		}
 	}
-	return nil
+	diag.FinishNanos = time.Since(finishStart).Nanoseconds()
+	return diag, nil
 }
 
 func (s *Shard) archiveItemsFromPromotedStubs(stubs []*ArchiveBucketNode) ([]ArchivedKV, error) {

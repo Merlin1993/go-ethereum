@@ -37,6 +37,20 @@ type nodeBlobCache struct {
 	limit      int
 	bytesLimit int64
 	bytes      int64
+	hits       int64
+	misses     int64
+	evictions  int64
+}
+
+// NodeCacheDiagnostics contains the current cache size and lifetime lookup
+// counters. Counters are maintained under the cache's existing mutex, so they
+// add no extra synchronization to the read path.
+type NodeCacheDiagnostics struct {
+	Entries   int64
+	Bytes     int64
+	Hits      int64
+	Misses    int64
+	Evictions int64
 }
 
 func newNodeBlobCache(limit int) *nodeBlobCache {
@@ -74,8 +88,10 @@ func (c *nodeBlobCache) get(key []byte) ([]byte, bool) {
 	defer c.mu.Unlock()
 	data, ok := c.cache.Get(string(key))
 	if !ok {
+		c.misses++
 		return nil, false
 	}
+	c.hits++
 	return data, true
 }
 
@@ -130,18 +146,30 @@ func (c *nodeBlobCache) removeOldestLocked() {
 		return
 	}
 	c.bytes -= int64(len(key) + len(value))
+	c.evictions++
 	if c.bytes < 0 {
 		c.bytes = 0
 	}
 }
 
 func (c *nodeBlobCache) stats() (entries int64, bytes int64) {
+	diag := c.diagnostics()
+	return diag.Entries, diag.Bytes
+}
+
+func (c *nodeBlobCache) diagnostics() NodeCacheDiagnostics {
 	if c == nil {
-		return 0, 0
+		return NodeCacheDiagnostics{}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return int64(c.cache.Len()), c.bytes
+	return NodeCacheDiagnostics{
+		Entries:   int64(c.cache.Len()),
+		Bytes:     c.bytes,
+		Hits:      c.hits,
+		Misses:    c.misses,
+		Evictions: c.evictions,
+	}
 }
 
 type commitmentPointCache struct {

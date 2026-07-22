@@ -187,6 +187,9 @@ func (n *InternalNode) IsDirty() bool {
 
 func (n *InternalNode) SetDirty(d bool) {
 	n.dirty = d
+	if d {
+		n.hash = nil
+	}
 }
 
 func (n *InternalNode) OriginalHash() []byte {
@@ -348,6 +351,9 @@ func (n *LeafNode) IsDirty() bool {
 
 func (n *LeafNode) SetDirty(d bool) {
 	n.dirty = d
+	if d {
+		n.hash = nil
+	}
 }
 
 func (n *LeafNode) OriginalHash() []byte {
@@ -466,6 +472,9 @@ func (n *ArchiveBucketNode) IsDirty() bool {
 
 func (n *ArchiveBucketNode) SetDirty(d bool) {
 	n.dirty = d
+	if d {
+		n.hash = nil
+	}
 }
 
 func (n *ArchiveBucketNode) invalidateMetaCache() {
