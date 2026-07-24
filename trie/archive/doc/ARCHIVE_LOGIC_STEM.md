@@ -68,16 +68,19 @@ storage 的二叉键不可反向还原原始地址和 slot。因此，当前实�
 
 ### 3.1 稀疏存储
 
-内存中的一个 Stem 有 256 个槽位，但落盘时只写实际存在的值。编码内容为：
+内存中的一个 Stem 有 256 个槽位。落盘时拆成两类记录：
 
 ```text
-版本标记
-+ 32-byte ValuesRoot
-+ 32-byte presence bitmap
-+ 按 suffix 顺序排列的非空槽位长度和值
+BFV1 || 31-byte stem key
+  -> 8-byte 版本标记 + 32-byte presence bitmap
+
+BFV1 || 32-byte stem/suffix key
+  -> 该 suffix 的实际值
 ```
 
-32 字节 bitmap 表示哪些 suffix 存在。空字节串也可以是一个“存在的值”；真正删除必须清掉对应的存在位。
+元数据固定为 40 字节。32 字节 bitmap 表示哪些 suffix 存在；实际值按 suffix 分开保存。空字节串也可以是一个“存在的值”；真正删除必须清掉对应的存在位并删除对应值记录。
+
+这种拆分不改变 Stem 的归档粒度，只是避免每次更新一个 suffix 时把同 Stem 的其他值重复写盘。
 
 ### 3.2 Stem 内部根
 
@@ -93,13 +96,13 @@ storage 的二叉键不可反向还原原始地址和 slot。因此，当前实�
 
 ### 3.3 外层叶子实际承诺的内容
 
-当前外层 ASCT 叶子不是只保存 `ValuesRoot`，而是对以下内容整体生成引用：
+当前外层 ASCT 叶子直接保存该 Stem 的 `ValuesRoot`：
 
 ```text
-31-byte stem key + 完整的 Stem 编码数据
+31-byte stem key -> 32-byte ValuesRoot
 ```
 
-所以，只提供一个 suffix、`ValuesRoot` 和 8 个内部证明，目前还不足以通过外层 ASCT 的值校验。完整的两层无状态证明还没有接入现有读写接口，这一点在第 9 节单独说明。
+归档桶里对应 Stem 的记录也保存同一个 `ValuesRoot`。因此，外层证明负责证明 Stem 和 `ValuesRoot` 的关系，内部 8 层证明负责证明 suffix 和 `ValuesRoot` 的关系。代码已经具备这两部分的底层校验能力，但还没有提供组合后的无状态恢复接口，见第 9 节。
 
 ## 4. 一棵二叉树和分片
 
@@ -139,13 +142,13 @@ shardID = stemKey 的前 ShardDepth 个 bit
 一次写入按下面的顺序执行：
 
 1. 把 32 字节状态键拆成 Stem key 和 suffix。
-2. 用 Stem key 读取当前完整 Stem 数据。
+2. 用 Stem key 读取 bitmap 和当前存在的 suffix 值。
 3. 修改或删除目标 suffix。
 4. 重新计算该 Stem 的 `ValuesRoot`。
-5. 重新编码整个 Stem。
-6. 用 31 字节 Stem key 把新编码写回外层 ASCT。
+5. 只写入变化的 suffix；只有新增或删除 suffix 时才重写 40 字节 bitmap。
+6. 用 31 字节 Stem key 把新的 `ValuesRoot` 写回外层 ASCT。
 
-如果 Stem 原来已经归档，第 2 步会读取当前完整 Stem，第 6 步会移除它的冷记录，并把更新后的 Stem 作为一个活跃叶子重新放回树中。
+如果 Stem 原来已经归档，第 6 步会移除它的冷记录，并把更新后的 Stem 作为一个活跃叶子重新放回树中。未变化的 suffix 记录不会重复写盘。
 
 这意味着：
 
@@ -155,14 +158,14 @@ shardID = stemKey 的前 ShardDepth 个 bit
 
 ### 5.2 批量更新
 
-同一批写入会先按 Stem 分组。每个受影响的 Stem 最多读取一次、编码一次，再把所有 suffix 更新一起写回。
+同一批写入会先按 Stem 分组。每个受影响的 Stem 最多读取一次、计算一次新根，再批量写入发生变化的 suffix。
 
-这是必要的性能优化。否则，同一区块内连续修改同一个 Stem 的多个 suffix，会反复重算 256 槽位的内部根并反复写入完整 Stem。
+这是必要的性能优化。否则，同一区块内连续修改同一个 Stem 的多个 suffix，会反复读取同一 Stem、反复计算内部根并多次进入存储层。
 
 ### 5.3 删除
 
-- 删除一个 suffix 后，只要 Stem 内还有其他值，就重写该 Stem。
-- 删除最后一个 suffix 后，才删除外层 Stem 叶子和对应的 flat value。
+- 删除一个 suffix 后，只删除该值记录并更新 bitmap 和 `ValuesRoot`。
+- 删除最后一个 suffix 后，再删除外层 Stem 叶子、bitmap 和最后一个值记录。
 
 ### 5.4 账户销毁
 
@@ -178,7 +181,7 @@ ASIC\x01 || 20-byte address || 8-byte code chunk number
 - storage 写入、删除时同步增加或移除 slot 索引。
 - code 更新时同步更新 chunk 索引；代码缩短后，多余的旧 chunk 会被明确删除。
 - 账户销毁时只扫描该地址的索引，批量删除它的 storage 和 code suffix，工作量与该账户自身的数据量成正比，不再与全局 Stem 数量成正比。
-- 销毁批次会先按 Stem 分组；每个受影响 Stem 最多加载、解码和写回一次，同时批量登记索引删除，避免逐 slot 重复读取同一 Stem。
+- 销毁批次会先按 Stem 分组；每个受影响 Stem 最多加载一次、计算一次新根，并批量写入变化记录和登记索引删除，避免逐 slot 重复读取同一 Stem。
 - 旧数据删除先执行，同一块内销毁后重建产生的新数据随后写入，因此不会误删新账户的数据，也不会让旧 slot 重新出现。
 - 树、flat value 和索引在同一次提交中落盘，避免根和索引处于不同版本。
 
@@ -201,7 +204,7 @@ Stem 到期后：
 1. 从活跃子树中移除 Stem 叶子。
 2. 把 Stem key 的剩余路径和它的值引用放入归档桶。
 3. 归档桶更新快速筛选信息和整体承诺。
-4. Stem 的完整编码数据仍保留在 flat value store 中。
+4. Stem 的 bitmap 和各 suffix 值仍保留在 flat value store 中。
 
 归档桶容量限制的是 **Stem 记录数**，不是 suffix 数量。一个装有 100 条记录的桶，代表 100 个 Stem；这些 Stem 内实际存在的 suffix 总数可能远大于 100。
 
@@ -213,9 +216,9 @@ Stem 到期后：
 
 1. 沿 Stem key 路径找到候选归档桶。
 2. 先做快速筛选，再精确匹配 Stem key。
-3. 从 flat value store 读取完整 Stem 编码。
-4. 校验该编码与桶内保存的值引用一致。
-5. 解码 Stem 并返回目标 suffix。
+3. 从 flat value store 读取 bitmap 和各 suffix 值。
+4. 重算 `ValuesRoot`，并与桶内保存的根一致。
+5. 返回目标 suffix。
 
 普通读取不会把 Stem 自动变回活跃状态。只有显式恢复或写入才会激活它。
 
@@ -223,39 +226,37 @@ Stem 到期后：
 
 当前恢复单位是整个 Stem：
 
-1. 读取并校验完整 Stem 编码。
+1. 读取 bitmap 和全部现存 suffix，并校验 `ValuesRoot`。
 2. 从归档桶中只删除这一条 Stem 记录。
-3. 把整个 Stem 作为活跃叶子放回外层树。
+3. 把该 Stem 的 `ValuesRoot` 作为活跃叶子放回外层树。
 4. 更新沿途二叉根。
 
 同一归档桶中的其他 Stem 不受影响。
 
-如果恢复后某个 suffix 又发生更新，系统直接在完整 Stem 上生成新的编码和新根。因为当前节点本地仍保存完整 Stem 数据，所以以后恢复或读取其他 suffix 不需要额外记住旧根；其他 suffix 已经被带入新根。
+如果恢复后某个 suffix 又发生更新，系统生成新根并只写变化的记录。因为当前节点本地仍保存该 Stem 的 bitmap 和全部 suffix 值，所以以后读取其他 suffix 不需要额外记住旧根；其他 suffix 已经被带入新根。
 
 ## 7. 数据持久化
 
 ### 7.1 flat value
 
-真实 Stem 数据使用下面的键保存：
+Stem 元数据和实际值使用下面的键保存：
 
 ```text
-BFV1 || 31-byte stem key -> encoded stem payload
+BFV1 || 31-byte stem key        -> 40-byte version/bitmap metadata
+BFV1 || 32-byte stem/suffix key -> one suffix value
 ```
 
-活跃叶子和归档桶都不重复保存完整数据，只保存由 Stem key 和完整编码共同计算出的 32 字节值引用。
+活跃叶子和归档桶都不重复保存实际值，只保存 32 字节 `ValuesRoot`。
 
-一次提交中，树节点、归档元数据和 flat value 的改动进入同一个提交边界，避免根已经更新但真实 Stem 数据尚未可见。
+一次提交中，树节点、归档元数据和 flat value 的改动进入同一个提交边界，避免根已经更新但 bitmap 或 suffix 值尚未可见。
 
 ### 7.2 当前“归档”的实际含义
 
-当前版本归档的是树结构中的活跃叶子，**没有从本地删除已归档 Stem 的完整 payload**。所以它已经能测量树结构压缩、归档桶开销和 Stem 粒度带来的影响，但还不是“全节点完全不保存归档数据”的最终形态。
+当前版本归档的是树结构中的活跃叶子，**没有从本地删除已归档 Stem 的 bitmap 和 suffix 值**。所以它已经能测量树结构压缩、归档桶开销和 Stem 粒度带来的影响，但还不是“全节点完全不保存归档数据”的最终形态。
 
-如果以后全节点删除冷 Stem payload，恢复时必须从外部获得以下二者之一：
+如果以后全节点删除冷 Stem 数据，按当前“整 Stem 激活”接口，恢复时必须从外部获得当前 bitmap 和全部现存 suffix 值。
 
-- 当前完整 Stem 数据；或
-- 能证明目标 suffix 的数据，加上从证明对应根推进到当前根所需的全部公开更新。
-
-后者需要额外的数据可用性和更新见证协议，当前代码尚未实现。
+单个 suffix 加 8 层内部证明可以验证该值属于当前 `ValuesRoot`，但不能重建并激活完整 Stem。若以后要支持部分恢复，需要另行设计数据可用性和更新见证协议；当前代码尚未实现。
 
 ## 8. 根变化如何处理
 
@@ -263,12 +264,12 @@ Stem 内任一 suffix 更新都会改变 `ValuesRoot`，外层 Stem 值引用也
 
 当前方案能够这样处理，是因为：
 
-1. 恢复或更新时已经取得完整 Stem。
-2. 未更新的 suffix 也在这份完整 Stem 中。
+1. 恢复或更新时已经取得 bitmap 和当前全部 suffix 值。
+2. 未更新的 suffix 仍保存在各自的独立记录中。
 3. 重新计算后，所有 suffix 共同受新的 `ValuesRoot` 约束。
-4. 以后读取其他 suffix 时，以当前完整 Stem 和当前根为准。
+4. 以后读取其他 suffix 时，以当前分散记录和当前根为准。
 
-只有在“节点不保存完整归档 Stem、每次只从外部取回一个 suffix”的方案中，才会遇到旧证明如何跟随每次根更新的问题。当前实现没有选择这条路径，因此也没有维护旧根链或逐 suffix 的增量见证。
+只有在“节点不保存完整归档 Stem、每次只从外部取回一个 suffix”的方案中，才会遇到旧证明如何跟随每次根更新的问题。当前实现没有选择这条路径，因此不维护旧根链或逐 suffix 的增量见证。
 
 ## 9. 证明模型和当前边界
 
@@ -277,14 +278,14 @@ Stem 内任一 suffix 更新都会改变 `ValuesRoot`，外层 Stem 值引用也
 1. **外层证明**：证明某个 Stem 记录属于当前 ASCT 全局根，或者属于某个受全局根约束的归档桶。
 2. **内部证明**：用固定 8 个相邻哈希证明某个 suffix 属于该 Stem 的 `ValuesRoot`。
 
-当前代码已经具备 Stem 内部证明，也保留了外层归档桶的查找和校验能力，但还没有提供一套组合后的“只带一个 suffix 就能无状态恢复”的接口。
+当前代码已经具备 Stem 内部证明，外层叶子和归档记录也直接约束 `ValuesRoot`，但还没有提供一套组合后的“只带一个 suffix 就能无状态恢复”的接口。
 
-主要原因是当前外层值引用约束的是 **完整 Stem 编码**，而不只是 `ValuesRoot`。因此，内部 suffix 证明不能替代完整 payload 的外层校验。
+主要原因不再是外层承诺方式，而是当前冷热和激活单位仍是完整 Stem：验证一个 suffix 不等于已经取得恢复完整 Stem 所需的全部数据。
 
 如果下一阶段要支持不保存冷 payload 的全节点，需要在以下方向中做选择：
 
-- 外部提供完整 Stem，继续沿用当前外层值引用；
-- 调整外层承诺，使它可以直接约束 `ValuesRoot` 和必要元数据，再设计两层组合证明；
+- 外部提供完整 Stem 的 bitmap 和全部值，继续沿用整 Stem 激活；
+- 允许部分恢复，并定义其余 suffix 数据如何保持可用；
 - 引入可验证的更新见证，让旧 suffix 证明能推进到当前根。
 
 这些属于后续协议设计，不应被写成当前已经完成的能力。
@@ -299,8 +300,8 @@ Stem 模式同时保留两组口径，避免把“Stem 数”和“真实值数�
 | `ArchivedDataSize` | 已归档 Stem 记录数 |
 | `ActiveLogicalValues` | 活跃 Stem 内实际存在的 suffix 总数 |
 | `ArchivedLogicalValues` | 已归档 Stem 内实际存在的 suffix 总数 |
-| `ActiveLogicalValueReadFailures` | 统计活跃 Stem 时无法读取或解码 payload 的数量 |
-| `ArchivedLogicalValueReadFailures` | 统计归档 Stem 时无法读取或解码 payload 的数量 |
+| `ActiveLogicalValueReadFailures` | 统计活跃 Stem 时无法读取或解码 bitmap 的数量 |
+| `ArchivedLogicalValueReadFailures` | 统计归档 Stem 时无法读取或解码 bitmap 的数量 |
 | `BucketItems*` | 每个归档桶包含的 Stem 记录数 |
 
 实验中比较真实数据密度时，应优先使用 logical value 口径，例如：
@@ -310,7 +311,7 @@ Stem 模式同时保留两组口径，避免把“Stem 数”和“真实值数�
 
 仅看 `ArchivedDataSize` 会低估一个 Stem 内聚合的实际值数量。
 
-统计 suffix 数时只读取 Stem 编码头部的 bitmap，不会为每个 Stem 重算完整的 256 槽位根。两个失败计数必须同时为零；否则 logical value 总数是不完整的，不能用于计算归档率或单位存储成本。
+统计 suffix 数时只读取 40 字节元数据中的 bitmap，不会读取所有 suffix 或重算根。两个失败计数必须同时为零；否则 logical value 总数是不完整的，不能用于计算归档率或单位存储成本。
 
 ## 11. 配置和兼容性
 
@@ -324,7 +325,7 @@ Stem 模式由 `Config.StemMode` 控制，回放实验使用：
 
 以下变化都影响持久化布局或根编码：
 
-- 按 Stem 保存 flat value；
+- Stem 元数据和 suffix 值使用拆分的 flat value 布局；
 - 外层树 key 从完整逻辑键变成 31 字节 Stem key；
 - 分片以上改成普通二叉根路径；
 - path storage 使用新的 `BPR1` 根路径记录。
@@ -335,15 +336,15 @@ Stem 模式由 `Config.StemMode` 控制，回放实验使用：
 
 实现和后续修改需要保持以下规则：
 
-1. 同一 Stem 的所有 suffix 只能存在于一份编码数据中。
+1. 同一 Stem 只能有一份 bitmap；每个存在的 suffix 只能有一条实际值记录。
 2. 一个 Stem 只能处于活跃或已归档中的一种状态，不能拆成两部分。
 3. 更新任一 suffix 都要刷新整个 Stem 的更新时间和外层值引用。
-4. Stem 编码中的 `ValuesRoot` 必须能由实际 suffix 值重新计算得到。
+4. 外层保存的 `ValuesRoot` 必须能由 bitmap 和实际 suffix 值重新计算得到。
 5. 外层 Stem key 必须固定为 31 字节；suffix 不参与外层寻址。
 6. 一个归档桶可以包含多个 Stem，但同一 Stem 不能同时留下重复的有效记录。
 7. 桶容量按 Stem 记录数计算，逻辑值统计按实际 suffix 数计算。
 8. 分片是全局二叉树的固定深度子树，不存在第二套独立的聚合树语义。
-9. 当前恢复依赖完整 Stem payload 可用；没有该数据时不能声称恢复已经完成。
+9. 当前恢复依赖 bitmap 和完整 suffix 集合可用；缺少其中任一部分时不能声称恢复已经完成。
 
 ## 13. 与 Logic Plus 的主要差异
 
@@ -351,18 +352,18 @@ Stem 模式由 `Config.StemMode` 控制，回放实验使用：
 | --- | --- |
 | 单个键值独立计时和归档 | 整个 Stem 统一计时和归档 |
 | 桶里一条记录对应一个键值 | 桶里一条记录对应一个 Stem |
-| 更新只恢复一个键值 | 更新会恢复并重写整个 Stem |
+| 更新只恢复一个键值 | 更新会恢复整个 Stem，但只写变化的 suffix 记录 |
 | 叶子数可近似看作实际值数 | 必须分开统计 Stem 数和 suffix 数 |
 | 根上方有独立汇总结构的表述 | 分片前缀就是同一棵二叉树的正常路径 |
 | 单层键值证明 | 外层 Stem 证明加内部 suffix 证明 |
 
 ## 14. 代码对应关系
 
-- `trie/archive/stem.go`：Stem 编码、内部根、内部证明和 Stem 级读写。
+- `trie/archive/stem.go`：Stem 元数据、内部根、内部证明和 Stem 级读写。
 - `trie/utils/binary_tree.go`：账户、storage 和 code 的 32 字节二叉键映射。
 - `trie/archive_trie.go`：状态层接口和 Stem 模式适配。
 - `trie/archive/root.go`：分片以上的普通二叉根路径。
-- `trie/archive/value_store.go`：完整 Stem payload 的 flat value 存取。
+- `trie/archive/value_store.go`：Stem bitmap 和 suffix 值的 flat value 存取。
 - `trie/archive/config.go`：Stem 开关和 Stem/suffix 两套统计口径。
 
-这份文档描述的是当前已经落到代码中的 Stem 版本。后续如果改为删除冷 payload 或支持单 suffix 无状态恢复，应先更新第 7～9 节，再调整实现和实验口径。
+这份文档描述的是当前已经落到代码中的 Stem 版本。后续如果改为删除冷数据或支持单 suffix 无状态恢复，应先更新第 7～9 节，再调整实现和实验口径。

@@ -200,11 +200,7 @@ func TestStemTrieGroupsSuffixesIntoOneOuterLeaf(t *testing.T) {
 		}
 	}
 
-	raw, err := trie.Backend().Get(key1[:StemSize])
-	if err != nil {
-		t.Fatalf("get raw stem: %v", err)
-	}
-	stem, err := decodeStem(raw, trie.Backend().Hasher())
+	stem, err := trie.loadStem(key1[:StemSize])
 	if err != nil || stem.Len() != 2 {
 		t.Fatalf("raw stem: len %d err %v", stem.Len(), err)
 	}
@@ -459,11 +455,7 @@ func TestStemTrieConcurrentWritesDoNotLoseSuffixes(t *testing.T) {
 		t.Fatalf("concurrent put: %v", err)
 	}
 
-	raw, err := trie.Backend().Get(stemTestKey(0x61, 0)[:StemSize])
-	if err != nil {
-		t.Fatal(err)
-	}
-	stem, err := decodeStem(raw, trie.Backend().Hasher())
+	stem, err := trie.loadStem(stemTestKey(0x61, 0)[:StemSize])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,6 +484,172 @@ func TestStemTrieSkipsUnchangedPut(t *testing.T) {
 	}
 	if window.ShardPutCalls != 1 {
 		t.Fatalf("unchanged archived value would not be refreshed: shard puts=%d", window.ShardPutCalls)
+	}
+}
+
+func TestStemTrieSplitStorageWritesOnlyChangedRecords(t *testing.T) {
+	trie, db := newStemTestTrie(t, false)
+	key1 := stemTestKey(0x63, 1)
+	key2 := stemTestKey(0x63, 2)
+	key3 := stemTestKey(0x63, 3)
+	commit := func() {
+		t.Helper()
+		batch := db.NewBatch()
+		if _, err := trie.Backend().CommitToBatch(batch, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := batch.Write(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := trie.PutBatch([]KeyValue{
+		{Key: key1, Value: []byte("one")},
+		{Key: key2, Value: []byte("two")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	commit()
+
+	before := LastArchiveCumulativeDiagnostics()
+	updated := []byte("one-updated")
+	if err := trie.Put(key1, updated); err != nil {
+		t.Fatal(err)
+	}
+	commit()
+	after := LastArchiveCumulativeDiagnostics()
+	if puts, bytesWritten := after.FlatValuePuts-before.FlatValuePuts, after.FlatValuePutBytes-before.FlatValuePutBytes; puts != 1 || bytesWritten != int64(len(updated)) {
+		t.Fatalf("existing suffix update wrote %d records/%d bytes, want 1/%d", puts, bytesWritten, len(updated))
+	}
+
+	before = after
+	added := []byte("three")
+	if err := trie.Put(key3, added); err != nil {
+		t.Fatal(err)
+	}
+	commit()
+	after = LastArchiveCumulativeDiagnostics()
+	metadataSize := int64(len(stemMetadataMagic) + StemSuffixCount/8)
+	if puts, bytesWritten := after.FlatValuePuts-before.FlatValuePuts, after.FlatValuePutBytes-before.FlatValuePutBytes; puts != 2 || bytesWritten != metadataSize+int64(len(added)) {
+		t.Fatalf("new suffix wrote %d records/%d bytes, want 2/%d", puts, bytesWritten, metadataSize+int64(len(added)))
+	}
+
+	before = after
+	if err := trie.Delete(key3); err != nil {
+		t.Fatal(err)
+	}
+	commit()
+	after = LastArchiveCumulativeDiagnostics()
+	if puts, deletes, bytesWritten := after.FlatValuePuts-before.FlatValuePuts, after.FlatValueDeletes-before.FlatValueDeletes, after.FlatValuePutBytes-before.FlatValuePutBytes; puts != 1 || deletes != 1 || bytesWritten != metadataSize {
+		t.Fatalf("suffix delete wrote %d puts/%d deletes/%d bytes, want 1/1/%d", puts, deletes, bytesWritten, metadataSize)
+	}
+
+	stem, err := trie.loadStem(key1[:StemSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	valueRef, _, err := trie.Backend().GetValueRef(key1[:StemSize])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(valueRef, stem.ValuesRoot(trie.Backend().Hasher())) {
+		t.Fatal("outer leaf does not store the stem root")
+	}
+
+	if _, err := trie.DeleteBatchWithValues([][]byte{key1, key2}); err != nil {
+		t.Fatal(err)
+	}
+	commit()
+	for _, physicalKey := range [][]byte{key1[:StemSize], key1, key2, key3} {
+		if _, err := trie.Backend().GetFlatValue(physicalKey); !errors.Is(err, ErrNodeNotFound) {
+			t.Fatalf("deleted stem retained flat record %x: %v", physicalKey, err)
+		}
+	}
+}
+
+func TestStemTrieMigratesLegacyBlobOnWrite(t *testing.T) {
+	trie, db := newStemTestTrie(t, false)
+	key1 := stemTestKey(0x64, 1)
+	key2 := stemTestKey(0x64, 2)
+	legacy := NewStem()
+	legacy.Put(key1[StemSize], []byte("old-one"))
+	legacy.Put(key2[StemSize], []byte("old-two"))
+	if err := trie.Backend().Put(key1[:StemSize], encodeStem(legacy, trie.Backend().Hasher())); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	root, err := trie.Backend().CommitToBatch(batch, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := NewTrie(root, db, NewPooledKeccakHasher(), trie.Backend().Config(), false)
+	reloaded, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := reloaded.Get(key2); err != nil || string(got) != "old-two" {
+		t.Fatalf("legacy read: got %q err %v", got, err)
+	}
+	if err := reloaded.Put(key1, []byte("new-one")); err != nil {
+		t.Fatal(err)
+	}
+	batch = db.NewBatch()
+	root, err = reloaded.Backend().CommitToBatch(batch, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := reloaded.Backend().GetFlatValue(key1[:StemSize])
+	if err != nil || len(metadata) < len(stemMetadataMagic) || !bytes.Equal(metadata[:len(stemMetadataMagic)], stemMetadataMagic[:]) {
+		t.Fatalf("legacy blob was not migrated: metadata=%x err=%v", metadata, err)
+	}
+
+	cleanBackend := NewTrie(root, db, NewPooledKeccakHasher(), trie.Backend().Config(), false)
+	clean, err := NewStemTrie(cleanBackend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := clean.Get(key1); err != nil || string(got) != "new-one" {
+		t.Fatalf("migrated update: got %q err %v", got, err)
+	}
+	if got, err := clean.Get(key2); err != nil || string(got) != "old-two" {
+		t.Fatalf("migrated sibling: got %q err %v", got, err)
+	}
+}
+
+func TestStemTrieReplaceStemStableBitmapWritesOnlyValue(t *testing.T) {
+	trie, db := newStemTestTrie(t, false)
+	key := stemTestKey(0x65, 0)
+	if err := trie.ReplaceStem(key, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := trie.Backend().CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	before := LastArchiveCumulativeDiagnostics()
+	value := []byte("second")
+	if err := trie.ReplaceStem(key, value); err != nil {
+		t.Fatal(err)
+	}
+	batch = db.NewBatch()
+	if _, err := trie.Backend().CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	after := LastArchiveCumulativeDiagnostics()
+	if puts, bytesWritten := after.FlatValuePuts-before.FlatValuePuts, after.FlatValuePutBytes-before.FlatValuePutBytes; puts != 1 || bytesWritten != int64(len(value)) {
+		t.Fatalf("stable replacement wrote %d records/%d bytes, want 1/%d", puts, bytesWritten, len(value))
 	}
 }
 

@@ -211,7 +211,10 @@ func (s *Shard) archiveDedupeFlatRef(entry *archiveDedupeEntry) ([]byte, bool) {
 	if err != nil || value == nil {
 		return nil, false
 	}
-	entry.flatRef = valueRefForKeyValue(entry.fullKey, value)
+	entry.flatRef, err = s.storedValueRef(entry.fullKey, value)
+	if err != nil {
+		return nil, false
+	}
 	return entry.flatRef, true
 }
 

@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"bytes"
 	"fmt"
 	"runtime"
 	"sync"
@@ -334,6 +335,134 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 	return val, err
 }
 
+// GetValueRef returns the commitment stored in the outer leaf or archive
+// bucket without loading its flat payload.
+func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
+	shardID := t.GetShardID(key)
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+		return nil, false, err
+	}
+	shard, err := t.getOrCreateShard(shardID)
+	if err != nil {
+		return nil, false, err
+	}
+	return shard.GetValueRef(key)
+}
+
+// GetFlatValue reads a flat record that shares the trie's shard routing.
+func (t *Trie) GetFlatValue(key []byte) ([]byte, error) {
+	shardID := t.GetShardID(key)
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+		return nil, err
+	}
+	shard, err := t.getOrCreateShard(shardID)
+	if err != nil {
+		return nil, err
+	}
+	return shard.GetFlatValue(key)
+}
+
+// StageFlatValue stages a split flat record for the next trie commit.
+func (t *Trie) StageFlatValue(key, value []byte) error {
+	shardID := t.GetShardID(key)
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+		return err
+	}
+	shard, err := t.getOrCreateShard(shardID)
+	if err != nil {
+		return err
+	}
+	t.markDirtyShard(shardID)
+	shard.StageFlatValue(key, value)
+	return nil
+}
+
+// StageFlatDelete stages removal of a split flat record.
+func (t *Trie) StageFlatDelete(key []byte) error {
+	shardID := t.GetShardID(key)
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+		return err
+	}
+	shard, err := t.getOrCreateShard(shardID)
+	if err != nil {
+		return err
+	}
+	t.markDirtyShard(shardID)
+	shard.StageFlatDelete(key)
+	return nil
+}
+
+// StageFlatBatch stages split flat puts and deletes with one shard lock per
+// affected shard.
+func (t *Trie) StageFlatBatch(puts []KeyValue, deletes [][]byte) error {
+	if len(puts) == 0 && len(deletes) == 0 {
+		return nil
+	}
+	firstID := -1
+	oneShard := true
+	checkID := func(key []byte) {
+		id := t.GetShardID(key)
+		if firstID < 0 {
+			firstID = id
+		} else if id != firstID {
+			oneShard = false
+		}
+	}
+	for _, entry := range puts {
+		checkID(entry.Key)
+	}
+	for _, key := range deletes {
+		checkID(key)
+	}
+	if oneShard {
+		if err := t.finishAsyncPruneForShard(firstID); err != nil {
+			return err
+		}
+		shard, err := t.getOrCreateShard(firstID)
+		if err != nil {
+			return err
+		}
+		t.markDirtyShard(firstID)
+		shard.StageFlatBatch(puts, deletes)
+		return nil
+	}
+	type flatChanges struct {
+		puts    []KeyValue
+		deletes [][]byte
+	}
+	groups := make(map[int]*flatChanges)
+	for _, entry := range puts {
+		id := t.GetShardID(entry.Key)
+		group := groups[id]
+		if group == nil {
+			group = &flatChanges{}
+			groups[id] = group
+		}
+		group.puts = append(group.puts, entry)
+	}
+	for _, key := range deletes {
+		id := t.GetShardID(key)
+		group := groups[id]
+		if group == nil {
+			group = &flatChanges{}
+			groups[id] = group
+		}
+		group.deletes = append(group.deletes, key)
+	}
+	for id, group := range groups {
+		if err := t.finishAsyncPruneForShard(id); err != nil {
+			return err
+		}
+		shard, err := t.getOrCreateShard(id)
+		if err != nil {
+			return err
+		}
+		t.markDirtyShard(id)
+		shard.StageFlatBatch(group.puts, group.deletes)
+	}
+	return nil
+}
+
 // Put 把新 value 写成热 leaf。如果该 key 已经在冷桶中，先删除旧冷 entry，
 // 保证一个 key 只有一个有效位置。
 func (t *Trie) Put(key []byte, value []byte) error {
@@ -354,9 +483,36 @@ func (t *Trie) Put(key []byte, value []byte) error {
 	return nil
 }
 
+// PutValueRef updates an outer leaf from a precomputed commitment without
+// rewriting a flat payload under the leaf key.
+func (t *Trie) PutValueRef(key, valueRef []byte) error {
+	start := time.Now()
+	defer func() { recordShardPutDiagnostics(1, time.Since(start)) }()
+	shardID := t.GetShardID(key)
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+		return err
+	}
+	shard, err := t.getOrCreateShard(shardID)
+	if err != nil {
+		return err
+	}
+	t.markDirtyShard(shardID)
+	return shard.PutValueRef(key, valueRef)
+}
+
 // PutBatch applies ordered writes in parallel across independent shards.
 // Writes targeting the same shard retain their original order.
 func (t *Trie) PutBatch(entries []KeyValue) error {
+	return t.putBatch(entries, false)
+}
+
+// PutValueRefBatch applies precomputed leaf commitments without staging flat
+// payloads under the outer keys.
+func (t *Trie) PutValueRefBatch(entries []KeyValue) error {
+	return t.putBatch(entries, true)
+}
+
+func (t *Trie) putBatch(entries []KeyValue, valueRefs bool) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -408,7 +564,11 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 				shard, err := t.getOrCreateShard(group.id)
 				if err == nil {
 					t.markDirtyShard(group.id)
-					err = shard.PutBatch(group.entries)
+					if valueRefs {
+						err = shard.PutValueRefBatch(group.entries)
+					} else {
+						err = shard.PutBatch(group.entries)
+					}
 				}
 				groupWork[index] = time.Since(groupStart).Nanoseconds()
 				errs[index] = err
@@ -869,6 +1029,16 @@ func (t *Trie) ForEach(fn func(key, value []byte) bool) {
 // the binary root. Unlike ForEach, it is suitable for recovery and tooling after
 // a trie reload, when most shards have not been opened in memory yet.
 func (t *Trie) ForEachAll(fn func(key, value []byte) bool) error {
+	return t.forEachAll(fn, false)
+}
+
+// ForEachAllValueRefs iterates outer keys and their stored commitments without
+// loading flat payloads.
+func (t *Trie) ForEachAllValueRefs(fn func(key, valueRef []byte) bool) error {
+	return t.forEachAll(fn, true)
+}
+
+func (t *Trie) forEachAll(fn func(key, value []byte) bool, valueRefs bool) error {
 	if err := t.finishAsyncPrune(); err != nil {
 		return err
 	}
@@ -892,6 +1062,13 @@ func (t *Trie) ForEachAll(fn func(key, value []byte) bool) error {
 		}
 		return true
 	}
+	walk := func(shard *Shard, node Node, prefix []byte) {
+		if valueRefs {
+			shard.forEachValueRef(node, prefix, t.config.ShardDepth, visit)
+		} else {
+			shard.forEach(node, prefix, t.config.ShardDepth, visit)
+		}
+	}
 	for id, shard := range loaded {
 		if shard == nil {
 			continue
@@ -900,8 +1077,22 @@ func (t *Trie) ForEachAll(fn func(key, value []byte) bool) error {
 		prefix := t.getShardPrefix(id)
 		shard.mu.RLock()
 		if shard.root != nil {
-			shard.forEach(shard.root, prefix, t.config.ShardDepth, visit)
-			shard.mu.RUnlock()
+			if valueRefs {
+				var entries []KeyValue
+				shard.forEachValueRef(shard.root, prefix, t.config.ShardDepth, func(key, valueRef []byte) bool {
+					entries = append(entries, KeyValue{Key: bytes.Clone(key), Value: bytes.Clone(valueRef)})
+					return true
+				})
+				shard.mu.RUnlock()
+				for _, entry := range entries {
+					if !visit(entry.Key, entry.Value) {
+						break
+					}
+				}
+			} else {
+				walk(shard, shard.root, prefix)
+				shard.mu.RUnlock()
+			}
 			if stopped {
 				return nil
 			}
@@ -917,7 +1108,7 @@ func (t *Trie) ForEachAll(fn func(key, value []byte) bool) error {
 		if err != nil {
 			return err
 		}
-		view.forEach(loadedRoot, prefix, t.config.ShardDepth, visit)
+		walk(view, loadedRoot, prefix)
 		if stopped {
 			return nil
 		}
@@ -935,7 +1126,7 @@ func (t *Trie) ForEachAll(fn func(key, value []byte) bool) error {
 		if err != nil {
 			return err
 		}
-		view.forEach(loadedRoot, prefix, t.config.ShardDepth, visit)
+		walk(view, loadedRoot, prefix)
 		if stopped {
 			return nil
 		}
@@ -1003,6 +1194,21 @@ func (t *Trie) Activate(key []byte, value []byte) error {
 	t.markDirtyShardLocked(shardID)
 	t.shardsMu.Unlock()
 	return shard.Activate(key, value)
+}
+
+// ActivateValueRef moves an archived key back to the hot tree without
+// rewriting its split flat records.
+func (t *Trie) ActivateValueRef(key, valueRef []byte) error {
+	shardID := t.GetShardID(key)
+	if err := t.finishAsyncPruneForShard(shardID); err != nil {
+		return err
+	}
+	shard, err := t.getOrCreateShard(shardID)
+	if err != nil {
+		return err
+	}
+	t.markDirtyShard(shardID)
+	return shard.ActivateValueRef(key, valueRef)
 }
 
 // Close releases any resources held by the trie.

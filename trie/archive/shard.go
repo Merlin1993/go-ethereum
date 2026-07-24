@@ -50,6 +50,7 @@ type Shard struct {
 	pendingFlatValues       map[string][]byte
 	pendingFlatValueDeletes map[string]struct{}
 	stagedFlatValues        []map[string][]byte
+	stagedFlatValueDeletes  []map[string]struct{}
 
 	// Node pool for reusing internal and leaf nodes
 	pool *NodePool
@@ -137,6 +138,7 @@ func (s *Shard) Reset(shardRoot []byte) {
 	s.pendingFlatValues = make(map[string][]byte)
 	s.pendingFlatValueDeletes = make(map[string]struct{})
 	s.stagedFlatValues = nil
+	s.stagedFlatValueDeletes = nil
 }
 
 // loadNode 根据哈希从 DB 读取并反序列化节点。
@@ -586,19 +588,45 @@ func (s *Shard) Get(key []byte) ([]byte, error) {
 		atomic.AddInt64(&common.BinaryMissNonExistentCount, 1)
 		return nil, ErrNodeNotFound
 	}
-	// Shards start at certain depth
-	val, fromArchive, err := s.get(s.root, key, s.config.ShardDepth)
+	// Shards start at certain depth.
+	valueRef, fromArchive, err := s.findValueRef(s.root, key, s.config.ShardDepth)
 	if err != nil {
 		atomic.AddInt64(&common.BinaryMissNonExistentCount, 1)
 		return nil, err
 	}
-
-	_ = fromArchive
-
+	val, err := s.getFlatValue(key)
+	if err != nil {
+		return nil, err
+	}
+	if fromArchive && len(valueRef) == common.HashLength {
+		actual, err := s.storedValueRef(key, val)
+		if err != nil || !bytes.Equal(valueRef, actual) {
+			return nil, errors.New("archive bucket valueRef verification failed")
+		}
+	}
 	return val, nil
 }
 
-func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
+// GetValueRef returns the value commitment stored in the hot leaf or archive
+// bucket without loading the flat value payload.
+func (s *Shard) GetValueRef(key []byte) ([]byte, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.root == nil && len(s.rootHash) > 0 {
+		var err error
+		s.root, err = s.loadNode(s.rootHash)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	if s.root == nil {
+		return nil, false, ErrNodeNotFound
+	}
+	return s.findValueRef(s.root, key, s.config.ShardDepth)
+}
+
+func (s *Shard) findValueRef(node Node, key []byte, depth int) ([]byte, bool, error) {
 	if node == nil {
 		return nil, false, ErrNodeNotFound
 	}
@@ -608,8 +636,7 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 		matchLen := s.commonPrefixLen(n.Path, n.PathBits, key, depth)
 		if matchLen == n.PathBits && depth+matchLen == len(key)*8 {
 			atomic.AddInt64(&common.BinaryHitCount, 1)
-			val, err := s.getFlatValue(key)
-			return val, false, err
+			return bytes.Clone(n.ValueHash), false, nil
 		}
 		return nil, false, ErrNodeNotFound
 
@@ -647,7 +674,7 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 				}
 
 				if next != nil {
-					val, fromArch, err := s.get(next, key, hotDepth+1)
+					val, fromArch, err := s.findValueRef(next, key, hotDepth+1)
 					if err == nil {
 						return val, fromArch, nil
 					}
@@ -682,7 +709,7 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 			}
 
 			if next != nil {
-				val, fromArch, err := s.get(next, key, hotDepth+1)
+				val, fromArch, err := s.findValueRef(next, key, hotDepth+1)
 				if err == nil {
 					return val, fromArch, nil
 				}
@@ -692,7 +719,7 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 		// [归档桶次之]：热路径未命中，按“后进先出”（栈）顺序查找侧挂的 StubList
 		for i := len(n.StubList) - 1; i >= 0; i-- {
 			bucket := n.StubList[i]
-			val, fromArch, err := s.getFromBucket(bucket, key, depth)
+			val, fromArch, err := s.findValueRefFromBucket(bucket, key, depth)
 			if err == nil {
 				return val, fromArch, nil
 			}
@@ -701,16 +728,36 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 		return nil, false, ErrNodeNotFound
 
 	case *ArchiveBucketNode:
-		return s.getFromBucket(n, key, depth)
+		return s.findValueRefFromBucket(n, key, depth)
 
 	default:
 		return nil, false, errors.New("unknown node type")
 	}
 }
 
+// get is retained for internal callers and tests that need the resolved flat
+// payload rather than only its commitment.
+func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
+	valueRef, fromArchive, err := s.findValueRef(node, key, depth)
+	if err != nil {
+		return nil, false, err
+	}
+	value, err := s.getFlatValue(key)
+	if err != nil {
+		return nil, fromArchive, err
+	}
+	if fromArchive && len(valueRef) == common.HashLength {
+		actual, err := s.storedValueRef(key, value)
+		if err != nil || !bytes.Equal(valueRef, actual) {
+			return nil, true, errors.New("archive bucket valueRef verification failed")
+		}
+	}
+	return value, fromArchive, nil
+}
+
 // getFromBucket 分三步验证冷桶 membership：bucket path 前缀、Cuckoo filter、
 // entry suffix 精确匹配。返回的真实 value 仍来自 flat value store，并用 valueRef 校验。
-func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]byte, bool, error) {
+func (s *Shard) findValueRefFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]byte, bool, error) {
 	proofStart := time.Now()
 
 	// 匹配位前缀
@@ -764,14 +811,7 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]b
 					if !ok {
 						return nil, false, errors.New("archive bucket proof verification failed")
 					}
-					val, err := s.getFlatValue(key)
-					if err != nil {
-						return nil, true, err
-					}
-					if len(item.ValueRef) == common.HashLength && !bytes.Equal(item.ValueRef, valueRefForKeyValue(key, val)) {
-						return nil, true, errors.New("archive bucket valueRef verification failed")
-					}
-					return val, true, nil
+					return bytes.Clone(item.ValueRef), true, nil
 				}
 			}
 		}
@@ -786,6 +826,24 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, _ int) ([]b
 	}
 
 	return nil, false, ErrNodeNotFound
+}
+
+func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, depth int) ([]byte, bool, error) {
+	valueRef, fromArchive, err := s.findValueRefFromBucket(bucket, key, depth)
+	if err != nil {
+		return nil, false, err
+	}
+	value, err := s.getFlatValue(key)
+	if err != nil {
+		return nil, fromArchive, err
+	}
+	if len(valueRef) == common.HashLength {
+		actual, err := s.storedValueRef(key, value)
+		if err != nil || !bytes.Equal(valueRef, actual) {
+			return nil, true, errors.New("archive bucket valueRef verification failed")
+		}
+	}
+	return value, fromArchive, nil
 }
 
 func updateAtomicMax(addr *int64, val int64) {
@@ -804,6 +862,25 @@ func (s *Shard) Put(key []byte, value []byte) error {
 	return s.putLocked(key, value)
 }
 
+// PutValueRef writes a leaf commitment without staging a flat payload under
+// the leaf key. Stem mode uses this to keep suffix values in separate records.
+func (s *Shard) PutValueRef(key, valueRef []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.putValueRefLocked(key, valueRef)
+}
+
+func (s *Shard) PutValueRefBatch(entries []KeyValue) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, entry := range entries {
+		if err := s.putValueRefLocked(entry.Key, entry.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Shard) PutBatch(entries []KeyValue) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -817,6 +894,11 @@ func (s *Shard) PutBatch(entries []KeyValue) error {
 
 // putLocked 暂存 flat value，删除旧冷 membership，然后插入只包含新 valueRef 的热 leaf。
 func (s *Shard) putLocked(key []byte, value []byte) error {
+	valHash := s.stageValueForKey(key, value)
+	return s.putValueRefLocked(key, valHash)
+}
+
+func (s *Shard) putValueRefLocked(key, valueRef []byte) error {
 	if s.root == nil && len(s.rootHash) > 0 {
 		var err error
 		s.root, err = s.loadNode(s.rootHash)
@@ -831,10 +913,9 @@ func (s *Shard) putLocked(key []byte, value []byte) error {
 			return err
 		}
 	}
-	valHash := s.stageValueForKey(key, value)
 
 	// Shard start depth
-	newRoot, err := s.insert(s.root, key, s.config.ShardDepth, valHash)
+	newRoot, err := s.insert(s.root, key, s.config.ShardDepth, bytes.Clone(valueRef))
 	if err != nil {
 		return err
 	}
@@ -899,6 +980,21 @@ func (s *Shard) markNodeStale(node Node) {
 
 // Activate 实现显式激活：从 StubList 查找并移除匹配项，然后执行常规插入
 func (s *Shard) Activate(key []byte, value []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	valHash := s.stageValueForKey(key, value)
+	return s.activateValueRef(key, valHash)
+}
+
+// ActivateValueRef restores an archived leaf using an already computed value
+// commitment and leaves its split flat records untouched.
+func (s *Shard) ActivateValueRef(key, valueRef []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activateValueRef(key, valueRef)
+}
+
+func (s *Shard) activateValueRef(key, valueRef []byte) error {
 	if s.root == nil && len(s.rootHash) > 0 {
 		var err error
 		s.root, err = s.loadNode(s.rootHash)
@@ -913,10 +1009,8 @@ func (s *Shard) Activate(key []byte, value []byte) error {
 	}
 
 	// 2. 执行常规插入
-	valHash := s.stageValueForKey(key, value)
-
 	var err error
-	s.root, err = s.insert(s.root, key, s.config.ShardDepth, valHash)
+	s.root, err = s.insert(s.root, key, s.config.ShardDepth, bytes.Clone(valueRef))
 	if err != nil {
 		return err
 	}
@@ -1741,6 +1835,73 @@ func (s *Shard) forEach(node Node, prefix []byte, bits int, fn func(key, value [
 					if !fn(fullK, value) {
 						return false
 					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+// forEachValueRef visits outer keys and their stored commitments without
+// loading flat payloads.
+func (s *Shard) forEachValueRef(node Node, prefix []byte, bits int, fn func(key, valueRef []byte) bool) bool {
+	if node == nil {
+		return true
+	}
+	switch n := node.(type) {
+	case *LeafNode:
+		fullKey, _ := s.prependPath(n.Path, n.PathBits, prefix, bits)
+		return fn(fullKey, bytes.Clone(n.ValueHash))
+	case *ArchiveBucketNode:
+		kvs, err := s.bucketItemsWithValueRefs(n)
+		if err != nil {
+			return true
+		}
+		for _, kv := range kvs {
+			fullKey, _ := s.prependPath(kv.Suffix, kv.SuffixBits, n.Path, n.PathBits)
+			if !fn(fullKey, bytes.Clone(kv.Value)) {
+				return false
+			}
+		}
+		return true
+	case *InternalNode:
+		newPrefix := prefix
+		newBits := bits
+		if n.PathBits > 0 {
+			newPrefix, _ = s.prependPath(n.Path, n.PathBits, prefix, bits)
+			newBits += n.PathBits
+		}
+		leftPrefix, leftBits := s.appendBit(newPrefix, newBits, 0)
+		if n.Left != nil {
+			if !s.forEachValueRef(n.Left, leftPrefix, leftBits, fn) {
+				return false
+			}
+		} else if len(n.LeftHash) > 0 {
+			loaded, _ := s.loadChildNode(n, 0, n.LeftHash)
+			if loaded != nil && !s.forEachValueRef(loaded, leftPrefix, leftBits, fn) {
+				return false
+			}
+		}
+		rightPrefix, rightBits := s.appendBit(newPrefix, newBits, 1)
+		if n.Right != nil {
+			if !s.forEachValueRef(n.Right, rightPrefix, rightBits, fn) {
+				return false
+			}
+		} else if len(n.RightHash) > 0 {
+			loaded, _ := s.loadChildNode(n, 1, n.RightHash)
+			if loaded != nil && !s.forEachValueRef(loaded, rightPrefix, rightBits, fn) {
+				return false
+			}
+		}
+		for _, bucket := range n.StubList {
+			kvs, err := s.bucketItemsWithValueRefs(bucket)
+			if err != nil {
+				continue
+			}
+			for _, kv := range kvs {
+				fullKey, _ := s.prependPath(kv.Suffix, kv.SuffixBits, bucket.Path, bucket.PathBits)
+				if !fn(fullKey, bytes.Clone(kv.Value)) {
+					return false
 				}
 			}
 		}

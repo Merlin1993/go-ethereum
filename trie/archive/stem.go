@@ -45,6 +45,7 @@ var (
 	ErrInvalidStem      = errors.New("archive: invalid stem encoding")
 	ErrNilStemTrie      = errors.New("archive: nil stem trie backend")
 	stemEncodingMagic   = [8]byte{'A', 'S', 'C', 'T', 'S', 'T', 'M', 1}
+	stemMetadataMagic   = [8]byte{'A', 'S', 'C', 'T', 'S', 'T', 'M', 2}
 	stemEmptyLeafDomain = []byte("ASCT_STEM_EMPTY_V1")
 	stemValueLeafDomain = []byte("ASCT_STEM_VALUE_V1")
 	stemInternalDomain  = []byte("ASCT_STEM_BRANCH_V1")
@@ -54,9 +55,9 @@ type stemTripleHasher interface {
 	HashTriple(first, second, third []byte) []byte
 }
 
-// Stem holds up to 256 values. The outer archive trie only sees one encoded
-// Stem value under the corresponding 31-byte stem key, so pruning and
-// activation naturally operate on the whole stem.
+// Stem holds up to 256 values. The outer archive trie sees one ValuesRoot
+// under the corresponding 31-byte stem key, so pruning and activation
+// naturally operate on the whole stem.
 type Stem struct {
 	values     map[byte][]byte
 	present    [StemSuffixCount / 8]byte
@@ -424,6 +425,14 @@ func decodeStemWithEmpty(data []byte, hasher Hasher, reusableEmpty *[StemProofDe
 // stemEncodedValueCount reads only the fixed stem header. Statistics use it
 // instead of rebuilding the 256-leaf value root for every stem.
 func stemEncodedValueCount(data []byte) (int, error) {
+	if len(data) == len(stemMetadataMagic)+StemSuffixCount/8 &&
+		bytes.Equal(data[:len(stemMetadataMagic)], stemMetadataMagic[:]) {
+		count := 0
+		for _, word := range data[len(stemMetadataMagic):] {
+			count += bits.OnesCount8(word)
+		}
+		return count, nil
+	}
 	headerSize := len(stemEncodingMagic) + 32 + StemSuffixCount/8
 	if len(data) < headerSize || !bytes.Equal(data[:len(stemEncodingMagic)], stemEncodingMagic[:]) {
 		return 0, ErrInvalidStem
@@ -436,9 +445,37 @@ func stemEncodedValueCount(data []byte) (int, error) {
 	return count, nil
 }
 
+func encodeStemMetadata(stem *Stem) []byte {
+	data := make([]byte, 0, len(stemMetadataMagic)+len(stem.present))
+	data = append(data, stemMetadataMagic[:]...)
+	data = append(data, stem.present[:]...)
+	return data
+}
+
+func decodeStemMetadata(data []byte) (*Stem, error) {
+	if len(data) != len(stemMetadataMagic)+StemSuffixCount/8 ||
+		!bytes.Equal(data[:len(stemMetadataMagic)], stemMetadataMagic[:]) {
+		return nil, ErrInvalidStem
+	}
+	stem := NewStem()
+	copy(stem.present[:], data[len(stemMetadataMagic):])
+	for _, word := range stem.present {
+		stem.count += bits.OnesCount8(word)
+	}
+	return stem, nil
+}
+
+func joinStemKey(stemKey []byte, suffix byte) []byte {
+	key := make([]byte, StemKeySize)
+	copy(key, stemKey)
+	key[StemSize] = suffix
+	return key
+}
+
 // StemTrie adapts a normal ASCT to 32-byte binary stem keys. Only the 31-byte
-// stem is inserted into the outer trie. Its 256 suffix values are encoded as
-// one value, making the stem the unit of aging, archiving, and activation.
+// stem and its ValuesRoot are inserted into the outer trie. The suffix bitmap
+// and values are stored separately, while the whole stem remains the unit of
+// aging, archiving, and activation.
 type StemTrie struct {
 	backend *Trie
 	locks   [256]sync.Mutex
@@ -491,6 +528,9 @@ func (t *StemTrie) Get(key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	lock := &t.locks[stemKey[0]]
+	lock.Lock()
+	defer lock.Unlock()
 	stem, err := t.loadStem(stemKey)
 	if err != nil {
 		return nil, err
@@ -503,7 +543,7 @@ func (t *StemTrie) Get(key []byte) ([]byte, error) {
 }
 
 // Put updates one suffix. If the stem is archived, this reads its current
-// payload, updates it, and writes the complete stem back as one hot leaf.
+// suffixes, updates the commitment, and writes the stem back as one hot leaf.
 func (t *StemTrie) Put(key, value []byte) error {
 	return t.put(key, value, false)
 }
@@ -531,34 +571,84 @@ func (t *StemTrie) put(key, value []byte, replace bool) error {
 	lock.Lock()
 	defer lock.Unlock()
 
-	var stem *Stem
-	if !replace {
-		loadStart := time.Now()
-		payload, loadErr := t.backend.Get(stemKey)
-		loadTime = time.Since(loadStart)
-		if loadErr == nil {
-			loadedBytes = len(payload)
-			decodeStart := time.Now()
-			stem, err = decodeStemWithEmpty(payload, t.backend.hasher, &t.empty)
-			decodeTime = time.Since(decodeStart)
-			if err != nil {
-				return fmt.Errorf("%w for %x", err, stemKey)
-			}
-		} else if !errors.Is(loadErr, ErrNodeNotFound) {
-			return loadErr
+	var (
+		stem       *Stem
+		oldStem    *Stem
+		split      bool
+		wasPresent bool
+	)
+	loadStart := time.Now()
+	if replace {
+		oldStem, split, loadedBytes, err = t.loadStoredStem(stemKey, false)
+	} else {
+		stem, split, loadedBytes, err = t.loadStoredStem(stemKey, true)
+	}
+	loadTime = time.Since(loadStart)
+	if err != nil && !errors.Is(err, ErrNodeNotFound) {
+		return err
+	}
+	if replace || stem == nil {
+		stem = &Stem{
+			values:     make(map[byte][]byte),
+			commitment: newStemCommitment(t.backend.hasher, &t.empty),
 		}
 	}
-	if stem == nil {
-		stem = &Stem{commitment: newStemCommitment(t.backend.hasher, &t.empty)}
+	if !replace {
+		wasPresent = stem.has(suffix)
 	}
 	noop = !stem.put(suffix, value)
+
 	encodeStart := time.Now()
-	encoded := encodeStem(stem, t.backend.hasher)
-	encodeTime = time.Since(encodeStart)
-	encodedBytes = len(encoded)
+	root := stem.ValuesRoot(t.backend.hasher)
 	commitmentHashes = stem.commitment.hashCount
+	encodeTime = time.Since(encodeStart)
+
 	backendStart := time.Now()
-	err = t.backend.Put(stemKey, encoded)
+	// The common path writes one value and, at most, one metadata record.
+	// Legacy migration may grow this slice once to hold all existing suffixes.
+	flatPuts := make([]KeyValue, 0, 2)
+	flatDeletes := make([][]byte, 0)
+	if replace && split && oldStem != nil {
+		for i := 0; i < StemSuffixCount; i++ {
+			oldSuffix := byte(i)
+			if oldSuffix == suffix || !oldStem.has(oldSuffix) {
+				continue
+			}
+			flatDeletes = append(flatDeletes, joinStemKey(stemKey, oldSuffix))
+		}
+	}
+	writeMetadata := !split
+	if split {
+		if replace {
+			writeMetadata = oldStem == nil || oldStem.Len() != 1 || !oldStem.has(suffix)
+		} else {
+			writeMetadata = !wasPresent
+		}
+	}
+	if writeMetadata {
+		metadata := encodeStemMetadata(stem)
+		flatPuts = append(flatPuts, KeyValue{Key: stemKey, Value: metadata})
+		encodedBytes += len(metadata)
+	}
+	if !split && !replace {
+		for i := 0; i < StemSuffixCount; i++ {
+			itemSuffix := byte(i)
+			if !stem.has(itemSuffix) {
+				continue
+			}
+			itemValue := stem.values[itemSuffix]
+			flatPuts = append(flatPuts, KeyValue{Key: joinStemKey(stemKey, itemSuffix), Value: itemValue})
+			encodedBytes += len(itemValue)
+		}
+	} else if !noop || replace {
+		flatPuts = append(flatPuts, KeyValue{Key: key, Value: value})
+		encodedBytes += len(value)
+	}
+	if err := t.backend.StageFlatBatch(flatPuts, flatDeletes); err != nil {
+		backendTime = time.Since(backendStart)
+		return err
+	}
+	err = t.backend.PutValueRef(stemKey, root)
 	backendTime = time.Since(backendStart)
 	return err
 }
@@ -625,17 +715,35 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 		}
 	}()
 
-	rawPuts := make([]KeyValue, 0, len(groups))
-	rawDeletes := make([][]byte, 0)
+	refPuts := make([]KeyValue, 0, len(groups))
+	outerDeletes := make([][]byte, 0)
+	flatPuts := make([]KeyValue, 0, len(updates)+len(groups))
+	flatDeletes := make([][]byte, 0)
 	for _, group := range groups {
 		loadStart := time.Now()
-		stem, err := t.loadStem(group.key)
+		stem, split, _, err := t.loadStoredStem(group.key, true)
 		loadTime += time.Since(loadStart)
 		if err != nil && !errors.Is(err, ErrNodeNotFound) {
 			return err
 		}
+		existed := err == nil
 		if stem == nil {
-			stem = &Stem{commitment: newStemCommitment(t.backend.hasher, &t.empty)}
+			stem = &Stem{
+				values:     make(map[byte][]byte),
+				commitment: newStemCommitment(t.backend.hasher, &t.empty),
+			}
+		}
+		beforePresent := stem.present
+		beforeValues := make(map[byte][]byte)
+		touched := make(map[byte]struct{})
+		for _, update := range group.updates {
+			suffix := update.Key[0]
+			if _, ok := touched[suffix]; !ok {
+				if value, present := stem.Get(suffix); present {
+					beforeValues[suffix] = value
+				}
+				touched[suffix] = struct{}{}
+			}
 		}
 		for _, update := range group.updates {
 			if update.Delete {
@@ -645,24 +753,59 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 			}
 		}
 		if stem.Len() == 0 {
-			if err == nil {
-				rawDeletes = append(rawDeletes, group.key)
+			if existed {
+				outerDeletes = append(outerDeletes, group.key)
+				if split {
+					for i := 0; i < StemSuffixCount; i++ {
+						suffix := byte(i)
+						if beforePresent[i/8]&(byte(1)<<(suffix%8)) != 0 {
+							flatDeletes = append(flatDeletes, joinStemKey(group.key, suffix))
+						}
+					}
+				}
 			}
 			continue
 		}
 		encodeStart := time.Now()
-		encoded := encodeStem(stem, t.backend.hasher)
+		root := stem.ValuesRoot(t.backend.hasher)
+		if !split {
+			flatPuts = append(flatPuts, KeyValue{Key: group.key, Value: encodeStemMetadata(stem)})
+			for i := 0; i < StemSuffixCount; i++ {
+				suffix := byte(i)
+				if stem.has(suffix) {
+					flatPuts = append(flatPuts, KeyValue{Key: joinStemKey(group.key, suffix), Value: bytes.Clone(stem.values[suffix])})
+				}
+			}
+		} else {
+			for suffix := range touched {
+				value, present := stem.Get(suffix)
+				oldValue, wasPresent := beforeValues[suffix]
+				switch {
+				case present && (!wasPresent || !bytes.Equal(value, oldValue)):
+					flatPuts = append(flatPuts, KeyValue{Key: joinStemKey(group.key, suffix), Value: value})
+				case !present && wasPresent:
+					flatDeletes = append(flatDeletes, joinStemKey(group.key, suffix))
+				}
+			}
+			if !bytes.Equal(beforePresent[:], stem.present[:]) {
+				flatPuts = append(flatPuts, KeyValue{Key: group.key, Value: encodeStemMetadata(stem)})
+			}
+		}
 		encodeTime += time.Since(encodeStart)
-		rawPuts = append(rawPuts, KeyValue{Key: group.key, Value: encoded})
+		refPuts = append(refPuts, KeyValue{Key: group.key, Value: root})
 	}
-	putCount = len(rawPuts)
-	deleteCount = len(rawDeletes)
+	putCount = len(refPuts)
+	deleteCount = len(outerDeletes)
 	backendStart := time.Now()
-	if err := t.backend.PutBatch(rawPuts); err != nil {
+	if err := t.backend.StageFlatBatch(flatPuts, flatDeletes); err != nil {
 		backendTime += time.Since(backendStart)
 		return err
 	}
-	for _, key := range rawDeletes {
+	if err := t.backend.PutValueRefBatch(refPuts); err != nil {
+		backendTime += time.Since(backendStart)
+		return err
+	}
+	for _, key := range outerDeletes {
 		if err := t.backend.Delete(key); err != nil {
 			backendTime += time.Since(backendStart)
 			return err
@@ -719,10 +862,12 @@ func (t *StemTrie) DeleteBatchWithValues(keys [][]byte) (StemDeleteBatchResult, 
 	}()
 
 	result.StemCount = len(groups)
-	rawPuts := make([]KeyValue, 0, len(groups))
-	rawDeletes := make([][]byte, 0, len(groups))
+	refPuts := make([]KeyValue, 0, len(groups))
+	outerDeletes := make([][]byte, 0, len(groups))
+	flatPuts := make([]KeyValue, 0, len(groups))
+	flatDeletes := make([][]byte, 0, len(keys))
 	for _, group := range groups {
-		stem, err := t.loadStem(group.key)
+		stem, split, _, err := t.loadStoredStem(group.key, true)
 		if err != nil {
 			return StemDeleteBatchResult{}, err
 		}
@@ -739,15 +884,47 @@ func (t *StemTrie) DeleteBatchWithValues(keys [][]byte) (StemDeleteBatchResult, 
 			stem.Delete(suffix)
 		}
 		if stem.Len() == 0 {
-			rawDeletes = append(rawDeletes, group.key)
+			outerDeletes = append(outerDeletes, group.key)
+			if split {
+				seen := make(map[byte]struct{})
+				for _, suffix := range group.suffixes {
+					if _, ok := seen[suffix]; ok {
+						continue
+					}
+					seen[suffix] = struct{}{}
+					flatDeletes = append(flatDeletes, joinStemKey(group.key, suffix))
+				}
+			}
 			continue
 		}
-		rawPuts = append(rawPuts, KeyValue{Key: group.key, Value: encodeStem(stem, t.backend.hasher)})
+		if split {
+			seen := make(map[byte]struct{})
+			for _, suffix := range group.suffixes {
+				if _, ok := seen[suffix]; ok {
+					continue
+				}
+				seen[suffix] = struct{}{}
+				flatDeletes = append(flatDeletes, joinStemKey(group.key, suffix))
+			}
+			flatPuts = append(flatPuts, KeyValue{Key: group.key, Value: encodeStemMetadata(stem)})
+		} else {
+			flatPuts = append(flatPuts, KeyValue{Key: group.key, Value: encodeStemMetadata(stem)})
+			for i := 0; i < StemSuffixCount; i++ {
+				suffix := byte(i)
+				if stem.has(suffix) {
+					flatPuts = append(flatPuts, KeyValue{Key: joinStemKey(group.key, suffix), Value: bytes.Clone(stem.values[suffix])})
+				}
+			}
+		}
+		refPuts = append(refPuts, KeyValue{Key: group.key, Value: stem.ValuesRoot(t.backend.hasher)})
 	}
-	if err := t.backend.PutBatch(rawPuts); err != nil {
+	if err := t.backend.StageFlatBatch(flatPuts, flatDeletes); err != nil {
 		return StemDeleteBatchResult{}, err
 	}
-	for _, key := range rawDeletes {
+	if err := t.backend.PutValueRefBatch(refPuts); err != nil {
+		return StemDeleteBatchResult{}, err
+	}
+	for _, key := range outerDeletes {
 		if err := t.backend.Delete(key); err != nil {
 			return StemDeleteBatchResult{}, err
 		}
@@ -766,7 +943,7 @@ func (t *StemTrie) Delete(key []byte) error {
 	lock.Lock()
 	defer lock.Unlock()
 
-	stem, err := t.loadStem(stemKey)
+	stem, split, _, err := t.loadStoredStem(stemKey, true)
 	if errors.Is(err, ErrNodeNotFound) {
 		return nil
 	}
@@ -777,9 +954,29 @@ func (t *StemTrie) Delete(key []byte) error {
 		return nil
 	}
 	if stem.Len() == 0 {
+		if split {
+			if err := t.backend.StageFlatDelete(key); err != nil {
+				return err
+			}
+		}
 		return t.backend.Delete(stemKey)
 	}
-	return t.backend.Put(stemKey, encodeStem(stem, t.backend.hasher))
+	flatPuts := []KeyValue{{Key: stemKey, Value: encodeStemMetadata(stem)}}
+	var flatDeletes [][]byte
+	if split {
+		flatDeletes = append(flatDeletes, bytes.Clone(key))
+	} else {
+		for i := 0; i < StemSuffixCount; i++ {
+			itemSuffix := byte(i)
+			if stem.has(itemSuffix) {
+				flatPuts = append(flatPuts, KeyValue{Key: joinStemKey(stemKey, itemSuffix), Value: bytes.Clone(stem.values[itemSuffix])})
+			}
+		}
+	}
+	if err := t.backend.StageFlatBatch(flatPuts, flatDeletes); err != nil {
+		return err
+	}
+	return t.backend.PutValueRef(stemKey, stem.ValuesRoot(t.backend.hasher))
 }
 
 // Activate restores the entire archived stem containing key to the hot tree.
@@ -793,14 +990,23 @@ func (t *StemTrie) Activate(key []byte) error {
 	lock.Lock()
 	defer lock.Unlock()
 
-	payload, err := t.backend.Get(stemKey)
+	stem, split, _, err := t.loadStoredStem(stemKey, true)
 	if err != nil {
 		return err
 	}
-	if _, err := decodeStemWithEmpty(payload, t.backend.hasher, &t.empty); err != nil {
-		return err
+	if !split {
+		flatPuts := []KeyValue{{Key: stemKey, Value: encodeStemMetadata(stem)}}
+		for i := 0; i < StemSuffixCount; i++ {
+			suffix := byte(i)
+			if stem.has(suffix) {
+				flatPuts = append(flatPuts, KeyValue{Key: joinStemKey(stemKey, suffix), Value: bytes.Clone(stem.values[suffix])})
+			}
+		}
+		if err := t.backend.StageFlatBatch(flatPuts, nil); err != nil {
+			return err
+		}
 	}
-	return t.backend.Activate(stemKey, payload)
+	return t.backend.ActivateValueRef(stemKey, stem.ValuesRoot(t.backend.hasher))
 }
 
 // Prove returns the current ValuesRoot and an eight-hash suffix proof.
@@ -809,6 +1015,9 @@ func (t *StemTrie) Prove(key []byte) ([]byte, StemProof, error) {
 	if err != nil {
 		return nil, StemProof{}, err
 	}
+	lock := &t.locks[stemKey[0]]
+	lock.Lock()
+	defer lock.Unlock()
 	stem, err := t.loadStem(stemKey)
 	if err != nil {
 		return nil, StemProof{}, err
@@ -822,8 +1031,11 @@ func (t *StemTrie) ForEach(fn func(key, value []byte) bool) error {
 		return ErrNilStemTrie
 	}
 	var iterErr error
-	err := t.backend.ForEachAll(func(stemKey, payload []byte) bool {
-		stem, err := decodeStemWithEmpty(payload, t.backend.hasher, &t.empty)
+	err := t.backend.ForEachAllValueRefs(func(stemKey, _ []byte) bool {
+		lock := &t.locks[stemKey[0]]
+		lock.Lock()
+		defer lock.Unlock()
+		stem, err := t.loadStem(stemKey)
 		if err != nil {
 			iterErr = err
 			return false
@@ -849,18 +1061,64 @@ func (t *StemTrie) ForEach(fn func(key, value []byte) bool) error {
 }
 
 func (t *StemTrie) loadStem(stemKey []byte) (*Stem, error) {
+	stem, _, _, err := t.loadStoredStem(stemKey, true)
+	return stem, err
+}
+
+// loadStoredStem loads either the split layout or the legacy single-blob
+// layout. Split stems keep only a bitmap under the 31-byte stem key and store
+// each value under its complete 32-byte key.
+func (t *StemTrie) loadStoredStem(stemKey []byte, loadValues bool) (*Stem, bool, int, error) {
 	if t == nil || t.backend == nil {
-		return nil, ErrNilStemTrie
+		return nil, false, 0, ErrNilStemTrie
 	}
-	payload, err := t.backend.Get(stemKey)
+	payload, err := t.backend.GetFlatValue(stemKey)
 	if err != nil {
-		return nil, err
+		return nil, false, 0, err
+	}
+	loadedBytes := len(payload)
+	if len(payload) >= len(stemMetadataMagic) && bytes.Equal(payload[:len(stemMetadataMagic)], stemMetadataMagic[:]) {
+		stem, err := decodeStemMetadata(payload)
+		if err != nil {
+			return nil, true, loadedBytes, fmt.Errorf("%w for %x", err, stemKey)
+		}
+		if !loadValues {
+			return stem, true, loadedBytes, nil
+		}
+		valueRef, _, err := t.backend.GetValueRef(stemKey)
+		if err != nil {
+			return nil, true, loadedBytes, err
+		}
+		for i := 0; i < StemSuffixCount; i++ {
+			suffix := byte(i)
+			if !stem.has(suffix) {
+				continue
+			}
+			value, err := t.backend.GetFlatValue(joinStemKey(stemKey, suffix))
+			if err != nil {
+				return nil, true, loadedBytes, fmt.Errorf("%w: missing suffix %d for %x", ErrInvalidStem, suffix, stemKey)
+			}
+			loadedBytes += len(value)
+			stem.values[suffix] = bytes.Clone(value)
+		}
+		stem.commitment = buildStemCommitment(stem, t.backend.hasher, &t.empty)
+		if !bytes.Equal(stem.ValuesRoot(t.backend.hasher), valueRef) {
+			return nil, true, loadedBytes, fmt.Errorf("%w: root mismatch for %x", ErrInvalidStem, stemKey)
+		}
+		return stem, true, loadedBytes, nil
+	}
+	valueRef, _, err := t.backend.GetValueRef(stemKey)
+	if err != nil {
+		return nil, false, loadedBytes, err
+	}
+	if !bytes.Equal(valueRefForKeyValue(stemKey, payload), valueRef) {
+		return nil, false, loadedBytes, fmt.Errorf("%w: legacy value reference mismatch for %x", ErrInvalidStem, stemKey)
 	}
 	stem, err := decodeStemWithEmpty(payload, t.backend.hasher, &t.empty)
 	if err != nil {
-		return nil, fmt.Errorf("%w for %x", err, stemKey)
+		return nil, false, loadedBytes, fmt.Errorf("%w for %x", err, stemKey)
 	}
-	return stem, nil
+	return stem, false, loadedBytes, nil
 }
 
 func splitStemKey(key []byte) ([]byte, byte, error) {

@@ -9,21 +9,24 @@ The complete logical design is documented in
 - bytes `[0:31]`: the stem routed through the outer binary ASCT;
 - byte `[31]`: one of the stem's 256 suffixes.
 
-The outer ASCT stores one leaf per stem. The leaf value is a deterministic,
-sparse encoding of all populated suffixes. Consequently, the existing ASCT
-epoch, pruning, archive bucket, and activation logic all operate on a complete
-stem. An archive bucket may still contain several stem records; updating or
-activating one stem removes only that stem record from the bucket.
+The outer ASCT stores one leaf per stem. Its value is the stem's 32-byte
+`ValuesRoot`. A 40-byte metadata record stores the version and presence bitmap,
+and each populated suffix value is stored separately under its complete
+32-byte key. Consequently, the existing ASCT epoch, pruning, archive bucket,
+and activation logic still operate on a complete stem. An archive bucket may
+contain several stem records; updating or activating one stem removes only
+that stem record from the bucket.
 
 Inside the encoded stem, 256 value hashes form an eight-level binary tree.
 `Stem.ValuesRoot` is its root, and `Stem.Prove` returns exactly eight sibling
 hashes for a suffix. The current implementation uses the ASCT Keccak hasher
 with separate domains for empty leaves, populated leaves, and branches.
 
-When one suffix of an archived stem is updated, `StemTrie.Put` reads the current
-stem payload, applies the update, recomputes `ValuesRoot`, and writes the whole
-stem back as one hot outer leaf. The untouched suffixes therefore move to the
-new root with the update; no old root is kept in the live trie.
+When one suffix is updated, `StemTrie.Put` recomputes `ValuesRoot` and writes
+only the changed suffix value. The 40-byte bitmap is rewritten only when a
+suffix is added or removed. If the stem was archived, the whole stem becomes
+hot again, but its unchanged suffix records are not rewritten. No old root is
+kept in the live trie.
 
 `trie.ArchiveTrie` enables this adapter when `database.BinaryConfig.StemMode`
 is true. It uses the same SHA-256 state-key derivation as `trie/bintrie`:
@@ -72,8 +75,9 @@ parent, so this reuse does not change the resulting root. Replay metrics expose
 the shard wall/work time, hashing and serialization time, worker count, and
 slowest root calculation.
 
-The first implementation retains the encoded stem payload in ASCT's existing
-flat value store. A stateless/full-node mode that drops archived payloads will
-need a separate availability protocol: a provider must supply the current stem
-payload, or a suffix proof plus every public update needed to advance that
-proof to the current `ValuesRoot`.
+The current implementation retains the bitmap and suffix records in ASCT's
+flat value store after archiving. A stateless/full-node mode that drops these
+records will need a separate availability protocol. Because activation is
+stem-granular, the current activation interface would require the complete
+current set of suffix values; a single suffix and its proof are enough to
+verify that suffix, but not to reconstruct and activate the complete stem.

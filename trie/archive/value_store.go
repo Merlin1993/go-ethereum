@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"bytes"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -18,10 +19,62 @@ func flatValueDataKey(key []byte) []byte {
 	return dataKey
 }
 
+func (s *Shard) GetFlatValue(key []byte) ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getFlatValue(key)
+}
+
+func (s *Shard) StageFlatValue(key, value []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stageFlatValueForKey(key, value)
+}
+
+func (s *Shard) StageFlatDelete(key []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stageFlatDeleteForKey(key)
+}
+
+func (s *Shard) StageFlatBatch(puts []KeyValue, deletes [][]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, key := range deletes {
+		s.stageFlatDeleteForKey(key)
+	}
+	for _, entry := range puts {
+		s.stageFlatValueForKey(entry.Key, entry.Value)
+	}
+}
+
 // stageValueForKey 把真实 value 写入 flat store 的 pending 区，并返回树中保存的 key-bound valueRef。
 func (s *Shard) stageValueForKey(key []byte, value []byte) []byte {
 	s.stageFlatValueForKey(key, value)
 	return valueRefForKeyValue(key, value)
+}
+
+func (s *Shard) storedValueRef(key, value []byte) ([]byte, error) {
+	if s.config == nil || !s.config.StemMode || len(key) != StemSize ||
+		len(value) < len(stemMetadataMagic) || !bytes.Equal(value[:len(stemMetadataMagic)], stemMetadataMagic[:]) {
+		return valueRefForKeyValue(key, value), nil
+	}
+	stem, err := decodeStemMetadata(value)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < StemSuffixCount; i++ {
+		suffix := byte(i)
+		if !stem.has(suffix) {
+			continue
+		}
+		item, err := s.getFlatValue(joinStemKey(key, suffix))
+		if err != nil {
+			return nil, err
+		}
+		stem.values[suffix] = bytes.Clone(item)
+	}
+	return stem.ValuesRoot(s.hasher), nil
 }
 
 func (s *Shard) stageFlatValueForKey(key []byte, value []byte) {
@@ -60,6 +113,9 @@ func (s *Shard) getFlatValue(key []byte) ([]byte, error) {
 		return nil, ErrNodeNotFound
 	}
 	for i := len(s.stagedFlatValues) - 1; i >= 0; i-- {
+		if _, deleted := s.stagedFlatValueDeletes[i][id]; deleted {
+			return nil, ErrNodeNotFound
+		}
 		if value, ok := s.stagedFlatValues[i][id]; ok {
 			return value, nil
 		}
@@ -98,12 +154,23 @@ func (s *Shard) commitPendingValues(batch Batcher) error {
 		return nil
 	}
 	flatValues := s.pendingFlatValues
-	if err := s.commitFlatValueStore(batch, flatValues, s.pendingFlatValueDeletes); err != nil {
+	flatDeletes := s.pendingFlatValueDeletes
+	if err := s.commitFlatValueStore(batch, flatValues, flatDeletes); err != nil {
 		return err
 	}
+	// A committed delete must also hide matching values retained in the small
+	// post-commit read window. Otherwise a subsequent stem update can briefly
+	// resurrect metadata or suffixes that no longer exist on disk.
+	for key := range flatDeletes {
+		for _, staged := range s.stagedFlatValues {
+			delete(staged, key)
+		}
+	}
 	s.stagedFlatValues = append(s.stagedFlatValues, flatValues)
+	s.stagedFlatValueDeletes = append(s.stagedFlatValueDeletes, flatDeletes)
 	if len(s.stagedFlatValues) > 2 {
 		s.stagedFlatValues = append([]map[string][]byte(nil), s.stagedFlatValues[len(s.stagedFlatValues)-2:]...)
+		s.stagedFlatValueDeletes = append([]map[string]struct{}(nil), s.stagedFlatValueDeletes[len(s.stagedFlatValueDeletes)-2:]...)
 	}
 	s.pendingFlatValues = make(map[string][]byte)
 	s.pendingFlatValueDeletes = make(map[string]struct{})

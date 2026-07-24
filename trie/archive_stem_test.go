@@ -164,7 +164,7 @@ func TestArchiveTrieStemModeColocatesAndRestoresState(t *testing.T) {
 	}
 }
 
-func TestArchiveTrieStemModeBasicAccountSkipsOldStemLoad(t *testing.T) {
+func TestArchiveTrieStemModeBasicAccountLoadsOnlyMetadata(t *testing.T) {
 	db := newArchiveStemTestDB()
 	tr := newArchiveStemWrapper(t, db, nil, 0)
 	addr := common.HexToAddress("0x4321")
@@ -179,8 +179,8 @@ func TestArchiveTrieStemModeBasicAccountSkipsOldStemLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	window := archivetrie.LastUpdateDiagnostics().Sub(before)
-	if window.StemPutCalls != 1 || window.StemPutLoadedBytes != 0 {
-		t.Fatalf("basic account loaded old stem: calls=%d loaded=%d", window.StemPutCalls, window.StemPutLoadedBytes)
+	if window.StemPutCalls != 1 || window.StemPutLoadedBytes != int64(8+archivetrie.StemSuffixCount/8) {
+		t.Fatalf("basic account loaded more than metadata: calls=%d loaded=%d", window.StemPutCalls, window.StemPutLoadedBytes)
 	}
 	got, err := tr.GetAccount(addr)
 	if err != nil || got == nil || got.Balance.Cmp(account.Balance) != 0 {
