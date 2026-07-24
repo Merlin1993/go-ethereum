@@ -95,6 +95,78 @@ func TestStemBinaryProofsAndEncoding(t *testing.T) {
 	}
 }
 
+func TestStemIncrementalCommitmentMatchesFullTree(t *testing.T) {
+	hasher := NewPooledKeccakHasher()
+	stem := NewStem()
+	checkRoot := func(step string) {
+		t.Helper()
+		got := stem.ValuesRoot(hasher)
+		want := fullStemValuesRoot(stem, hasher)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: incremental root %x, full root %x", step, got, want)
+		}
+	}
+	checkRoot("empty")
+	for i := 0; i < StemSuffixCount; i++ {
+		stem.Put(byte(i), bytes.Repeat([]byte{byte(i), byte(255 - i)}, i%7+1))
+		checkRoot(fmt.Sprintf("put-%d", i))
+	}
+	for i := StemSuffixCount - 1; i >= 0; i -= 3 {
+		stem.Put(byte(i), []byte{0xff, byte(i)})
+		checkRoot(fmt.Sprintf("update-%d", i))
+	}
+	for i := 0; i < StemSuffixCount; i += 2 {
+		stem.Delete(byte(i))
+		checkRoot(fmt.Sprintf("delete-%d", i))
+	}
+	for i := 0; i < StemSuffixCount; i++ {
+		proof := stem.Prove(byte(i), hasher)
+		if !VerifyStemProof(stem.ValuesRoot(hasher), proof, hasher) {
+			t.Fatalf("proof for suffix %d did not verify after incremental updates", i)
+		}
+	}
+}
+
+func TestStemCommitmentCachesEightLevelPath(t *testing.T) {
+	hasher := &stemCountingHasher{inner: NewPooledKeccakHasher()}
+	stem := NewStem()
+	stem.Put(17, []byte("first"))
+	stem.ValuesRoot(hasher)
+	initial := hasher.calls.Load()
+	if want := int64(1 + StemProofDepth + 1 + StemProofDepth); initial != want {
+		t.Fatalf("initial sparse tree used %d hashes, want %d", initial, want)
+	}
+	stem.ValuesRoot(hasher)
+	if got := hasher.calls.Load(); got != initial {
+		t.Fatalf("unchanged root was rehashed: before=%d after=%d", initial, got)
+	}
+	stem.Put(17, []byte("second"))
+	stem.ValuesRoot(hasher)
+	if got, want := hasher.calls.Load()-initial, int64(1+StemProofDepth); got != want {
+		t.Fatalf("single suffix update used %d hashes, want %d", got, want)
+	}
+}
+
+func fullStemValuesRoot(stem *Stem, hasher Hasher) []byte {
+	level := make([][]byte, StemSuffixCount)
+	empty := hasher.Hash(stemEmptyLeafDomain)
+	for i := range level {
+		if stem != nil && stem.has(byte(i)) {
+			level[i] = stemValueHash(stem.values[byte(i)], hasher)
+		} else {
+			level[i] = empty
+		}
+	}
+	for len(level) > 1 {
+		parents := make([][]byte, len(level)/2)
+		for i := range parents {
+			parents[i] = stemBranchHash(level[i*2], level[i*2+1], hasher)
+		}
+		level = parents
+	}
+	return level[0]
+}
+
 func TestStemTrieGroupsSuffixesIntoOneOuterLeaf(t *testing.T) {
 	trie, _ := newStemTestTrie(t, true)
 	key1 := stemTestKey(0x31, 1)
@@ -151,6 +223,27 @@ func TestStemTrieGroupsSuffixesIntoOneOuterLeaf(t *testing.T) {
 	}
 	if _, err := trie.Backend().Get(key1[:StemSize]); !errors.Is(err, ErrNodeNotFound) {
 		t.Fatalf("empty outer stem was not deleted: %v", err)
+	}
+}
+
+func TestStemTrieReplaceStemDropsSiblingSuffixes(t *testing.T) {
+	trie, _ := newStemTestTrie(t, false)
+	key1 := stemTestKey(0x32, 1)
+	key2 := stemTestKey(0x32, 2)
+	if err := trie.PutBatch([]KeyValue{
+		{Key: key1, Value: []byte("old-one")},
+		{Key: key2, Value: []byte("old-two")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := trie.ReplaceStem(key1, []byte("new-one")); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := trie.Get(key1); err != nil || string(got) != "new-one" {
+		t.Fatalf("replacement value: got %q err %v", got, err)
+	}
+	if _, err := trie.Get(key2); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("replacement retained sibling suffix: %v", err)
 	}
 }
 
@@ -379,6 +472,29 @@ func TestStemTrieConcurrentWritesDoNotLoseSuffixes(t *testing.T) {
 	}
 }
 
+func TestStemTrieSkipsUnchangedPut(t *testing.T) {
+	trie, _ := newStemTestTrie(t, false)
+	key := stemTestKey(0x62, 9)
+	value := []byte("unchanged")
+	if err := trie.Put(key, value); err != nil {
+		t.Fatal(err)
+	}
+	before := LastUpdateDiagnostics()
+	if err := trie.Put(key, value); err != nil {
+		t.Fatal(err)
+	}
+	window := LastUpdateDiagnostics().Sub(before)
+	if window.StemPutCalls != 1 || window.StemPutNoops != 1 {
+		t.Fatalf("unchanged put diagnostics: calls=%d noops=%d", window.StemPutCalls, window.StemPutNoops)
+	}
+	if window.StemPutCommitmentHashes != 9 {
+		t.Fatalf("unchanged value rebuilt commitment: hashes=%d", window.StemPutCommitmentHashes)
+	}
+	if window.ShardPutCalls != 1 {
+		t.Fatalf("unchanged archived value would not be refreshed: shard puts=%d", window.ShardPutCalls)
+	}
+}
+
 func BenchmarkStemTrieDeleteBatchWithValues100K(b *testing.B) {
 	const slots = 100_000
 	keys := make([][]byte, slots)
@@ -405,5 +521,111 @@ func BenchmarkStemTrieDeleteBatchWithValues100K(b *testing.B) {
 		if len(deleted.Values) != slots {
 			b.Fatalf("deleted %d values", len(deleted.Values))
 		}
+	}
+}
+
+var benchmarkStemRoot []byte
+
+func BenchmarkStemSingleSuffixUpdate(b *testing.B) {
+	hasher := NewPooledKeccakHasher()
+	b.Run("full-rebuild", func(b *testing.B) {
+		stem := NewStem()
+		stem.Put(17, []byte{0})
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			stem.Put(17, []byte{byte(i)})
+			benchmarkStemRoot = fullStemValuesRoot(stem, hasher)
+		}
+	})
+	b.Run("incremental", func(b *testing.B) {
+		stem := NewStem()
+		stem.Put(17, []byte{0})
+		stem.ValuesRoot(hasher)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			stem.Put(17, []byte{byte(i)})
+			benchmarkStemRoot = stem.ValuesRoot(hasher)
+		}
+	})
+}
+
+func BenchmarkStemDecodeUpdateEncode(b *testing.B) {
+	hasher := NewPooledKeccakHasher()
+	empty := stemEmptyRoots(hasher)
+	stem := NewStem()
+	stem.Put(17, []byte{2})
+	encoded := encodeStem(stem, hasher)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		stem, err := decodeStemWithEmpty(encoded, hasher, &empty)
+		if err != nil {
+			b.Fatal(err)
+		}
+		stem.Put(17, []byte{byte(i & 1)})
+		encoded = encodeStem(stem, hasher)
+	}
+	benchmarkStemRoot = encoded
+}
+
+func BenchmarkStemTriePutExistingAccount(b *testing.B) {
+	for _, benchmark := range []struct {
+		name    string
+		replace bool
+	}{
+		{name: "load-before-put"},
+		{name: "replace", replace: true},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			trie, _ := newStemTestTrie(b, false)
+			key := stemTestKey(0x81, 0)
+			if err := trie.Put(key, []byte{2}); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var err error
+				if benchmark.replace {
+					err = trie.ReplaceStem(key, []byte{byte(i & 1)})
+				} else {
+					err = trie.Put(key, []byte{byte(i & 1)})
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkStemTriePutNewAccount(b *testing.B) {
+	for _, benchmark := range []struct {
+		name    string
+		replace bool
+	}{
+		{name: "load-before-put"},
+		{name: "replace", replace: true},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			trie, _ := newStemTestTrie(b, false)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				key := make([]byte, StemKeySize)
+				binary.BigEndian.PutUint64(key[StemSize-8:StemSize], uint64(i+1))
+				var err error
+				if benchmark.replace {
+					err = trie.ReplaceStem(key, []byte{byte(i)})
+				} else {
+					err = trie.Put(key, []byte{byte(i)})
+				}
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

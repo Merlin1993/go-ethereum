@@ -66,23 +66,31 @@ type CommitDiagnostics struct {
 	ShardMaxNodeType          int64
 	ShardMaxNodeBytes         int64
 
-	RawBatchOps          int64
-	RawBatchBytes        int64
-	RawShardMaxID        int64
-	RawShardMaxOps       int64
-	RawShardMaxBytes     int64
-	NodeCacheEntries     int64
-	NodeCacheBytes       int64
-	NodeCacheTotalHits   int64
-	NodeCacheTotalMisses int64
-	NodeCacheEvictions   int64
-	RuntimeHeapAlloc     int64
-	RuntimeHeapSys       int64
-	RuntimeHeapInuse     int64
-	RuntimeSys           int64
-	RuntimeNumGC         int64
-	RuntimePauseTotal    int64
-	RuntimeLastPauseNs   int64
+	RawBatchOps              int64
+	RawBatchBytes            int64
+	RawShardMaxID            int64
+	RawShardMaxOps           int64
+	RawShardMaxBytes         int64
+	NodeCacheEntries         int64
+	NodeCacheBytes           int64
+	NodeCacheEntryLimit      int64
+	NodeCacheBytesLimit      int64
+	NodeCacheShards          int64
+	NodeCacheTotalHits       int64
+	NodeCacheTotalMisses     int64
+	NodeCacheEvictions       int64
+	NodeCacheLockContentions int64
+	NodeCacheLockWaitNanos   int64
+	NodeCacheDBGets          int64
+	NodeCacheDBGetNanos      int64
+	NodeCacheDBLoadBytes     int64
+	RuntimeHeapAlloc         int64
+	RuntimeHeapSys           int64
+	RuntimeHeapInuse         int64
+	RuntimeSys               int64
+	RuntimeNumGC             int64
+	RuntimePauseTotal        int64
+	RuntimeLastPauseNs       int64
 }
 
 // HashDiagnostics describes the root calculation performed by the latest
@@ -197,6 +205,93 @@ type ArchiveCumulativeDiagnostics struct {
 	FlatValuePutBytes int64
 }
 
+// UpdateDiagnostics contains cumulative counters for the hot state-update path.
+// Callers take two snapshots and subtract them to obtain one replay window.
+type UpdateDiagnostics struct {
+	StemPutCalls            int64
+	StemPutNoops            int64
+	StemPutLoadedBytes      int64
+	StemPutEncodedBytes     int64
+	StemPutCommitmentHashes int64
+	StemPutTotalNanos       int64
+	StemPutLoadNanos        int64
+	StemPutDecodeNanos      int64
+	StemPutEncodeNanos      int64
+	StemPutBackendNanos     int64
+
+	StemApplyCalls        int64
+	StemApplyUpdates      int64
+	StemApplyStems        int64
+	StemApplyPuts         int64
+	StemApplyDeletes      int64
+	StemApplyTotalNanos   int64
+	StemApplyLoadNanos    int64
+	StemApplyEncodeNanos  int64
+	StemApplyBackendNanos int64
+
+	ShardPutCalls          int64
+	ShardPutValues         int64
+	ShardPutNanos          int64
+	ShardPutBatchCalls     int64
+	ShardPutBatchValues    int64
+	ShardPutBatchShards    int64
+	ShardPutBatchWallNanos int64
+	ShardPutBatchWorkNanos int64
+	ShardDeleteCalls       int64
+	ShardDeleteNanos       int64
+
+	FlatValueGets          int64
+	FlatValueReadIONanos   int64
+	FlatValueReadIOBytes   int64
+	FlatValuePuts          int64
+	FlatValueDeletes       int64
+	FlatValueWriteNanos    int64
+	ArchivePromotionChecks int64
+	ArchivePromotionHits   int64
+}
+
+func (d UpdateDiagnostics) Sub(previous UpdateDiagnostics) UpdateDiagnostics {
+	return UpdateDiagnostics{
+		StemPutCalls:            d.StemPutCalls - previous.StemPutCalls,
+		StemPutNoops:            d.StemPutNoops - previous.StemPutNoops,
+		StemPutLoadedBytes:      d.StemPutLoadedBytes - previous.StemPutLoadedBytes,
+		StemPutEncodedBytes:     d.StemPutEncodedBytes - previous.StemPutEncodedBytes,
+		StemPutCommitmentHashes: d.StemPutCommitmentHashes - previous.StemPutCommitmentHashes,
+		StemPutTotalNanos:       d.StemPutTotalNanos - previous.StemPutTotalNanos,
+		StemPutLoadNanos:        d.StemPutLoadNanos - previous.StemPutLoadNanos,
+		StemPutDecodeNanos:      d.StemPutDecodeNanos - previous.StemPutDecodeNanos,
+		StemPutEncodeNanos:      d.StemPutEncodeNanos - previous.StemPutEncodeNanos,
+		StemPutBackendNanos:     d.StemPutBackendNanos - previous.StemPutBackendNanos,
+		StemApplyCalls:          d.StemApplyCalls - previous.StemApplyCalls,
+		StemApplyUpdates:        d.StemApplyUpdates - previous.StemApplyUpdates,
+		StemApplyStems:          d.StemApplyStems - previous.StemApplyStems,
+		StemApplyPuts:           d.StemApplyPuts - previous.StemApplyPuts,
+		StemApplyDeletes:        d.StemApplyDeletes - previous.StemApplyDeletes,
+		StemApplyTotalNanos:     d.StemApplyTotalNanos - previous.StemApplyTotalNanos,
+		StemApplyLoadNanos:      d.StemApplyLoadNanos - previous.StemApplyLoadNanos,
+		StemApplyEncodeNanos:    d.StemApplyEncodeNanos - previous.StemApplyEncodeNanos,
+		StemApplyBackendNanos:   d.StemApplyBackendNanos - previous.StemApplyBackendNanos,
+		ShardPutCalls:           d.ShardPutCalls - previous.ShardPutCalls,
+		ShardPutValues:          d.ShardPutValues - previous.ShardPutValues,
+		ShardPutNanos:           d.ShardPutNanos - previous.ShardPutNanos,
+		ShardPutBatchCalls:      d.ShardPutBatchCalls - previous.ShardPutBatchCalls,
+		ShardPutBatchValues:     d.ShardPutBatchValues - previous.ShardPutBatchValues,
+		ShardPutBatchShards:     d.ShardPutBatchShards - previous.ShardPutBatchShards,
+		ShardPutBatchWallNanos:  d.ShardPutBatchWallNanos - previous.ShardPutBatchWallNanos,
+		ShardPutBatchWorkNanos:  d.ShardPutBatchWorkNanos - previous.ShardPutBatchWorkNanos,
+		ShardDeleteCalls:        d.ShardDeleteCalls - previous.ShardDeleteCalls,
+		ShardDeleteNanos:        d.ShardDeleteNanos - previous.ShardDeleteNanos,
+		FlatValueGets:           d.FlatValueGets - previous.FlatValueGets,
+		FlatValueReadIONanos:    d.FlatValueReadIONanos - previous.FlatValueReadIONanos,
+		FlatValueReadIOBytes:    d.FlatValueReadIOBytes - previous.FlatValueReadIOBytes,
+		FlatValuePuts:           d.FlatValuePuts - previous.FlatValuePuts,
+		FlatValueDeletes:        d.FlatValueDeletes - previous.FlatValueDeletes,
+		FlatValueWriteNanos:     d.FlatValueWriteNanos - previous.FlatValueWriteNanos,
+		ArchivePromotionChecks:  d.ArchivePromotionChecks - previous.ArchivePromotionChecks,
+		ArchivePromotionHits:    d.ArchivePromotionHits - previous.ArchivePromotionHits,
+	}
+}
+
 func (d PrunePressureDiagnostics) String() string {
 	return fmt.Sprintf(
 		"pruneLastShardID=%d pruneLastTotal=%v pruneLastShard=%v pruneLastLockWait=%v pruneLastRootLoad=%v pruneLastWalk=%v pruneLastFinish=%v pruneDetailedCounters=%v pruneLastLeaves=%d pruneLastStubs=%d pruneLastBuildItems=%d pruneLastBuildBuckets=%d pruneLastPathAbsorbed=%d pruneLastRootPoolItems=%d pruneLastRootPoolBuckets=%d pruneLastInternalVisits=%d pruneMaxShardID=%d pruneMaxTotal=%v pruneMaxShard=%v pruneMaxLockWait=%v pruneMaxRootLoad=%v pruneMaxWalk=%v pruneMaxFinish=%v pruneMaxDetailedCounters=%v pruneMaxLeaves=%d pruneMaxStubs=%d pruneMaxBuildItems=%d pruneMaxBuildBuckets=%d pruneMaxPathAbsorbed=%d pruneMaxRootPoolItems=%d pruneMaxRootPoolBuckets=%d pruneMaxInternalVisits=%d",
@@ -240,10 +335,148 @@ var (
 	archiveCumulativeFlatValuePuts     int64
 	archiveCumulativeFlatValueDeletes  int64
 	archiveCumulativeFlatValuePutBytes int64
+	updateStemPutCalls                 int64
+	updateStemPutNoops                 int64
+	updateStemPutLoadedBytes           int64
+	updateStemPutEncodedBytes          int64
+	updateStemPutCommitmentHashes      int64
+	updateStemPutTotalNanos            int64
+	updateStemPutLoadNanos             int64
+	updateStemPutDecodeNanos           int64
+	updateStemPutEncodeNanos           int64
+	updateStemPutBackendNanos          int64
+	updateStemApplyCalls               int64
+	updateStemApplyUpdates             int64
+	updateStemApplyStems               int64
+	updateStemApplyPuts                int64
+	updateStemApplyDeletes             int64
+	updateStemApplyTotalNanos          int64
+	updateStemApplyLoadNanos           int64
+	updateStemApplyEncodeNanos         int64
+	updateStemApplyBackendNanos        int64
+	updateShardPutCalls                int64
+	updateShardPutValues               int64
+	updateShardPutNanos                int64
+	updateShardPutBatchCalls           int64
+	updateShardPutBatchValues          int64
+	updateShardPutBatchShards          int64
+	updateShardPutBatchWallNanos       int64
+	updateShardPutBatchWorkNanos       int64
+	updateShardDeleteCalls             int64
+	updateShardDeleteNanos             int64
+	updateFlatValueGets                int64
+	updateFlatValueReadIONanos         int64
+	updateFlatValueReadIOBytes         int64
+	updateFlatValuePuts                int64
+	updateFlatValueDeletes             int64
+	updateFlatValueWriteNanos          int64
+	updateArchivePromotionChecks       int64
+	updateArchivePromotionHits         int64
 
 	hashDiagnosticsMu sync.Mutex
 	hashDiagnostics   HashDiagnostics
 )
+
+func LastUpdateDiagnostics() UpdateDiagnostics {
+	return UpdateDiagnostics{
+		StemPutCalls:            atomic.LoadInt64(&updateStemPutCalls),
+		StemPutNoops:            atomic.LoadInt64(&updateStemPutNoops),
+		StemPutLoadedBytes:      atomic.LoadInt64(&updateStemPutLoadedBytes),
+		StemPutEncodedBytes:     atomic.LoadInt64(&updateStemPutEncodedBytes),
+		StemPutCommitmentHashes: atomic.LoadInt64(&updateStemPutCommitmentHashes),
+		StemPutTotalNanos:       atomic.LoadInt64(&updateStemPutTotalNanos),
+		StemPutLoadNanos:        atomic.LoadInt64(&updateStemPutLoadNanos),
+		StemPutDecodeNanos:      atomic.LoadInt64(&updateStemPutDecodeNanos),
+		StemPutEncodeNanos:      atomic.LoadInt64(&updateStemPutEncodeNanos),
+		StemPutBackendNanos:     atomic.LoadInt64(&updateStemPutBackendNanos),
+		StemApplyCalls:          atomic.LoadInt64(&updateStemApplyCalls),
+		StemApplyUpdates:        atomic.LoadInt64(&updateStemApplyUpdates),
+		StemApplyStems:          atomic.LoadInt64(&updateStemApplyStems),
+		StemApplyPuts:           atomic.LoadInt64(&updateStemApplyPuts),
+		StemApplyDeletes:        atomic.LoadInt64(&updateStemApplyDeletes),
+		StemApplyTotalNanos:     atomic.LoadInt64(&updateStemApplyTotalNanos),
+		StemApplyLoadNanos:      atomic.LoadInt64(&updateStemApplyLoadNanos),
+		StemApplyEncodeNanos:    atomic.LoadInt64(&updateStemApplyEncodeNanos),
+		StemApplyBackendNanos:   atomic.LoadInt64(&updateStemApplyBackendNanos),
+		ShardPutCalls:           atomic.LoadInt64(&updateShardPutCalls),
+		ShardPutValues:          atomic.LoadInt64(&updateShardPutValues),
+		ShardPutNanos:           atomic.LoadInt64(&updateShardPutNanos),
+		ShardPutBatchCalls:      atomic.LoadInt64(&updateShardPutBatchCalls),
+		ShardPutBatchValues:     atomic.LoadInt64(&updateShardPutBatchValues),
+		ShardPutBatchShards:     atomic.LoadInt64(&updateShardPutBatchShards),
+		ShardPutBatchWallNanos:  atomic.LoadInt64(&updateShardPutBatchWallNanos),
+		ShardPutBatchWorkNanos:  atomic.LoadInt64(&updateShardPutBatchWorkNanos),
+		ShardDeleteCalls:        atomic.LoadInt64(&updateShardDeleteCalls),
+		ShardDeleteNanos:        atomic.LoadInt64(&updateShardDeleteNanos),
+		FlatValueGets:           atomic.LoadInt64(&updateFlatValueGets),
+		FlatValueReadIONanos:    atomic.LoadInt64(&updateFlatValueReadIONanos),
+		FlatValueReadIOBytes:    atomic.LoadInt64(&updateFlatValueReadIOBytes),
+		FlatValuePuts:           atomic.LoadInt64(&updateFlatValuePuts),
+		FlatValueDeletes:        atomic.LoadInt64(&updateFlatValueDeletes),
+		FlatValueWriteNanos:     atomic.LoadInt64(&updateFlatValueWriteNanos),
+		ArchivePromotionChecks:  atomic.LoadInt64(&updateArchivePromotionChecks),
+		ArchivePromotionHits:    atomic.LoadInt64(&updateArchivePromotionHits),
+	}
+}
+
+func recordStemPutDiagnostics(noop bool, loadedBytes, encodedBytes, commitmentHashes int, total, load, decode, encode, backend time.Duration) {
+	atomic.AddInt64(&updateStemPutCalls, 1)
+	if noop {
+		atomic.AddInt64(&updateStemPutNoops, 1)
+	}
+	atomic.AddInt64(&updateStemPutLoadedBytes, int64(loadedBytes))
+	atomic.AddInt64(&updateStemPutEncodedBytes, int64(encodedBytes))
+	atomic.AddInt64(&updateStemPutCommitmentHashes, int64(commitmentHashes))
+	atomic.AddInt64(&updateStemPutTotalNanos, total.Nanoseconds())
+	atomic.AddInt64(&updateStemPutLoadNanos, load.Nanoseconds())
+	atomic.AddInt64(&updateStemPutDecodeNanos, decode.Nanoseconds())
+	atomic.AddInt64(&updateStemPutEncodeNanos, encode.Nanoseconds())
+	atomic.AddInt64(&updateStemPutBackendNanos, backend.Nanoseconds())
+}
+
+func recordStemApplyDiagnostics(updates, stems, puts, deletes int, total, load, encode, backend time.Duration) {
+	atomic.AddInt64(&updateStemApplyCalls, 1)
+	atomic.AddInt64(&updateStemApplyUpdates, int64(updates))
+	atomic.AddInt64(&updateStemApplyStems, int64(stems))
+	atomic.AddInt64(&updateStemApplyPuts, int64(puts))
+	atomic.AddInt64(&updateStemApplyDeletes, int64(deletes))
+	atomic.AddInt64(&updateStemApplyTotalNanos, total.Nanoseconds())
+	atomic.AddInt64(&updateStemApplyLoadNanos, load.Nanoseconds())
+	atomic.AddInt64(&updateStemApplyEncodeNanos, encode.Nanoseconds())
+	atomic.AddInt64(&updateStemApplyBackendNanos, backend.Nanoseconds())
+}
+
+func recordShardPutDiagnostics(values int, elapsed time.Duration) {
+	atomic.AddInt64(&updateShardPutCalls, 1)
+	atomic.AddInt64(&updateShardPutValues, int64(values))
+	atomic.AddInt64(&updateShardPutNanos, elapsed.Nanoseconds())
+}
+
+func recordShardPutBatchDiagnostics(values, shards int, wall, work time.Duration) {
+	atomic.AddInt64(&updateShardPutBatchCalls, 1)
+	atomic.AddInt64(&updateShardPutBatchValues, int64(values))
+	atomic.AddInt64(&updateShardPutBatchShards, int64(shards))
+	atomic.AddInt64(&updateShardPutBatchWallNanos, wall.Nanoseconds())
+	atomic.AddInt64(&updateShardPutBatchWorkNanos, work.Nanoseconds())
+}
+
+func recordShardDeleteDiagnostics(elapsed time.Duration) {
+	atomic.AddInt64(&updateShardDeleteCalls, 1)
+	atomic.AddInt64(&updateShardDeleteNanos, elapsed.Nanoseconds())
+}
+
+func recordFlatValueGet() { atomic.AddInt64(&updateFlatValueGets, 1) }
+
+func recordFlatValueReadIO(elapsed time.Duration, bytes int) {
+	atomic.AddInt64(&updateFlatValueReadIONanos, elapsed.Nanoseconds())
+	atomic.AddInt64(&updateFlatValueReadIOBytes, int64(bytes))
+}
+
+func recordFlatValueWrite(puts, deletes int, elapsed time.Duration) {
+	atomic.AddInt64(&updateFlatValuePuts, int64(puts))
+	atomic.AddInt64(&updateFlatValueDeletes, int64(deletes))
+	atomic.AddInt64(&updateFlatValueWriteNanos, elapsed.Nanoseconds())
+}
 
 func recordHashDiagnostics(diag HashDiagnostics) {
 	hashDiagnosticsMu.Lock()
@@ -483,9 +716,17 @@ var (
 	commitDiagRawShardMaxBytes           int64
 	commitDiagNodeCacheEntries           int64
 	commitDiagNodeCacheBytes             int64
+	commitDiagNodeCacheEntryLimit        int64
+	commitDiagNodeCacheBytesLimit        int64
+	commitDiagNodeCacheShards            int64
 	commitDiagNodeCacheTotalHits         int64
 	commitDiagNodeCacheTotalMisses       int64
 	commitDiagNodeCacheEvictions         int64
+	commitDiagNodeCacheLockContentions   int64
+	commitDiagNodeCacheLockWaitNanos     int64
+	commitDiagNodeCacheDBGets            int64
+	commitDiagNodeCacheDBGetNanos        int64
+	commitDiagNodeCacheDBLoadBytes       int64
 	commitDiagRuntimeHeapAlloc           int64
 	commitDiagRuntimeHeapSys             int64
 	commitDiagRuntimeHeapInuse           int64
@@ -560,9 +801,17 @@ func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagRawShardMaxBytes, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheEntries, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheBytes, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheEntryLimit, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheBytesLimit, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheShards, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheTotalHits, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheTotalMisses, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheEvictions, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheLockContentions, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheLockWaitNanos, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheDBGets, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheDBGetNanos, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheDBLoadBytes, 0)
 	atomic.StoreInt64(&commitDiagRuntimeHeapAlloc, 0)
 	atomic.StoreInt64(&commitDiagRuntimeHeapSys, 0)
 	atomic.StoreInt64(&commitDiagRuntimeHeapInuse, 0)
@@ -760,10 +1009,20 @@ func RecordWrapperResourceDiagnostics(rawOps, rawBytes, rawMaxShardID, rawMaxOps
 
 // RecordNodeCacheDiagnostics records the lifetime counters of the caches used
 // by the wrapper and the active archive trie.
-func RecordNodeCacheDiagnostics(hits, misses, evictions int64) {
-	atomic.StoreInt64(&commitDiagNodeCacheTotalHits, hits)
-	atomic.StoreInt64(&commitDiagNodeCacheTotalMisses, misses)
-	atomic.StoreInt64(&commitDiagNodeCacheEvictions, evictions)
+func RecordNodeCacheDiagnostics(diag NodeCacheDiagnostics) {
+	atomic.StoreInt64(&commitDiagNodeCacheEntries, diag.Entries)
+	atomic.StoreInt64(&commitDiagNodeCacheBytes, diag.Bytes)
+	atomic.StoreInt64(&commitDiagNodeCacheEntryLimit, diag.EntryLimit)
+	atomic.StoreInt64(&commitDiagNodeCacheBytesLimit, diag.BytesLimit)
+	atomic.StoreInt64(&commitDiagNodeCacheShards, diag.Shards)
+	atomic.StoreInt64(&commitDiagNodeCacheTotalHits, diag.Hits)
+	atomic.StoreInt64(&commitDiagNodeCacheTotalMisses, diag.Misses)
+	atomic.StoreInt64(&commitDiagNodeCacheEvictions, diag.Evictions)
+	atomic.StoreInt64(&commitDiagNodeCacheLockContentions, diag.LockContentions)
+	atomic.StoreInt64(&commitDiagNodeCacheLockWaitNanos, diag.LockWaitNanos)
+	atomic.StoreInt64(&commitDiagNodeCacheDBGets, diag.DBGets)
+	atomic.StoreInt64(&commitDiagNodeCacheDBGetNanos, diag.DBGetNanos)
+	atomic.StoreInt64(&commitDiagNodeCacheDBLoadBytes, diag.DBLoadBytes)
 }
 
 func recordNodeCacheLookupIfEnabled(config *Config, hit bool) {
@@ -784,6 +1043,10 @@ func recordPathDBGetIfEnabled(config *Config) {
 }
 
 func recordArchivePromotionCheckIfEnabled(config *Config, hit bool) {
+	atomic.AddInt64(&updateArchivePromotionChecks, 1)
+	if hit {
+		atomic.AddInt64(&updateArchivePromotionHits, 1)
+	}
 	if config == nil || !config.EnablePathDiagnostics {
 		return
 	}
@@ -944,9 +1207,17 @@ func LastCommitDiagnostics() CommitDiagnostics {
 		RawShardMaxBytes:           atomic.LoadInt64(&commitDiagRawShardMaxBytes),
 		NodeCacheEntries:           atomic.LoadInt64(&commitDiagNodeCacheEntries),
 		NodeCacheBytes:             atomic.LoadInt64(&commitDiagNodeCacheBytes),
+		NodeCacheEntryLimit:        atomic.LoadInt64(&commitDiagNodeCacheEntryLimit),
+		NodeCacheBytesLimit:        atomic.LoadInt64(&commitDiagNodeCacheBytesLimit),
+		NodeCacheShards:            atomic.LoadInt64(&commitDiagNodeCacheShards),
 		NodeCacheTotalHits:         atomic.LoadInt64(&commitDiagNodeCacheTotalHits),
 		NodeCacheTotalMisses:       atomic.LoadInt64(&commitDiagNodeCacheTotalMisses),
 		NodeCacheEvictions:         atomic.LoadInt64(&commitDiagNodeCacheEvictions),
+		NodeCacheLockContentions:   atomic.LoadInt64(&commitDiagNodeCacheLockContentions),
+		NodeCacheLockWaitNanos:     atomic.LoadInt64(&commitDiagNodeCacheLockWaitNanos),
+		NodeCacheDBGets:            atomic.LoadInt64(&commitDiagNodeCacheDBGets),
+		NodeCacheDBGetNanos:        atomic.LoadInt64(&commitDiagNodeCacheDBGetNanos),
+		NodeCacheDBLoadBytes:       atomic.LoadInt64(&commitDiagNodeCacheDBLoadBytes),
 		RuntimeHeapAlloc:           atomic.LoadInt64(&commitDiagRuntimeHeapAlloc),
 		RuntimeHeapSys:             atomic.LoadInt64(&commitDiagRuntimeHeapSys),
 		RuntimeHeapInuse:           atomic.LoadInt64(&commitDiagRuntimeHeapInuse),

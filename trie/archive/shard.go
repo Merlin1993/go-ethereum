@@ -157,7 +157,7 @@ func (s *Shard) loadNode(hash []byte) (Node, error) {
 	data, ok := s.getCachedNodeBlob(storageKey)
 	if !ok {
 		var err error
-		data, err = s.db.Get(storageKey)
+		data, err = s.loadNodeBlob(storageKey)
 		recordPathDBGetIfEnabled(s.config)
 		if err != nil {
 			if s.config != nil && s.config.UsePathStorage() {
@@ -174,7 +174,7 @@ func (s *Shard) loadNode(hash []byte) (Node, error) {
 	if err != nil {
 		if ok && s.config != nil && s.config.UsePathStorage() {
 			s.removeCachedNodeBlob(storageKey)
-			data, err = s.db.Get(storageKey)
+			data, err = s.loadNodeBlob(storageKey)
 			recordPathDBGetIfEnabled(s.config)
 			if err != nil {
 				return nil, fmt.Errorf("load node at shard %d path %x/%d hash %x: %w", s.id, persisted.path, persisted.bits, hash, err)
@@ -196,7 +196,7 @@ func (s *Shard) loadNode(hash []byte) (Node, error) {
 	if s.config != nil && s.config.UsePathStorage() && !bytes.Equal(s.hasher.Hash(data), hash) {
 		if ok {
 			s.removeCachedNodeBlob(storageKey)
-			data, err = s.db.Get(storageKey)
+			data, err = s.loadNodeBlob(storageKey)
 			recordPathDBGetIfEnabled(s.config)
 			if err != nil {
 				return nil, fmt.Errorf("load node at shard %d path %x/%d hash %x: %w", s.id, persisted.path, persisted.bits, hash, err)
@@ -234,7 +234,7 @@ func (s *Shard) loadNodeAtPath(hash, path []byte, bits int) (Node, error) {
 	data, ok := s.getCachedNodeBlob(storageKey)
 	if !ok {
 		var err error
-		data, err = s.db.Get(storageKey)
+		data, err = s.loadNodeBlob(storageKey)
 		recordPathDBGetIfEnabled(s.config)
 		if err != nil {
 			if s.config != nil && s.config.UsePathStorage() {
@@ -251,7 +251,7 @@ func (s *Shard) loadNodeAtPath(hash, path []byte, bits int) (Node, error) {
 	if err != nil {
 		if ok && s.config != nil && s.config.UsePathStorage() {
 			s.removeCachedNodeBlob(storageKey)
-			data, err = s.db.Get(storageKey)
+			data, err = s.loadNodeBlob(storageKey)
 			recordPathDBGetIfEnabled(s.config)
 			if err != nil {
 				return nil, fmt.Errorf("load node at shard %d path %x/%d hash %x: %w", s.id, path, bits, hash, err)
@@ -273,7 +273,7 @@ func (s *Shard) loadNodeAtPath(hash, path []byte, bits int) (Node, error) {
 	if s.config != nil && s.config.UsePathStorage() && !bytes.Equal(s.hasher.Hash(data), hash) {
 		if ok {
 			s.removeCachedNodeBlob(storageKey)
-			data, err = s.db.Get(storageKey)
+			data, err = s.loadNodeBlob(storageKey)
 			recordPathDBGetIfEnabled(s.config)
 			if err != nil {
 				return nil, fmt.Errorf("load node at shard %d path %x/%d hash %x: %w", s.id, path, bits, hash, err)
@@ -363,6 +363,13 @@ func (s *Shard) getCachedNodeBlob(storageKey []byte) ([]byte, bool) {
 	data, ok := s.nodeCache.get(storageKey)
 	recordNodeCacheLookupIfEnabled(s.config, ok)
 	return data, ok
+}
+
+func (s *Shard) loadNodeBlob(storageKey []byte) ([]byte, error) {
+	start := time.Now()
+	data, err := s.db.Get(storageKey)
+	s.nodeCache.recordDBGet(time.Since(start), len(data))
+	return data, err
 }
 
 func (s *Shard) cacheNodeBlob(storageKey, data []byte) {

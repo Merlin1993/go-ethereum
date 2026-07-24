@@ -50,26 +50,27 @@ type ProcessorHost struct {
 }
 
 var (
-	dbDir            = flag.String("dbDir2", "F:\\expire_data\\expire_state_db", "Database directory")
-	dataDir          = flag.String("dataDir2", "E:\\ethdata", "Input data directory")
-	startIdx         = flag.Int("startFileIdx2", 1, "Start file index")
-	endIdx           = flag.Int("endFileIdx2", 21, "End file index")
-	useVerkle        = flag.Bool("useVerkle2", false, "Enable Verkle trie")
-	useBinaryTrie    = flag.Bool("useBinaryTrie2", true, "Enable Binary trie")
-	useKV            = flag.Bool("useKV2", false, "Enable no-hash KV state backend")
-	useMemory        = flag.Bool("useMemory2", false, "Use in-memory DB")
-	binaryArchiveDir = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
-	metricsDir       = flag.String("metricsDir2", ".", "Directory for mainnet metrics CSV/JSON output")
-	statsInterval    = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
-	pruneInterval    = flag.Int("pruneInterval", 1, "Blocks between Trie.PruneNextShard() calls")
-	maxBlocks        = flag.Int("blocks", 0, "Maximum number of blocks to process during processor or consistency tests (0 = all)")
+	dbDir                 = flag.String("dbDir2", "F:\\expire_data\\expire_state_db", "Database directory")
+	dataDir               = flag.String("dataDir2", "E:\\ethdata", "Input data directory")
+	startIdx              = flag.Int("startFileIdx2", 1, "Start file index")
+	endIdx                = flag.Int("endFileIdx2", 21, "End file index")
+	useVerkle             = flag.Bool("useVerkle2", false, "Enable Verkle trie")
+	useBinaryTrie         = flag.Bool("useBinaryTrie2", true, "Enable Binary trie")
+	useKV                 = flag.Bool("useKV2", false, "Enable no-hash KV state backend")
+	useMemory             = flag.Bool("useMemory2", false, "Use in-memory DB")
+	binaryArchiveDir      = flag.String("binaryArchiveDir2", "F:\\expire_data\\expire_state_db_achive", "Binary trie archive directory")
+	metricsDir            = flag.String("metricsDir2", ".", "Directory for mainnet metrics CSV/JSON output")
+	statsInterval         = flag.Int("statsInterval2", 100000, "Statistics reporting interval (in blocks)")
+	fullTrieStatsInterval = flag.Int("fullTrieStatsInterval", 2000000, "Blocks between exact full-trie structure scans; 0 only scans at the end")
+	pruneInterval         = flag.Int("pruneInterval", 1, "Blocks between Trie.PruneNextShard() calls")
+	maxBlocks             = flag.Int("blocks", 0, "Maximum number of blocks to process during processor or consistency tests (0 = all)")
 
 	// Binary Trie Ablation flags
 	shardDepth                  = flag.Int("shardDepth", 8, "Binary trie shard depth")
 	archiveBucketSize           = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
 	cuckooBuckets               = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
 	cuckooSlots                 = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
-	binaryNodeCacheLimit        = flag.Int("binaryNodeCacheLimit", 262144, "Binary trie process node cache entry limit; 0 uses default, negative disables cache")
+	binaryNodeCacheLimit        = flag.Int("binaryNodeCacheLimit", archivetrie.DefaultNodeCacheLimit, "Binary trie process node cache entry limit; 0 uses default, negative disables cache")
 	binaryNodeCacheBytesLimitMB = flag.Int("binaryNodeCacheBytesLimitMB", 512, "Binary trie process node cache byte limit in MiB; 0 uses default, negative disables byte cap")
 	binaryPathDiagnostics       = flag.Bool("binaryPathDiagnostics", false, "Enable binary trie path/cache diagnostics")
 	binaryPruneShardMetrics     = flag.Bool("binaryPruneShardMetrics", false, "Write per-prune binary shard pressure metrics CSV")
@@ -94,19 +95,20 @@ func TestMain(m *testing.M) {
 }
 
 type ProcessorConfig struct {
-	DbDir            string
-	DataDir          string
-	StartFileIdx     int
-	EndFileIdx       int
-	UseVerkle        bool
-	UseBinaryTrie    bool
-	UseKV            bool
-	UseMemory        bool
-	BinaryArchiveDir string
-	MetricsDir       string
-	StartNum         uint64
-	PruneInterval    int
-	MaxBlocks        int
+	DbDir                 string
+	DataDir               string
+	StartFileIdx          int
+	EndFileIdx            int
+	UseVerkle             bool
+	UseBinaryTrie         bool
+	UseKV                 bool
+	UseMemory             bool
+	BinaryArchiveDir      string
+	MetricsDir            string
+	StartNum              uint64
+	PruneInterval         int
+	MaxBlocks             int
+	FullTrieStatsInterval int
 
 	// Ablation params
 	ShardDepth                  int
@@ -249,6 +251,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		StartNum:                    46147,
 		PruneInterval:               *pruneInterval,
 		MaxBlocks:                   *maxBlocks,
+		FullTrieStatsInterval:       *fullTrieStatsInterval,
 		ShardDepth:                  *shardDepth,
 		ArchiveBucketSize:           *archiveBucketSize,
 		CuckooBuckets:               *cuckooBuckets,
@@ -302,81 +305,147 @@ func TestExpireStateProcessor(t *testing.T) {
 	// Statistics tracking
 	statsIv := uint64(*statsInterval)
 	var (
-		intervalBlocks         uint64
-		totalProcessedBlocks   uint64
-		epochID                uint64
-		totalTxTime            time.Duration
-		maxTxTime              time.Duration
-		maxTxTimeBlock         uint64
-		totalFinaliseTime      time.Duration
-		maxFinaliseTime        time.Duration
-		totalCommitTime        time.Duration
-		maxCommitTime          time.Duration
-		maxCommitBlock         uint64
-		totalStatePreCommit    time.Duration
-		maxStatePreCommit      time.Duration
-		maxStatePreCommitBlock uint64
-		totalPostCommit        time.Duration
-		maxPostCommit          time.Duration
-		maxPostCommitBlock     uint64
-		totalRootPipelineTime  time.Duration
-		maxRootPipelineTime    time.Duration
-		maxRootPipelineBlock   uint64
-		totalRootComputeTime   time.Duration
-		maxRootComputeTime     time.Duration
-		maxRootComputeBlock    uint64
-		totalRootDBWriteTime   time.Duration
-		maxRootDBWriteTime     time.Duration
-		maxRootDBWriteBlock    uint64
-		totalHandleDestruct    time.Duration
-		maxHandleDestruct      time.Duration
-		maxHandleDestructBlock uint64
-		totalAccountStateWipe  time.Duration
-		maxAccountStateWipe    time.Duration
-		maxAccountWipeBlock    uint64
-		totalDestroyedAccounts uint64
-		totalWipedAccounts     uint64
-		totalWipedStorageSlots uint64
-		totalWipedCodeChunks   uint64
-		totalWipedStemRecords  uint64
-		totalWipeIndexScan     time.Duration
-		totalWipeStemDelete    time.Duration
-		totalWipeIndexStage    time.Duration
-		totalWipeOriginBuild   time.Duration
-		totalHashShardWall     time.Duration
-		totalHashTotal         time.Duration
-		totalHashShardWork     time.Duration
-		totalHashSerialize     time.Duration
-		totalHashCompute       time.Duration
-		totalHashRootMerge     time.Duration
-		maxHashTotal           time.Duration
-		maxHashBlock           uint64
-		totalHashDirtyShards   int64
-		totalHashWorkers       int64
-		totalHashNodes         int64
-		totalHashDirtyNodes    int64
-		totalHashCleanNodes    int64
-		totalPruneTime         time.Duration
-		maxPruneTime           time.Duration
-		maxPruneBlock          uint64
-		totalArchiveCompute    time.Duration
-		maxArchiveCompute      time.Duration
-		totalArchiveWait       time.Duration
-		maxArchiveWait         time.Duration
-		totalArchiveWaitExcess time.Duration
-		maxArchiveWaitExcess   time.Duration
-		maxArchiveWaitBlock    uint64
-		maxProofSizeBlockBlock uint64
-		pruneCount             uint64
-		totalStorageSize       int64 // Cumulative storage size
-		intervalTxCount        uint64
-		intervalSuccessTxCount uint64
-		globalTxCount          uint64
-		globalSuccessTxCount   uint64
-		lastNodeCacheHits      int64
-		lastNodeCacheMisses    int64
-		lastNodeCacheEvictions int64
+		intervalBlocks               uint64
+		totalProcessedBlocks         uint64
+		epochID                      uint64
+		totalTxTime                  time.Duration
+		maxTxTime                    time.Duration
+		maxTxTimeBlock               uint64
+		totalFinaliseTime            time.Duration
+		maxFinaliseTime              time.Duration
+		totalCommitTime              time.Duration
+		maxCommitTime                time.Duration
+		maxCommitBlock               uint64
+		totalStatePreCommit          time.Duration
+		maxStatePreCommit            time.Duration
+		maxStatePreCommitBlock       uint64
+		totalIntermediateFinalise    time.Duration
+		maxIntermediateFinalise      time.Duration
+		maxIntermediateFinaliseBlock uint64
+		totalStorageUpdates          time.Duration
+		maxStorageUpdates            time.Duration
+		maxStorageUpdatesBlock       uint64
+		totalStorageUpdateWork       time.Duration
+		maxStorageUpdateObject       time.Duration
+		maxStorageUpdateObjectBlock  uint64
+		maxStorageUpdateObjectSlots  int64
+		totalStorageUpdateObjects    int64
+		totalStorageUpdateSlots      int64
+		maxStorageUpdateWorkers      int64
+		totalAccountUpdates          time.Duration
+		maxAccountUpdates            time.Duration
+		maxAccountUpdatesBlock       uint64
+		totalAccountHashes           time.Duration
+		maxAccountHashes             time.Duration
+		maxAccountHashesBlock        uint64
+		totalIntermediateMutations   int64
+		totalAccountUpdated          int64
+		totalAccountDeleted          int64
+		totalStorageUpdated          int64
+		totalStorageDeleted          int64
+		totalPostCommit              time.Duration
+		maxPostCommit                time.Duration
+		maxPostCommitBlock           uint64
+		totalRootPipelineTime        time.Duration
+		maxRootPipelineTime          time.Duration
+		maxRootPipelineBlock         uint64
+		totalRootComputeTime         time.Duration
+		maxRootComputeTime           time.Duration
+		maxRootComputeBlock          uint64
+		totalRootDBWriteTime         time.Duration
+		maxRootDBWriteTime           time.Duration
+		maxRootDBWriteBlock          uint64
+		totalHandleDestruct          time.Duration
+		maxHandleDestruct            time.Duration
+		maxHandleDestructBlock       uint64
+		totalAccountStateWipe        time.Duration
+		maxAccountStateWipe          time.Duration
+		maxAccountWipeBlock          uint64
+		totalDestroyedAccounts       uint64
+		totalWipedAccounts           uint64
+		totalWipedStorageSlots       uint64
+		totalWipedCodeChunks         uint64
+		totalWipedStemRecords        uint64
+		totalWipeIndexScan           time.Duration
+		totalWipeStemDelete          time.Duration
+		totalWipeIndexStage          time.Duration
+		totalWipeOriginBuild         time.Duration
+		totalHashShardWall           time.Duration
+		totalHashTotal               time.Duration
+		totalHashShardWork           time.Duration
+		totalHashSerialize           time.Duration
+		totalHashCompute             time.Duration
+		totalHashRootMerge           time.Duration
+		maxHashTotal                 time.Duration
+		maxHashBlock                 uint64
+		totalHashDirtyShards         int64
+		totalHashWorkers             int64
+		totalHashNodes               int64
+		totalHashDirtyNodes          int64
+		totalHashCleanNodes          int64
+		totalPruneTime               time.Duration
+		maxPruneTime                 time.Duration
+		maxPruneBlock                uint64
+		totalArchiveCompute          time.Duration
+		maxArchiveCompute            time.Duration
+		totalArchiveWait             time.Duration
+		maxArchiveWait               time.Duration
+		totalArchiveWaitExcess       time.Duration
+		maxArchiveWaitExcess         time.Duration
+		maxArchiveWaitBlock          uint64
+		maxProofSizeBlockBlock       uint64
+		pruneCount                   uint64
+		totalStorageSize             int64 // Cumulative storage size
+		intervalTxCount              uint64
+		intervalSuccessTxCount       uint64
+		globalTxCount                uint64
+		globalSuccessTxCount         uint64
+		lastNodeCacheHits            int64
+		lastNodeCacheMisses          int64
+		lastNodeCacheEvictions       int64
+		lastNodeCacheLockContentions int64
+		lastNodeCacheLockWaitNanos   int64
+		lastNodeCacheDBGets          int64
+		lastNodeCacheDBGetNanos      int64
+		lastNodeCacheDBLoadBytes     int64
+		lastUpdateDiagnostics        archivetrie.UpdateDiagnostics
 	)
+	recordPreCommitBreakdown := func(block uint64, statedb *state.StateDB) {
+		totalIntermediateFinalise += statedb.IntermediateFinalise
+		if statedb.IntermediateFinalise > maxIntermediateFinalise {
+			maxIntermediateFinalise = statedb.IntermediateFinalise
+			maxIntermediateFinaliseBlock = block
+		}
+		totalStorageUpdates += statedb.StorageUpdates
+		if statedb.StorageUpdates > maxStorageUpdates {
+			maxStorageUpdates = statedb.StorageUpdates
+			maxStorageUpdatesBlock = block
+		}
+		totalStorageUpdateWork += statedb.StorageUpdateWork
+		if statedb.StorageUpdateMaxObject > maxStorageUpdateObject {
+			maxStorageUpdateObject = statedb.StorageUpdateMaxObject
+			maxStorageUpdateObjectBlock = block
+			maxStorageUpdateObjectSlots = statedb.StorageUpdateMaxObjectSlots
+		}
+		totalStorageUpdateObjects += statedb.StorageUpdateObjects
+		totalStorageUpdateSlots += statedb.StorageUpdateSlots
+		maxStorageUpdateWorkers = max(maxStorageUpdateWorkers, statedb.StorageUpdateWorkers)
+		totalAccountUpdates += statedb.AccountUpdates
+		if statedb.AccountUpdates > maxAccountUpdates {
+			maxAccountUpdates = statedb.AccountUpdates
+			maxAccountUpdatesBlock = block
+		}
+		totalAccountHashes += statedb.AccountHashes
+		if statedb.AccountHashes > maxAccountHashes {
+			maxAccountHashes = statedb.AccountHashes
+			maxAccountHashesBlock = block
+		}
+		totalIntermediateMutations += statedb.IntermediateMutations
+		totalAccountUpdated += int64(statedb.AccountUpdated)
+		totalAccountDeleted += int64(statedb.AccountDeleted)
+		totalStorageUpdated += statedb.StorageUpdated.Load()
+		totalStorageDeleted += statedb.StorageDeleted.Load()
+	}
 	recordHashBlockStats := func(block uint64, diag archivetrie.HashDiagnostics) {
 		if !cfg.UseBinaryTrie {
 			return
@@ -451,6 +520,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		archivetrie.ResetPrunePressureDiagnostics()
 		archivetrie.ResetArchiveCumulativeDiagnostics()
 	}
+	var lastFullTrieStats *archivetrie.TrieStats
+	var lastFullTrieStatsBlock uint64
 
 	// Write CSV Header
 	metricsHeader := []string{
@@ -512,7 +583,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Storage_Layout", "Shared_DB_Bytes", "Archive_Storage_Bytes_Valid",
 		"Avg_Tx_Execution_ms", "Max_Tx_Execution_ms", "Max_Tx_Execution_Block",
 		"Interval_Tx_Count", "Interval_Success_Tx_Count", "Tx_Execution_TPS",
-		"Metrics_Collection_ms", "State_Dir_Scan_ms", "Archive_Dir_Scan_ms", "Trie_Stats_ms",
+		"Metrics_Collection_ms", "State_Dir_Scan_ms", "Archive_Dir_Scan_ms", "Trie_Stats_ms", "Trie_Stats_Exact", "Trie_Stats_Block",
 		"NodeCache_Total_Hits", "NodeCache_Total_Misses", "NodeCache_Total_Evictions",
 		"NodeCache_Window_Hits", "NodeCache_Window_Misses", "NodeCache_Window_Evictions",
 		"Avg_Hash_Total_ms", "Avg_Hash_Shard_Wall_ms", "Avg_Hash_Shard_Work_ms", "Avg_Hash_Serialize_ms",
@@ -520,6 +591,26 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Avg_Hash_Dirty_Shards", "Avg_Hash_Workers", "Avg_Hash_Nodes", "Avg_Hash_Dirty_Nodes", "Avg_Hash_Clean_Nodes",
 		"Indexed_Wiped_Stem_Records", "Wipe_Index_Scan_ms", "Wipe_Stem_Delete_ms",
 		"Wipe_Index_Stage_ms", "Wipe_Origin_Build_ms",
+		"Avg_Intermediate_Finalise_ms", "Max_Intermediate_Finalise_ms", "Max_Intermediate_Finalise_Block",
+		"Avg_Storage_Updates_ms", "Max_Storage_Updates_ms", "Max_Storage_Updates_Block",
+		"Avg_Storage_Update_Work_ms", "Max_Storage_Object_ms", "Max_Storage_Object_Block", "Max_Storage_Object_Slots",
+		"Avg_Storage_Objects", "Avg_Storage_Slots", "Max_Storage_Workers",
+		"Avg_Account_Updates_ms", "Max_Account_Updates_ms", "Max_Account_Updates_Block",
+		"Avg_Account_Hashes_ms", "Max_Account_Hashes_ms", "Max_Account_Hashes_Block",
+		"Intermediate_Mutations", "Account_Updated", "Account_Deleted", "Storage_Updated", "Storage_Deleted",
+		"Stem_Put_Calls", "Stem_Put_Noops", "Stem_Put_Loaded_Bytes", "Stem_Put_Encoded_Bytes", "Stem_Put_Commitment_Hashes",
+		"Stem_Put_Total_ms", "Stem_Put_Load_ms", "Stem_Put_Decode_ms", "Stem_Put_Encode_ms", "Stem_Put_Backend_ms",
+		"Stem_Apply_Calls", "Stem_Apply_Updates", "Stem_Apply_Stems", "Stem_Apply_Puts", "Stem_Apply_Deletes",
+		"Stem_Apply_Total_ms", "Stem_Apply_Load_ms", "Stem_Apply_Encode_ms", "Stem_Apply_Backend_ms",
+		"Shard_Put_Calls", "Shard_Put_Values", "Shard_Put_ms",
+		"Shard_PutBatch_Calls", "Shard_PutBatch_Values", "Shard_PutBatch_Shards", "Shard_PutBatch_Wall_ms", "Shard_PutBatch_Work_ms",
+		"Shard_Delete_Calls", "Shard_Delete_ms",
+		"Flat_Value_Gets", "Flat_Value_Read_IO_ms", "Flat_Value_Read_IO_Bytes",
+		"Flat_Value_Puts", "Flat_Value_Deletes", "Flat_Value_Write_ms",
+		"Archive_Promotion_Checks", "Archive_Promotion_Hits",
+		"NodeCache_Entry_Limit", "NodeCache_Bytes_Limit", "NodeCache_Shards",
+		"NodeCache_Window_Lock_Contentions", "NodeCache_Window_Lock_Wait_ms",
+		"NodeCache_Window_DB_Gets", "NodeCache_Window_DB_Get_ms", "NodeCache_Window_DB_Load_Bytes",
 	}
 	writer.Write(metricsHeader)
 	kvStatsWriter.Write([]string{
@@ -528,7 +619,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Writes", "Write_3M", "Write_6M", "Write_1Y", "Write_NonExistent",
 	})
 
-	reportStats := func() {
+	reportStats := func(final bool) {
 		if intervalBlocks == 0 {
 			return
 		}
@@ -599,43 +690,55 @@ func TestExpireStateProcessor(t *testing.T) {
 			bucketItemsMax         int
 		)
 		trieStatsDuration := time.Duration(0)
+		trieStatsExact := false
 		if cfg.UseBinaryTrie {
 			if active := host.trieDB.GetArchiveTrie(); active != nil {
 				if bt, ok := active.(*archivetrie.Trie); ok {
-					trieStatsStart := time.Now()
-					stats := bt.Stats()
-					trieStatsDuration = time.Since(trieStatsStart)
-					trieChildNodeCount = stats.LeafCount
-					totalArchivedItems = stats.ArchivedDataSize
-					activeLogicalValues = stats.ActiveLogicalValues
-					archivedLogicalValues = stats.ArchivedLogicalValues
-					activeLogicalFailures = stats.ActiveLogicalValueReadFailures
-					archiveLogicalFailures = stats.ArchivedLogicalValueReadFailures
-					totalBucketCount = stats.BucketCount
-					rootBucketCount = stats.RootBucketCount
-					rootArchivedItems = stats.RootArchivedSize
-					rootLeafBucketCount = stats.RootLeafBucketCount
-					rootLeafItems = stats.RootLeafArchivedSize
-					stubBucketCount = stats.StubBucketCount
-					stubArchivedItems = stats.StubArchivedSize
-					rootStubBucketCount = stats.RootStubBucketCount
-					rootStubItems = stats.RootStubArchivedSize
-					deepStubBucketCount = stats.DeepStubBucketCount
-					deepStubItems = stats.DeepStubArchivedSize
-					childBucketCount = stats.ChildBucketCount
-					childArchivedItems = stats.ChildArchivedSize
-					maxStubListBuckets = stats.MaxStubListBuckets
-					maxStubListItems = stats.MaxStubListItems
-					maxRootStubBuckets = stats.MaxRootStubBuckets
-					maxRootStubItems = stats.MaxRootStubItems
-					maxDeepStubBuckets = stats.MaxDeepStubBuckets
-					maxDeepStubItems = stats.MaxDeepStubItems
-					maxBucketsPath = stats.MaxBucketsPath
-					bucketItemsAvg = stats.BucketItemsAvg
-					bucketItemsP50 = stats.BucketItemsP50
-					bucketItemsP95 = stats.BucketItemsP95
-					bucketItemsP99 = stats.BucketItemsP99
-					bucketItemsMax = stats.BucketItemsMax
+					runFullStats := final
+					if cfg.FullTrieStatsInterval > 0 && totalProcessedBlocks%uint64(cfg.FullTrieStatsInterval) == 0 {
+						runFullStats = true
+					}
+					if runFullStats {
+						trieStatsStart := time.Now()
+						lastFullTrieStats = bt.Stats()
+						trieStatsDuration = time.Since(trieStatsStart)
+						lastFullTrieStatsBlock = totalProcessedBlocks
+						trieStatsExact = true
+					}
+					stats := lastFullTrieStats
+					if stats != nil {
+						trieChildNodeCount = stats.LeafCount
+						totalArchivedItems = stats.ArchivedDataSize
+						activeLogicalValues = stats.ActiveLogicalValues
+						archivedLogicalValues = stats.ArchivedLogicalValues
+						activeLogicalFailures = stats.ActiveLogicalValueReadFailures
+						archiveLogicalFailures = stats.ArchivedLogicalValueReadFailures
+						totalBucketCount = stats.BucketCount
+						rootBucketCount = stats.RootBucketCount
+						rootArchivedItems = stats.RootArchivedSize
+						rootLeafBucketCount = stats.RootLeafBucketCount
+						rootLeafItems = stats.RootLeafArchivedSize
+						stubBucketCount = stats.StubBucketCount
+						stubArchivedItems = stats.StubArchivedSize
+						rootStubBucketCount = stats.RootStubBucketCount
+						rootStubItems = stats.RootStubArchivedSize
+						deepStubBucketCount = stats.DeepStubBucketCount
+						deepStubItems = stats.DeepStubArchivedSize
+						childBucketCount = stats.ChildBucketCount
+						childArchivedItems = stats.ChildArchivedSize
+						maxStubListBuckets = stats.MaxStubListBuckets
+						maxStubListItems = stats.MaxStubListItems
+						maxRootStubBuckets = stats.MaxRootStubBuckets
+						maxRootStubItems = stats.MaxRootStubItems
+						maxDeepStubBuckets = stats.MaxDeepStubBuckets
+						maxDeepStubItems = stats.MaxDeepStubItems
+						maxBucketsPath = stats.MaxBucketsPath
+						bucketItemsAvg = stats.BucketItemsAvg
+						bucketItemsP50 = stats.BucketItemsP50
+						bucketItemsP95 = stats.BucketItemsP95
+						bucketItemsP99 = stats.BucketItemsP99
+						bucketItemsMax = stats.BucketItemsMax
+					}
 				}
 			}
 		}
@@ -671,6 +774,11 @@ func TestExpireStateProcessor(t *testing.T) {
 		cacheWindowHits := commitDiag.NodeCacheTotalHits - lastNodeCacheHits
 		cacheWindowMisses := commitDiag.NodeCacheTotalMisses - lastNodeCacheMisses
 		cacheWindowEvictions := commitDiag.NodeCacheEvictions - lastNodeCacheEvictions
+		cacheWindowLockContentions := commitDiag.NodeCacheLockContentions - lastNodeCacheLockContentions
+		cacheWindowLockWaitNanos := commitDiag.NodeCacheLockWaitNanos - lastNodeCacheLockWaitNanos
+		cacheWindowDBGets := commitDiag.NodeCacheDBGets - lastNodeCacheDBGets
+		cacheWindowDBGetNanos := commitDiag.NodeCacheDBGetNanos - lastNodeCacheDBGetNanos
+		cacheWindowDBLoadBytes := commitDiag.NodeCacheDBLoadBytes - lastNodeCacheDBLoadBytes
 		if cacheWindowHits < 0 {
 			cacheWindowHits = commitDiag.NodeCacheTotalHits
 		}
@@ -680,9 +788,32 @@ func TestExpireStateProcessor(t *testing.T) {
 		if cacheWindowEvictions < 0 {
 			cacheWindowEvictions = commitDiag.NodeCacheEvictions
 		}
+		if cacheWindowLockContentions < 0 {
+			cacheWindowLockContentions = commitDiag.NodeCacheLockContentions
+		}
+		if cacheWindowLockWaitNanos < 0 {
+			cacheWindowLockWaitNanos = commitDiag.NodeCacheLockWaitNanos
+		}
+		if cacheWindowDBGets < 0 {
+			cacheWindowDBGets = commitDiag.NodeCacheDBGets
+		}
+		if cacheWindowDBGetNanos < 0 {
+			cacheWindowDBGetNanos = commitDiag.NodeCacheDBGetNanos
+		}
+		if cacheWindowDBLoadBytes < 0 {
+			cacheWindowDBLoadBytes = commitDiag.NodeCacheDBLoadBytes
+		}
 		lastNodeCacheHits = commitDiag.NodeCacheTotalHits
 		lastNodeCacheMisses = commitDiag.NodeCacheTotalMisses
 		lastNodeCacheEvictions = commitDiag.NodeCacheEvictions
+		lastNodeCacheLockContentions = commitDiag.NodeCacheLockContentions
+		lastNodeCacheLockWaitNanos = commitDiag.NodeCacheLockWaitNanos
+		lastNodeCacheDBGets = commitDiag.NodeCacheDBGets
+		lastNodeCacheDBGetNanos = commitDiag.NodeCacheDBGetNanos
+		lastNodeCacheDBLoadBytes = commitDiag.NodeCacheDBLoadBytes
+		updateDiagnosticsNow := archivetrie.LastUpdateDiagnostics()
+		windowUpdateDiagnostics := updateDiagnosticsNow.Sub(lastUpdateDiagnostics)
+		lastUpdateDiagnostics = updateDiagnosticsNow
 		txExecutionTPS := 0.0
 		if totalTxTime > 0 {
 			txExecutionTPS = float64(intervalSuccessTxCount) / totalTxTime.Seconds()
@@ -696,6 +827,13 @@ func TestExpireStateProcessor(t *testing.T) {
 		fmt.Printf("  Finalise - Avg: %.2f ms, Max: %v\n", float64(totalFinaliseTime.Milliseconds())/float64(intervalBlocks), maxFinaliseTime)
 		fmt.Printf("  State Commit - Avg: %.2f ms, Max: %v\n", float64(totalCommitTime.Milliseconds())/float64(intervalBlocks), maxCommitTime)
 		fmt.Printf("  State PreCommit - Avg: %.2f ms, Max: %v\n", float64(totalStatePreCommit.Milliseconds())/float64(intervalBlocks), maxStatePreCommit)
+		fmt.Printf("  PreCommit breakdown - finalise=%.3fms storageWall=%.3fms storageWork=%.3fms accountUpdate=%.3fms hash=%.3fms; storageObjects=%d slots=%d maxWorkers=%d longestObject=%v/%d slots\n",
+			float64(totalIntermediateFinalise)/float64(intervalBlocks)/float64(time.Millisecond),
+			float64(totalStorageUpdates)/float64(intervalBlocks)/float64(time.Millisecond),
+			float64(totalStorageUpdateWork)/float64(intervalBlocks)/float64(time.Millisecond),
+			float64(totalAccountUpdates)/float64(intervalBlocks)/float64(time.Millisecond),
+			float64(totalAccountHashes)/float64(intervalBlocks)/float64(time.Millisecond),
+			totalStorageUpdateObjects, totalStorageUpdateSlots, maxStorageUpdateWorkers, maxStorageUpdateObject, maxStorageUpdateObjectSlots)
 		fmt.Printf("  State PostCommit - Avg: %.2f ms, Max: %v\n", float64(totalPostCommit.Milliseconds())/float64(intervalBlocks), maxPostCommit)
 		if cfg.UseBinaryTrie {
 			fmt.Printf("  Account state wipe - Avg: %.3f ms, Max: %v, destroyed=%d wiped=%d slots=%d stems=%d codeChunks=%d phases(index=%v stem=%v stage=%v origin=%v)\n",
@@ -723,6 +861,10 @@ func TestExpireStateProcessor(t *testing.T) {
 			fmt.Printf("  Node cache - window hits=%d misses=%d evictions=%d; lifetime hits=%d misses=%d evictions=%d\n",
 				cacheWindowHits, cacheWindowMisses, cacheWindowEvictions,
 				commitDiag.NodeCacheTotalHits, commitDiag.NodeCacheTotalMisses, commitDiag.NodeCacheEvictions)
+			fmt.Printf("  Node cache detail - entries=%d/%d bytes=%d/%d shards=%d windowLockWait=%v contentions=%d dbGets=%d dbTime=%v loaded=%d bytes\n",
+				commitDiag.NodeCacheEntries, commitDiag.NodeCacheEntryLimit, commitDiag.NodeCacheBytes, commitDiag.NodeCacheBytesLimit,
+				commitDiag.NodeCacheShards, time.Duration(cacheWindowLockWaitNanos), cacheWindowLockContentions,
+				cacheWindowDBGets, time.Duration(cacheWindowDBGetNanos), cacheWindowDBLoadBytes)
 		}
 		if cfg.UseBinaryTrie {
 			fmt.Printf("  ASCT Struct - OuterLeaves=%d, ArchiveRecords=%d, ActiveLogicalValues=%d, ArchivedLogicalValues=%d, LogicalReadFailures=%d/%d, Buckets=%d, RootBuckets=%d/%d items (leaf=%d/%d, stub=%d/%d), StubBuckets=%d/%d items (deep=%d/%d), ChildBuckets=%d/%d items, MaxBucketsPath=%d, MaxStubList=%d/%d items (root=%d/%d, deep=%d/%d)\n",
@@ -1013,6 +1155,8 @@ func TestExpireStateProcessor(t *testing.T) {
 			fmt.Sprintf("%.3f", float64(stateDirScanDuration)/float64(time.Millisecond)),
 			fmt.Sprintf("%.3f", float64(archiveDirScanDuration)/float64(time.Millisecond)),
 			fmt.Sprintf("%.3f", float64(trieStatsDuration)/float64(time.Millisecond)),
+			strconv.FormatBool(trieStatsExact),
+			strconv.FormatUint(lastFullTrieStatsBlock, 10),
 			strconv.FormatInt(commitDiag.NodeCacheTotalHits, 10),
 			strconv.FormatInt(commitDiag.NodeCacheTotalMisses, 10),
 			strconv.FormatInt(commitDiag.NodeCacheEvictions, 10),
@@ -1037,6 +1181,75 @@ func TestExpireStateProcessor(t *testing.T) {
 			fmt.Sprintf("%.3f", float64(totalWipeStemDelete)/float64(time.Millisecond)),
 			fmt.Sprintf("%.3f", float64(totalWipeIndexStage)/float64(time.Millisecond)),
 			fmt.Sprintf("%.3f", float64(totalWipeOriginBuild)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(totalIntermediateFinalise)/float64(intervalBlocks)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(maxIntermediateFinalise)/float64(time.Millisecond)),
+			strconv.FormatUint(maxIntermediateFinaliseBlock, 10),
+			fmt.Sprintf("%.3f", float64(totalStorageUpdates)/float64(intervalBlocks)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(maxStorageUpdates)/float64(time.Millisecond)),
+			strconv.FormatUint(maxStorageUpdatesBlock, 10),
+			fmt.Sprintf("%.3f", float64(totalStorageUpdateWork)/float64(intervalBlocks)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(maxStorageUpdateObject)/float64(time.Millisecond)),
+			strconv.FormatUint(maxStorageUpdateObjectBlock, 10),
+			strconv.FormatInt(maxStorageUpdateObjectSlots, 10),
+			fmt.Sprintf("%.3f", float64(totalStorageUpdateObjects)/float64(intervalBlocks)),
+			fmt.Sprintf("%.3f", float64(totalStorageUpdateSlots)/float64(intervalBlocks)),
+			strconv.FormatInt(maxStorageUpdateWorkers, 10),
+			fmt.Sprintf("%.3f", float64(totalAccountUpdates)/float64(intervalBlocks)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(maxAccountUpdates)/float64(time.Millisecond)),
+			strconv.FormatUint(maxAccountUpdatesBlock, 10),
+			fmt.Sprintf("%.3f", float64(totalAccountHashes)/float64(intervalBlocks)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(maxAccountHashes)/float64(time.Millisecond)),
+			strconv.FormatUint(maxAccountHashesBlock, 10),
+			strconv.FormatInt(totalIntermediateMutations, 10),
+			strconv.FormatInt(totalAccountUpdated, 10),
+			strconv.FormatInt(totalAccountDeleted, 10),
+			strconv.FormatInt(totalStorageUpdated, 10),
+			strconv.FormatInt(totalStorageDeleted, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemPutCalls, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemPutNoops, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemPutLoadedBytes, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemPutEncodedBytes, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemPutCommitmentHashes, 10),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemPutTotalNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemPutLoadNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemPutDecodeNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemPutEncodeNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemPutBackendNanos)/float64(time.Millisecond)),
+			strconv.FormatInt(windowUpdateDiagnostics.StemApplyCalls, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemApplyUpdates, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemApplyStems, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemApplyPuts, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemApplyDeletes, 10),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemApplyTotalNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemApplyLoadNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemApplyEncodeNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemApplyBackendNanos)/float64(time.Millisecond)),
+			strconv.FormatInt(windowUpdateDiagnostics.ShardPutCalls, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.ShardPutValues, 10),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.ShardPutNanos)/float64(time.Millisecond)),
+			strconv.FormatInt(windowUpdateDiagnostics.ShardPutBatchCalls, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.ShardPutBatchValues, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.ShardPutBatchShards, 10),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.ShardPutBatchWallNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.ShardPutBatchWorkNanos)/float64(time.Millisecond)),
+			strconv.FormatInt(windowUpdateDiagnostics.ShardDeleteCalls, 10),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.ShardDeleteNanos)/float64(time.Millisecond)),
+			strconv.FormatInt(windowUpdateDiagnostics.FlatValueGets, 10),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.FlatValueReadIONanos)/float64(time.Millisecond)),
+			strconv.FormatInt(windowUpdateDiagnostics.FlatValueReadIOBytes, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.FlatValuePuts, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.FlatValueDeletes, 10),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.FlatValueWriteNanos)/float64(time.Millisecond)),
+			strconv.FormatInt(windowUpdateDiagnostics.ArchivePromotionChecks, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.ArchivePromotionHits, 10),
+			strconv.FormatInt(commitDiag.NodeCacheEntryLimit, 10),
+			strconv.FormatInt(commitDiag.NodeCacheBytesLimit, 10),
+			strconv.FormatInt(commitDiag.NodeCacheShards, 10),
+			strconv.FormatInt(cacheWindowLockContentions, 10),
+			fmt.Sprintf("%.3f", float64(cacheWindowLockWaitNanos)/float64(time.Millisecond)),
+			strconv.FormatInt(cacheWindowDBGets, 10),
+			fmt.Sprintf("%.3f", float64(cacheWindowDBGetNanos)/float64(time.Millisecond)),
+			strconv.FormatInt(cacheWindowDBLoadBytes, 10),
 		}
 		if len(record) != len(metricsHeader) {
 			t.Fatalf("metrics CSV column mismatch: header=%d record=%d", len(metricsHeader), len(record))
@@ -1054,6 +1267,30 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalStatePreCommit = 0
 		maxStatePreCommit = 0
 		maxStatePreCommitBlock = 0
+		totalIntermediateFinalise = 0
+		maxIntermediateFinalise = 0
+		maxIntermediateFinaliseBlock = 0
+		totalStorageUpdates = 0
+		maxStorageUpdates = 0
+		maxStorageUpdatesBlock = 0
+		totalStorageUpdateWork = 0
+		maxStorageUpdateObject = 0
+		maxStorageUpdateObjectBlock = 0
+		maxStorageUpdateObjectSlots = 0
+		totalStorageUpdateObjects = 0
+		totalStorageUpdateSlots = 0
+		maxStorageUpdateWorkers = 0
+		totalAccountUpdates = 0
+		maxAccountUpdates = 0
+		maxAccountUpdatesBlock = 0
+		totalAccountHashes = 0
+		maxAccountHashes = 0
+		maxAccountHashesBlock = 0
+		totalIntermediateMutations = 0
+		totalAccountUpdated = 0
+		totalAccountDeleted = 0
+		totalStorageUpdated = 0
+		totalStorageDeleted = 0
 		totalPostCommit = 0
 		maxPostCommit = 0
 		maxPostCommitBlock = 0
@@ -1376,6 +1613,7 @@ processFiles:
 					t.Fatalf("pre-commit failed at empty block %d: %v", b, err)
 				}
 				preCommitDuration := time.Since(preCommitStart)
+				recordPreCommitBreakdown(b, statedb)
 				var hashDiag archivetrie.HashDiagnostics
 				if cfg.UseBinaryTrie {
 					hashDiag = archivetrie.LastHashDiagnostics()
@@ -1478,7 +1716,7 @@ processFiles:
 				totalProcessedBlocks++
 				currentBlock++
 				if intervalBlocks >= statsIv {
-					reportStats()
+					reportStats(false)
 				}
 			}
 
@@ -1591,6 +1829,7 @@ processFiles:
 				t.Fatalf("pre-commit failed at block %d: %v", b, err)
 			}
 			preCommitDuration := time.Since(preCommitStart)
+			recordPreCommitBreakdown(b, statedb)
 			var hashDiag archivetrie.HashDiagnostics
 			if cfg.UseBinaryTrie {
 				hashDiag = archivetrie.LastHashDiagnostics()
@@ -1722,7 +1961,7 @@ processFiles:
 			totalProcessedBlocks++
 			currentBlock++
 			if intervalBlocks >= statsIv {
-				reportStats()
+				reportStats(false)
 			}
 			// 每 10w 区块刷新一次假阳性分布
 			if (b+1)%100000 == 0 {
@@ -1732,7 +1971,7 @@ processFiles:
 	}
 	// 最后不足一个周期的统计报告
 	if intervalBlocks > 0 {
-		reportStats()
+		reportStats(true)
 	}
 	fmt.Printf("\n>>> FINAL TRANSACTION SUCCESS RATE SUMMARY <<<\n")
 	if globalTxCount > 0 {
@@ -1919,6 +2158,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 		StartNum:                    46147,
 		PruneInterval:               *pruneInterval,
 		MaxBlocks:                   *maxBlocks,
+		FullTrieStatsInterval:       *fullTrieStatsInterval,
 		ShardDepth:                  *shardDepth,
 		ArchiveBucketSize:           *archiveBucketSize,
 		CuckooBuckets:               *cuckooBuckets,

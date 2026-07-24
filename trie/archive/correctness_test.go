@@ -2833,6 +2833,34 @@ func TestNodeBlobCacheHonorsByteLimit(t *testing.T) {
 	}
 }
 
+func TestNodeBlobCacheShardsConcurrentAccessAndDiagnostics(t *testing.T) {
+	cache := newNodeBlobCacheWithBytesLimit(4096, 4*1024*1024)
+	if diag := cache.diagnostics(); diag.Shards != nodeCacheShardCount {
+		t.Fatalf("unexpected cache shard count: got %d want %d", diag.Shards, nodeCacheShardCount)
+	}
+	var workers sync.WaitGroup
+	for worker := 0; worker < 16; worker++ {
+		workers.Add(1)
+		go func(worker int) {
+			defer workers.Done()
+			for item := 0; item < 256; item++ {
+				key := []byte{byte(worker), byte(item), byte(item >> 8)}
+				cache.add(key, []byte{byte(item)})
+				if _, ok := cache.get(key); !ok {
+					t.Errorf("cache miss immediately after add: worker=%d item=%d", worker, item)
+					return
+				}
+			}
+		}(worker)
+	}
+	workers.Wait()
+	cache.recordDBGet(2*time.Millisecond, 123)
+	diag := cache.diagnostics()
+	if diag.Hits != 16*256 || diag.DBGets != 1 || diag.DBGetNanos != int64(2*time.Millisecond) || diag.DBLoadBytes != 123 {
+		t.Fatalf("unexpected sharded cache diagnostics: %+v", diag)
+	}
+}
+
 func TestPathNodeCacheRemovesStalePath(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	config := DefaultConfig()

@@ -197,15 +197,26 @@ type StateDB struct {
 	// TrieDBCommits   time.Duration
 
 	// Measurements gathered during execution for debugging purposes
-	AccountReads    time.Duration
-	AccountHashes   time.Duration
-	AccountUpdates  time.Duration
-	AccountCommits  time.Duration
-	StorageReads    time.Duration
-	StorageUpdates  time.Duration
-	StorageCommits  time.Duration
-	SnapshotCommits time.Duration
-	TrieDBCommits   time.Duration
+	AccountReads   time.Duration
+	AccountHashes  time.Duration
+	AccountUpdates time.Duration
+	AccountCommits time.Duration
+	StorageReads   time.Duration
+	StorageUpdates time.Duration
+	// StorageUpdateWork is the sum of per-account storage update time. It can
+	// exceed StorageUpdates because independent accounts are processed in
+	// parallel, while StorageUpdates is the elapsed wall time.
+	StorageUpdateWork           time.Duration
+	StorageUpdateMaxObject      time.Duration
+	StorageUpdateObjects        int64
+	StorageUpdateSlots          int64
+	StorageUpdateWorkers        int64
+	StorageUpdateMaxObjectSlots int64
+	StorageCommits              time.Duration
+	SnapshotCommits             time.Duration
+	TrieDBCommits               time.Duration
+	IntermediateFinalise        time.Duration
+	IntermediateMutations       int64
 
 	CommitInternal          time.Duration
 	CommitHandleDestruction time.Duration
@@ -1020,7 +1031,9 @@ func (s *StateDB) wipeUnifiedDestructedState() {
 // goes into transaction receipts.
 func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common.Hash) {
 	// Finalise all the dirty storage states and write them into the tries
+	finaliseStart := time.Now()
 	s.Finalise(deleteEmptyObjects)
+	s.IntermediateFinalise += time.Since(finaliseStart)
 	s.wipeUnifiedDestructedState()
 	if s.dbErr != nil {
 		return common.Hash{}, common.Hash{}
@@ -1039,8 +1052,17 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common
 	// method will internally call a blocking trie fetch from the prefetcher,
 	// so there's no need to explicitly wait for the prefetchers to finish.
 	var (
-		start   = time.Now()
-		workers errgroup.Group
+		start             = time.Now()
+		trackStorageWork  = s.db.TrieDB().IsBinary()
+		workers           errgroup.Group
+		storageWork       atomic.Int64
+		storageObjects    atomic.Int64
+		storageSlots      atomic.Int64
+		storageActive     atomic.Int64
+		storageMaxWorkers atomic.Int64
+		storageMaxMu      sync.Mutex
+		storageMaxObject  time.Duration
+		storageMaxSlots   int64
 	)
 	if s.db.TrieDB().IsVerkle() {
 		// Whilst MPT storage tries are independent, Verkle has one single trie
@@ -1055,10 +1077,21 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common
 			continue
 		}
 		obj := s.stateObjects[addr] // closure for the task runner below
+		var slotCount int64
+		if trackStorageWork {
+			slotCount = int64(len(obj.uncommittedStorage))
+		}
 		if s.db.TrieDB().CacheTrie() != nil && obj.code != nil && len(obj.code) > 0 && obj.dirtyCode {
 			s.db.TrieDB().CacheTrie().AddCode(common.BytesToHash(obj.CodeHash()), obj.code)
 		}
 		workers.Go(func() error {
+			var objectStart time.Time
+			if trackStorageWork {
+				objectStart = time.Now()
+				active := storageActive.Add(1)
+				for current := storageMaxWorkers.Load(); active > current && !storageMaxWorkers.CompareAndSwap(current, active); current = storageMaxWorkers.Load() {
+				}
+			}
 			if s.db.TrieDB().IsVerkle() {
 				obj.updateTrie()
 			} else {
@@ -1068,6 +1101,19 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common
 				if s.witness != nil && obj.trie != nil {
 					s.witness.AddState(obj.trie.Witness())
 				}
+			}
+			if trackStorageWork {
+				storageActive.Add(-1)
+				elapsed := time.Since(objectStart).Nanoseconds()
+				storageWork.Add(elapsed)
+				storageObjects.Add(1)
+				storageSlots.Add(slotCount)
+				storageMaxMu.Lock()
+				if time.Duration(elapsed) > storageMaxObject {
+					storageMaxObject = time.Duration(elapsed)
+					storageMaxSlots = slotCount
+				}
+				storageMaxMu.Unlock()
 			}
 			return nil
 		})
@@ -1107,6 +1153,14 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common
 	}
 	workers.Wait()
 	s.StorageUpdates += time.Since(start)
+	s.StorageUpdateWork += time.Duration(storageWork.Load())
+	s.StorageUpdateMaxObject = max(s.StorageUpdateMaxObject, storageMaxObject)
+	s.StorageUpdateObjects += storageObjects.Load()
+	s.StorageUpdateSlots += storageSlots.Load()
+	s.StorageUpdateWorkers = max(s.StorageUpdateWorkers, storageMaxWorkers.Load())
+	if storageMaxObject >= s.StorageUpdateMaxObject {
+		s.StorageUpdateMaxObjectSlots = storageMaxSlots
+	}
 
 	// Now we're about to start to write changes to the trie. The trie is so far
 	// _untouched_. We can check with the prefetcher, if it can give us a trie
@@ -1152,6 +1206,7 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common
 		}
 		usedAddrs = append(usedAddrs, addr) // Copy needed for closure
 	}
+	s.IntermediateMutations += int64(len(usedAddrs))
 	for _, deletedAddr := range deletedAddrs {
 		s.deleteStateObject(deletedAddr)
 		s.AccountDeleted += 1

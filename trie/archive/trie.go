@@ -337,6 +337,8 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 // Put 把新 value 写成热 leaf。如果该 key 已经在冷桶中，先删除旧冷 entry，
 // 保证一个 key 只有一个有效位置。
 func (t *Trie) Put(key []byte, value []byte) error {
+	start := time.Now()
+	defer func() { recordShardPutDiagnostics(1, time.Since(start)) }()
 	shardID := t.GetShardID(key)
 	if err := t.finishAsyncPruneForShard(shardID); err != nil {
 		return err
@@ -358,6 +360,15 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 	if len(entries) == 0 {
 		return nil
 	}
+	totalStart := time.Now()
+	var groupWork []int64
+	defer func() {
+		var work time.Duration
+		for _, nanos := range groupWork {
+			work += time.Duration(nanos)
+		}
+		recordShardPutBatchDiagnostics(len(entries), len(groupWork), time.Since(totalStart), work)
+	}()
 	type shardWrites struct {
 		id      int
 		entries []KeyValue
@@ -374,6 +385,7 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 		}
 		groups[index].entries = append(groups[index].entries, entry)
 	}
+	groupWork = make([]int64, len(groups))
 	for _, group := range groups {
 		if err := t.finishAsyncPruneForShard(group.id); err != nil {
 			return err
@@ -392,11 +404,13 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 			defer wg.Done()
 			for index := range jobs {
 				group := groups[index]
+				groupStart := time.Now()
 				shard, err := t.getOrCreateShard(group.id)
 				if err == nil {
 					t.markDirtyShard(group.id)
 					err = shard.PutBatch(group.entries)
 				}
+				groupWork[index] = time.Since(groupStart).Nanoseconds()
 				errs[index] = err
 			}
 		}()
@@ -416,6 +430,8 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 
 // Delete 同时删除 key 的热状态和冷状态。
 func (t *Trie) Delete(key []byte) error {
+	start := time.Now()
+	defer func() { recordShardDeleteDiagnostics(time.Since(start)) }()
 	shardID := t.GetShardID(key)
 	if err := t.finishAsyncPruneForShard(shardID); err != nil {
 		return err

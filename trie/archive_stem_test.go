@@ -164,6 +164,30 @@ func TestArchiveTrieStemModeColocatesAndRestoresState(t *testing.T) {
 	}
 }
 
+func TestArchiveTrieStemModeBasicAccountSkipsOldStemLoad(t *testing.T) {
+	db := newArchiveStemTestDB()
+	tr := newArchiveStemWrapper(t, db, nil, 0)
+	addr := common.HexToAddress("0x4321")
+	account := types.NewEmptyStateAccount()
+	account.Balance.SetUint64(1)
+	if err := tr.UpdateAccount(addr, account, 0); err != nil {
+		t.Fatal(err)
+	}
+	account.Balance.SetUint64(2)
+	before := archivetrie.LastUpdateDiagnostics()
+	if err := tr.UpdateAccount(addr, account, 0); err != nil {
+		t.Fatal(err)
+	}
+	window := archivetrie.LastUpdateDiagnostics().Sub(before)
+	if window.StemPutCalls != 1 || window.StemPutLoadedBytes != 0 {
+		t.Fatalf("basic account loaded old stem: calls=%d loaded=%d", window.StemPutCalls, window.StemPutLoadedBytes)
+	}
+	got, err := tr.GetAccount(addr)
+	if err != nil || got == nil || got.Balance.Cmp(account.Balance) != 0 {
+		t.Fatalf("updated account: account=%v err=%v", got, err)
+	}
+}
+
 func TestArchiveTrieStemModeStorageIteratorAndReload(t *testing.T) {
 	db := newArchiveStemTestDB()
 	tr := newArchiveStemWrapper(t, db, nil, 8)

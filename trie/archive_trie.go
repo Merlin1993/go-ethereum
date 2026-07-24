@@ -145,7 +145,7 @@ var (
 	globalTrieRegistryMu sync.Mutex
 )
 
-const defaultBinaryNodeCacheLimit = 262144
+const defaultBinaryNodeCacheLimit = archivetrie.DefaultNodeCacheLimit
 
 // archiveNodeBlobCache 是 wrapper 层的全局节点缓存。
 // 与 trie 内部的 nodeBlobCache 不同，它服务于跨 adapter 读取，所以生命周期更长；
@@ -271,11 +271,14 @@ func (c *archiveNodeBlobCache) diagnostics() archivetrie.NodeCacheDiagnostics {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return archivetrie.NodeCacheDiagnostics{
-		Entries:   int64(c.cache.Len()),
-		Bytes:     c.bytes,
-		Hits:      c.hits,
-		Misses:    c.misses,
-		Evictions: c.evictions,
+		Entries:    int64(c.cache.Len()),
+		Bytes:      c.bytes,
+		EntryLimit: int64(c.limit),
+		BytesLimit: c.bytesLimit,
+		Shards:     1,
+		Hits:       c.hits,
+		Misses:     c.misses,
+		Evictions:  c.evictions,
 	}
 }
 
@@ -445,7 +448,14 @@ func NewArchiveTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Da
 		}
 	}
 
-	configureArchiveNodeCache(nodeCacheLimit, nodeCacheBytesLimit)
+	// Path-mode nodes are cached by their physical path inside archivetrie.
+	// The wrapper cache is keyed by 32-byte hashes and cannot serve those reads,
+	// so keeping a second equally-sized LRU only adds lock and memory overhead.
+	if config.UsePathStorage() {
+		configureArchiveNodeCache(-1, 0)
+	} else {
+		configureArchiveNodeCache(nodeCacheLimit, nodeCacheBytesLimit)
+	}
 	config.NodeCacheLimit = nodeCacheLimit
 	config.NodeCacheBytesLimit = nodeCacheBytesLimit
 	config.PhysicalDelete = physicalDelete
@@ -1134,6 +1144,9 @@ func (t *ArchiveTrie) GetStorage(addr common.Address, key []byte) ([]byte, error
 func (t *ArchiveTrie) UpdateAccount(address common.Address, acc *types.StateAccount, codeLen int) error {
 	value := types.SlimAccountRLP(*acc)
 	if t.stem != nil {
+		if accountUsesOnlyBasicStem(acc) {
+			return t.stem.ReplaceStem(trieutils.BinaryTreeBasicDataKey(address), value)
+		}
 		return t.stem.Put(trieutils.BinaryTreeBasicDataKey(address), value)
 	}
 	return t.trie.Put(address.Bytes(), value)
@@ -1142,9 +1155,18 @@ func (t *ArchiveTrie) UpdateAccount(address common.Address, acc *types.StateAcco
 // UpdateAccountRLP 直接写入上层已经编码好的账户 RLP。
 func (t *ArchiveTrie) UpdateAccountRLP(address common.Address, account []byte, codeLen int) error {
 	if t.stem != nil {
+		if decoded, err := types.FullAccount(account); err == nil && accountUsesOnlyBasicStem(decoded) {
+			return t.stem.ReplaceStem(trieutils.BinaryTreeBasicDataKey(address), account)
+		}
 		return t.stem.Put(trieutils.BinaryTreeBasicDataKey(address), account)
 	}
 	return t.trie.Put(address.Bytes(), account)
+}
+
+func accountUsesOnlyBasicStem(account *types.StateAccount) bool {
+	return account != nil &&
+		account.Root == types.EmptyRootHash &&
+		bytes.Equal(account.CodeHash, types.EmptyCodeHash[:])
 }
 
 // UpdateStorage 写入单个 storage slot；空值表示删除。
@@ -1630,9 +1652,22 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 		// 慢提交时下面还会额外记录完整 runtime.MemStats。
 		cacheDiag := t.trie.NodeCacheDiagnostics()
 		globalCacheDiag := archiveNodeCacheDiagnostics()
-		nodeCacheEntries := cacheDiag.Entries + globalCacheDiag.Entries
-		nodeCacheBytes := cacheDiag.Bytes + globalCacheDiag.Bytes
-		archivetrie.RecordNodeCacheDiagnostics(cacheDiag.Hits+globalCacheDiag.Hits, cacheDiag.Misses+globalCacheDiag.Misses, cacheDiag.Evictions+globalCacheDiag.Evictions)
+		cacheDiag.Entries += globalCacheDiag.Entries
+		cacheDiag.Bytes += globalCacheDiag.Bytes
+		cacheDiag.EntryLimit += globalCacheDiag.EntryLimit
+		cacheDiag.BytesLimit += globalCacheDiag.BytesLimit
+		cacheDiag.Shards += globalCacheDiag.Shards
+		cacheDiag.Hits += globalCacheDiag.Hits
+		cacheDiag.Misses += globalCacheDiag.Misses
+		cacheDiag.Evictions += globalCacheDiag.Evictions
+		cacheDiag.LockContentions += globalCacheDiag.LockContentions
+		cacheDiag.LockWaitNanos += globalCacheDiag.LockWaitNanos
+		cacheDiag.DBGets += globalCacheDiag.DBGets
+		cacheDiag.DBGetNanos += globalCacheDiag.DBGetNanos
+		cacheDiag.DBLoadBytes += globalCacheDiag.DBLoadBytes
+		nodeCacheEntries := cacheDiag.Entries
+		nodeCacheBytes := cacheDiag.Bytes
+		archivetrie.RecordNodeCacheDiagnostics(cacheDiag)
 		archivetrie.RecordWrapperResourceDiagnostics(rawTotalOps, rawTotalBytes, rawMaxShardID, rawMaxOps, rawMaxBytes, nodeCacheEntries, nodeCacheBytes, 0, 0, 0, 0, 0, 0, 0)
 		if totalDuration > 5*time.Second || shardCommitDuration > 5*time.Second || rootHashDuration > 5*time.Second || batchWriteDuration > 5*time.Second {
 			var mem runtime.MemStats

@@ -84,6 +84,27 @@ func (h *PooledKeccakHasher) Hash(data []byte) []byte {
 	return hash
 }
 
+// HashTriple hashes the concatenation of three slices without allocating a
+// temporary combined buffer.
+func (h *PooledKeccakHasher) HashTriple(first, second, third []byte) []byte {
+	raw := keccakPool.Get()
+	var sha crypto.KeccakState
+	if raw == nil {
+		sha = crypto.NewKeccakState()
+	} else {
+		sha = raw.(crypto.KeccakState)
+	}
+	defer keccakPool.Put(sha)
+
+	sha.Reset()
+	sha.Write(first)
+	sha.Write(second)
+	sha.Write(third)
+	hash := make([]byte, 32)
+	sha.Read(hash)
+	return hash
+}
+
 // NodePool manages reuse of Trie nodes to reduce GC pressure.
 type NodePool struct {
 	internalPool sync.Pool

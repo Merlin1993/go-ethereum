@@ -36,6 +36,7 @@ type Config struct {
 	CuckooBuckets             int // Number of buckets in cuckoo filter (default 32)
 	CuckooSlots               int // Slots per bucket in cuckoo filter (default 4)
 	NodeStorageScheme         string
+	statsView                 bool // Internal read-only views must not pollute hot-path diagnostics.
 }
 
 // DefaultConfig returns a Config with default values.
@@ -164,11 +165,17 @@ func (t *Trie) Stats() *TrieStats {
 }
 
 func newStatsShardView(id int, db KVStore, hasher Hasher, config *Config, nodeCache *nodeBlobCache, rootHash []byte, pruning bool, globalEpochBit func() byte) *Shard {
+	viewConfig := config
+	if config != nil {
+		copy := *config
+		copy.statsView = true
+		viewConfig = &copy
+	}
 	return &Shard{
 		id:             id,
 		db:             db,
 		hasher:         hasher,
-		config:         config,
+		config:         viewConfig,
 		nodeCache:      nodeCache,
 		rootHash:       append([]byte(nil), rootHash...),
 		nodePaths:      make(map[string]persistedNodePath),

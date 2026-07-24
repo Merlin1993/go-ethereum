@@ -2,6 +2,8 @@ package archive
 
 import (
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/trie/archive/ecmh"
@@ -9,7 +11,11 @@ import (
 
 // DefaultNodeCacheLimit mirrors the archive trie wrapper default. A zero config
 // value resolves to this default; negative values disable the cache.
-const DefaultNodeCacheLimit = 262144
+const DefaultNodeCacheLimit = 1048576
+
+// nodeCacheShardCount keeps unrelated shard workers off the same LRU lock.
+// It is deliberately fixed so cache behavior stays comparable across runs.
+const nodeCacheShardCount = 64
 
 // DefaultNodeCacheBytesLimit is a hard memory guard for serialized clean-node
 // blobs. The entry limit alone is not enough for long path-mode replays because
@@ -31,26 +37,45 @@ const DefaultCommitmentPointCacheLimit = -1
 // turning large dirty-shard windows into LevelDB/GC contention spikes.
 const DefaultCommitWorkers = 16
 
+type nodeBlobCacheShard struct {
+	mu              sync.Mutex
+	cache           lru.BasicLRU[string, []byte]
+	limit           int
+	bytesLimit      int64
+	bytes           int64
+	hits            int64
+	misses          int64
+	evictions       int64
+	lockWaitNanos   int64
+	lockContentions int64
+}
+
 type nodeBlobCache struct {
-	mu         sync.Mutex
-	cache      lru.BasicLRU[string, []byte]
-	limit      int
-	bytesLimit int64
-	bytes      int64
-	hits       int64
-	misses     int64
-	evictions  int64
+	shards      []nodeBlobCacheShard
+	limit       int
+	bytesLimit  int64
+	dbGets      atomic.Int64
+	dbGetNanos  atomic.Int64
+	dbLoadBytes atomic.Int64
 }
 
 // NodeCacheDiagnostics contains the current cache size and lifetime lookup
 // counters. Counters are maintained under the cache's existing mutex, so they
 // add no extra synchronization to the read path.
 type NodeCacheDiagnostics struct {
-	Entries   int64
-	Bytes     int64
-	Hits      int64
-	Misses    int64
-	Evictions int64
+	Entries         int64
+	Bytes           int64
+	EntryLimit      int64
+	BytesLimit      int64
+	Shards          int64
+	Hits            int64
+	Misses          int64
+	Evictions       int64
+	LockContentions int64
+	LockWaitNanos   int64
+	DBGets          int64
+	DBGetNanos      int64
+	DBLoadBytes     int64
 }
 
 func newNodeBlobCache(limit int) *nodeBlobCache {
@@ -73,25 +98,81 @@ func newNodeBlobCacheWithBytesLimit(limit int, bytesLimit int64) *nodeBlobCache 
 	case bytesLimit < 0:
 		bytesLimit = 0
 	}
-	return &nodeBlobCache{
-		cache:      lru.NewBasicLRU[string, []byte](limit),
+	shardCount := nodeCacheShardCount
+	// Tiny caches are primarily used by tests and short-lived tools. Keeping
+	// them as one LRU preserves exact global eviction semantics and avoids
+	// dividing a small byte budget into unusably small pieces.
+	if limit < nodeCacheShardCount*16 {
+		shardCount = 1
+	}
+	cache := &nodeBlobCache{
+		shards:     make([]nodeBlobCacheShard, shardCount),
 		limit:      limit,
 		bytesLimit: bytesLimit,
 	}
+	for i := range cache.shards {
+		entryLimit := limit / shardCount
+		if i < limit%shardCount {
+			entryLimit++
+		}
+		byteLimit := int64(0)
+		if bytesLimit > 0 {
+			byteLimit = bytesLimit / int64(shardCount)
+			if int64(i) < bytesLimit%int64(shardCount) {
+				byteLimit++
+			}
+		}
+		cache.shards[i] = nodeBlobCacheShard{
+			cache:      lru.NewBasicLRU[string, []byte](entryLimit),
+			limit:      entryLimit,
+			bytesLimit: byteLimit,
+		}
+	}
+	return cache
+}
+
+func nodeCacheHash(key []byte) uint64 {
+	// FNV-1a is cheap and, unlike selecting a prefix byte, distributes path
+	// storage keys whose leading bytes are intentionally identical.
+	const (
+		offset64 = uint64(14695981039346656037)
+		prime64  = uint64(1099511628211)
+	)
+	hash := offset64
+	for _, b := range key {
+		hash ^= uint64(b)
+		hash *= prime64
+	}
+	return hash
+}
+
+func (c *nodeBlobCache) shard(key []byte) *nodeBlobCacheShard {
+	return &c.shards[nodeCacheHash(key)%uint64(len(c.shards))]
+}
+
+func (s *nodeBlobCacheShard) lock() {
+	if s.mu.TryLock() {
+		return
+	}
+	start := time.Now()
+	s.mu.Lock()
+	s.lockWaitNanos += time.Since(start).Nanoseconds()
+	s.lockContentions++
 }
 
 func (c *nodeBlobCache) get(key []byte) ([]byte, bool) {
 	if c == nil || len(key) == 0 {
 		return nil, false
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	data, ok := c.cache.Get(string(key))
+	shard := c.shard(key)
+	shard.lock()
+	defer shard.mu.Unlock()
+	data, ok := shard.cache.Get(string(key))
 	if !ok {
-		c.misses++
+		shard.misses++
 		return nil, false
 	}
-	c.hits++
+	shard.hits++
 	return data, true
 }
 
@@ -101,54 +182,64 @@ func (c *nodeBlobCache) add(key []byte, data []byte) {
 	}
 	k := string(key)
 	size := int64(len(k) + len(data))
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.bytesLimit > 0 && size > c.bytesLimit {
-		c.removeStringLocked(k)
+	shard := c.shard(key)
+	shard.lock()
+	defer shard.mu.Unlock()
+	if shard.bytesLimit > 0 && size > shard.bytesLimit {
+		shard.removeStringLocked(k)
 		return
 	}
-	if old, ok := c.cache.Peek(k); ok {
-		c.bytes -= int64(len(k) + len(old))
-		c.cache.Remove(k)
+	if old, ok := shard.cache.Peek(k); ok {
+		shard.bytes -= int64(len(k) + len(old))
+		shard.cache.Remove(k)
 	}
-	for c.limit > 0 && c.cache.Len() >= c.limit {
-		c.removeOldestLocked()
+	for shard.limit > 0 && shard.cache.Len() >= shard.limit {
+		shard.removeOldestLocked()
 	}
-	for c.bytesLimit > 0 && c.bytes+size > c.bytesLimit && c.cache.Len() > 0 {
-		c.removeOldestLocked()
+	for shard.bytesLimit > 0 && shard.bytes+size > shard.bytesLimit && shard.cache.Len() > 0 {
+		shard.removeOldestLocked()
 	}
-	c.cache.Add(k, data)
-	c.bytes += size
+	shard.cache.Add(k, data)
+	shard.bytes += size
 }
 
 func (c *nodeBlobCache) remove(key []byte) {
 	if c == nil || len(key) == 0 {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.removeStringLocked(string(key))
+	shard := c.shard(key)
+	shard.lock()
+	defer shard.mu.Unlock()
+	shard.removeStringLocked(string(key))
 }
 
-func (c *nodeBlobCache) removeStringLocked(key string) {
-	if c == nil {
-		return
-	}
-	if old, ok := c.cache.Peek(key); ok {
-		c.bytes -= int64(len(key) + len(old))
-		c.cache.Remove(key)
+func (s *nodeBlobCacheShard) removeStringLocked(key string) {
+	if old, ok := s.cache.Peek(key); ok {
+		s.bytes -= int64(len(key) + len(old))
+		s.cache.Remove(key)
 	}
 }
 
-func (c *nodeBlobCache) removeOldestLocked() {
-	key, value, ok := c.cache.RemoveOldest()
+func (s *nodeBlobCacheShard) removeOldestLocked() {
+	key, value, ok := s.cache.RemoveOldest()
 	if !ok {
 		return
 	}
-	c.bytes -= int64(len(key) + len(value))
-	c.evictions++
-	if c.bytes < 0 {
-		c.bytes = 0
+	s.bytes -= int64(len(key) + len(value))
+	s.evictions++
+	if s.bytes < 0 {
+		s.bytes = 0
+	}
+}
+
+func (c *nodeBlobCache) recordDBGet(elapsed time.Duration, loadedBytes int) {
+	if c == nil {
+		return
+	}
+	c.dbGets.Add(1)
+	c.dbGetNanos.Add(elapsed.Nanoseconds())
+	if loadedBytes > 0 {
+		c.dbLoadBytes.Add(int64(loadedBytes))
 	}
 }
 
@@ -161,15 +252,27 @@ func (c *nodeBlobCache) diagnostics() NodeCacheDiagnostics {
 	if c == nil {
 		return NodeCacheDiagnostics{}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return NodeCacheDiagnostics{
-		Entries:   int64(c.cache.Len()),
-		Bytes:     c.bytes,
-		Hits:      c.hits,
-		Misses:    c.misses,
-		Evictions: c.evictions,
+	diag := NodeCacheDiagnostics{
+		EntryLimit:  int64(c.limit),
+		BytesLimit:  c.bytesLimit,
+		Shards:      int64(len(c.shards)),
+		DBGets:      c.dbGets.Load(),
+		DBGetNanos:  c.dbGetNanos.Load(),
+		DBLoadBytes: c.dbLoadBytes.Load(),
 	}
+	for i := range c.shards {
+		shard := &c.shards[i]
+		shard.lock()
+		diag.Entries += int64(shard.cache.Len())
+		diag.Bytes += shard.bytes
+		diag.Hits += shard.hits
+		diag.Misses += shard.misses
+		diag.Evictions += shard.evictions
+		diag.LockContentions += shard.lockContentions
+		diag.LockWaitNanos += shard.lockWaitNanos
+		shard.mu.Unlock()
+	}
+	return diag
 }
 
 type commitmentPointCache struct {

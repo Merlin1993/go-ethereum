@@ -110,12 +110,13 @@ go test ./core/tree_test -run TestExpireStateProcessor -count=1 -timeout 0 -v -a
   -dbDir2 "$run\state_db" `
   -binaryArchiveDir2 "$run\archive_db" `
   -metricsDir2 "$run" `
-  -startFileIdx2 1 -endFileIdx2 21 -statsInterval2 100000 -blocks 0 `
+  -startFileIdx2 1 -endFileIdx2 21 -statsInterval2 100000 -fullTrieStatsInterval 2000000 -blocks 0 `
   -shardDepth 20 -archiveBucketSize 100 `
   -cuckooBuckets 16 -cuckooSlots 4 `
   -binaryStemArchive=true `
   -binaryPhysicalDelete=false -binaryNodeStorage path `
   -binaryCommitWorkers=16 `
+  -binaryNodeCacheLimit=1048576 `
   -binaryNodeCacheBytesLimitMB=512 `
   -binaryPathDiagnostics=false `
   -binaryCommitWatchdogSec=30 `
@@ -129,6 +130,12 @@ go test ./core/tree_test -run TestExpireStateProcessor -count=1 -timeout 0 -v -a
 The 8-second root and destruction limits are acceptance guards, not timeout
 workarounds. Keep per-shard prune CSV disabled for the first performance replay;
 enable it only when archive/prune itself is the suspected bottleneck.
+
+`statsInterval2` controls the lightweight performance rows. Exact structural
+tree scans are much heavier and are controlled separately by
+`fullTrieStatsInterval`; rows with `Trie_Stats_Exact=false` reuse the most recent
+structural snapshot and `Trie_Stats_Block` identifies its block. Set
+`fullTrieStatsInterval=0` to run the exact scan only for a non-empty final window.
 
 Recommended local guard thresholds:
 
@@ -306,6 +313,10 @@ Common metrics:
 - `Wipe_Index_Scan_ms`, `Wipe_Stem_Delete_ms`, `Wipe_Index_Stage_ms`, `Wipe_Origin_Build_ms`
 - `Avg_Hash_Total_ms`, `Avg_Hash_Shard_Wall_ms`, `Avg_Hash_Shard_Work_ms`
 - `Avg_Hash_Workers`, `Avg_Hash_Dirty_Shards`, `Max_Hash_Total_ms`
+- `Stem_Put_Calls`, `Stem_Put_Noops`, `Stem_Put_Commitment_Hashes`
+- `Stem_Put_Total_ms`, `Stem_Put_Load_ms`, `Stem_Put_Decode_ms`
+- `Stem_Put_Encode_ms`, `Stem_Put_Backend_ms`
+- `Stem_Put_Loaded_Bytes`, `Stem_Put_Encoded_Bytes`
 - `NodeCache_Window_Hits`, `NodeCache_Window_Misses`, `NodeCache_Window_Evictions`
 - `Metrics_Collection_ms`, `State_Dir_Scan_ms`, `Trie_Stats_ms`
 - `State_Storage_Bytes`

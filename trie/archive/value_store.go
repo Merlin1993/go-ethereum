@@ -1,6 +1,10 @@
 package archive
 
-import "github.com/ethereum/go-ethereum/common"
+import (
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+)
 
 var flatValuePrefix = []byte{'B', 'F', 'V', '1'}
 
@@ -41,6 +45,10 @@ func (s *Shard) stageFlatDeleteForKey(key []byte) {
 // getFlatValue 是真实 value 的唯一读取路径。archive metadata 只证明 membership，
 // 执行读取仍从 pending、staged、外部 snapshot reader 或本地 flat-value 表取值。
 func (s *Shard) getFlatValue(key []byte) ([]byte, error) {
+	recordDiagnostics := s.config == nil || !s.config.statsView
+	if recordDiagnostics {
+		recordFlatValueGet()
+	}
 	if len(key) == 0 {
 		return nil, ErrNodeNotFound
 	}
@@ -57,11 +65,26 @@ func (s *Shard) getFlatValue(key []byte) ([]byte, error) {
 		}
 	}
 	if s.config != nil && s.config.FlatReader != nil {
-		if value, err := s.config.FlatReader.GetFlatValue(key); err == nil && value != nil {
+		var start time.Time
+		if recordDiagnostics {
+			start = time.Now()
+		}
+		value, err := s.config.FlatReader.GetFlatValue(key)
+		if recordDiagnostics {
+			recordFlatValueReadIO(time.Since(start), len(value))
+		}
+		if err == nil && value != nil {
 			return value, nil
 		}
 	}
+	var start time.Time
+	if recordDiagnostics {
+		start = time.Now()
+	}
 	value, err := s.db.Get(flatValueDataKey(key))
+	if recordDiagnostics {
+		recordFlatValueReadIO(time.Since(start), len(value))
+	}
 	if err == nil && value != nil {
 		return value, nil
 	}
@@ -88,6 +111,10 @@ func (s *Shard) commitPendingValues(batch Batcher) error {
 }
 
 func (s *Shard) commitFlatValueStore(batch Batcher, values map[string][]byte, deletes map[string]struct{}) error {
+	start := time.Now()
+	if s.config == nil || !s.config.statsView {
+		defer func() { recordFlatValueWrite(len(values), len(deletes), time.Since(start)) }()
+	}
 	if batch == nil {
 		for key := range deletes {
 			if err := s.db.Delete(flatValueDataKey([]byte(key))); err != nil {
