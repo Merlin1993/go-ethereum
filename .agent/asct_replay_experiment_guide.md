@@ -53,6 +53,10 @@ Each run directory should contain:
 - `go_test.exit.txt` or `go_test.exit`
 - `asct_mainnet_metrics.csv`
 - ASCT only: `asct_prune_shard_metrics.csv` when `-binaryPruneShardMetrics=true`
+- ASCT only: `asct_filter_fp_metrics.csv` when
+  `-binaryFilterFPSamplesPerBucket` is positive
+- ASCT only: `asct_final_storage_breakdown.json` when
+  `-binaryStorageBreakdownFinal=true`
 
 ## 2. Preflight Checklist
 
@@ -122,6 +126,9 @@ go test ./core/tree_test -run TestExpireStateProcessor -count=1 -timeout 0 -v -a
   -binaryCommitWatchdogSec=30 `
   -binaryAsyncPrune=true `
   -binaryPruneShardMetrics=false `
+  -binaryFilterFPSamplesPerBucket=1 `
+  -binaryFilterFPSeed=1 `
+  -binaryStorageBreakdownFinal=true `
   -maxRootPipelineMs 8000 `
   -maxHandleDestructionMs 8000 `
   -maxPruningMs 30000
@@ -135,7 +142,37 @@ enable it only when archive/prune itself is the suspected bottleneck.
 tree scans are much heavier and are controlled separately by
 `fullTrieStatsInterval`; rows with `Trie_Stats_Exact=false` reuse the most recent
 structural snapshot and `Trie_Stats_Block` identifies its block. Set
-`fullTrieStatsInterval=0` to run the exact scan only for a non-empty final window.
+`fullTrieStatsInterval=0` to skip periodic exact structure scans.
+The final storage breakdown is intentionally more expensive: it reads every
+reachable suffix once and writes `asct_final_storage_breakdown.json`, including
+when the replay ends exactly on a statistics interval boundary. Intermediate
+exact scans do not perform this inventory, so they do not distort the
+performance run.
+`Active_Only_Logical_Bytes` is the reachable hot tree, active Stem records, and
+required account indexes. `Archived_Payload_Logical_Bytes` is the archive
+bucket plus archived Stem payload. These are logical key/value bytes, not
+LevelDB table size; compare their sum with `Shared_DB_Bytes` to expose shared
+database, obsolete-version, WAL, and compaction overhead.
+
+The synthetic filter workload checks one known member and the configured
+number of known non-members per archive bucket. Use `Synthetic_Negative_Queries`
+as the false-positive denominator. Detailed density, path-depth, and shard rows
+are written to `asct_filter_fp_metrics.csv`.
+
+For the async-prune A/B, run the same commit and all the same flags twice,
+changing only `-binaryAsyncPrune=true` to `false`. Use separate fresh databases;
+the main CSV now records this mode explicitly.
+
+Proof acceptance limits can be enforced without changing code:
+
+```text
+-maxAvgArchiveProofBytes <bytes>
+-maxItemArchiveProofBytes <bytes>
+-maxArchiveProofVerifyMs <milliseconds>
+```
+
+A zero limit disables that guard. Record the chosen limits before starting the
+run; do not infer an SLA after seeing the result.
 
 Recommended local guard thresholds:
 

@@ -1,6 +1,7 @@
 package tree
 
 import (
+	"bytes"
 	stdbinary "encoding/binary"
 	"encoding/csv"
 	"encoding/json"
@@ -74,6 +75,9 @@ var (
 	binaryNodeCacheBytesLimitMB = flag.Int("binaryNodeCacheBytesLimitMB", 512, "Binary trie process node cache byte limit in MiB; 0 uses default, negative disables byte cap")
 	binaryPathDiagnostics       = flag.Bool("binaryPathDiagnostics", false, "Enable binary trie path/cache diagnostics")
 	binaryPruneShardMetrics     = flag.Bool("binaryPruneShardMetrics", false, "Write per-prune binary shard pressure metrics CSV")
+	binaryFilterFPSamples       = flag.Int("binaryFilterFPSamplesPerBucket", 1, "Known-negative Cuckoo-filter probes per archive bucket during exact trie scans; 0 disables")
+	binaryFilterFPSeed          = flag.Int64("binaryFilterFPSeed", 1, "Deterministic seed for archive filter probes")
+	binaryStorageBreakdownFinal = flag.Bool("binaryStorageBreakdownFinal", true, "Read every reachable suffix at the final exact scan to measure active/archive logical bytes")
 	binaryAsyncPrune            = flag.Bool("binaryAsyncPrune", false, "Run binary shard pruning asynchronously and wait before root commit")
 	binaryCommitWorkers         = flag.Int("binaryCommitWorkers", 0, "Max parallel binary shard commit workers; 0 uses binary default cap")
 	binaryCommitWatchdog        = flag.Int("binaryCommitWatchdogSec", 0, "Dump goroutines if one binary wrapper commit exceeds this many seconds; 0 disables")
@@ -84,6 +88,9 @@ var (
 	maxRootPipelineMs           = flag.Int("maxRootPipelineMs", 0, "Abort if any block root pipeline exceeds this many milliseconds; 0 disables")
 	maxHandleDestructMs         = flag.Int("maxHandleDestructionMs", 0, "Abort if any block handleDestruction exceeds this many milliseconds; 0 disables")
 	maxPruningMs                = flag.Int("maxPruningMs", 0, "Abort if any binary pruning step exceeds this many milliseconds; 0 disables")
+	maxAvgArchiveProofBytes     = flag.Int("maxAvgArchiveProofBytes", 0, "Abort if an interval's average archive proof exceeds this many bytes; 0 disables")
+	maxItemArchiveProofBytes    = flag.Int("maxItemArchiveProofBytes", 0, "Abort if an archive item proof exceeds this many bytes; 0 disables")
+	maxArchiveProofVerifyMs     = flag.Int("maxArchiveProofVerifyMs", 0, "Abort if archive proof verification exceeds this many milliseconds; 0 disables")
 )
 
 func TestMain(m *testing.M) {
@@ -119,6 +126,9 @@ type ProcessorConfig struct {
 	BinaryNodeCacheBytesLimitMB int
 	BinaryPathDiagnostics       bool
 	BinaryPruneShardMetrics     bool
+	BinaryFilterFPSamples       int
+	BinaryFilterFPSeed          int64
+	BinaryStorageBreakdownFinal bool
 	BinaryAsyncPrune            bool
 	BinaryCommitWorkers         int
 	BinaryCommitWatchdog        int
@@ -129,6 +139,31 @@ type ProcessorConfig struct {
 	MaxRootPipelineMs           int
 	MaxHandleDestructMs         int
 	MaxPruningMs                int
+	MaxAvgArchiveProofBytes     int
+	MaxItemArchiveProofBytes    int
+	MaxArchiveProofVerifyMs     int
+}
+
+type finalStorageBreakdownReport struct {
+	Block                       uint64  `json:"block"`
+	ScanDurationMs              float64 `json:"scan_duration_ms"`
+	Valid                       bool    `json:"valid"`
+	ReadFailures                int64   `json:"read_failures"`
+	SharedDatabasePhysicalBytes int64   `json:"shared_database_physical_bytes"`
+	RootBranchLogicalBytes      int64   `json:"root_branch_logical_bytes"`
+	HotTreeNodeLogicalBytes     int64   `json:"hot_tree_node_logical_bytes"`
+	ArchiveBucketLogicalBytes   int64   `json:"archive_bucket_logical_bytes"`
+	ActiveStemMetadataBytes     int64   `json:"active_stem_metadata_bytes"`
+	ArchivedStemMetadataBytes   int64   `json:"archived_stem_metadata_bytes"`
+	ActiveSuffixValueBytes      int64   `json:"active_suffix_value_bytes"`
+	ArchivedSuffixValueBytes    int64   `json:"archived_suffix_value_bytes"`
+	ActiveLegacyStemBlobBytes   int64   `json:"active_legacy_stem_blob_bytes"`
+	ArchivedLegacyStemBlobBytes int64   `json:"archived_legacy_stem_blob_bytes"`
+	ArchiveIndexLogicalBytes    int64   `json:"archive_index_logical_bytes"`
+	ArchiveIndexEntries         int64   `json:"archive_index_entries"`
+	ActiveOnlyLogicalBytes      int64   `json:"active_only_logical_bytes"`
+	ArchivedPayloadLogicalBytes int64   `json:"archived_payload_logical_bytes"`
+	ReachableLogicalBytes       int64   `json:"reachable_logical_bytes"`
 }
 
 func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
@@ -228,6 +263,29 @@ func checkDurationLimit(t *testing.T, label string, block uint64, got time.Durat
 	}
 }
 
+func durationPercentiles(samples []time.Duration) (time.Duration, time.Duration, time.Duration) {
+	if len(samples) == 0 {
+		return 0, 0, 0
+	}
+	ordered := append([]time.Duration(nil), samples...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	at := func(percent int) time.Duration {
+		rank := (len(ordered)*percent + 99) / 100
+		if rank < 1 {
+			rank = 1
+		}
+		return ordered[rank-1]
+	}
+	return at(50), at(95), at(99)
+}
+
+func microsPer(nanos, count int64) float64 {
+	if count <= 0 {
+		return 0
+	}
+	return float64(nanos) / float64(count) / float64(time.Microsecond)
+}
+
 // Transaction loading is now handled by TransactionStreamer in processor_utils.go
 
 // 增加配置 -- binary-trie的分片数 binary-trie stub桶的大小上限.
@@ -260,6 +318,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
 		BinaryPathDiagnostics:       *binaryPathDiagnostics,
 		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
+		BinaryFilterFPSamples:       *binaryFilterFPSamples,
+		BinaryFilterFPSeed:          *binaryFilterFPSeed,
+		BinaryStorageBreakdownFinal: *binaryStorageBreakdownFinal,
 		BinaryAsyncPrune:            *binaryAsyncPrune,
 		BinaryCommitWorkers:         *binaryCommitWorkers,
 		BinaryCommitWatchdog:        *binaryCommitWatchdog,
@@ -270,6 +331,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		MaxRootPipelineMs:           *maxRootPipelineMs,
 		MaxHandleDestructMs:         *maxHandleDestructMs,
 		MaxPruningMs:                *maxPruningMs,
+		MaxAvgArchiveProofBytes:     *maxAvgArchiveProofBytes,
+		MaxItemArchiveProofBytes:    *maxItemArchiveProofBytes,
+		MaxArchiveProofVerifyMs:     *maxArchiveProofVerifyMs,
 	}
 	fmt.Printf("[ASCT_CONFIG] stemArchive=%t shardDepth=%d bucketSize=%d nodeStorage=%s pruneInterval=%d\n",
 		cfg.BinaryStemArchive, cfg.ShardDepth, cfg.ArchiveBucketSize, cfg.BinaryNodeStorage, cfg.PruneInterval)
@@ -409,6 +473,12 @@ func TestExpireStateProcessor(t *testing.T) {
 		lastNodeCacheDBGetNanos      int64
 		lastNodeCacheDBLoadBytes     int64
 		lastUpdateDiagnostics        archivetrie.UpdateDiagnostics
+		lastStemPutLatency           archivetrie.LatencyHistogram
+		lastStemApplyLatency         archivetrie.LatencyHistogram
+		commitLatencySamples         []time.Duration
+		preCommitLatencySamples      []time.Duration
+		rootPipelineLatencySamples   []time.Duration
+		rootChargedLatencySamples    []time.Duration
 	)
 	recordPreCommitBreakdown := func(block uint64, statedb *state.StateDB) {
 		totalIntermediateFinalise += statedb.IntermediateFinalise
@@ -497,6 +567,23 @@ func TestExpireStateProcessor(t *testing.T) {
 	kvStatsWriter := csv.NewWriter(kvStatsFile)
 	defer kvStatsWriter.Flush()
 
+	var filterFPWriter *csv.Writer
+	var filterFPFile *os.File
+	if cfg.UseBinaryTrie && cfg.BinaryFilterFPSamples > 0 {
+		filterFPFile, err = os.Create(filepath.Join(outputDir, "asct_filter_fp_metrics.csv"))
+		if err != nil {
+			t.Fatalf("failed to create archive filter metrics csv file: %v", err)
+		}
+		defer filterFPFile.Close()
+		filterFPWriter = csv.NewWriter(filterFPFile)
+		defer filterFPWriter.Flush()
+		filterFPWriter.Write([]string{
+			"Block", "Dimension", "Group", "Buckets", "Sampled_Buckets",
+			"Filter_Checks", "Filter_Positives", "Positive_Queries", "True_Positives",
+			"Negative_Queries", "False_Positives", "FPR",
+		})
+	}
+
 	var pruneShardWriter *csv.Writer
 	var pruneShardFile *os.File
 	if cfg.UseBinaryTrie && cfg.BinaryPruneShardMetrics {
@@ -522,6 +609,10 @@ func TestExpireStateProcessor(t *testing.T) {
 	}
 	var lastFullTrieStats *archivetrie.TrieStats
 	var lastFullTrieStatsBlock uint64
+	var lastFilterFPStats *archivetrie.ArchiveFilterFPStats
+	var lastFilterFPStatsBlock uint64
+	var finalStorageStats *archivetrie.TrieStats
+	var finalStorageScanDuration time.Duration
 
 	// Write CSV Header
 	metricsHeader := []string{
@@ -531,12 +622,20 @@ func TestExpireStateProcessor(t *testing.T) {
 		// 内存相关列用于判断是否真泄漏：Heap 持续增长说明仍有长期引用；
 		// NodeCache_MB 顶到上限则说明缓存保护生效，后续可调 bytes limit 做性能/内存折中。
 		"Heap_Alloc_MB", "Heap_Sys_MB", "Runtime_Sys_MB", "NodeCache_MB", "NodeCache_Entries",
-		"Stem_Archive_Mode",
+		"Stem_Archive_Mode", "Async_Prune_Mode", "Physical_Delete_Mode", "Node_Storage_Scheme",
+		"Filter_Negative_Samples_Per_Bucket", "Final_Storage_Breakdown_Enabled",
+		"Max_Avg_Archive_Proof_Bytes_SLA", "Max_Item_Archive_Proof_Bytes_SLA", "Max_Archive_Proof_Verify_ms_SLA",
 		"Archive_Bytes_Per_Item", "State_Bytes_Per_Active_Leaf",
 		"Archive_Bytes_Per_Logical_Value", "State_Bytes_Per_Active_Logical_Value",
 		"Trie_Child_Node_Count", "Total_Archived_Items", "Total_Bucket_Count",
 		"Active_Logical_Values", "Archived_Logical_Values",
 		"Active_Logical_Value_Read_Failures", "Archived_Logical_Value_Read_Failures",
+		"Root_Branch_Logical_Bytes", "Hot_Tree_Node_Logical_Bytes", "Archive_Bucket_Logical_Bytes",
+		"Active_Stem_Metadata_Bytes", "Archived_Stem_Metadata_Bytes",
+		"Active_Suffix_Value_Bytes", "Archived_Suffix_Value_Bytes",
+		"Active_Legacy_Stem_Blob_Bytes", "Archived_Legacy_Stem_Blob_Bytes",
+		"Archive_Index_Logical_Bytes", "Archive_Index_Entries", "Storage_Breakdown_Read_Failures", "Storage_Breakdown_Valid",
+		"Active_Only_Logical_Bytes", "Archived_Payload_Logical_Bytes", "Reachable_Logical_Bytes",
 		"Root_Bucket_Count", "Root_Archived_Items", "Root_Leaf_Bucket_Count", "Root_Leaf_Archived_Items",
 		"Stub_Bucket_Count", "Stub_Archived_Items", "Child_Bucket_Count", "Child_Archived_Items",
 		"Root_Stub_Bucket_Count", "Root_Stub_Archived_Items", "Deep_Stub_Bucket_Count", "Deep_Stub_Archived_Items",
@@ -545,10 +644,14 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Max_Buckets_On_Single_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max",
 		"Avg_Finalise_Time_ms", "Max_Finalise_Time_ms",
 		"Avg_State_Commit_Time_ms", "Max_State_Commit_Time_ms",
+		"State_Commit_P50_ms", "State_Commit_P95_ms", "State_Commit_P99_ms",
 		"Avg_State_PreCommit_Time_ms", "Max_State_PreCommit_Time_ms",
+		"State_PreCommit_P50_ms", "State_PreCommit_P95_ms", "State_PreCommit_P99_ms",
 		"Avg_State_PostCommit_Time_ms", "Max_State_PostCommit_Time_ms",
 		"Avg_Root_Pipeline_Wall_Time_ms", "Max_Root_Pipeline_Wall_Time_ms",
+		"Root_Pipeline_P50_ms", "Root_Pipeline_P95_ms", "Root_Pipeline_P99_ms",
 		"Avg_Root_Compute_Charged_Time_ms", "Max_Root_Compute_Charged_Time_ms",
+		"Root_Charged_P50_ms", "Root_Charged_P95_ms", "Root_Charged_P99_ms",
 		"Avg_Root_DB_Write_Time_ms", "Max_Root_DB_Write_Time_ms",
 		"Avg_Archive_Wait_Over_Budget_ms", "Max_Archive_Wait_Over_Budget_ms", "Archive_Overlap_Budget_ms",
 		"Max_State_Commit_Block", "Max_State_PreCommit_Block", "Max_State_PostCommit_Block",
@@ -576,8 +679,11 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Avg_Proof_Size_Byte", "Max_Proof_Size_Byte",
 		"Max_Pruning_Block", "Max_Proof_Size_Block",
 		"Block_Start", "Block_End",
-		"Item_Proof_Min", "Item_Proof_P25", "Item_Proof_Med", "Item_Proof_P75", "Item_Proof_Max",
+		"Item_Proof_Min", "Item_Proof_P25", "Item_Proof_Med", "Item_Proof_P75", "Item_Proof_P95", "Item_Proof_P99", "Item_Proof_Max",
 		"Cycle_FP_Count", "Max_FP_In_Single_Block",
+		"Synthetic_Filter_Stats_Block", "Synthetic_Filter_Checks", "Synthetic_Filter_Positives",
+		"Synthetic_Positive_Queries", "Synthetic_True_Positives",
+		"Synthetic_Negative_Queries", "Synthetic_False_Positives", "Synthetic_Filter_FPR",
 		"Cumulative_Archived_Leaves", "Cumulative_Flat_Value_Puts", "Cumulative_Flat_Value_Deletes",
 		"Cumulative_Flat_Value_Put_Bytes", "Cumulative_Archive_Event_Rate_Pct", "Cumulative_Archived_vs_Active_Pct",
 		"Storage_Layout", "Shared_DB_Bytes", "Archive_Storage_Bytes_Valid",
@@ -600,8 +706,10 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Intermediate_Mutations", "Account_Updated", "Account_Deleted", "Storage_Updated", "Storage_Deleted",
 		"Stem_Put_Calls", "Stem_Put_Noops", "Stem_Put_Loaded_Bytes", "Stem_Put_Encoded_Bytes", "Stem_Put_Commitment_Hashes",
 		"Stem_Put_Total_ms", "Stem_Put_Load_ms", "Stem_Put_Decode_ms", "Stem_Put_Encode_ms", "Stem_Put_Backend_ms",
+		"Stem_Put_P50_us", "Stem_Put_P95_us", "Stem_Put_P99_us",
 		"Stem_Apply_Calls", "Stem_Apply_Updates", "Stem_Apply_Stems", "Stem_Apply_Puts", "Stem_Apply_Deletes",
 		"Stem_Apply_Total_ms", "Stem_Apply_Load_ms", "Stem_Apply_Encode_ms", "Stem_Apply_Backend_ms",
+		"Stem_ApplyBatch_P50_us", "Stem_ApplyBatch_P95_us", "Stem_ApplyBatch_P99_us",
 		"Shard_Put_Calls", "Shard_Put_Values", "Shard_Put_ms",
 		"Shard_PutBatch_Calls", "Shard_PutBatch_Values", "Shard_PutBatch_Shards", "Shard_PutBatch_Wall_ms", "Shard_PutBatch_Work_ms",
 		"Shard_Delete_Calls", "Shard_Delete_ms",
@@ -611,6 +719,10 @@ func TestExpireStateProcessor(t *testing.T) {
 		"NodeCache_Entry_Limit", "NodeCache_Bytes_Limit", "NodeCache_Shards",
 		"NodeCache_Window_Lock_Contentions", "NodeCache_Window_Lock_Wait_ms",
 		"NodeCache_Window_DB_Gets", "NodeCache_Window_DB_Get_ms", "NodeCache_Window_DB_Load_Bytes",
+		"Account_Update_us_Per_Account", "Storage_Update_us_Per_Slot",
+		"PreCommit_us_Per_Mutation", "Root_Charged_us_Per_Mutation",
+		"Stem_Put_us_Per_Call", "Stem_Apply_us_Per_Stem",
+		"Flat_Read_IO_us_Per_Get", "NodeCache_DB_Get_us_Per_Get", "NodeCache_DB_Load_Bytes_Per_Get",
 	}
 	writer.Write(metricsHeader)
 	kvStatsWriter.Write([]string{
@@ -688,6 +800,22 @@ func TestExpireStateProcessor(t *testing.T) {
 			bucketItemsP95         int
 			bucketItemsP99         int
 			bucketItemsMax         int
+			rootBranchBytes        int64
+			hotTreeNodeBytes       int64
+			archiveBucketBytes     int64
+			activeStemMetadata     int64
+			archivedStemMetadata   int64
+			activeSuffixBytes      int64
+			archivedSuffixBytes    int64
+			activeLegacyStemBytes  int64
+			archiveLegacyStemBytes int64
+			archiveIndexBytes      int64
+			archiveIndexEntries    int64
+			storageReadFailures    int64
+			storageBreakdownValid  bool
+			activeOnlyBytes        int64
+			archivedPayloadBytes   int64
+			reachableLogicalBytes  int64
 		)
 		trieStatsDuration := time.Duration(0)
 		trieStatsExact := false
@@ -700,10 +828,58 @@ func TestExpireStateProcessor(t *testing.T) {
 					}
 					if runFullStats {
 						trieStatsStart := time.Now()
-						lastFullTrieStats = bt.Stats()
+						measureStorage := final && cfg.BinaryStorageBreakdownFinal
+						lastFullTrieStats = bt.StatsWithDiagnostics(
+							cfg.BinaryFilterFPSamples,
+							cfg.BinaryFilterFPSeed+int64(totalProcessedBlocks),
+							measureStorage,
+						)
 						trieStatsDuration = time.Since(trieStatsStart)
+						if measureStorage {
+							finalStorageStats = lastFullTrieStats
+							finalStorageScanDuration = trieStatsDuration
+						}
 						lastFullTrieStatsBlock = totalProcessedBlocks
 						trieStatsExact = true
+						lastFilterFPStats = lastFullTrieStats.FilterFPStats()
+						lastFilterFPStatsBlock = totalProcessedBlocks
+						if filterFPWriter != nil && lastFilterFPStats != nil {
+							writeFilterRow := func(dimension, group string, buckets, sampled, checks, positives, positiveQueries, truePositives, negativeQueries, falsePositives int64, rate float64) {
+								filterFPWriter.Write([]string{
+									strconv.FormatUint(totalProcessedBlocks, 10),
+									dimension,
+									group,
+									strconv.FormatInt(buckets, 10),
+									strconv.FormatInt(sampled, 10),
+									strconv.FormatInt(checks, 10),
+									strconv.FormatInt(positives, 10),
+									strconv.FormatInt(positiveQueries, 10),
+									strconv.FormatInt(truePositives, 10),
+									strconv.FormatInt(negativeQueries, 10),
+									strconv.FormatInt(falsePositives, 10),
+									fmt.Sprintf("%.9f", rate),
+								})
+							}
+							writeFilterRow(
+								"all", "all",
+								lastFilterFPStats.BucketCount, lastFilterFPStats.SampledBuckets,
+								lastFilterFPStats.FilterChecks, lastFilterFPStats.FilterPositives,
+								lastFilterFPStats.PositiveQueries, lastFilterFPStats.TruePositives,
+								lastFilterFPStats.NegativeQueries, lastFilterFPStats.FalsePositives,
+								lastFilterFPStats.Rate,
+							)
+							for _, group := range lastFilterFPStats.Groups {
+								writeFilterRow(
+									group.Dimension, group.Group,
+									group.BucketCount, group.SampledBuckets,
+									group.FilterChecks, group.FilterPositives,
+									group.PositiveQueries, group.TruePositives,
+									group.NegativeQueries, group.FalsePositives,
+									group.Rate,
+								)
+							}
+							filterFPWriter.Flush()
+						}
 					}
 					stats := lastFullTrieStats
 					if stats != nil {
@@ -738,6 +914,22 @@ func TestExpireStateProcessor(t *testing.T) {
 						bucketItemsP95 = stats.BucketItemsP95
 						bucketItemsP99 = stats.BucketItemsP99
 						bucketItemsMax = stats.BucketItemsMax
+						rootBranchBytes = stats.RootBranchLogicalBytes
+						hotTreeNodeBytes = stats.HotTreeNodeLogicalBytes
+						archiveBucketBytes = stats.ArchiveBucketLogicalBytes
+						activeStemMetadata = stats.ActiveStemMetadataBytes
+						archivedStemMetadata = stats.ArchivedStemMetadataBytes
+						activeSuffixBytes = stats.ActiveSuffixValueBytes
+						archivedSuffixBytes = stats.ArchivedSuffixValueBytes
+						activeLegacyStemBytes = stats.ActiveLegacyStemBlobBytes
+						archiveLegacyStemBytes = stats.ArchivedLegacyStemBlobBytes
+						archiveIndexBytes = stats.ArchiveIndexLogicalBytes
+						archiveIndexEntries = stats.ArchiveIndexEntries
+						storageReadFailures = stats.StorageBreakdownReadFailures
+						storageBreakdownValid = stats.StorageBreakdownValid
+						activeOnlyBytes = stats.ActiveOnlyLogicalBytes
+						archivedPayloadBytes = stats.ArchivedPayloadLogicalBytes
+						reachableLogicalBytes = stats.ReachableLogicalBytes
 					}
 				}
 			}
@@ -814,6 +1006,16 @@ func TestExpireStateProcessor(t *testing.T) {
 		updateDiagnosticsNow := archivetrie.LastUpdateDiagnostics()
 		windowUpdateDiagnostics := updateDiagnosticsNow.Sub(lastUpdateDiagnostics)
 		lastUpdateDiagnostics = updateDiagnosticsNow
+		commitP50, commitP95, commitP99 := durationPercentiles(commitLatencySamples)
+		preCommitP50, preCommitP95, preCommitP99 := durationPercentiles(preCommitLatencySamples)
+		rootPipelineP50, rootPipelineP95, rootPipelineP99 := durationPercentiles(rootPipelineLatencySamples)
+		rootChargedP50, rootChargedP95, rootChargedP99 := durationPercentiles(rootChargedLatencySamples)
+		stemPutLatencyNow := archivetrie.LastStemPutLatencyHistogram()
+		stemPutLatencyWindow := stemPutLatencyNow.Sub(lastStemPutLatency)
+		lastStemPutLatency = stemPutLatencyNow
+		stemApplyLatencyNow := archivetrie.LastStemApplyLatencyHistogram()
+		stemApplyLatencyWindow := stemApplyLatencyNow.Sub(lastStemApplyLatency)
+		lastStemApplyLatency = stemApplyLatencyNow
 		txExecutionTPS := 0.0
 		if totalTxTime > 0 {
 			txExecutionTPS = float64(intervalSuccessTxCount) / totalTxTime.Seconds()
@@ -878,6 +1080,11 @@ func TestExpireStateProcessor(t *testing.T) {
 				maxStubListBuckets, maxStubListItems,
 				maxRootStubBuckets, maxRootStubItems,
 				maxDeepStubBuckets, maxDeepStubItems)
+			fmt.Printf("  ASCT reachable logical bytes - activeOnly=%d archivePayload=%d total=%d (root=%d hotNodes=%d buckets=%d activeMeta=%d archivedMeta=%d activeSuffix=%d archivedSuffix=%d indexes=%d/%d entries failures=%d)\n",
+				activeOnlyBytes, archivedPayloadBytes, reachableLogicalBytes,
+				rootBranchBytes, hotTreeNodeBytes, archiveBucketBytes,
+				activeStemMetadata, archivedStemMetadata, activeSuffixBytes, archivedSuffixBytes,
+				archiveIndexBytes, archiveIndexEntries, storageReadFailures)
 		}
 
 		avgBinaryPruneTime := 0.0
@@ -975,7 +1182,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		copy(sizes, common.BinaryItemProofSizes)
 		common.BinaryStatsMu.Unlock()
 
-		var minS, p25S, medS, p75S, maxS int64
+		var minS, p25S, medS, p75S, p95S, p99S, maxS int64
 		if len(sizes) > 0 {
 			sort.Slice(sizes, func(i, j int) bool { return sizes[i] < sizes[j] })
 			minS = sizes[0]
@@ -983,6 +1190,19 @@ func TestExpireStateProcessor(t *testing.T) {
 			medS = sizes[len(sizes)/2]
 			p25S = sizes[len(sizes)/4]
 			p75S = sizes[3*len(sizes)/4]
+			p95S = sizes[(len(sizes)*95+99)/100-1]
+			p99S = sizes[(len(sizes)*99+99)/100-1]
+		}
+		if cfg.UseBinaryTrie && missExistent > 0 {
+			if cfg.MaxAvgArchiveProofBytes > 0 && avgProofSizeBlock > float64(cfg.MaxAvgArchiveProofBytes) {
+				t.Fatalf("archive proof average exceeded SLA at block %d: %.2f > %d bytes", totalProcessedBlocks, avgProofSizeBlock, cfg.MaxAvgArchiveProofBytes)
+			}
+			if cfg.MaxItemArchiveProofBytes > 0 && maxS > int64(cfg.MaxItemArchiveProofBytes) {
+				t.Fatalf("archive item proof exceeded SLA at block %d: %d > %d bytes", totalProcessedBlocks, maxS, cfg.MaxItemArchiveProofBytes)
+			}
+			if cfg.MaxArchiveProofVerifyMs > 0 && maxVerifTime > float64(cfg.MaxArchiveProofVerifyMs) {
+				t.Fatalf("archive proof verification exceeded SLA at block %d: %.3f > %d ms", totalProcessedBlocks, maxVerifTime, cfg.MaxArchiveProofVerifyMs)
+			}
 		}
 		fmt.Printf("  Item_Proof_Size 五数概括: Min=%d, P25=%d, Median=%d, P75=%d, Max=%d\n", minS, p25S, medS, p75S, maxS)
 
@@ -1002,6 +1222,21 @@ func TestExpireStateProcessor(t *testing.T) {
 		common.BinaryStatsMu.Unlock()
 		fmt.Printf("  假阳性归档桶平均大小: %.2f (样本数: %d)\n", fpAvgBucketSize, fpDistCount)
 
+		var syntheticChecks, syntheticPositives, syntheticPositiveQueries, syntheticTruePositives, syntheticNegativeQueries, syntheticFalsePositives int64
+		var syntheticFPR float64
+		if lastFilterFPStats != nil {
+			syntheticChecks = lastFilterFPStats.FilterChecks
+			syntheticPositives = lastFilterFPStats.FilterPositives
+			syntheticPositiveQueries = lastFilterFPStats.PositiveQueries
+			syntheticTruePositives = lastFilterFPStats.TruePositives
+			syntheticNegativeQueries = lastFilterFPStats.NegativeQueries
+			syntheticFalsePositives = lastFilterFPStats.FalsePositives
+			syntheticFPR = lastFilterFPStats.Rate
+			fmt.Printf("  ASCT synthetic filter probes - checks=%d positives=%d TP=%d negatives=%d FP=%d FPR=%.9f\n",
+				syntheticChecks, syntheticPositives, syntheticTruePositives,
+				syntheticNegativeQueries, syntheticFalsePositives, syntheticFPR)
+		}
+
 		metricsCollectionDuration := time.Since(metricsStart)
 		// 写入 CSV
 		record := []string{
@@ -1018,6 +1253,14 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(commitDiag.NodeCacheBytes/(1024*1024), 10),
 			strconv.FormatInt(commitDiag.NodeCacheEntries, 10),
 			strconv.FormatBool(cfg.BinaryStemArchive),
+			strconv.FormatBool(cfg.BinaryAsyncPrune),
+			strconv.FormatBool(cfg.BinaryPhysicalDelete),
+			cfg.BinaryNodeStorage,
+			strconv.Itoa(cfg.BinaryFilterFPSamples),
+			strconv.FormatBool(cfg.BinaryStorageBreakdownFinal),
+			strconv.Itoa(cfg.MaxAvgArchiveProofBytes),
+			strconv.Itoa(cfg.MaxItemArchiveProofBytes),
+			strconv.Itoa(cfg.MaxArchiveProofVerifyMs),
 			fmt.Sprintf("%.2f", archiveBytesPerItem),
 			fmt.Sprintf("%.2f", stateBytesPerActiveLeaf),
 			fmt.Sprintf("%.2f", archiveBytesPerLogicalValue),
@@ -1029,6 +1272,22 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(archivedLogicalValues, 10),
 			strconv.FormatInt(activeLogicalFailures, 10),
 			strconv.FormatInt(archiveLogicalFailures, 10),
+			strconv.FormatInt(rootBranchBytes, 10),
+			strconv.FormatInt(hotTreeNodeBytes, 10),
+			strconv.FormatInt(archiveBucketBytes, 10),
+			strconv.FormatInt(activeStemMetadata, 10),
+			strconv.FormatInt(archivedStemMetadata, 10),
+			strconv.FormatInt(activeSuffixBytes, 10),
+			strconv.FormatInt(archivedSuffixBytes, 10),
+			strconv.FormatInt(activeLegacyStemBytes, 10),
+			strconv.FormatInt(archiveLegacyStemBytes, 10),
+			strconv.FormatInt(archiveIndexBytes, 10),
+			strconv.FormatInt(archiveIndexEntries, 10),
+			strconv.FormatInt(storageReadFailures, 10),
+			strconv.FormatBool(storageBreakdownValid),
+			strconv.FormatInt(activeOnlyBytes, 10),
+			strconv.FormatInt(archivedPayloadBytes, 10),
+			strconv.FormatInt(reachableLogicalBytes, 10),
 			strconv.Itoa(rootBucketCount),
 			strconv.FormatInt(rootArchivedItems, 10),
 			strconv.Itoa(rootLeafBucketCount),
@@ -1057,14 +1316,26 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(maxFinaliseTime.Milliseconds(), 10),
 			fmt.Sprintf("%.2f", float64(totalCommitTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxCommitTime.Milliseconds(), 10),
+			fmt.Sprintf("%.3f", float64(commitP50)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(commitP95)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(commitP99)/float64(time.Millisecond)),
 			fmt.Sprintf("%.2f", float64(totalStatePreCommit.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxStatePreCommit.Milliseconds(), 10),
+			fmt.Sprintf("%.3f", float64(preCommitP50)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(preCommitP95)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(preCommitP99)/float64(time.Millisecond)),
 			fmt.Sprintf("%.2f", float64(totalPostCommit.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxPostCommit.Milliseconds(), 10),
 			fmt.Sprintf("%.2f", float64(totalRootPipelineTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxRootPipelineTime.Milliseconds(), 10),
+			fmt.Sprintf("%.3f", float64(rootPipelineP50)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(rootPipelineP95)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(rootPipelineP99)/float64(time.Millisecond)),
 			fmt.Sprintf("%.2f", float64(totalRootComputeTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxRootComputeTime.Milliseconds(), 10),
+			fmt.Sprintf("%.3f", float64(rootChargedP50)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(rootChargedP95)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(rootChargedP99)/float64(time.Millisecond)),
 			fmt.Sprintf("%.2f", float64(totalRootDBWriteTime.Milliseconds())/float64(intervalBlocks)),
 			strconv.FormatInt(maxRootDBWriteTime.Milliseconds(), 10),
 			fmt.Sprintf("%.2f", float64(totalArchiveWaitExcess.Milliseconds())/float64(intervalBlocks)),
@@ -1133,9 +1404,19 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(p25S, 10),
 			strconv.FormatInt(medS, 10),
 			strconv.FormatInt(p75S, 10),
+			strconv.FormatInt(p95S, 10),
+			strconv.FormatInt(p99S, 10),
 			strconv.FormatInt(maxS, 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryCycleFPCount), 10),
 			strconv.FormatInt(atomic.LoadInt64(&common.BinaryMaxFPInSingleBlock), 10),
+			strconv.FormatUint(lastFilterFPStatsBlock, 10),
+			strconv.FormatInt(syntheticChecks, 10),
+			strconv.FormatInt(syntheticPositives, 10),
+			strconv.FormatInt(syntheticPositiveQueries, 10),
+			strconv.FormatInt(syntheticTruePositives, 10),
+			strconv.FormatInt(syntheticNegativeQueries, 10),
+			strconv.FormatInt(syntheticFalsePositives, 10),
+			fmt.Sprintf("%.9f", syntheticFPR),
 			strconv.FormatInt(cumulativeArchive.ArchivedLeaves, 10),
 			strconv.FormatInt(cumulativeArchive.FlatValuePuts, 10),
 			strconv.FormatInt(cumulativeArchive.FlatValueDeletes, 10),
@@ -1215,6 +1496,9 @@ func TestExpireStateProcessor(t *testing.T) {
 			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemPutDecodeNanos)/float64(time.Millisecond)),
 			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemPutEncodeNanos)/float64(time.Millisecond)),
 			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemPutBackendNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(stemPutLatencyWindow.Percentile(50))/float64(time.Microsecond)),
+			fmt.Sprintf("%.3f", float64(stemPutLatencyWindow.Percentile(95))/float64(time.Microsecond)),
+			fmt.Sprintf("%.3f", float64(stemPutLatencyWindow.Percentile(99))/float64(time.Microsecond)),
 			strconv.FormatInt(windowUpdateDiagnostics.StemApplyCalls, 10),
 			strconv.FormatInt(windowUpdateDiagnostics.StemApplyUpdates, 10),
 			strconv.FormatInt(windowUpdateDiagnostics.StemApplyStems, 10),
@@ -1224,6 +1508,9 @@ func TestExpireStateProcessor(t *testing.T) {
 			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemApplyLoadNanos)/float64(time.Millisecond)),
 			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemApplyEncodeNanos)/float64(time.Millisecond)),
 			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.StemApplyBackendNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", float64(stemApplyLatencyWindow.Percentile(50))/float64(time.Microsecond)),
+			fmt.Sprintf("%.3f", float64(stemApplyLatencyWindow.Percentile(95))/float64(time.Microsecond)),
+			fmt.Sprintf("%.3f", float64(stemApplyLatencyWindow.Percentile(99))/float64(time.Microsecond)),
 			strconv.FormatInt(windowUpdateDiagnostics.ShardPutCalls, 10),
 			strconv.FormatInt(windowUpdateDiagnostics.ShardPutValues, 10),
 			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.ShardPutNanos)/float64(time.Millisecond)),
@@ -1250,6 +1537,20 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(cacheWindowDBGets, 10),
 			fmt.Sprintf("%.3f", float64(cacheWindowDBGetNanos)/float64(time.Millisecond)),
 			strconv.FormatInt(cacheWindowDBLoadBytes, 10),
+			fmt.Sprintf("%.3f", microsPer(totalAccountUpdates.Nanoseconds(), totalAccountUpdated)),
+			fmt.Sprintf("%.3f", microsPer(totalStorageUpdates.Nanoseconds(), totalStorageUpdated+totalStorageDeleted)),
+			fmt.Sprintf("%.3f", microsPer(totalStatePreCommit.Nanoseconds(), totalIntermediateMutations)),
+			fmt.Sprintf("%.3f", microsPer(totalRootComputeTime.Nanoseconds(), totalIntermediateMutations)),
+			fmt.Sprintf("%.3f", microsPer(windowUpdateDiagnostics.StemPutTotalNanos, windowUpdateDiagnostics.StemPutCalls)),
+			fmt.Sprintf("%.3f", microsPer(windowUpdateDiagnostics.StemApplyTotalNanos, windowUpdateDiagnostics.StemApplyStems)),
+			fmt.Sprintf("%.3f", microsPer(windowUpdateDiagnostics.FlatValueReadIONanos, windowUpdateDiagnostics.FlatValueGets)),
+			fmt.Sprintf("%.3f", microsPer(cacheWindowDBGetNanos, cacheWindowDBGets)),
+			fmt.Sprintf("%.3f", func() float64 {
+				if cacheWindowDBGets <= 0 {
+					return 0
+				}
+				return float64(cacheWindowDBLoadBytes) / float64(cacheWindowDBGets)
+			}()),
 		}
 		if len(record) != len(metricsHeader) {
 			t.Fatalf("metrics CSV column mismatch: header=%d record=%d", len(metricsHeader), len(record))
@@ -1348,6 +1649,10 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalHashNodes = 0
 		totalHashDirtyNodes = 0
 		totalHashCleanNodes = 0
+		commitLatencySamples = commitLatencySamples[:0]
+		preCommitLatencySamples = preCommitLatencySamples[:0]
+		rootPipelineLatencySamples = rootPipelineLatencySamples[:0]
+		rootChargedLatencySamples = rootChargedLatencySamples[:0]
 
 		atomic.StoreInt64(&common.BinaryHitCount, 0)
 		atomic.StoreInt64(&common.BinaryMissNonExistentCount, 0)
@@ -1650,6 +1955,10 @@ processFiles:
 				if finaliseDuration > maxFinaliseTime {
 					maxFinaliseTime = finaliseDuration
 				}
+				commitLatencySamples = append(commitLatencySamples, commitDuration)
+				preCommitLatencySamples = append(preCommitLatencySamples, preCommitDuration)
+				rootPipelineLatencySamples = append(rootPipelineLatencySamples, rootDuration)
+				rootChargedLatencySamples = append(rootChargedLatencySamples, rootTiming.computeCharged)
 				totalCommitTime += commitDuration
 				if commitDuration > maxCommitTime {
 					maxCommitTime = commitDuration
@@ -1902,6 +2211,10 @@ processFiles:
 			if finaliseDuration > maxFinaliseTime {
 				maxFinaliseTime = finaliseDuration
 			}
+			commitLatencySamples = append(commitLatencySamples, commitDuration)
+			preCommitLatencySamples = append(preCommitLatencySamples, preCommitDuration)
+			rootPipelineLatencySamples = append(rootPipelineLatencySamples, rootDuration)
+			rootChargedLatencySamples = append(rootChargedLatencySamples, rootTiming.computeCharged)
 			totalCommitTime += commitDuration
 			if commitDuration > maxCommitTime {
 				maxCommitTime = commitDuration
@@ -1973,6 +2286,48 @@ processFiles:
 	if intervalBlocks > 0 {
 		reportStats(true)
 	}
+	if cfg.UseBinaryTrie && cfg.BinaryStorageBreakdownFinal {
+		if finalStorageStats == nil {
+			if active := host.trieDB.GetArchiveTrie(); active != nil {
+				if bt, ok := active.(*archivetrie.Trie); ok {
+					scanStart := time.Now()
+					finalStorageStats = bt.StatsWithDiagnostics(0, cfg.BinaryFilterFPSeed+int64(totalProcessedBlocks), true)
+					finalStorageScanDuration = time.Since(scanStart)
+				}
+			}
+		}
+		if finalStorageStats != nil {
+			sharedDatabasePhysicalBytes, _ := getDirSize(cfg.DbDir)
+			report := finalStorageBreakdownReport{
+				Block:                       totalProcessedBlocks,
+				ScanDurationMs:              float64(finalStorageScanDuration) / float64(time.Millisecond),
+				Valid:                       finalStorageStats.StorageBreakdownValid,
+				ReadFailures:                finalStorageStats.StorageBreakdownReadFailures,
+				SharedDatabasePhysicalBytes: sharedDatabasePhysicalBytes,
+				RootBranchLogicalBytes:      finalStorageStats.RootBranchLogicalBytes,
+				HotTreeNodeLogicalBytes:     finalStorageStats.HotTreeNodeLogicalBytes,
+				ArchiveBucketLogicalBytes:   finalStorageStats.ArchiveBucketLogicalBytes,
+				ActiveStemMetadataBytes:     finalStorageStats.ActiveStemMetadataBytes,
+				ArchivedStemMetadataBytes:   finalStorageStats.ArchivedStemMetadataBytes,
+				ActiveSuffixValueBytes:      finalStorageStats.ActiveSuffixValueBytes,
+				ArchivedSuffixValueBytes:    finalStorageStats.ArchivedSuffixValueBytes,
+				ActiveLegacyStemBlobBytes:   finalStorageStats.ActiveLegacyStemBlobBytes,
+				ArchivedLegacyStemBlobBytes: finalStorageStats.ArchivedLegacyStemBlobBytes,
+				ArchiveIndexLogicalBytes:    finalStorageStats.ArchiveIndexLogicalBytes,
+				ArchiveIndexEntries:         finalStorageStats.ArchiveIndexEntries,
+				ActiveOnlyLogicalBytes:      finalStorageStats.ActiveOnlyLogicalBytes,
+				ArchivedPayloadLogicalBytes: finalStorageStats.ArchivedPayloadLogicalBytes,
+				ReachableLogicalBytes:       finalStorageStats.ReachableLogicalBytes,
+			}
+			data, err := json.MarshalIndent(report, "", "  ")
+			if err != nil {
+				t.Fatalf("failed to encode final ASCT storage breakdown: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(outputDir, "asct_final_storage_breakdown.json"), data, 0644); err != nil {
+				t.Fatalf("failed to write final ASCT storage breakdown: %v", err)
+			}
+		}
+	}
 	fmt.Printf("\n>>> FINAL TRANSACTION SUCCESS RATE SUMMARY <<<\n")
 	if globalTxCount > 0 {
 		fmt.Printf("Total Transactions: %d\n", globalTxCount)
@@ -2036,23 +2391,44 @@ type consistencyTracer struct {
 	count    int
 	hasher   hash.Hash
 	blockNum uint64
+	accounts map[common.Address]struct{}
+	storage  map[common.Address]map[common.Hash]struct{}
 }
 
 func newConsistencyTracer(prefix string) *consistencyTracer {
 	return &consistencyTracer{
-		prefix: prefix,
-		hasher: crypto.NewKeccakState(),
+		prefix:   prefix,
+		hasher:   crypto.NewKeccakState(),
+		accounts: make(map[common.Address]struct{}),
+		storage:  make(map[common.Address]map[common.Hash]struct{}),
 	}
 }
 
 func (t *consistencyTracer) Reset() {
 	t.count = 0
 	t.hasher.Reset()
+	clear(t.accounts)
+	clear(t.storage)
+}
+
+func (t *consistencyTracer) TrackAccount(addr common.Address) {
+	t.accounts[addr] = struct{}{}
+}
+
+func (t *consistencyTracer) trackStorage(addr common.Address, slot common.Hash) {
+	t.TrackAccount(addr)
+	slots := t.storage[addr]
+	if slots == nil {
+		slots = make(map[common.Hash]struct{})
+		t.storage[addr] = slots
+	}
+	slots[slot] = struct{}{}
 }
 
 func (t *consistencyTracer) Hooks() *tracing.Hooks {
 	return &tracing.Hooks{
 		OnBalanceChange: func(addr common.Address, prev, new *big.Int, reason tracing.BalanceChangeReason) {
+			t.TrackAccount(addr)
 			t.count++
 			t.hasher.Write(addr[:])
 			t.hasher.Write(common.LeftPadBytes(new.Bytes(), 32))
@@ -2063,6 +2439,7 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 			}
 		},
 		OnNonceChangeV2: func(addr common.Address, prev, new uint64, reason tracing.NonceChangeReason) {
+			t.TrackAccount(addr)
 			t.count++
 			t.hasher.Write(addr[:])
 			var b [8]byte
@@ -2075,6 +2452,7 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 			}
 		},
 		OnCodeChange: func(addr common.Address, prevCodeHash common.Hash, prevCode []byte, codeHash common.Hash, code []byte) {
+			t.TrackAccount(addr)
 			t.count++
 			t.hasher.Write(addr[:])
 			t.hasher.Write(codeHash[:])
@@ -2085,6 +2463,7 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 			}
 		},
 		OnStorageChange: func(addr common.Address, slot common.Hash, prev, new common.Hash) {
+			t.trackStorage(addr, slot)
 			t.count++
 			t.hasher.Write(addr[:])
 			t.hasher.Write(slot[:])
@@ -2095,6 +2474,62 @@ func (t *consistencyTracer) Hooks() *tracing.Hooks {
 				t.logToFile(msg)
 			}
 		},
+	}
+}
+
+func verifyPersistedTouchedState(t *testing.T, block uint64, mptHost, binHost *ProcessorHost, mptRoot, binRoot common.Hash, mptTracer, binTracer *consistencyTracer) {
+	t.Helper()
+	mptState, err := state.New(mptRoot, mptHost.sdb)
+	if err != nil {
+		t.Fatalf("Block %d: reopen MPT state: %v", block, err)
+	}
+	binState, err := state.New(binRoot, binHost.sdb)
+	if err != nil {
+		t.Fatalf("Block %d: reopen BIN state: %v", block, err)
+	}
+	accounts := make(map[common.Address]struct{}, len(mptTracer.accounts)+len(binTracer.accounts))
+	for addr := range mptTracer.accounts {
+		accounts[addr] = struct{}{}
+	}
+	for addr := range binTracer.accounts {
+		accounts[addr] = struct{}{}
+	}
+	for addr := range accounts {
+		if mptState.Exist(addr) != binState.Exist(addr) {
+			t.Fatalf("Block %d: persisted existence mismatch for %s: MPT=%t BIN=%t", block, addr, mptState.Exist(addr), binState.Exist(addr))
+		}
+		if mptState.GetNonce(addr) != binState.GetNonce(addr) {
+			t.Fatalf("Block %d: persisted nonce mismatch for %s: MPT=%d BIN=%d", block, addr, mptState.GetNonce(addr), binState.GetNonce(addr))
+		}
+		if mptState.GetBalance(addr).Cmp(binState.GetBalance(addr)) != 0 {
+			t.Fatalf("Block %d: persisted balance mismatch for %s: MPT=%s BIN=%s", block, addr, mptState.GetBalance(addr), binState.GetBalance(addr))
+		}
+		if mptState.GetCodeHash(addr) != binState.GetCodeHash(addr) {
+			t.Fatalf("Block %d: persisted code hash mismatch for %s: MPT=%s BIN=%s", block, addr, mptState.GetCodeHash(addr), binState.GetCodeHash(addr))
+		}
+		if !bytes.Equal(mptState.GetCode(addr), binState.GetCode(addr)) {
+			t.Fatalf("Block %d: persisted code mismatch for %s", block, addr)
+		}
+	}
+	storage := make(map[common.Address]map[common.Hash]struct{})
+	for _, tracer := range []*consistencyTracer{mptTracer, binTracer} {
+		for addr, slots := range tracer.storage {
+			merged := storage[addr]
+			if merged == nil {
+				merged = make(map[common.Hash]struct{})
+				storage[addr] = merged
+			}
+			for slot := range slots {
+				merged[slot] = struct{}{}
+			}
+		}
+	}
+	for addr, slots := range storage {
+		for slot := range slots {
+			if mptValue, binValue := mptState.GetState(addr, slot), binState.GetState(addr, slot); mptValue != binValue {
+				t.Fatalf("Block %d: persisted storage mismatch for %s/%s: MPT=%s BIN=%s", block, addr, slot, mptValue, binValue)
+			}
+		}
 	}
 }
 
@@ -2167,12 +2602,18 @@ func TestBinaryTrieConsistency(t *testing.T) {
 		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
 		BinaryPathDiagnostics:       *binaryPathDiagnostics,
 		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
+		BinaryFilterFPSamples:       *binaryFilterFPSamples,
+		BinaryFilterFPSeed:          *binaryFilterFPSeed,
+		BinaryStorageBreakdownFinal: *binaryStorageBreakdownFinal,
 		BinaryAsyncPrune:            *binaryAsyncPrune,
 		BinaryCommitWorkers:         *binaryCommitWorkers,
 		BinaryCommitWatchdog:        *binaryCommitWatchdog,
 		BinaryPhysicalDelete:        *binaryPhysicalDelete,
 		BinaryStemArchive:           *binaryStemArchive,
 		BinaryNodeStorage:           *binaryNodeStorage,
+		MaxAvgArchiveProofBytes:     *maxAvgArchiveProofBytes,
+		MaxItemArchiveProofBytes:    *maxItemArchiveProofBytes,
+		MaxArchiveProofVerifyMs:     *maxArchiveProofVerifyMs,
 	}
 	os.RemoveAll(binCfg.DbDir)
 	os.RemoveAll(binCfg.BinaryArchiveDir)
@@ -2283,6 +2724,7 @@ consistencyFiles:
 				if mptSummary.WriteHash != binSummary.WriteHash {
 					t.Fatalf("Block %d (empty): WriteHash mismatch! MPT=%s, BIN=%s, binRoot=%s", b, mptSummary.WriteHash.Hex(), binSummary.WriteHash.Hex(), binRoot.Hex())
 				}
+				verifyPersistedTouchedState(t, b, mptHost, binHost, mptRoot, binRoot, mptTracer, binTracer)
 
 				mptLastRoot = mptRoot
 				binLastRoot = binRoot
@@ -2319,6 +2761,7 @@ consistencyFiles:
 			bigBalance := new(big.Int).Mul(big.NewInt(1e15), big.NewInt(1e18))
 			balance, _ := uint256.FromBig(bigBalance)
 			for _, msg := range msgs {
+				mptTracer.TrackAccount(msg.From)
 				mptStateDB.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
 			}
 
@@ -2368,6 +2811,7 @@ consistencyFiles:
 			}
 			// Pre-allocate balance for all senders
 			for _, msg := range msgs {
+				binTracer.TrackAccount(msg.From)
 				binStateDB.SetBalance(msg.From, balance, tracing.BalanceChangeUnspecified)
 			}
 
@@ -2427,6 +2871,7 @@ consistencyFiles:
 			if mptSummary.WriteHash != binSummary.WriteHash {
 				t.Fatalf("Block %d: WriteHash mismatch! MPT=%s, BIN=%s (WriteCount=%d), binSuccess=%d, binRoot=%s", b, mptSummary.WriteHash.Hex(), binSummary.WriteHash.Hex(), mptSummary.WriteCount, binSuccessCount, binRoot.Hex())
 			}
+			verifyPersistedTouchedState(t, b, mptHost, binHost, mptRoot, binRoot, mptTracer, binTracer)
 
 			if b == 52313 {
 				targetAddr := common.HexToAddress("0x59622442B567187157b85d6928A6c56e1E0841CA")

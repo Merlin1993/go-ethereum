@@ -530,6 +530,34 @@ func (a *archiveDBAdapter) diskDB() ethdb.Database {
 
 // Put 写入下层 trie 产生的节点或 raw 数据。
 // 32 字节 hash-mode 节点会进入进程级缓存，并在 commit 期间补进 pending NodeSet。
+// ArchiveIndexLogicalSize reports reachable index key/value bytes. It excludes
+// LevelDB table, WAL, obsolete-version and compaction overhead.
+func (a *archiveDBAdapter) ArchiveIndexLogicalSize() (int64, int64, error) {
+	db := a.diskDB()
+	if db == nil {
+		return 0, 0, errors.New("archive index store is unavailable")
+	}
+	var totalBytes, totalEntries int64
+	for _, prefix := range [][]byte{archiveStemStorageIndexPrefix, archiveStemCodeIndexPrefix} {
+		it := db.NewIterator(prefix, nil)
+		for it.Next() {
+			totalEntries++
+			totalBytes += int64(len(it.Key()) + len(it.Value()))
+		}
+		err := it.Error()
+		it.Release()
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+	if data, err := db.Get(archiveStemIndexSchemaKey); err == nil {
+		totalEntries++
+		totalBytes += int64(len(archiveStemIndexSchemaKey) + len(data))
+	}
+	return totalBytes, totalEntries, nil
+}
+
+// Put stores one lower-trie node or flat record.
 func (a *archiveDBAdapter) Put(key, value []byte) error {
 	h := common.BytesToHash(key)
 	if len(key) == 32 && !archivetrie.IsPathStorageKey(key) {
@@ -1161,6 +1189,40 @@ func (t *ArchiveTrie) UpdateAccountRLP(address common.Address, account []byte, c
 		return t.stem.Put(trieutils.BinaryTreeBasicDataKey(address), account)
 	}
 	return t.trie.Put(address.Bytes(), account)
+}
+
+// UpdateAccountsBatch applies one block's account mutations together. Stem
+// mode keeps the basic-account metadata-only load and lets independent shards
+// resolve their paths in parallel.
+func (t *ArchiveTrie) UpdateAccountsBatch(updates []AccountUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	if t.stem == nil {
+		entries := make([]archivetrie.KeyValue, 0, len(updates))
+		for _, update := range updates {
+			if update.Account == nil {
+				return errors.New("nil account in batch")
+			}
+			entries = append(entries, archivetrie.KeyValue{
+				Key:   update.Address.Bytes(),
+				Value: types.SlimAccountRLP(*update.Account),
+			})
+		}
+		return t.trie.PutBatch(entries)
+	}
+	stemUpdates := make([]archivetrie.StemUpdate, 0, len(updates))
+	for _, update := range updates {
+		if update.Account == nil {
+			return errors.New("nil account in batch")
+		}
+		stemUpdates = append(stemUpdates, archivetrie.StemUpdate{
+			Key:     trieutils.BinaryTreeBasicDataKey(update.Address),
+			Value:   types.SlimAccountRLP(*update.Account),
+			Replace: accountUsesOnlyBasicStem(update.Account),
+		})
+	}
+	return t.stem.ApplyBatch(stemUpdates)
 }
 
 func accountUsesOnlyBasicStem(account *types.StateAccount) bool {

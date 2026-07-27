@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type stemCountingHasher struct {
@@ -92,6 +93,23 @@ func TestStemBinaryProofsAndEncoding(t *testing.T) {
 	encoded[len(stemEncodingMagic)] ^= 0x01
 	if _, err := decodeStem(encoded, hasher); !errors.Is(err, ErrInvalidStem) {
 		t.Fatalf("corrupt values root was accepted: %v", err)
+	}
+}
+
+func TestLatencyHistogramPercentiles(t *testing.T) {
+	var previous, current LatencyHistogram
+	for _, nanos := range []int64{100, 200, 300, 400, 10_000} {
+		current.Buckets[latencyBucketIndex(nanos)]++
+		current.Count++
+	}
+	previous.Buckets[latencyBucketIndex(100)]++
+	previous.Count++
+	window := current.Sub(previous)
+	if window.Count != 4 {
+		t.Fatalf("window count: got %d want 4", window.Count)
+	}
+	if p50, p95 := window.Percentile(50), window.Percentile(95); p50 < 200*time.Nanosecond || p50 > 400*time.Nanosecond || p95 < 10*time.Microsecond {
+		t.Fatalf("unexpected histogram percentiles: p50=%v p95=%v", p50, p95)
 	}
 }
 
@@ -247,6 +265,7 @@ func TestStemArchiveAndUpdateRestoresWholeStem(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	config := DefaultConfig()
 	config.ShardDepth = 8
+	config.StemMode = true
 	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
 	trie, err := NewStemTrie(backend)
 	if err != nil {
@@ -328,6 +347,67 @@ func TestStemArchiveAndUpdateRestoresWholeStem(t *testing.T) {
 	}
 }
 
+func TestStemStatsStorageBreakdownAndFilterNegatives(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.StemMode = true
+	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
+	trie, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key1 := stemTestKey(0x52, 7)
+	key2 := stemTestKey(0x52, 200)
+	value1 := []byte("old-7")
+	value2 := []byte("old-200")
+	if err := trie.PutBatch([]KeyValue{{Key: key1, Value: value1}, {Key: key2, Value: value2}}); err != nil {
+		t.Fatal(err)
+	}
+	commit := func() {
+		batch := db.NewBatch()
+		if _, err := trie.Backend().CommitToBatch(batch, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := batch.Write(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commit()
+	shardID := trie.Backend().GetShardID(key1[:StemSize])
+	trie.Backend().SetGlobalEpoch(0)
+	trie.Backend().pruneShardIdx = shardID
+	if err := trie.Backend().PruneNextShard(); err != nil {
+		t.Fatal(err)
+	}
+	commit()
+
+	stats := trie.Backend().StatsWithDiagnostics(20, 7, true)
+	if !stats.StorageBreakdownValid || stats.StorageBreakdownReadFailures != 0 {
+		t.Fatalf("invalid storage breakdown: valid=%t failures=%d active=%d archived=%d activeMeta=%d archivedMeta=%d activeSuffix=%d archivedSuffix=%d",
+			stats.StorageBreakdownValid, stats.StorageBreakdownReadFailures,
+			stats.ActiveLogicalValues, stats.ArchivedLogicalValues,
+			stats.ActiveStemMetadataBytes, stats.ArchivedStemMetadataBytes,
+			stats.ActiveSuffixValueBytes, stats.ArchivedSuffixValueBytes)
+	}
+	wantMetadata := int64(len(flatValueDataKey(key1[:StemSize])) + len(stemMetadataMagic) + StemSuffixCount/8)
+	wantSuffixes := int64(len(flatValueDataKey(key1)) + len(value1) + len(flatValueDataKey(key2)) + len(value2))
+	if stats.ArchivedStemMetadataBytes != wantMetadata || stats.ArchivedSuffixValueBytes != wantSuffixes {
+		t.Fatalf("archived flat bytes: metadata=%d/%d suffixes=%d/%d",
+			stats.ArchivedStemMetadataBytes, wantMetadata, stats.ArchivedSuffixValueBytes, wantSuffixes)
+	}
+	if stats.ArchiveBucketLogicalBytes == 0 || stats.ArchivedPayloadLogicalBytes == 0 ||
+		stats.ReachableLogicalBytes != stats.ActiveOnlyLogicalBytes+stats.ArchivedPayloadLogicalBytes {
+		t.Fatalf("incomplete logical byte totals: %+v", stats)
+	}
+	filterStats := stats.FilterFPStats()
+	if filterStats == nil || filterStats.SampledBuckets != 1 || filterStats.PositiveQueries != 1 ||
+		filterStats.TruePositives != 1 || filterStats.NegativeQueries != 20 ||
+		filterStats.FilterChecks != 21 || len(filterStats.Groups) != 3 {
+		t.Fatalf("unexpected synthetic filter stats: %+v", filterStats)
+	}
+}
+
 func TestStemTrieRejectsNonTreeKeys(t *testing.T) {
 	trie, _ := newStemTestTrie(t, false)
 	if err := trie.Put(make([]byte, StemKeySize-1), []byte("value")); !errors.Is(err, ErrInvalidStemKey) {
@@ -361,6 +441,49 @@ func TestStemTrieApplyBatchMixedUpdates(t *testing.T) {
 	}
 	if got, err := trie.Get(key3); err != nil || string(got) != "three" {
 		t.Fatalf("inserted suffix: got %q err %v", got, err)
+	}
+}
+
+func TestStemTrieApplyBatchReplaceDropsSiblingSuffixes(t *testing.T) {
+	trie, db := newStemTestTrie(t, false)
+	key1 := stemTestKey(0x72, 1)
+	key2 := stemTestKey(0x72, 2)
+	if err := trie.PutBatch([]KeyValue{
+		{Key: key1, Value: []byte("old-one")},
+		{Key: key2, Value: []byte("old-two")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := trie.Backend().CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := trie.ApplyBatch([]StemUpdate{{
+		Key:     key1,
+		Value:   []byte("new-one"),
+		Replace: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	batch = db.NewBatch()
+	if _, err := trie.Backend().CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := trie.Get(key1); err != nil || string(got) != "new-one" {
+		t.Fatalf("replacement value: got %q err %v", got, err)
+	}
+	if _, err := trie.Get(key2); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("replacement retained sibling suffix: %v", err)
+	}
+	if _, err := trie.Backend().GetFlatValue(key2); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("replacement retained sibling flat record: %v", err)
 	}
 }
 

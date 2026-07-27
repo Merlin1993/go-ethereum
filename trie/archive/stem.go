@@ -487,6 +487,10 @@ type StemUpdate struct {
 	Key    []byte
 	Value  []byte
 	Delete bool
+	// Replace discards every value that existed before this update in the same
+	// stem. It is used for basic accounts whose stem is known to contain only
+	// the account suffix.
+	Replace bool
 }
 
 // StemDeleteBatchResult contains the values removed by DeleteBatchWithValues.
@@ -694,9 +698,10 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 			groups = append(groups, stemWrites{key: bytes.Clone(stemKey)})
 		}
 		groups[id].updates = append(groups[id].updates, StemUpdate{
-			Key:    []byte{suffix},
-			Value:  bytes.Clone(update.Value),
-			Delete: update.Delete,
+			Key:     []byte{suffix},
+			Value:   bytes.Clone(update.Value),
+			Delete:  update.Delete,
+			Replace: update.Replace,
 		})
 		lockIDs[int(stemKey[0])] = struct{}{}
 	}
@@ -715,37 +720,66 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 		}
 	}()
 
-	refPuts := make([]KeyValue, 0, len(groups))
-	outerDeletes := make([][]byte, 0)
-	flatPuts := make([]KeyValue, 0, len(updates)+len(groups))
-	flatDeletes := make([][]byte, 0)
-	for _, group := range groups {
+	type stemBatchResult struct {
+		refPut      *KeyValue
+		outerDelete []byte
+		flatPuts    []KeyValue
+		flatDeletes [][]byte
+		loadTime    time.Duration
+		encodeTime  time.Duration
+		err         error
+	}
+	processGroup := func(group stemWrites) stemBatchResult {
+		var result stemBatchResult
+		lastReplace := -1
+		for i, update := range group.updates {
+			if update.Replace {
+				lastReplace = i
+			}
+		}
 		loadStart := time.Now()
-		stem, split, _, err := t.loadStoredStem(group.key, true)
-		loadTime += time.Since(loadStart)
+		stem, split, _, err := t.loadStoredStem(group.key, lastReplace < 0)
+		result.loadTime = time.Since(loadStart)
 		if err != nil && !errors.Is(err, ErrNodeNotFound) {
-			return err
+			result.err = err
+			return result
 		}
 		existed := err == nil
-		if stem == nil {
+		oldStem := stem
+		if stem == nil || lastReplace >= 0 {
 			stem = &Stem{
 				values:     make(map[byte][]byte),
 				commitment: newStemCommitment(t.backend.hasher, &t.empty),
 			}
 		}
-		beforePresent := stem.present
+		var beforePresent [StemSuffixCount / 8]byte
+		if oldStem != nil {
+			beforePresent = oldStem.present
+		}
 		beforeValues := make(map[byte][]byte)
 		touched := make(map[byte]struct{})
-		for _, update := range group.updates {
+		effectiveUpdates := group.updates
+		if lastReplace >= 0 {
+			effectiveUpdates = group.updates[lastReplace:]
+		}
+		for _, update := range effectiveUpdates {
 			suffix := update.Key[0]
 			if _, ok := touched[suffix]; !ok {
-				if value, present := stem.Get(suffix); present {
-					beforeValues[suffix] = value
+				if lastReplace < 0 {
+					if value, present := stem.Get(suffix); present {
+						beforeValues[suffix] = value
+					}
 				}
 				touched[suffix] = struct{}{}
 			}
 		}
-		for _, update := range group.updates {
+		for _, update := range effectiveUpdates {
+			if update.Replace {
+				stem = &Stem{
+					values:     make(map[byte][]byte),
+					commitment: newStemCommitment(t.backend.hasher, &t.empty),
+				}
+			}
 			if update.Delete {
 				stem.Delete(update.Key[0])
 			} else {
@@ -754,27 +788,42 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 		}
 		if stem.Len() == 0 {
 			if existed {
-				outerDeletes = append(outerDeletes, group.key)
+				result.outerDelete = group.key
 				if split {
 					for i := 0; i < StemSuffixCount; i++ {
 						suffix := byte(i)
 						if beforePresent[i/8]&(byte(1)<<(suffix%8)) != 0 {
-							flatDeletes = append(flatDeletes, joinStemKey(group.key, suffix))
+							result.flatDeletes = append(result.flatDeletes, joinStemKey(group.key, suffix))
 						}
 					}
 				}
 			}
-			continue
+			return result
 		}
 		encodeStart := time.Now()
 		root := stem.ValuesRoot(t.backend.hasher)
 		if !split {
-			flatPuts = append(flatPuts, KeyValue{Key: group.key, Value: encodeStemMetadata(stem)})
+			result.flatPuts = append(result.flatPuts, KeyValue{Key: group.key, Value: encodeStemMetadata(stem)})
 			for i := 0; i < StemSuffixCount; i++ {
 				suffix := byte(i)
 				if stem.has(suffix) {
-					flatPuts = append(flatPuts, KeyValue{Key: joinStemKey(group.key, suffix), Value: bytes.Clone(stem.values[suffix])})
+					result.flatPuts = append(result.flatPuts, KeyValue{Key: joinStemKey(group.key, suffix), Value: bytes.Clone(stem.values[suffix])})
 				}
+			}
+		} else if lastReplace >= 0 {
+			for i := 0; i < StemSuffixCount; i++ {
+				suffix := byte(i)
+				wasPresent := beforePresent[i/8]&(byte(1)<<(suffix%8)) != 0
+				present := stem.has(suffix)
+				switch {
+				case wasPresent && !present:
+					result.flatDeletes = append(result.flatDeletes, joinStemKey(group.key, suffix))
+				case present:
+					result.flatPuts = append(result.flatPuts, KeyValue{Key: joinStemKey(group.key, suffix), Value: bytes.Clone(stem.values[suffix])})
+				}
+			}
+			if !bytes.Equal(beforePresent[:], stem.present[:]) {
+				result.flatPuts = append(result.flatPuts, KeyValue{Key: group.key, Value: encodeStemMetadata(stem)})
 			}
 		} else {
 			for suffix := range touched {
@@ -782,17 +831,60 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 				oldValue, wasPresent := beforeValues[suffix]
 				switch {
 				case present && (!wasPresent || !bytes.Equal(value, oldValue)):
-					flatPuts = append(flatPuts, KeyValue{Key: joinStemKey(group.key, suffix), Value: value})
+					result.flatPuts = append(result.flatPuts, KeyValue{Key: joinStemKey(group.key, suffix), Value: value})
 				case !present && wasPresent:
-					flatDeletes = append(flatDeletes, joinStemKey(group.key, suffix))
+					result.flatDeletes = append(result.flatDeletes, joinStemKey(group.key, suffix))
 				}
 			}
 			if !bytes.Equal(beforePresent[:], stem.present[:]) {
-				flatPuts = append(flatPuts, KeyValue{Key: group.key, Value: encodeStemMetadata(stem)})
+				result.flatPuts = append(result.flatPuts, KeyValue{Key: group.key, Value: encodeStemMetadata(stem)})
 			}
 		}
-		encodeTime += time.Since(encodeStart)
-		refPuts = append(refPuts, KeyValue{Key: group.key, Value: root})
+		result.encodeTime = time.Since(encodeStart)
+		result.refPut = &KeyValue{Key: group.key, Value: root}
+		return result
+	}
+
+	// Stem payload reads and root reconstruction are independent across stems.
+	// Run them in parallel so a block with hundreds of account mutations does
+	// not serialize all LevelDB reads before the already-parallel shard writes.
+	results := make([]stemBatchResult, len(groups))
+	workers := t.backend.parallelWorkerCount(len(groups))
+	jobs := make(chan int, len(groups))
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				results[index] = processGroup(groups[index])
+			}
+		}()
+	}
+	for index := range groups {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+
+	refPuts := make([]KeyValue, 0, len(groups))
+	outerDeletes := make([][]byte, 0)
+	flatPuts := make([]KeyValue, 0, len(updates)+len(groups))
+	flatDeletes := make([][]byte, 0)
+	for _, result := range results {
+		loadTime += result.loadTime
+		encodeTime += result.encodeTime
+		if result.err != nil {
+			return result.err
+		}
+		if result.refPut != nil {
+			refPuts = append(refPuts, *result.refPut)
+		}
+		if result.outerDelete != nil {
+			outerDeletes = append(outerDeletes, result.outerDelete)
+		}
+		flatPuts = append(flatPuts, result.flatPuts...)
+		flatDeletes = append(flatDeletes, result.flatDeletes...)
 	}
 	putCount = len(refPuts)
 	deleteCount = len(outerDeletes)

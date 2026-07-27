@@ -547,10 +547,7 @@ func (t *Trie) putBatch(entries []KeyValue, valueRefs bool) error {
 			return err
 		}
 	}
-	workers := runtime.GOMAXPROCS(0)
-	if workers > len(groups) {
-		workers = len(groups)
-	}
+	workers := t.parallelWorkerCount(len(groups))
 	jobs := make(chan int, len(groups))
 	errs := make([]error, len(groups))
 	var wg sync.WaitGroup

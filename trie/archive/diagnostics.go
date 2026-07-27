@@ -2,7 +2,9 @@ package archive
 
 import (
 	"fmt"
+	"math/bits"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -250,6 +252,42 @@ type UpdateDiagnostics struct {
 	ArchivePromotionHits   int64
 }
 
+const latencyHistogramBuckets = 512
+
+// LatencyHistogram is a cumulative, low-overhead log histogram with eight
+// buckets per power of two. Percentiles are returned as bucket upper bounds.
+type LatencyHistogram struct {
+	Buckets [latencyHistogramBuckets]int64
+	Count   int64
+}
+
+func (h LatencyHistogram) Sub(previous LatencyHistogram) LatencyHistogram {
+	var out LatencyHistogram
+	out.Count = h.Count - previous.Count
+	for i := range out.Buckets {
+		out.Buckets[i] = h.Buckets[i] - previous.Buckets[i]
+	}
+	return out
+}
+
+func (h LatencyHistogram) Percentile(percent int) time.Duration {
+	if h.Count <= 0 || percent <= 0 {
+		return 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	rank := (h.Count*int64(percent) + 99) / 100
+	var seen int64
+	for i, count := range h.Buckets {
+		seen += count
+		if seen >= rank {
+			return time.Duration(latencyBucketUpperBound(i))
+		}
+	}
+	return time.Duration(latencyBucketUpperBound(latencyHistogramBuckets - 1))
+}
+
 func (d UpdateDiagnostics) Sub(previous UpdateDiagnostics) UpdateDiagnostics {
 	return UpdateDiagnostics{
 		StemPutCalls:            d.StemPutCalls - previous.StemPutCalls,
@@ -372,6 +410,10 @@ var (
 	updateFlatValueWriteNanos          int64
 	updateArchivePromotionChecks       int64
 	updateArchivePromotionHits         int64
+	updateStemPutLatencyBuckets        [latencyHistogramBuckets]int64
+	updateStemPutLatencyCount          int64
+	updateStemApplyLatencyBuckets      [latencyHistogramBuckets]int64
+	updateStemApplyLatencyCount        int64
 
 	hashDiagnosticsMu sync.Mutex
 	hashDiagnostics   HashDiagnostics
@@ -419,6 +461,14 @@ func LastUpdateDiagnostics() UpdateDiagnostics {
 	}
 }
 
+func LastStemPutLatencyHistogram() LatencyHistogram {
+	return snapshotLatencyHistogram(&updateStemPutLatencyBuckets, &updateStemPutLatencyCount)
+}
+
+func LastStemApplyLatencyHistogram() LatencyHistogram {
+	return snapshotLatencyHistogram(&updateStemApplyLatencyBuckets, &updateStemApplyLatencyCount)
+}
+
 func recordStemPutDiagnostics(noop bool, loadedBytes, encodedBytes, commitmentHashes int, total, load, decode, encode, backend time.Duration) {
 	atomic.AddInt64(&updateStemPutCalls, 1)
 	if noop {
@@ -432,6 +482,7 @@ func recordStemPutDiagnostics(noop bool, loadedBytes, encodedBytes, commitmentHa
 	atomic.AddInt64(&updateStemPutDecodeNanos, decode.Nanoseconds())
 	atomic.AddInt64(&updateStemPutEncodeNanos, encode.Nanoseconds())
 	atomic.AddInt64(&updateStemPutBackendNanos, backend.Nanoseconds())
+	recordLatency(&updateStemPutLatencyBuckets, &updateStemPutLatencyCount, total)
 }
 
 func recordStemApplyDiagnostics(updates, stems, puts, deletes int, total, load, encode, backend time.Duration) {
@@ -444,6 +495,57 @@ func recordStemApplyDiagnostics(updates, stems, puts, deletes int, total, load, 
 	atomic.AddInt64(&updateStemApplyLoadNanos, load.Nanoseconds())
 	atomic.AddInt64(&updateStemApplyEncodeNanos, encode.Nanoseconds())
 	atomic.AddInt64(&updateStemApplyBackendNanos, backend.Nanoseconds())
+	recordLatency(&updateStemApplyLatencyBuckets, &updateStemApplyLatencyCount, total)
+}
+
+func snapshotLatencyHistogram(buckets *[latencyHistogramBuckets]int64, count *int64) LatencyHistogram {
+	var out LatencyHistogram
+	out.Count = atomic.LoadInt64(count)
+	for i := range out.Buckets {
+		out.Buckets[i] = atomic.LoadInt64(&buckets[i])
+	}
+	return out
+}
+
+func recordLatency(buckets *[latencyHistogramBuckets]int64, count *int64, elapsed time.Duration) {
+	index := latencyBucketIndex(elapsed.Nanoseconds())
+	atomic.AddInt64(&buckets[index], 1)
+	atomic.AddInt64(count, 1)
+}
+
+func latencyBucketIndex(nanos int64) int {
+	if nanos <= 1 {
+		return 0
+	}
+	value := uint64(nanos)
+	exponent := bits.Len64(value) - 1
+	base := uint64(1) << exponent
+	sub := int((value - base) * 8 / base)
+	if sub > 7 {
+		sub = 7
+	}
+	index := exponent*8 + sub
+	if index >= latencyHistogramBuckets {
+		return latencyHistogramBuckets - 1
+	}
+	return index
+}
+
+func latencyBucketUpperBound(index int) int64 {
+	if index <= 0 {
+		return 1
+	}
+	exponent := index / 8
+	sub := index % 8
+	if exponent >= 62 {
+		return int64(^uint64(0) >> 1)
+	}
+	base := uint64(1) << exponent
+	upper := base + base*uint64(sub+1)/8
+	if upper > uint64(^uint64(0)>>1) {
+		return int64(^uint64(0) >> 1)
+	}
+	return int64(upper)
 }
 
 func recordShardPutDiagnostics(values int, elapsed time.Duration) {
@@ -1305,17 +1407,41 @@ func (d CommitDiagnostics) String() string {
 
 // ArchiveFilterFPStats summarizes direct Cuckoo filter false-positive sampling.
 type ArchiveFilterFPStats struct {
-	BucketCount    int64
-	SampledBuckets int64
-	Samples        int64
-	FalsePositives int64
-	Rate           float64
+	BucketCount     int64
+	SampledBuckets  int64
+	Samples         int64 // Backward-compatible alias for NegativeQueries.
+	FilterChecks    int64
+	FilterPositives int64
+	PositiveQueries int64
+	TruePositives   int64
+	NegativeQueries int64
+	FalsePositives  int64
+	Rate            float64
+	Groups          []ArchiveFilterFPGroup
+
+	groups map[string]*ArchiveFilterFPGroup
+}
+
+// ArchiveFilterFPGroup separates the synthetic workload by the factors that
+// most directly affect Cuckoo-filter pressure.
+type ArchiveFilterFPGroup struct {
+	Dimension       string
+	Group           string
+	BucketCount     int64
+	SampledBuckets  int64
+	FilterChecks    int64
+	FilterPositives int64
+	PositiveQueries int64
+	TruePositives   int64
+	NegativeQueries int64
+	FalsePositives  int64
+	Rate            float64
 }
 
 // SampleArchiveFilterFalsePositives samples non-member suffixes directly against
 // archive bucket filters. It is a diagnostic helper and does not affect roots.
 func (t *Trie) SampleArchiveFilterFalsePositives(samplesPerBucket int, seed int64) *ArchiveFilterFPStats {
-	stats := &ArchiveFilterFPStats{}
+	stats := &ArchiveFilterFPStats{groups: make(map[string]*ArchiveFilterFPGroup)}
 	if t == nil || samplesPerBucket <= 0 {
 		return stats
 	}
@@ -1354,9 +1480,11 @@ func (t *Trie) SampleArchiveFilterFalsePositives(samplesPerBucket int, seed int6
 		}
 	}
 
-	if stats.Samples > 0 {
-		stats.Rate = float64(stats.FalsePositives) / float64(stats.Samples)
+	stats.Samples = stats.NegativeQueries
+	if stats.NegativeQueries > 0 {
+		stats.Rate = float64(stats.FalsePositives) / float64(stats.NegativeQueries)
 	}
+	stats.finalizeGroups()
 	return stats
 }
 
@@ -1439,16 +1567,105 @@ func (s *Shard) sampleArchiveFilterFPBucket(bucket *ArchiveBucketNode, stats *Ar
 	}
 
 	stats.SampledBuckets++
+	groups := stats.filterGroups(s.id, bucket)
+	for _, group := range groups {
+		group.SampledBuckets++
+	}
+	knownMember := archiveItemKey(keys[0].SuffixBits, keys[0].Suffix)
+	stats.PositiveQueries++
+	stats.FilterChecks++
+	for _, group := range groups {
+		group.PositiveQueries++
+		group.FilterChecks++
+	}
+	if filter.Lookup(knownMember) {
+		stats.TruePositives++
+		stats.FilterPositives++
+		for _, group := range groups {
+			group.TruePositives++
+			group.FilterPositives++
+		}
+	}
 	for i := 0; i < samplesPerBucket; i++ {
 		template := keys[rng.Intn(len(keys))]
 		keyWithLen, ok := randomNonMemberArchiveSuffix(rng, template.SuffixBits, existing)
 		if !ok {
 			continue
 		}
-		stats.Samples++
+		stats.NegativeQueries++
+		stats.FilterChecks++
+		for _, group := range groups {
+			group.NegativeQueries++
+			group.FilterChecks++
+		}
 		if filter.Lookup(keyWithLen) {
 			stats.FalsePositives++
+			stats.FilterPositives++
+			for _, group := range groups {
+				group.FalsePositives++
+				group.FilterPositives++
+			}
 		}
+	}
+}
+
+func (s *ArchiveFilterFPStats) filterGroups(shardID int, bucket *ArchiveBucketNode) []*ArchiveFilterFPGroup {
+	density := archiveFilterDensityGroup(bucket.Count)
+	depth := fmt.Sprintf("%d-%d", bucket.PathBits/32*32, bucket.PathBits/32*32+31)
+	shard := fmt.Sprintf("%d", shardID)
+	groups := []*ArchiveFilterFPGroup{
+		s.filterGroup("density", density),
+		s.filterGroup("path_depth", depth),
+		s.filterGroup("shard", shard),
+	}
+	for _, group := range groups {
+		group.BucketCount++
+	}
+	return groups
+}
+
+func (s *ArchiveFilterFPStats) filterGroup(dimension, group string) *ArchiveFilterFPGroup {
+	key := dimension + "\x00" + group
+	if current := s.groups[key]; current != nil {
+		return current
+	}
+	current := &ArchiveFilterFPGroup{Dimension: dimension, Group: group}
+	s.groups[key] = current
+	return current
+}
+
+func (s *ArchiveFilterFPStats) finalizeGroups() {
+	if len(s.groups) == 0 {
+		return
+	}
+	s.Groups = make([]ArchiveFilterFPGroup, 0, len(s.groups))
+	for _, group := range s.groups {
+		if group.NegativeQueries > 0 {
+			group.Rate = float64(group.FalsePositives) / float64(group.NegativeQueries)
+		}
+		s.Groups = append(s.Groups, *group)
+	}
+	sort.Slice(s.Groups, func(i, j int) bool {
+		if s.Groups[i].Dimension != s.Groups[j].Dimension {
+			return s.Groups[i].Dimension < s.Groups[j].Dimension
+		}
+		return s.Groups[i].Group < s.Groups[j].Group
+	})
+	s.groups = nil
+}
+
+func archiveFilterDensityGroup(count uint64) string {
+	switch {
+	case count <= 10:
+		return "1-10"
+	case count <= 30:
+		return "11-30"
+	case count <= 60:
+		return "31-60"
+	case count <= 100:
+		return "61-100"
+	default:
+		return "101+"
 	}
 }
 

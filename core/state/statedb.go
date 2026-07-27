@@ -732,6 +732,10 @@ func (s *StateDB) updateStateObject(obj *stateObject) {
 	}
 }
 
+type accountBatchUpdater interface {
+	UpdateAccountsBatch([]trie.AccountUpdate) error
+}
+
 // deleteStateObject removes the given object from the state trie.
 func (s *StateDB) deleteStateObject(addr common.Address) {
 	if err := s.trie.DeleteAccount(addr); err != nil {
@@ -1189,9 +1193,11 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common
 	// into a shortnode. This requires `B` to be resolved from disk.
 	// Whereas if the created node is handled first, then the collapse is avoided, and `B` is not resolved.
 	var (
-		usedAddrs    []common.Address
-		deletedAddrs []common.Address
+		usedAddrs      []common.Address
+		deletedAddrs   []common.Address
+		accountUpdates []trie.AccountUpdate
 	)
+	accountBatcher, batchAccounts := s.trie.(accountBatchUpdater)
 	for addr, op := range s.mutations {
 		if op.applied {
 			continue
@@ -1201,10 +1207,27 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) (common.Hash, common
 		if op.isDelete() {
 			deletedAddrs = append(deletedAddrs, addr)
 		} else {
-			s.updateStateObject(s.stateObjects[addr])
+			obj := s.stateObjects[addr]
+			if batchAccounts {
+				if obj.dirtyCode {
+					s.trie.UpdateContractCode(obj.Address(), common.BytesToHash(obj.CodeHash()), obj.code)
+				}
+				accountUpdates = append(accountUpdates, trie.AccountUpdate{
+					Address: addr,
+					Account: &obj.data,
+					CodeLen: len(obj.code),
+				})
+			} else {
+				s.updateStateObject(obj)
+			}
 			s.AccountUpdated += 1
 		}
 		usedAddrs = append(usedAddrs, addr) // Copy needed for closure
+	}
+	if batchAccounts {
+		if err := accountBatcher.UpdateAccountsBatch(accountUpdates); err != nil {
+			s.setError(fmt.Errorf("update accounts batch: %v", err))
+		}
 	}
 	s.IntermediateMutations += int64(len(usedAddrs))
 	for _, deletedAddr := range deletedAddrs {

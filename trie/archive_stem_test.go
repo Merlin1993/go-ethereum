@@ -188,6 +188,62 @@ func TestArchiveTrieStemModeBasicAccountLoadsOnlyMetadata(t *testing.T) {
 	}
 }
 
+func TestArchiveTrieStemModeBatchesAccountsAndPreservesSiblingState(t *testing.T) {
+	db := newArchiveStemTestDB()
+	tr := newArchiveStemWrapper(t, db, nil, 8)
+	contract := common.HexToAddress("0x1122")
+	basic := common.HexToAddress("0x3344")
+	code := []byte{0x60, 0x01, 0x00}
+	contractAccount := &types.StateAccount{
+		Nonce:    1,
+		Balance:  uint256.NewInt(10),
+		Root:     types.EmptyRootHash,
+		CodeHash: common.HexToHash("0x1234").Bytes(),
+	}
+	var slot common.Hash
+	slot[31] = 3
+	value := []byte("storage")
+	if err := tr.UpdateAccount(contract, contractAccount, len(code)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.UpdateStorage(contract, slot[:], value); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.UpdateContractCode(contract, common.BytesToHash(contractAccount.CodeHash), code); err != nil {
+		t.Fatal(err)
+	}
+
+	updatedContract := contractAccount.Copy()
+	updatedContract.Balance = uint256.NewInt(20)
+	basicAccount := types.NewEmptyStateAccount()
+	basicAccount.Nonce = 9
+	basicAccount.Balance = uint256.NewInt(30)
+	before := archivetrie.LastUpdateDiagnostics()
+	if err := tr.UpdateAccountsBatch([]AccountUpdate{
+		{Address: contract, Account: updatedContract, CodeLen: len(code)},
+		{Address: basic, Account: basicAccount},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	window := archivetrie.LastUpdateDiagnostics().Sub(before)
+	if window.StemApplyCalls != 1 || window.StemApplyStems != 2 {
+		t.Fatalf("account batch did not use one two-stem apply: calls=%d stems=%d", window.StemApplyCalls, window.StemApplyStems)
+	}
+	if got, err := tr.GetStorage(contract, slot[:]); err != nil || !bytes.Equal(got, value) {
+		t.Fatalf("batch account update lost storage sibling: got=%x err=%v", got, err)
+	}
+	chunk := trieutils.ChunkifyBinaryCode(code)
+	if got, err := tr.stem.Get(trieutils.BinaryTreeCodeChunkKey(contract, 0)); err != nil || !bytes.Equal(got, chunk[:common.HashLength]) {
+		t.Fatalf("batch account update lost code sibling: got=%x err=%v", got, err)
+	}
+	if got, err := tr.GetAccount(contract); err != nil || got.Balance.Cmp(updatedContract.Balance) != 0 {
+		t.Fatalf("updated contract account mismatch: account=%v err=%v", got, err)
+	}
+	if got, err := tr.GetAccount(basic); err != nil || got.Nonce != basicAccount.Nonce || got.Balance.Cmp(basicAccount.Balance) != 0 {
+		t.Fatalf("new basic account mismatch: account=%v err=%v", got, err)
+	}
+}
+
 func TestArchiveTrieStemModeStorageIteratorAndReload(t *testing.T) {
 	db := newArchiveStemTestDB()
 	tr := newArchiveStemWrapper(t, db, nil, 8)

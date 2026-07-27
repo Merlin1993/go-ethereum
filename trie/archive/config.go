@@ -1,6 +1,10 @@
 package archive
 
-import "sort"
+import (
+	"bytes"
+	"math/rand"
+	"sort"
+)
 
 // MaxPathBits is the maximum number of bits a key path can have in the archive trie.
 // Storage keys use compositeKey = address(20 bytes) + slot(32 bytes) = 52 bytes = 416 bits.
@@ -14,6 +18,10 @@ const (
 
 type FlatValueReader interface {
 	GetFlatValue(key []byte) ([]byte, error)
+}
+
+type archiveIndexLogicalSizer interface {
+	ArchiveIndexLogicalSize() (bytes int64, entries int64, err error)
 }
 
 // Config holds the configuration parameters for the Trie.
@@ -113,7 +121,32 @@ type TrieStats struct {
 	BucketItemsP99                   int     // P99 archived KV pairs per bucket
 	BucketItemsMax                   int     // Max archived KV pairs in a bucket
 
+	// The byte counters below measure reachable logical database records
+	// (key bytes plus value bytes). They deliberately do not claim to be LSM
+	// physical bytes: obsolete versions, tables, WALs and compaction overhead
+	// must be measured from the database separately.
+	RootBranchLogicalBytes       int64
+	HotTreeNodeLogicalBytes      int64
+	ArchiveBucketLogicalBytes    int64
+	ActiveStemMetadataBytes      int64
+	ArchivedStemMetadataBytes    int64
+	ActiveSuffixValueBytes       int64
+	ArchivedSuffixValueBytes     int64
+	ActiveLegacyStemBlobBytes    int64
+	ArchivedLegacyStemBlobBytes  int64
+	ArchiveIndexLogicalBytes     int64
+	ArchiveIndexEntries          int64
+	StorageBreakdownReadFailures int64
+	StorageBreakdownValid        bool
+	ActiveOnlyLogicalBytes       int64
+	ArchivedPayloadLogicalBytes  int64
+	ReachableLogicalBytes        int64
+
 	bucketItemHist map[int]int
+	filterStats    *ArchiveFilterFPStats
+	filterRNG      *rand.Rand
+	filterSamples  int
+	measureStorage bool
 
 	FalsePositiveCount int64 // Number of false positives from Cuckoo Filter
 	TotalProofSize     int64 // Total size of generated proofs
@@ -123,8 +156,22 @@ type TrieStats struct {
 
 // Stats returns the statistics for the entire Trie.
 func (t *Trie) Stats() *TrieStats {
+	return t.StatsWithDiagnostics(0, 0, false)
+}
+
+// StatsWithDiagnostics performs one exact reachable-tree scan. The full
+// suffix-byte inventory is opt-in because it reads every reachable suffix.
+func (t *Trie) StatsWithDiagnostics(filterSamplesPerBucket int, filterSeed int64, measureStorage bool) *TrieStats {
 	_ = t.finishAsyncPrune()
-	stats := &TrieStats{bucketItemHist: make(map[int]int)}
+	stats := &TrieStats{
+		bucketItemHist: make(map[int]int),
+		measureStorage: measureStorage,
+	}
+	if filterSamplesPerBucket > 0 {
+		stats.filterStats = &ArchiveFilterFPStats{groups: make(map[string]*ArchiveFilterFPGroup)}
+		stats.filterRNG = rand.New(rand.NewSource(filterSeed))
+		stats.filterSamples = filterSamplesPerBucket
+	}
 
 	t.shardsMu.RLock()
 	shards := make([]*Shard, len(t.shards))
@@ -161,7 +208,76 @@ func (t *Trie) Stats() *TrieStats {
 	}
 
 	stats.finalizeBucketItemStats()
+	if stats.filterStats != nil {
+		stats.filterStats.Samples = stats.filterStats.NegativeQueries
+		if stats.filterStats.NegativeQueries > 0 {
+			stats.filterStats.Rate = float64(stats.filterStats.FalsePositives) / float64(stats.filterStats.NegativeQueries)
+		}
+		stats.filterStats.finalizeGroups()
+	}
+	if measureStorage {
+		stats.RootBranchLogicalBytes = t.rootBranchLogicalSize()
+		if indexSizer, ok := t.db.(archiveIndexLogicalSizer); ok {
+			indexBytes, entries, err := indexSizer.ArchiveIndexLogicalSize()
+			if err != nil {
+				stats.StorageBreakdownReadFailures++
+			} else {
+				stats.ArchiveIndexLogicalBytes = indexBytes
+				stats.ArchiveIndexEntries = entries
+			}
+		}
+		stats.ActiveOnlyLogicalBytes =
+			stats.RootBranchLogicalBytes +
+				stats.HotTreeNodeLogicalBytes +
+				stats.ActiveStemMetadataBytes +
+				stats.ActiveSuffixValueBytes +
+				stats.ActiveLegacyStemBlobBytes +
+				stats.ArchiveIndexLogicalBytes
+		stats.ArchivedPayloadLogicalBytes =
+			stats.ArchiveBucketLogicalBytes +
+				stats.ArchivedStemMetadataBytes +
+				stats.ArchivedSuffixValueBytes +
+				stats.ArchivedLegacyStemBlobBytes
+		stats.ReachableLogicalBytes = stats.ActiveOnlyLogicalBytes + stats.ArchivedPayloadLogicalBytes
+		stats.StorageBreakdownValid = stats.StorageBreakdownReadFailures == 0
+	}
 	return stats
+}
+
+func (s *TrieStats) FilterFPStats() *ArchiveFilterFPStats {
+	if s == nil {
+		return nil
+	}
+	return s.filterStats
+}
+
+func (t *Trie) rootBranchLogicalSize() int64 {
+	if t.config == nil || t.config.ShardDepth == 0 {
+		return 0
+	}
+	t.rootMu.Lock()
+	defer t.rootMu.Unlock()
+
+	var walk func(*rootBranch, int, int) int64
+	walk = func(branch *rootBranch, depth, prefix int) int64 {
+		if branch == nil {
+			return 0
+		}
+		keyBytes := 32
+		if t.config.UsePathStorage() {
+			keyBytes = len(pathRootBranchKey(depth, prefix))
+		}
+		size := int64(keyBytes + rootBranchSize)
+		if depth >= t.config.ShardDepth-1 {
+			return size
+		}
+		for bit := 0; bit < 2; bit++ {
+			childPrefix := (prefix << 1) | bit
+			size += walk(branch.children[bit], depth+1, childPrefix)
+		}
+		return size
+	}
+	return walk(t.rootBranch, 0, 0)
 }
 
 func newStatsShardView(id int, db KVStore, hasher Hasher, config *Config, nodeCache *nodeBlobCache, rootHash []byte, pruning bool, globalEpochBit func() byte) *Shard {
@@ -286,6 +402,9 @@ func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPat
 	if node == nil {
 		return
 	}
+	if stats.measureStorage {
+		s.addNodeLogicalSize(node, path, pathBits, stats)
+	}
 
 	switch n := node.(type) {
 	case *InternalNode:
@@ -302,8 +421,11 @@ func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPat
 			stats.DeepStubBucketCount += numBuckets
 		}
 		for _, bucket := range n.StubList {
+			if stats.filterStats != nil {
+				s.sampleArchiveFilterFPBucket(bucket, stats.filterStats, stats.filterRNG, stats.filterSamples)
+			}
 			stats.ArchivedDataSize += int64(bucket.Count)
-			logicalValues, failures := s.archiveLogicalValueCount(bucket)
+			logicalValues, failures := s.archiveLogicalValueStats(bucket, stats)
 			stats.ArchivedLogicalValues += logicalValues
 			stats.ArchivedLogicalValueReadFailures += failures
 			stats.StubArchivedSize += int64(bucket.Count)
@@ -376,19 +498,34 @@ func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPat
 			payload, err := s.getFlatValue(fullKey)
 			if err != nil {
 				stats.ActiveLogicalValueReadFailures++
+				if stats.measureStorage {
+					stats.StorageBreakdownReadFailures++
+				}
 				break
 			}
-			count, err := stemEncodedValueCount(payload)
-			if err != nil {
+			if _, err := stemEncodedValueCount(payload); err != nil {
 				stats.ActiveLogicalValueReadFailures++
+				if stats.measureStorage {
+					stats.StorageBreakdownReadFailures++
+				}
 				break
 			}
+			count, metadataBytes, suffixBytes, legacyBytes, storageFailures := s.stemLogicalValueStats(fullKey, payload, stats.measureStorage)
 			stats.ActiveLogicalValues += int64(count)
+			if stats.measureStorage {
+				stats.ActiveStemMetadataBytes += metadataBytes
+				stats.ActiveSuffixValueBytes += suffixBytes
+				stats.ActiveLegacyStemBlobBytes += legacyBytes
+				stats.StorageBreakdownReadFailures += storageFailures
+			}
 		}
 	case *ArchiveBucketNode:
+		if stats.filterStats != nil {
+			s.sampleArchiveFilterFPBucket(n, stats.filterStats, stats.filterRNG, stats.filterSamples)
+		}
 		stats.BucketCount++
 		stats.ArchivedDataSize += int64(n.Count)
-		logicalValues, failures := s.archiveLogicalValueCount(n)
+		logicalValues, failures := s.archiveLogicalValueStats(n, stats)
 		stats.ArchivedLogicalValues += logicalValues
 		stats.ArchivedLogicalValueReadFailures += failures
 		stats.addBucketItemCount(n.Count)
@@ -408,6 +545,10 @@ func (s *Shard) nodeStatsAtPath(node Node, path []byte, pathBits int, currentPat
 }
 
 func (s *Shard) archiveLogicalValueCount(bucket *ArchiveBucketNode) (int64, int64) {
+	return s.archiveLogicalValueStats(bucket, nil)
+}
+
+func (s *Shard) archiveLogicalValueStats(bucket *ArchiveBucketNode, stats *TrieStats) (int64, int64) {
 	if bucket == nil {
 		return 0, 0
 	}
@@ -420,13 +561,90 @@ func (s *Shard) archiveLogicalValueCount(bucket *ArchiveBucketNode) (int64, int6
 	}
 	var count, failures int64
 	for _, item := range items {
-		_, payload := s.archiveItemFlatValue(bucket, item)
-		values, err := stemEncodedValueCount(payload)
-		if err == nil {
-			count += int64(values)
-		} else {
+		fullKey, payload := s.archiveItemFlatValue(bucket, item)
+		measureStorage := stats != nil && stats.measureStorage
+		values, metadataBytes, suffixBytes, legacyBytes, storageFailures := s.stemLogicalValueStats(fullKey, payload, measureStorage)
+		if payload == nil {
 			failures++
+		} else if _, err := stemEncodedValueCount(payload); err != nil {
+			failures++
+		} else {
+			count += int64(values)
+		}
+		if measureStorage {
+			stats.ArchivedStemMetadataBytes += metadataBytes
+			stats.ArchivedSuffixValueBytes += suffixBytes
+			stats.ArchivedLegacyStemBlobBytes += legacyBytes
+			stats.StorageBreakdownReadFailures += storageFailures
 		}
 	}
 	return count, failures
+}
+
+func (s *Shard) addNodeLogicalSize(node Node, path []byte, pathBits int, stats *TrieStats) {
+	data, err := node.Serialize()
+	if err != nil {
+		stats.StorageBreakdownReadFailures++
+		return
+	}
+	keyBytes := 32
+	if s.config != nil && s.config.UsePathStorage() {
+		keyBytes = len(pathNodeKey(s.id, path, pathBits))
+	}
+	recordBytes := int64(keyBytes + len(data))
+	switch n := node.(type) {
+	case *ArchiveBucketNode:
+		stats.ArchiveBucketLogicalBytes += recordBytes
+	case *InternalNode:
+		var embedded int64
+		for _, bucket := range n.StubList {
+			bucketData, err := bucket.Serialize()
+			if err != nil {
+				stats.StorageBreakdownReadFailures++
+				continue
+			}
+			embedded += int64(uvarintLen(uint64(len(bucketData))) + len(bucketData))
+		}
+		if embedded > recordBytes {
+			embedded = recordBytes
+		}
+		stats.ArchiveBucketLogicalBytes += embedded
+		stats.HotTreeNodeLogicalBytes += recordBytes - embedded
+	default:
+		stats.HotTreeNodeLogicalBytes += recordBytes
+	}
+}
+
+func (s *Shard) stemLogicalValueStats(key, payload []byte, measureStorage bool) (count int, metadataBytes, suffixBytes, legacyBytes, failures int64) {
+	if len(key) == 0 || len(payload) == 0 {
+		return 0, 0, 0, 0, 1
+	}
+	recordBytes := int64(len(flatValueDataKey(key)) + len(payload))
+	if len(payload) == len(stemMetadataMagic)+StemSuffixCount/8 &&
+		bytes.Equal(payload[:len(stemMetadataMagic)], stemMetadataMagic[:]) {
+		metadataBytes = recordBytes
+		bitmap := payload[len(stemMetadataMagic):]
+		for i := 0; i < StemSuffixCount; i++ {
+			if bitmap[i/8]&(1<<uint(i%8)) == 0 {
+				continue
+			}
+			count++
+			if !measureStorage {
+				continue
+			}
+			fullKey := joinStemKey(key, byte(i))
+			value, err := s.getFlatValue(fullKey)
+			if err != nil {
+				failures++
+				continue
+			}
+			suffixBytes += int64(len(flatValueDataKey(fullKey)) + len(value))
+		}
+		return count, metadataBytes, suffixBytes, 0, failures
+	}
+	count, err := stemEncodedValueCount(payload)
+	if err != nil {
+		return 0, 0, 0, 0, 1
+	}
+	return count, 0, 0, recordBytes, 0
 }
