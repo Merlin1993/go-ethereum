@@ -487,6 +487,57 @@ func TestStemTrieApplyBatchReplaceDropsSiblingSuffixes(t *testing.T) {
 	}
 }
 
+func TestStemTrieApplyBatchConcurrentPathReloadsInOneShard(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.NodeStorageScheme = NodeStoragePath
+	config.NodeCacheLimit = -1
+	config.NodeCacheBytesLimit = -1
+	config.NodeCacheWarmPathBits = -2
+	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, false)
+	trie, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const stems = 64
+	keys := make([][]byte, stems)
+	initial := make([]KeyValue, stems)
+	for i := range keys {
+		key := make([]byte, StemKeySize)
+		key[0] = 0x42 // Keep every stem in the same depth-8 shard.
+		key[1] = byte(i)
+		key[StemSize] = 1
+		keys[i] = key
+		initial[i] = KeyValue{Key: key, Value: []byte{byte(i)}}
+	}
+	if err := trie.PutBatch(initial); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := backend.CommitToBatch(batch, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	updates := make([]StemUpdate, stems)
+	for i, key := range keys {
+		updates[i] = StemUpdate{Key: key, Value: []byte{byte(i), 0xff}}
+	}
+	if err := trie.ApplyBatch(updates); err != nil {
+		t.Fatal(err)
+	}
+	for i, key := range keys {
+		got, err := trie.Get(key)
+		if err != nil || !bytes.Equal(got, updates[i].Value) {
+			t.Fatalf("stem %d after concurrent reload: got %x err %v", i, got, err)
+		}
+	}
+}
+
 func TestStemTrieDeleteBatchWithValuesLoadsEachStemOnce(t *testing.T) {
 	trie, _ := newStemTestTrie(t, false)
 	keys := [][]byte{

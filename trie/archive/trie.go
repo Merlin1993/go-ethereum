@@ -1072,7 +1072,9 @@ func (t *Trie) forEachAll(fn func(key, value []byte) bool, valueRefs bool) error
 		}
 		delete(roots, id)
 		prefix := t.getShardPrefix(id)
-		shard.mu.RLock()
+		// Walking can lazily load children and register their persisted paths.
+		// Use the write lock even though the caller only observes values.
+		shard.mu.Lock()
 		if shard.root != nil {
 			if valueRefs {
 				var entries []KeyValue
@@ -1080,7 +1082,7 @@ func (t *Trie) forEachAll(fn func(key, value []byte) bool, valueRefs bool) error
 					entries = append(entries, KeyValue{Key: bytes.Clone(key), Value: bytes.Clone(valueRef)})
 					return true
 				})
-				shard.mu.RUnlock()
+				shard.mu.Unlock()
 				for _, entry := range entries {
 					if !visit(entry.Key, entry.Value) {
 						break
@@ -1088,7 +1090,7 @@ func (t *Trie) forEachAll(fn func(key, value []byte) bool, valueRefs bool) error
 				}
 			} else {
 				walk(shard, shard.root, prefix)
-				shard.mu.RUnlock()
+				shard.mu.Unlock()
 			}
 			if stopped {
 				return nil
@@ -1096,7 +1098,7 @@ func (t *Trie) forEachAll(fn func(key, value []byte) bool, valueRefs bool) error
 			continue
 		}
 		root := append([]byte(nil), shard.rootHash...)
-		shard.mu.RUnlock()
+		shard.mu.Unlock()
 		if len(root) == 0 {
 			continue
 		}

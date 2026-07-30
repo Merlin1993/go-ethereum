@@ -18,7 +18,9 @@ import (
 // 它是加锁、剪枝、懒加载和提交的基本单位。destructive commit 后可以卸载 live root，
 // 后续访问再用 rootHash 从数据库懒加载回来。
 type Shard struct {
-	mu         sync.RWMutex // Protects root, rootHash, and staleSet
+	// Lazy reads install the root, child links, and hash-to-path mappings, so
+	// they must take the write side of this lock too.
+	mu         sync.RWMutex // Protects root, rootHash, staleSet, and nodePaths
 	root       Node
 	db         KVStore
 	hasher     Hasher
@@ -115,6 +117,8 @@ func configCommitmentPointCacheLimit(config *Config) int {
 
 // ClearCaches 清除分片内存中的缓存数据。
 func (s *Shard) ClearCaches() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.root != nil {
 		if in, ok := s.root.(*InternalNode); ok {
 			in.ClearCaches()
@@ -574,8 +578,8 @@ func (s *Shard) archiveBucketFilter(bucket *ArchiveBucketNode) *cuckoo.Filter {
 // Get 在单个 shard 内查找 key。顺序是先走热 child，再查侧挂 StubList，
 // 最后处理直接命中的 ArchiveBucketNode。
 func (s *Shard) Get(key []byte) ([]byte, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.root == nil && len(s.rootHash) > 0 {
 		var err error
@@ -610,8 +614,8 @@ func (s *Shard) Get(key []byte) ([]byte, error) {
 // GetValueRef returns the value commitment stored in the hot leaf or archive
 // bucket without loading the flat value payload.
 func (s *Shard) GetValueRef(key []byte) ([]byte, bool, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.root == nil && len(s.rootHash) > 0 {
 		var err error
@@ -1748,6 +1752,8 @@ func (s *Shard) commitStaleDeletes(batch Batcher) error {
 
 // ForEach iterates over all leaves in the shard.
 func (s *Shard) ForEach(prefix []byte, bits int, fn func(key, value []byte) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.root == nil {
 		return
 	}
@@ -1755,6 +1761,8 @@ func (s *Shard) ForEach(prefix []byte, bits int, fn func(key, value []byte) bool
 }
 
 func (s *Shard) ForEachPrefix(prefix []byte, bits int, matchPrefix []byte, matchBits int, fn func(key, value []byte) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.root == nil {
 		return
 	}
