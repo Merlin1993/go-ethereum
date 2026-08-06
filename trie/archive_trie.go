@@ -151,14 +151,17 @@ const defaultBinaryNodeCacheLimit = archivetrie.DefaultNodeCacheLimit
 // 与 trie 内部的 nodeBlobCache 不同，它服务于跨 adapter 读取，所以生命周期更长；
 // 这里显式维护 bytes，避免长回放时只按条目淘汰导致实际内存失控。
 type archiveNodeBlobCache struct {
-	mu         sync.Mutex
-	cache      lru.BasicLRU[common.Hash, []byte]
-	limit      int
-	bytesLimit int64
-	bytes      int64
-	hits       int64
-	misses     int64
-	evictions  int64
+	mu               sync.Mutex
+	cache            lru.BasicLRU[common.Hash, []byte]
+	limit            int
+	bytesLimit       int64
+	bytes            int64
+	hits             int64
+	misses           int64
+	evictions        int64
+	entryEvictions   int64
+	byteEvictions    int64
+	oversizedRejects int64
 }
 
 // newArchiveNodeBlobCache 创建带 entry 上限和字节上限的全局节点缓存。
@@ -190,6 +193,7 @@ func (c *archiveNodeBlobCache) add(hash common.Hash, value []byte) {
 	// 单个节点已经超过总字节上限时直接丢弃，防止大对象长期驻留。
 	if c.bytesLimit > 0 && size > c.bytesLimit {
 		c.removeLocked(hash)
+		c.oversizedRejects++
 		return
 	}
 	if old, ok := c.cache.Peek(hash); ok {
@@ -197,12 +201,16 @@ func (c *archiveNodeBlobCache) add(hash common.Hash, value []byte) {
 		c.cache.Remove(hash)
 	}
 	for c.limit > 0 && c.cache.Len() >= c.limit {
-		c.removeOldestLocked()
+		if c.removeOldestLocked() {
+			c.entryEvictions++
+		}
 	}
 	// byte 上限比 entry 上限更贴近真实内存压力。这里用 LRU 逐个淘汰到可容纳
 	// 新节点为止，让实验里的 binaryNodeCacheBytesLimitMB 变成硬保护。
 	for c.bytesLimit > 0 && c.bytes+size > c.bytesLimit && c.cache.Len() > 0 {
-		c.removeOldestLocked()
+		if c.removeOldestLocked() {
+			c.byteEvictions++
+		}
 	}
 	c.cache.Add(hash, data)
 	c.bytes += size
@@ -246,16 +254,17 @@ func (c *archiveNodeBlobCache) removeLocked(hash common.Hash) {
 }
 
 // removeOldestLocked 淘汰最旧节点，供 entry/bytes 两种限制复用。
-func (c *archiveNodeBlobCache) removeOldestLocked() {
+func (c *archiveNodeBlobCache) removeOldestLocked() bool {
 	_, value, ok := c.cache.RemoveOldest()
 	if !ok {
-		return
+		return false
 	}
 	c.bytes -= int64(common.HashLength + len(value))
 	c.evictions++
 	if c.bytes < 0 {
 		c.bytes = 0
 	}
+	return true
 }
 
 // stats 返回当前缓存体量，用于实验 CSV 的 NodeCache_* 统计。
@@ -271,14 +280,17 @@ func (c *archiveNodeBlobCache) diagnostics() archivetrie.NodeCacheDiagnostics {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return archivetrie.NodeCacheDiagnostics{
-		Entries:    int64(c.cache.Len()),
-		Bytes:      c.bytes,
-		EntryLimit: int64(c.limit),
-		BytesLimit: c.bytesLimit,
-		Shards:     1,
-		Hits:       c.hits,
-		Misses:     c.misses,
-		Evictions:  c.evictions,
+		Entries:          int64(c.cache.Len()),
+		Bytes:            c.bytes,
+		EntryLimit:       int64(c.limit),
+		BytesLimit:       c.bytesLimit,
+		Shards:           1,
+		Hits:             c.hits,
+		Misses:           c.misses,
+		Evictions:        c.evictions,
+		EntryEvictions:   c.entryEvictions,
+		ByteEvictions:    c.byteEvictions,
+		OversizedRejects: c.oversizedRejects,
 	}
 }
 
@@ -1722,6 +1734,9 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 		cacheDiag.Hits += globalCacheDiag.Hits
 		cacheDiag.Misses += globalCacheDiag.Misses
 		cacheDiag.Evictions += globalCacheDiag.Evictions
+		cacheDiag.EntryEvictions += globalCacheDiag.EntryEvictions
+		cacheDiag.ByteEvictions += globalCacheDiag.ByteEvictions
+		cacheDiag.OversizedRejects += globalCacheDiag.OversizedRejects
 		cacheDiag.LockContentions += globalCacheDiag.LockContentions
 		cacheDiag.LockWaitNanos += globalCacheDiag.LockWaitNanos
 		cacheDiag.DBGets += globalCacheDiag.DBGets

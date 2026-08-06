@@ -467,6 +467,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		lastNodeCacheHits            int64
 		lastNodeCacheMisses          int64
 		lastNodeCacheEvictions       int64
+		lastCacheEntryEvictions      int64
+		lastCacheByteEvictions       int64
+		lastCacheOversizedRejects    int64
 		lastNodeCacheLockContentions int64
 		lastNodeCacheLockWaitNanos   int64
 		lastNodeCacheDBGets          int64
@@ -723,6 +726,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		"PreCommit_us_Per_Mutation", "Root_Charged_us_Per_Mutation",
 		"Stem_Put_us_Per_Call", "Stem_Apply_us_Per_Stem",
 		"Flat_Read_IO_us_Per_Get", "NodeCache_DB_Get_us_Per_Get", "NodeCache_DB_Load_Bytes_Per_Get",
+		"NodeCache_Total_Entry_Evictions", "NodeCache_Total_Byte_Evictions", "NodeCache_Total_Oversized_Rejects",
+		"NodeCache_Window_Entry_Evictions", "NodeCache_Window_Byte_Evictions", "NodeCache_Window_Oversized_Rejects",
+		"Shard_GetValueRef_Calls", "Shard_GetValueRef_Lock_Wait_ms", "Shard_GetValueRef_Lock_Wait_us_Per_Call",
 	}
 	writer.Write(metricsHeader)
 	kvStatsWriter.Write([]string{
@@ -966,6 +972,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		cacheWindowHits := commitDiag.NodeCacheTotalHits - lastNodeCacheHits
 		cacheWindowMisses := commitDiag.NodeCacheTotalMisses - lastNodeCacheMisses
 		cacheWindowEvictions := commitDiag.NodeCacheEvictions - lastNodeCacheEvictions
+		cacheWindowEntryEvictions := commitDiag.NodeCacheEntryEvictions - lastCacheEntryEvictions
+		cacheWindowByteEvictions := commitDiag.NodeCacheByteEvictions - lastCacheByteEvictions
+		cacheWindowOversizedRejects := commitDiag.NodeCacheOversizedRejects - lastCacheOversizedRejects
 		cacheWindowLockContentions := commitDiag.NodeCacheLockContentions - lastNodeCacheLockContentions
 		cacheWindowLockWaitNanos := commitDiag.NodeCacheLockWaitNanos - lastNodeCacheLockWaitNanos
 		cacheWindowDBGets := commitDiag.NodeCacheDBGets - lastNodeCacheDBGets
@@ -979,6 +988,15 @@ func TestExpireStateProcessor(t *testing.T) {
 		}
 		if cacheWindowEvictions < 0 {
 			cacheWindowEvictions = commitDiag.NodeCacheEvictions
+		}
+		if cacheWindowEntryEvictions < 0 {
+			cacheWindowEntryEvictions = commitDiag.NodeCacheEntryEvictions
+		}
+		if cacheWindowByteEvictions < 0 {
+			cacheWindowByteEvictions = commitDiag.NodeCacheByteEvictions
+		}
+		if cacheWindowOversizedRejects < 0 {
+			cacheWindowOversizedRejects = commitDiag.NodeCacheOversizedRejects
 		}
 		if cacheWindowLockContentions < 0 {
 			cacheWindowLockContentions = commitDiag.NodeCacheLockContentions
@@ -998,6 +1016,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		lastNodeCacheHits = commitDiag.NodeCacheTotalHits
 		lastNodeCacheMisses = commitDiag.NodeCacheTotalMisses
 		lastNodeCacheEvictions = commitDiag.NodeCacheEvictions
+		lastCacheEntryEvictions = commitDiag.NodeCacheEntryEvictions
+		lastCacheByteEvictions = commitDiag.NodeCacheByteEvictions
+		lastCacheOversizedRejects = commitDiag.NodeCacheOversizedRejects
 		lastNodeCacheLockContentions = commitDiag.NodeCacheLockContentions
 		lastNodeCacheLockWaitNanos = commitDiag.NodeCacheLockWaitNanos
 		lastNodeCacheDBGets = commitDiag.NodeCacheDBGets
@@ -1060,13 +1081,17 @@ func TestExpireStateProcessor(t *testing.T) {
 			commitDiag.NodeCacheEntries,
 		)
 		if cfg.UseBinaryTrie {
-			fmt.Printf("  Node cache - window hits=%d misses=%d evictions=%d; lifetime hits=%d misses=%d evictions=%d\n",
-				cacheWindowHits, cacheWindowMisses, cacheWindowEvictions,
-				commitDiag.NodeCacheTotalHits, commitDiag.NodeCacheTotalMisses, commitDiag.NodeCacheEvictions)
+			fmt.Printf("  Node cache - window hits=%d misses=%d evictions=%d (entry=%d byte=%d oversized=%d); lifetime hits=%d misses=%d evictions=%d (entry=%d byte=%d oversized=%d)\n",
+				cacheWindowHits, cacheWindowMisses, cacheWindowEvictions, cacheWindowEntryEvictions, cacheWindowByteEvictions, cacheWindowOversizedRejects,
+				commitDiag.NodeCacheTotalHits, commitDiag.NodeCacheTotalMisses, commitDiag.NodeCacheEvictions,
+				commitDiag.NodeCacheEntryEvictions, commitDiag.NodeCacheByteEvictions, commitDiag.NodeCacheOversizedRejects)
 			fmt.Printf("  Node cache detail - entries=%d/%d bytes=%d/%d shards=%d windowLockWait=%v contentions=%d dbGets=%d dbTime=%v loaded=%d bytes\n",
 				commitDiag.NodeCacheEntries, commitDiag.NodeCacheEntryLimit, commitDiag.NodeCacheBytes, commitDiag.NodeCacheBytesLimit,
 				commitDiag.NodeCacheShards, time.Duration(cacheWindowLockWaitNanos), cacheWindowLockContentions,
 				cacheWindowDBGets, time.Duration(cacheWindowDBGetNanos), cacheWindowDBLoadBytes)
+			fmt.Printf("  Shard value-ref lock - calls=%d wait=%v avg=%.3fus\n",
+				windowUpdateDiagnostics.ValueRefCalls, time.Duration(windowUpdateDiagnostics.ValueRefLockWaitNanos),
+				microsPer(windowUpdateDiagnostics.ValueRefLockWaitNanos, windowUpdateDiagnostics.ValueRefCalls))
 		}
 		if cfg.UseBinaryTrie {
 			fmt.Printf("  ASCT Struct - OuterLeaves=%d, ArchiveRecords=%d, ActiveLogicalValues=%d, ArchivedLogicalValues=%d, LogicalReadFailures=%d/%d, Buckets=%d, RootBuckets=%d/%d items (leaf=%d/%d, stub=%d/%d), StubBuckets=%d/%d items (deep=%d/%d), ChildBuckets=%d/%d items, MaxBucketsPath=%d, MaxStubList=%d/%d items (root=%d/%d, deep=%d/%d)\n",
@@ -1551,6 +1576,15 @@ func TestExpireStateProcessor(t *testing.T) {
 				}
 				return float64(cacheWindowDBLoadBytes) / float64(cacheWindowDBGets)
 			}()),
+			strconv.FormatInt(commitDiag.NodeCacheEntryEvictions, 10),
+			strconv.FormatInt(commitDiag.NodeCacheByteEvictions, 10),
+			strconv.FormatInt(commitDiag.NodeCacheOversizedRejects, 10),
+			strconv.FormatInt(cacheWindowEntryEvictions, 10),
+			strconv.FormatInt(cacheWindowByteEvictions, 10),
+			strconv.FormatInt(cacheWindowOversizedRejects, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.ValueRefCalls, 10),
+			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.ValueRefLockWaitNanos)/float64(time.Millisecond)),
+			fmt.Sprintf("%.3f", microsPer(windowUpdateDiagnostics.ValueRefLockWaitNanos, windowUpdateDiagnostics.ValueRefCalls)),
 		}
 		if len(record) != len(metricsHeader) {
 			t.Fatalf("metrics CSV column mismatch: header=%d record=%d", len(metricsHeader), len(record))

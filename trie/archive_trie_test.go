@@ -10,6 +10,35 @@ import (
 	"github.com/ethereum/go-ethereum/trie/trienode"
 )
 
+func TestArchiveNodeBlobCacheEvictionReasons(t *testing.T) {
+	var first, second, third common.Hash
+	first[0], second[0], third[0] = 1, 2, 3
+
+	entryLimited := newArchiveNodeBlobCache(2, 1024)
+	entryLimited.add(first, []byte("one"))
+	entryLimited.add(second, []byte("two"))
+	entryLimited.add(third, []byte("three"))
+	entryDiag := entryLimited.diagnostics()
+	if entryDiag.Evictions != 1 || entryDiag.EntryEvictions != 1 || entryDiag.ByteEvictions != 0 {
+		t.Fatalf("unexpected entry-pressure diagnostics: %+v", entryDiag)
+	}
+
+	byteLimited := newArchiveNodeBlobCache(10, 70)
+	byteLimited.add(first, []byte("first-value"))
+	byteLimited.add(second, []byte("second-value"))
+	byteDiag := byteLimited.diagnostics()
+	if byteDiag.Evictions != 1 || byteDiag.EntryEvictions != 0 || byteDiag.ByteEvictions != 1 {
+		t.Fatalf("unexpected byte-pressure diagnostics: %+v", byteDiag)
+	}
+
+	oversized := newArchiveNodeBlobCache(10, common.HashLength)
+	oversized.add(first, []byte{1})
+	oversizedDiag := oversized.diagnostics()
+	if oversizedDiag.Entries != 0 || oversizedDiag.OversizedRejects != 1 {
+		t.Fatalf("unexpected oversized-entry diagnostics: %+v", oversizedDiag)
+	}
+}
+
 func TestNodeSetBatcherPersistsRawFlatValues(t *testing.T) {
 	disk := rawdb.NewMemoryDatabase()
 	adapter := &archiveDBAdapter{disk: disk}

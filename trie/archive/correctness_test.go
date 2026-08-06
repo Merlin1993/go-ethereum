@@ -2828,8 +2828,41 @@ func TestNodeBlobCacheHonorsByteLimit(t *testing.T) {
 		t.Fatalf("newest entry missing after byte-pressure insert")
 	}
 	diag := cache.diagnostics()
-	if diag.Hits != 1 || diag.Misses != 1 || diag.Evictions != 1 {
+	if diag.Hits != 1 || diag.Misses != 1 || diag.Evictions != 1 || diag.EntryEvictions != 0 || diag.ByteEvictions != 1 || diag.OversizedRejects != 0 {
 		t.Fatalf("unexpected cache diagnostics: %+v", diag)
+	}
+}
+
+func TestNodeBlobCacheReportsEntryPressure(t *testing.T) {
+	cache := newNodeBlobCacheWithBytesLimit(2, 1024)
+	cache.add([]byte("a"), []byte("one"))
+	cache.add([]byte("b"), []byte("two"))
+	cache.add([]byte("c"), []byte("three"))
+
+	diag := cache.diagnostics()
+	if diag.Entries != 2 || diag.Evictions != 1 || diag.EntryEvictions != 1 || diag.ByteEvictions != 0 || diag.OversizedRejects != 0 {
+		t.Fatalf("unexpected entry-pressure diagnostics: %+v", diag)
+	}
+}
+
+func TestNodeBlobCacheReportsOversizedReject(t *testing.T) {
+	cache := newNodeBlobCacheWithBytesLimit(10, 16)
+	cache.add([]byte("oversized"), bytes.Repeat([]byte{1}, 16))
+
+	diag := cache.diagnostics()
+	if diag.Entries != 0 || diag.Evictions != 0 || diag.EntryEvictions != 0 || diag.ByteEvictions != 0 || diag.OversizedRejects != 1 {
+		t.Fatalf("unexpected oversized-entry diagnostics: %+v", diag)
+	}
+}
+
+func TestValueRefDiagnosticsAggregateShards(t *testing.T) {
+	before := LastUpdateDiagnostics()
+	recordShardGetValueRefDiagnostics(1, 2*time.Millisecond)
+	recordShardGetValueRefDiagnostics(1+nodeCacheShardCount, 3*time.Millisecond)
+
+	delta := LastUpdateDiagnostics().Sub(before)
+	if delta.ValueRefCalls != 2 || delta.ValueRefLockWaitNanos != int64(5*time.Millisecond) {
+		t.Fatalf("unexpected value-ref diagnostics: %+v", delta)
 	}
 }
 

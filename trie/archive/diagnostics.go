@@ -68,31 +68,34 @@ type CommitDiagnostics struct {
 	ShardMaxNodeType          int64
 	ShardMaxNodeBytes         int64
 
-	RawBatchOps              int64
-	RawBatchBytes            int64
-	RawShardMaxID            int64
-	RawShardMaxOps           int64
-	RawShardMaxBytes         int64
-	NodeCacheEntries         int64
-	NodeCacheBytes           int64
-	NodeCacheEntryLimit      int64
-	NodeCacheBytesLimit      int64
-	NodeCacheShards          int64
-	NodeCacheTotalHits       int64
-	NodeCacheTotalMisses     int64
-	NodeCacheEvictions       int64
-	NodeCacheLockContentions int64
-	NodeCacheLockWaitNanos   int64
-	NodeCacheDBGets          int64
-	NodeCacheDBGetNanos      int64
-	NodeCacheDBLoadBytes     int64
-	RuntimeHeapAlloc         int64
-	RuntimeHeapSys           int64
-	RuntimeHeapInuse         int64
-	RuntimeSys               int64
-	RuntimeNumGC             int64
-	RuntimePauseTotal        int64
-	RuntimeLastPauseNs       int64
+	RawBatchOps               int64
+	RawBatchBytes             int64
+	RawShardMaxID             int64
+	RawShardMaxOps            int64
+	RawShardMaxBytes          int64
+	NodeCacheEntries          int64
+	NodeCacheBytes            int64
+	NodeCacheEntryLimit       int64
+	NodeCacheBytesLimit       int64
+	NodeCacheShards           int64
+	NodeCacheTotalHits        int64
+	NodeCacheTotalMisses      int64
+	NodeCacheEvictions        int64
+	NodeCacheEntryEvictions   int64
+	NodeCacheByteEvictions    int64
+	NodeCacheOversizedRejects int64
+	NodeCacheLockContentions  int64
+	NodeCacheLockWaitNanos    int64
+	NodeCacheDBGets           int64
+	NodeCacheDBGetNanos       int64
+	NodeCacheDBLoadBytes      int64
+	RuntimeHeapAlloc          int64
+	RuntimeHeapSys            int64
+	RuntimeHeapInuse          int64
+	RuntimeSys                int64
+	RuntimeNumGC              int64
+	RuntimePauseTotal         int64
+	RuntimeLastPauseNs        int64
 }
 
 // HashDiagnostics describes the root calculation performed by the latest
@@ -250,6 +253,16 @@ type UpdateDiagnostics struct {
 	FlatValueWriteNanos    int64
 	ArchivePromotionChecks int64
 	ArchivePromotionHits   int64
+	ValueRefCalls          int64
+	ValueRefLockWaitNanos  int64
+}
+
+// Keep hot counters on separate cache lines so parallel stem workers do not
+// serialize on diagnostics while measuring shard-lock contention.
+type valueRefDiagnosticShard struct {
+	calls     atomic.Int64
+	waitNanos atomic.Int64
+	_         [48]byte
 }
 
 const latencyHistogramBuckets = 512
@@ -327,6 +340,8 @@ func (d UpdateDiagnostics) Sub(previous UpdateDiagnostics) UpdateDiagnostics {
 		FlatValueWriteNanos:     d.FlatValueWriteNanos - previous.FlatValueWriteNanos,
 		ArchivePromotionChecks:  d.ArchivePromotionChecks - previous.ArchivePromotionChecks,
 		ArchivePromotionHits:    d.ArchivePromotionHits - previous.ArchivePromotionHits,
+		ValueRefCalls:           d.ValueRefCalls - previous.ValueRefCalls,
+		ValueRefLockWaitNanos:   d.ValueRefLockWaitNanos - previous.ValueRefLockWaitNanos,
 	}
 }
 
@@ -414,13 +429,14 @@ var (
 	updateStemPutLatencyCount          int64
 	updateStemApplyLatencyBuckets      [latencyHistogramBuckets]int64
 	updateStemApplyLatencyCount        int64
+	updateValueRefDiagnostics          [nodeCacheShardCount]valueRefDiagnosticShard
 
 	hashDiagnosticsMu sync.Mutex
 	hashDiagnostics   HashDiagnostics
 )
 
 func LastUpdateDiagnostics() UpdateDiagnostics {
-	return UpdateDiagnostics{
+	diag := UpdateDiagnostics{
 		StemPutCalls:            atomic.LoadInt64(&updateStemPutCalls),
 		StemPutNoops:            atomic.LoadInt64(&updateStemPutNoops),
 		StemPutLoadedBytes:      atomic.LoadInt64(&updateStemPutLoadedBytes),
@@ -458,6 +474,19 @@ func LastUpdateDiagnostics() UpdateDiagnostics {
 		FlatValueWriteNanos:     atomic.LoadInt64(&updateFlatValueWriteNanos),
 		ArchivePromotionChecks:  atomic.LoadInt64(&updateArchivePromotionChecks),
 		ArchivePromotionHits:    atomic.LoadInt64(&updateArchivePromotionHits),
+	}
+	for i := range updateValueRefDiagnostics {
+		diag.ValueRefCalls += updateValueRefDiagnostics[i].calls.Load()
+		diag.ValueRefLockWaitNanos += updateValueRefDiagnostics[i].waitNanos.Load()
+	}
+	return diag
+}
+
+func recordShardGetValueRefDiagnostics(shardID int, lockWait time.Duration) {
+	diag := &updateValueRefDiagnostics[uint(shardID)%uint(len(updateValueRefDiagnostics))]
+	diag.calls.Add(1)
+	if lockWait > 0 {
+		diag.waitNanos.Add(lockWait.Nanoseconds())
 	}
 }
 
@@ -824,6 +853,9 @@ var (
 	commitDiagNodeCacheTotalHits         int64
 	commitDiagNodeCacheTotalMisses       int64
 	commitDiagNodeCacheEvictions         int64
+	commitDiagNodeCacheEntryEvictions    int64
+	commitDiagNodeCacheByteEvictions     int64
+	commitDiagNodeCacheOversizedRejects  int64
 	commitDiagNodeCacheLockContentions   int64
 	commitDiagNodeCacheLockWaitNanos     int64
 	commitDiagNodeCacheDBGets            int64
@@ -909,6 +941,9 @@ func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagNodeCacheTotalHits, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheTotalMisses, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheEvictions, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheEntryEvictions, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheByteEvictions, 0)
+	atomic.StoreInt64(&commitDiagNodeCacheOversizedRejects, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheLockContentions, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheLockWaitNanos, 0)
 	atomic.StoreInt64(&commitDiagNodeCacheDBGets, 0)
@@ -1120,6 +1155,9 @@ func RecordNodeCacheDiagnostics(diag NodeCacheDiagnostics) {
 	atomic.StoreInt64(&commitDiagNodeCacheTotalHits, diag.Hits)
 	atomic.StoreInt64(&commitDiagNodeCacheTotalMisses, diag.Misses)
 	atomic.StoreInt64(&commitDiagNodeCacheEvictions, diag.Evictions)
+	atomic.StoreInt64(&commitDiagNodeCacheEntryEvictions, diag.EntryEvictions)
+	atomic.StoreInt64(&commitDiagNodeCacheByteEvictions, diag.ByteEvictions)
+	atomic.StoreInt64(&commitDiagNodeCacheOversizedRejects, diag.OversizedRejects)
 	atomic.StoreInt64(&commitDiagNodeCacheLockContentions, diag.LockContentions)
 	atomic.StoreInt64(&commitDiagNodeCacheLockWaitNanos, diag.LockWaitNanos)
 	atomic.StoreInt64(&commitDiagNodeCacheDBGets, diag.DBGets)
@@ -1315,6 +1353,9 @@ func LastCommitDiagnostics() CommitDiagnostics {
 		NodeCacheTotalHits:         atomic.LoadInt64(&commitDiagNodeCacheTotalHits),
 		NodeCacheTotalMisses:       atomic.LoadInt64(&commitDiagNodeCacheTotalMisses),
 		NodeCacheEvictions:         atomic.LoadInt64(&commitDiagNodeCacheEvictions),
+		NodeCacheEntryEvictions:    atomic.LoadInt64(&commitDiagNodeCacheEntryEvictions),
+		NodeCacheByteEvictions:     atomic.LoadInt64(&commitDiagNodeCacheByteEvictions),
+		NodeCacheOversizedRejects:  atomic.LoadInt64(&commitDiagNodeCacheOversizedRejects),
 		NodeCacheLockContentions:   atomic.LoadInt64(&commitDiagNodeCacheLockContentions),
 		NodeCacheLockWaitNanos:     atomic.LoadInt64(&commitDiagNodeCacheLockWaitNanos),
 		NodeCacheDBGets:            atomic.LoadInt64(&commitDiagNodeCacheDBGets),
@@ -1332,7 +1373,7 @@ func LastCommitDiagnostics() CommitDiagnostics {
 
 func (d CommitDiagnostics) String() string {
 	return fmt.Sprintf(
-		"total=%v commitToBatch=%v shardCommit=%v rootHash=%v batchWrite=%v adapterMerge=%v trieDBUpdate=%v pruneTotal=%v pruneWait=%v pruneShard=%v prunePrefetchStart=%v dirtyShards=%d nodeCacheHits=%d nodeCacheMisses=%d pathNodeDBGets=%d archivePromotionChecks=%d archivePromotionHits=%d bucketRecomputes=%d commitmentPointCacheHits=%d commitmentPointCacheMisses=%d pruneInternalVisits=%d pruneHotSkips=%d pruneChildHits=%d pruneChildSkips=%d pruneBulkCollects=%d pruneCollectedLeaves=%d pruneCollectedStubs=%d pruneBuildItems=%d pruneBuildBuckets=%d pruneArchiveBuildParallels=%d prunePathAbsorbedItems=%d pruneRootPoolItems=%d pruneRootPoolBuckets=%d shardMaxID=%d shardMaxCommit=%v shardMaxLockWait=%v shardMaxRootCommit=%v shardMaxSerialize=%v shardMaxHash=%v shardMaxPersist=%v shardMaxBatchPut=%v shardMaxCache=%v shardMaxBookkeep=%v shardMaxNode=%v shardMaxNodeType=%d shardMaxNodeBytes=%d shardMaxStaleDeletes=%v shardMaxPendingValues=%v shardMaxNodeCount=%d shardMaxStaleSetLen=%d shardMaxPendingValuesCount=%d shardMaxPendingFlatValuesCount=%d rawBatchOps=%d rawBatchBytes=%d rawShardMaxID=%d rawShardMaxOps=%d rawShardMaxBytes=%d nodeCacheEntries=%d nodeCacheBytes=%d nodeCacheTotalHits=%d nodeCacheTotalMisses=%d nodeCacheEvictions=%d heapAlloc=%d heapSys=%d heapInuse=%d runtimeSys=%d numGC=%d pauseTotal=%v lastPause=%v",
+		"total=%v commitToBatch=%v shardCommit=%v rootHash=%v batchWrite=%v adapterMerge=%v trieDBUpdate=%v pruneTotal=%v pruneWait=%v pruneShard=%v prunePrefetchStart=%v dirtyShards=%d nodeCacheHits=%d nodeCacheMisses=%d pathNodeDBGets=%d archivePromotionChecks=%d archivePromotionHits=%d bucketRecomputes=%d commitmentPointCacheHits=%d commitmentPointCacheMisses=%d pruneInternalVisits=%d pruneHotSkips=%d pruneChildHits=%d pruneChildSkips=%d pruneBulkCollects=%d pruneCollectedLeaves=%d pruneCollectedStubs=%d pruneBuildItems=%d pruneBuildBuckets=%d pruneArchiveBuildParallels=%d prunePathAbsorbedItems=%d pruneRootPoolItems=%d pruneRootPoolBuckets=%d shardMaxID=%d shardMaxCommit=%v shardMaxLockWait=%v shardMaxRootCommit=%v shardMaxSerialize=%v shardMaxHash=%v shardMaxPersist=%v shardMaxBatchPut=%v shardMaxCache=%v shardMaxBookkeep=%v shardMaxNode=%v shardMaxNodeType=%d shardMaxNodeBytes=%d shardMaxStaleDeletes=%v shardMaxPendingValues=%v shardMaxNodeCount=%d shardMaxStaleSetLen=%d shardMaxPendingValuesCount=%d shardMaxPendingFlatValuesCount=%d rawBatchOps=%d rawBatchBytes=%d rawShardMaxID=%d rawShardMaxOps=%d rawShardMaxBytes=%d nodeCacheEntries=%d nodeCacheBytes=%d nodeCacheTotalHits=%d nodeCacheTotalMisses=%d nodeCacheEvictions=%d nodeCacheEntryEvictions=%d nodeCacheByteEvictions=%d nodeCacheOversizedRejects=%d heapAlloc=%d heapSys=%d heapInuse=%d runtimeSys=%d numGC=%d pauseTotal=%v lastPause=%v",
 		time.Duration(d.TotalNanos),
 		time.Duration(d.CommitToBatchNanos),
 		time.Duration(d.ShardCommitNanos),
@@ -1395,6 +1436,9 @@ func (d CommitDiagnostics) String() string {
 		d.NodeCacheTotalHits,
 		d.NodeCacheTotalMisses,
 		d.NodeCacheEvictions,
+		d.NodeCacheEntryEvictions,
+		d.NodeCacheByteEvictions,
+		d.NodeCacheOversizedRejects,
 		d.RuntimeHeapAlloc,
 		d.RuntimeHeapSys,
 		d.RuntimeHeapInuse,

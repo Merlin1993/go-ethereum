@@ -10,8 +10,11 @@ import (
 )
 
 // DefaultNodeCacheLimit mirrors the archive trie wrapper default. A zero config
-// value resolves to this default; negative values disable the cache.
-const DefaultNodeCacheLimit = 1048576
+// value resolves to this default; negative values disable the cache. The first
+// 10M-block path-mode replay exhausted the old 1M-entry cap while accounting
+// for only about 78 MiB of serialized keys and values, so use the conservative
+// 4M-entry A/B candidate while retaining the independent byte guard below.
+const DefaultNodeCacheLimit = 4 * 1024 * 1024
 
 // nodeCacheShardCount keeps unrelated shard workers off the same LRU lock.
 // It is deliberately fixed so cache behavior stays comparable across runs.
@@ -38,16 +41,19 @@ const DefaultCommitmentPointCacheLimit = -1
 const DefaultCommitWorkers = 16
 
 type nodeBlobCacheShard struct {
-	mu              sync.Mutex
-	cache           lru.BasicLRU[string, []byte]
-	limit           int
-	bytesLimit      int64
-	bytes           int64
-	hits            int64
-	misses          int64
-	evictions       int64
-	lockWaitNanos   int64
-	lockContentions int64
+	mu               sync.Mutex
+	cache            lru.BasicLRU[string, []byte]
+	limit            int
+	bytesLimit       int64
+	bytes            int64
+	hits             int64
+	misses           int64
+	evictions        int64
+	entryEvictions   int64
+	byteEvictions    int64
+	oversizedRejects int64
+	lockWaitNanos    int64
+	lockContentions  int64
 }
 
 type nodeBlobCache struct {
@@ -63,19 +69,22 @@ type nodeBlobCache struct {
 // counters. Counters are maintained under the cache's existing mutex, so they
 // add no extra synchronization to the read path.
 type NodeCacheDiagnostics struct {
-	Entries         int64
-	Bytes           int64
-	EntryLimit      int64
-	BytesLimit      int64
-	Shards          int64
-	Hits            int64
-	Misses          int64
-	Evictions       int64
-	LockContentions int64
-	LockWaitNanos   int64
-	DBGets          int64
-	DBGetNanos      int64
-	DBLoadBytes     int64
+	Entries          int64
+	Bytes            int64
+	EntryLimit       int64
+	BytesLimit       int64
+	Shards           int64
+	Hits             int64
+	Misses           int64
+	Evictions        int64
+	EntryEvictions   int64
+	ByteEvictions    int64
+	OversizedRejects int64
+	LockContentions  int64
+	LockWaitNanos    int64
+	DBGets           int64
+	DBGetNanos       int64
+	DBLoadBytes      int64
 }
 
 func newNodeBlobCache(limit int) *nodeBlobCache {
@@ -187,6 +196,7 @@ func (c *nodeBlobCache) add(key []byte, data []byte) {
 	defer shard.mu.Unlock()
 	if shard.bytesLimit > 0 && size > shard.bytesLimit {
 		shard.removeStringLocked(k)
+		shard.oversizedRejects++
 		return
 	}
 	if old, ok := shard.cache.Peek(k); ok {
@@ -194,10 +204,14 @@ func (c *nodeBlobCache) add(key []byte, data []byte) {
 		shard.cache.Remove(k)
 	}
 	for shard.limit > 0 && shard.cache.Len() >= shard.limit {
-		shard.removeOldestLocked()
+		if shard.removeOldestLocked() {
+			shard.entryEvictions++
+		}
 	}
 	for shard.bytesLimit > 0 && shard.bytes+size > shard.bytesLimit && shard.cache.Len() > 0 {
-		shard.removeOldestLocked()
+		if shard.removeOldestLocked() {
+			shard.byteEvictions++
+		}
 	}
 	shard.cache.Add(k, data)
 	shard.bytes += size
@@ -220,16 +234,17 @@ func (s *nodeBlobCacheShard) removeStringLocked(key string) {
 	}
 }
 
-func (s *nodeBlobCacheShard) removeOldestLocked() {
+func (s *nodeBlobCacheShard) removeOldestLocked() bool {
 	key, value, ok := s.cache.RemoveOldest()
 	if !ok {
-		return
+		return false
 	}
 	s.bytes -= int64(len(key) + len(value))
 	s.evictions++
 	if s.bytes < 0 {
 		s.bytes = 0
 	}
+	return true
 }
 
 func (c *nodeBlobCache) recordDBGet(elapsed time.Duration, loadedBytes int) {
@@ -268,6 +283,9 @@ func (c *nodeBlobCache) diagnostics() NodeCacheDiagnostics {
 		diag.Hits += shard.hits
 		diag.Misses += shard.misses
 		diag.Evictions += shard.evictions
+		diag.EntryEvictions += shard.entryEvictions
+		diag.ByteEvictions += shard.byteEvictions
+		diag.OversizedRejects += shard.oversizedRejects
 		diag.LockContentions += shard.lockContentions
 		diag.LockWaitNanos += shard.lockWaitNanos
 		shard.mu.Unlock()

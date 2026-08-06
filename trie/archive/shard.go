@@ -614,7 +614,13 @@ func (s *Shard) Get(key []byte) ([]byte, error) {
 // GetValueRef returns the value commitment stored in the hot leaf or archive
 // bucket without loading the flat value payload.
 func (s *Shard) GetValueRef(key []byte) ([]byte, bool, error) {
-	s.mu.Lock()
+	var lockWait time.Duration
+	if !s.mu.TryLock() {
+		lockStart := time.Now()
+		s.mu.Lock()
+		lockWait = time.Since(lockStart)
+	}
+	recordShardGetValueRefDiagnostics(s.id, lockWait)
 	defer s.mu.Unlock()
 
 	if s.root == nil && len(s.rootHash) > 0 {
