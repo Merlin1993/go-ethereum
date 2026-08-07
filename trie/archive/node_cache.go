@@ -25,11 +25,12 @@ const nodeCacheShardCount = 64
 // archive metadata nodes can vary widely in size.
 const DefaultNodeCacheBytesLimit int64 = 512 * 1024 * 1024
 
-// DefaultNodeCacheWarmPathBits disables commit-time eager warming in path mode.
-// Positive values are useful for experiments, but current long runs show that
-// even root eager warming costs more in commit/LRU churn than it saves. Loaded
-// nodes are still cached lazily on demand.
-const DefaultNodeCacheWarmPathBits = -2
+// DefaultNodeCacheWarmPathBits retains only the freshly persisted shard root in
+// path mode. Destructive commits unload the in-memory shard, so keeping the
+// serialized root avoids immediately reading the same record back from disk.
+// Descendants remain demand-loaded to avoid filling the cache with write-once
+// commit output.
+const DefaultNodeCacheWarmPathBits = -1
 
 // DefaultCommitmentPointCacheLimit keeps decoded ECMH commitment-point caching
 // disabled by default. Long destructive path runs showed near-zero reuse for

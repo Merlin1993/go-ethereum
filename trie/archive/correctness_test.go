@@ -2642,7 +2642,9 @@ func TestPathNodeCacheServesDestructiveReload(t *testing.T) {
 	config.NodeStorageScheme = NodeStoragePath
 	config.EnablePathDiagnostics = true
 	config.NodeCacheLimit = 128
-	config.NodeCacheWarmPathBits = -1
+	if config.NodeCacheWarmPathBits != -1 {
+		t.Fatalf("unexpected default path cache warming: got %d want -1", config.NodeCacheWarmPathBits)
+	}
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	key := make([]byte, 32)
@@ -2673,6 +2675,77 @@ func TestPathNodeCacheServesDestructiveReload(t *testing.T) {
 	}
 	if diag.PathNodeDBGets != 0 {
 		t.Fatalf("expected cached destructive reload to avoid path DB gets, got %d", diag.PathNodeDBGets)
+	}
+}
+
+func TestPathNodeCacheWithoutRootWriteThroughReloadsDB(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.NodeStorageScheme = NodeStoragePath
+	config.EnablePathDiagnostics = true
+	config.NodeCacheLimit = 128
+	config.NodeCacheWarmPathBits = -2
+	trie := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
+
+	key := make([]byte, 32)
+	key[0] = 0x42
+	if err := trie.Put(key, []byte("uncached-value")); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := trie.CommitToBatch(batch, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	ResetCommitDiagnostics()
+	if _, err := trie.Get(key); err != nil {
+		t.Fatal(err)
+	}
+	if diag := LastCommitDiagnostics(); diag.PathNodeDBGets == 0 {
+		t.Fatal("expected disabled root write-through to reload the shard root from DB")
+	}
+}
+
+func BenchmarkPathNodeCacheDestructiveReload(b *testing.B) {
+	for _, test := range []struct {
+		name         string
+		warmPathBits int
+	}{
+		{name: "disabled", warmPathBits: -2},
+		{name: "root-only", warmPathBits: -1},
+	} {
+		b.Run(test.name, func(b *testing.B) {
+			db := NewMemoryDBAdapter()
+			config := DefaultConfig()
+			config.ShardDepth = 8
+			config.NodeStorageScheme = NodeStoragePath
+			config.NodeCacheLimit = 128
+			config.NodeCacheWarmPathBits = test.warmPathBits
+			trie := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
+			key := make([]byte, 32)
+			key[0] = 0x42
+			value := make([]byte, 8)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				binary.LittleEndian.PutUint64(value, uint64(i))
+				if err := trie.Put(key, value); err != nil {
+					b.Fatal(err)
+				}
+				batch := db.NewBatch()
+				if _, err := trie.CommitToBatch(batch, true); err != nil {
+					b.Fatal(err)
+				}
+				if err := batch.Write(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
 
@@ -2751,7 +2824,7 @@ func TestPruneAbsorbUsesPreNodePrefixForLongPath(t *testing.T) {
 	}
 }
 
-func TestPathNodeCacheLazyDefaultWarmsAfterLoad(t *testing.T) {
+func TestPathNodeCacheLazyLoadWarmsAfterMiss(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()
 	config := DefaultConfig()
@@ -2759,6 +2832,7 @@ func TestPathNodeCacheLazyDefaultWarmsAfterLoad(t *testing.T) {
 	config.NodeStorageScheme = NodeStoragePath
 	config.EnablePathDiagnostics = true
 	config.NodeCacheLimit = 128
+	config.NodeCacheWarmPathBits = -2
 	trie := NewTrie(nil, db, hasher, config, true)
 
 	key := make([]byte, 32)
@@ -2785,7 +2859,7 @@ func TestPathNodeCacheLazyDefaultWarmsAfterLoad(t *testing.T) {
 	}
 	diag := LastCommitDiagnostics()
 	if diag.NodeCacheMisses == 0 || diag.PathNodeDBGets == 0 {
-		t.Fatalf("expected default lazy reload to miss cache and read path DB, diag=%s", diag)
+		t.Fatalf("expected disabled write-through to miss cache and read path DB, diag=%s", diag)
 	}
 
 	shardID := trie.GetShardID(key)
