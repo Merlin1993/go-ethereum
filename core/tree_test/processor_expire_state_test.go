@@ -73,6 +73,7 @@ var (
 	cuckooSlots                 = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
 	binaryNodeCacheLimit        = flag.Int("binaryNodeCacheLimit", archivetrie.DefaultNodeCacheLimit, "Binary trie process node cache entry limit; 0 uses default, negative disables cache")
 	binaryNodeCacheBytesLimitMB = flag.Int("binaryNodeCacheBytesLimitMB", 512, "Binary trie process node cache byte limit in MiB; 0 uses default, negative disables byte cap")
+	binaryNodeCacheWarmPathBits = flag.Int("binaryNodeCacheWarmPathBits", archivetrie.DefaultNodeCacheWarmPathBits, "Path-mode write-through cache depth; -1 retains shard roots only, <-1 disables")
 	binaryPathDiagnostics       = flag.Bool("binaryPathDiagnostics", false, "Enable binary trie path/cache diagnostics")
 	binaryPruneShardMetrics     = flag.Bool("binaryPruneShardMetrics", false, "Write per-prune binary shard pressure metrics CSV")
 	binaryFilterFPSamples       = flag.Int("binaryFilterFPSamplesPerBucket", 1, "Known-negative Cuckoo-filter probes per archive bucket during exact trie scans; 0 disables")
@@ -124,6 +125,7 @@ type ProcessorConfig struct {
 	CuckooSlots                 int
 	BinaryNodeCacheLimit        int
 	BinaryNodeCacheBytesLimitMB int
+	BinaryNodeCacheWarmPathBits int
 	BinaryPathDiagnostics       bool
 	BinaryPruneShardMetrics     bool
 	BinaryFilterFPSamples       int
@@ -150,6 +152,8 @@ type finalStorageBreakdownReport struct {
 	Valid                       bool    `json:"valid"`
 	ReadFailures                int64   `json:"read_failures"`
 	SharedDatabasePhysicalBytes int64   `json:"shared_database_physical_bytes"`
+	ActiveLogicalValues         int64   `json:"active_logical_values"`
+	ArchivedLogicalValues       int64   `json:"archived_logical_values"`
 	RootBranchLogicalBytes      int64   `json:"root_branch_logical_bytes"`
 	HotTreeNodeLogicalBytes     int64   `json:"hot_tree_node_logical_bytes"`
 	ArchiveBucketLogicalBytes   int64   `json:"archive_bucket_logical_bytes"`
@@ -164,6 +168,90 @@ type finalStorageBreakdownReport struct {
 	ActiveOnlyLogicalBytes      int64   `json:"active_only_logical_bytes"`
 	ArchivedPayloadLogicalBytes int64   `json:"archived_payload_logical_bytes"`
 	ReachableLogicalBytes       int64   `json:"reachable_logical_bytes"`
+}
+
+func rewriteLastMetricsRecord(path string, updates map[string]string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	records, err := csv.NewReader(file).ReadAll()
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if len(records) < 2 {
+		return fmt.Errorf("metrics CSV has no data row")
+	}
+	header, last := records[0], records[len(records)-1]
+	if len(last) != len(header) {
+		return fmt.Errorf("metrics CSV last row has %d columns, want %d", len(last), len(header))
+	}
+	columns := make(map[string]int, len(header))
+	for i, name := range header {
+		columns[name] = i
+	}
+	for name, value := range updates {
+		column, ok := columns[name]
+		if !ok {
+			return fmt.Errorf("metrics CSV column %q not found", name)
+		}
+		last[column] = value
+	}
+
+	temp, err := os.CreateTemp(filepath.Dir(path), ".asct-metrics-*.csv")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	defer os.Remove(tempPath)
+	writer := csv.NewWriter(temp)
+	writer.WriteAll(records)
+	if err := writer.Error(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
+}
+
+func finalStorageMetricsUpdates(stats *archivetrie.TrieStats, scanDuration time.Duration, block uint64, sharedDatabaseBytes int64) map[string]string {
+	return map[string]string{
+		"Cumulative_Storage_Bytes":             strconv.FormatInt(sharedDatabaseBytes, 10),
+		"State_Storage_Bytes":                  strconv.FormatInt(sharedDatabaseBytes, 10),
+		"Shared_DB_Bytes":                      strconv.FormatInt(sharedDatabaseBytes, 10),
+		"Trie_Child_Node_Count":                strconv.FormatInt(stats.LeafCount, 10),
+		"Total_Archived_Items":                 strconv.FormatInt(stats.ArchivedDataSize, 10),
+		"Total_Bucket_Count":                   strconv.Itoa(stats.BucketCount),
+		"Active_Logical_Values":                strconv.FormatInt(stats.ActiveLogicalValues, 10),
+		"Archived_Logical_Values":              strconv.FormatInt(stats.ArchivedLogicalValues, 10),
+		"Active_Logical_Value_Read_Failures":   strconv.FormatInt(stats.ActiveLogicalValueReadFailures, 10),
+		"Archived_Logical_Value_Read_Failures": strconv.FormatInt(stats.ArchivedLogicalValueReadFailures, 10),
+		"Root_Branch_Logical_Bytes":            strconv.FormatInt(stats.RootBranchLogicalBytes, 10),
+		"Hot_Tree_Node_Logical_Bytes":          strconv.FormatInt(stats.HotTreeNodeLogicalBytes, 10),
+		"Archive_Bucket_Logical_Bytes":         strconv.FormatInt(stats.ArchiveBucketLogicalBytes, 10),
+		"Active_Stem_Metadata_Bytes":           strconv.FormatInt(stats.ActiveStemMetadataBytes, 10),
+		"Archived_Stem_Metadata_Bytes":         strconv.FormatInt(stats.ArchivedStemMetadataBytes, 10),
+		"Active_Suffix_Value_Bytes":            strconv.FormatInt(stats.ActiveSuffixValueBytes, 10),
+		"Archived_Suffix_Value_Bytes":          strconv.FormatInt(stats.ArchivedSuffixValueBytes, 10),
+		"Active_Legacy_Stem_Blob_Bytes":        strconv.FormatInt(stats.ActiveLegacyStemBlobBytes, 10),
+		"Archived_Legacy_Stem_Blob_Bytes":      strconv.FormatInt(stats.ArchivedLegacyStemBlobBytes, 10),
+		"Archive_Index_Logical_Bytes":          strconv.FormatInt(stats.ArchiveIndexLogicalBytes, 10),
+		"Archive_Index_Entries":                strconv.FormatInt(stats.ArchiveIndexEntries, 10),
+		"Storage_Breakdown_Read_Failures":      strconv.FormatInt(stats.StorageBreakdownReadFailures, 10),
+		"Storage_Breakdown_Valid":              strconv.FormatBool(stats.StorageBreakdownValid),
+		"Active_Only_Logical_Bytes":            strconv.FormatInt(stats.ActiveOnlyLogicalBytes, 10),
+		"Archived_Payload_Logical_Bytes":       strconv.FormatInt(stats.ArchivedPayloadLogicalBytes, 10),
+		"Reachable_Logical_Bytes":              strconv.FormatInt(stats.ReachableLogicalBytes, 10),
+		"Trie_Stats_ms":                        fmt.Sprintf("%.3f", float64(scanDuration)/float64(time.Millisecond)),
+		"Trie_Stats_Exact":                     strconv.FormatBool(true),
+		"Trie_Stats_Block":                     strconv.FormatUint(block, 10),
+	}
 }
 
 func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
@@ -212,6 +300,7 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 			CuckooSlots:           cfg.CuckooSlots,
 			NodeCacheLimit:        cfg.BinaryNodeCacheLimit,
 			NodeCacheBytesLimit:   int64(cfg.BinaryNodeCacheBytesLimitMB) * 1024 * 1024,
+			NodeCacheWarmPathBits: cfg.BinaryNodeCacheWarmPathBits,
 			EnablePathDiagnostics: cfg.BinaryPathDiagnostics,
 			AsyncPrune:            cfg.BinaryAsyncPrune,
 			CommitWorkers:         cfg.BinaryCommitWorkers,
@@ -316,6 +405,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		CuckooSlots:                 *cuckooSlots,
 		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,
 		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
+		BinaryNodeCacheWarmPathBits: *binaryNodeCacheWarmPathBits,
 		BinaryPathDiagnostics:       *binaryPathDiagnostics,
 		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
 		BinaryFilterFPSamples:       *binaryFilterFPSamples,
@@ -335,8 +425,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		MaxItemArchiveProofBytes:    *maxItemArchiveProofBytes,
 		MaxArchiveProofVerifyMs:     *maxArchiveProofVerifyMs,
 	}
-	fmt.Printf("[ASCT_CONFIG] stemArchive=%t shardDepth=%d bucketSize=%d nodeStorage=%s pruneInterval=%d\n",
-		cfg.BinaryStemArchive, cfg.ShardDepth, cfg.ArchiveBucketSize, cfg.BinaryNodeStorage, cfg.PruneInterval)
+	fmt.Printf("[ASCT_CONFIG] stemArchive=%t shardDepth=%d bucketSize=%d nodeStorage=%s pruneInterval=%d nodeCacheWarmPathBits=%d\n",
+		cfg.BinaryStemArchive, cfg.ShardDepth, cfg.ArchiveBucketSize, cfg.BinaryNodeStorage, cfg.PruneInterval, cfg.BinaryNodeCacheWarmPathBits)
 
 	common.UseVerkle = cfg.UseVerkle
 	if cfg.UseVerkle {
@@ -554,13 +644,19 @@ func TestExpireStateProcessor(t *testing.T) {
 	}
 
 	// CSV file setup
-	csvFile, err := os.Create(filepath.Join(outputDir, "asct_mainnet_metrics.csv"))
+	metricsCSVPath := filepath.Join(outputDir, "asct_mainnet_metrics.csv")
+	csvFile, err := os.Create(metricsCSVPath)
 	if err != nil {
 		t.Fatalf("failed to create csv file: %v", err)
 	}
-	defer csvFile.Close()
 	writer := csv.NewWriter(csvFile)
-	defer writer.Flush()
+	metricsCSVClosed := false
+	defer func() {
+		if !metricsCSVClosed {
+			writer.Flush()
+			_ = csvFile.Close()
+		}
+	}()
 
 	kvStatsFile, err := os.Create(filepath.Join(outputDir, "kv_block_access_stats.csv"))
 	if err != nil {
@@ -719,7 +815,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Flat_Value_Gets", "Flat_Value_Read_IO_ms", "Flat_Value_Read_IO_Bytes",
 		"Flat_Value_Puts", "Flat_Value_Deletes", "Flat_Value_Write_ms",
 		"Archive_Promotion_Checks", "Archive_Promotion_Hits",
-		"NodeCache_Entry_Limit", "NodeCache_Bytes_Limit", "NodeCache_Shards",
+		"NodeCache_Entry_Limit", "NodeCache_Bytes_Limit", "NodeCache_Warm_Path_Bits", "NodeCache_Shards",
 		"NodeCache_Window_Lock_Contentions", "NodeCache_Window_Lock_Wait_ms",
 		"NodeCache_Window_DB_Gets", "NodeCache_Window_DB_Get_ms", "NodeCache_Window_DB_Load_Bytes",
 		"Account_Update_us_Per_Account", "Storage_Update_us_Per_Slot",
@@ -1556,6 +1652,7 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(windowUpdateDiagnostics.ArchivePromotionHits, 10),
 			strconv.FormatInt(commitDiag.NodeCacheEntryLimit, 10),
 			strconv.FormatInt(commitDiag.NodeCacheBytesLimit, 10),
+			strconv.Itoa(cfg.BinaryNodeCacheWarmPathBits),
 			strconv.FormatInt(commitDiag.NodeCacheShards, 10),
 			strconv.FormatInt(cacheWindowLockContentions, 10),
 			fmt.Sprintf("%.3f", float64(cacheWindowLockWaitNanos)/float64(time.Millisecond)),
@@ -2320,6 +2417,14 @@ processFiles:
 	if intervalBlocks > 0 {
 		reportStats(true)
 	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		t.Fatalf("failed to flush metrics CSV: %v", err)
+	}
+	if err := csvFile.Close(); err != nil {
+		t.Fatalf("failed to close metrics CSV: %v", err)
+	}
+	metricsCSVClosed = true
 	if cfg.UseBinaryTrie && cfg.BinaryStorageBreakdownFinal {
 		if finalStorageStats == nil {
 			if active := host.trieDB.GetArchiveTrie(); active != nil {
@@ -2338,6 +2443,8 @@ processFiles:
 				Valid:                       finalStorageStats.StorageBreakdownValid,
 				ReadFailures:                finalStorageStats.StorageBreakdownReadFailures,
 				SharedDatabasePhysicalBytes: sharedDatabasePhysicalBytes,
+				ActiveLogicalValues:         finalStorageStats.ActiveLogicalValues,
+				ArchivedLogicalValues:       finalStorageStats.ArchivedLogicalValues,
 				RootBranchLogicalBytes:      finalStorageStats.RootBranchLogicalBytes,
 				HotTreeNodeLogicalBytes:     finalStorageStats.HotTreeNodeLogicalBytes,
 				ArchiveBucketLogicalBytes:   finalStorageStats.ArchiveBucketLogicalBytes,
@@ -2359,6 +2466,12 @@ processFiles:
 			}
 			if err := os.WriteFile(filepath.Join(outputDir, "asct_final_storage_breakdown.json"), data, 0644); err != nil {
 				t.Fatalf("failed to write final ASCT storage breakdown: %v", err)
+			}
+			if totalProcessedBlocks > 0 {
+				updates := finalStorageMetricsUpdates(finalStorageStats, finalStorageScanDuration, totalProcessedBlocks, sharedDatabasePhysicalBytes)
+				if err := rewriteLastMetricsRecord(metricsCSVPath, updates); err != nil {
+					t.Fatalf("failed to backfill final ASCT storage metrics: %v", err)
+				}
 			}
 		}
 	}
@@ -2634,6 +2747,7 @@ func TestBinaryTrieConsistency(t *testing.T) {
 		CuckooSlots:                 *cuckooSlots,
 		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,
 		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
+		BinaryNodeCacheWarmPathBits: *binaryNodeCacheWarmPathBits,
 		BinaryPathDiagnostics:       *binaryPathDiagnostics,
 		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
 		BinaryFilterFPSamples:       *binaryFilterFPSamples,
