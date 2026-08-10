@@ -480,6 +480,7 @@ type StemTrie struct {
 	backend *Trie
 	locks   [256]sync.Mutex
 	empty   [StemProofDepth + 1][]byte
+	cache   *stemStateCache
 }
 
 // StemUpdate is one logical suffix mutation used by ApplyBatch.
@@ -513,6 +514,7 @@ func NewStemTrie(backend *Trie) (*StemTrie, error) {
 		backend.stemView = &StemTrie{
 			backend: backend,
 			empty:   stemEmptyRoots(backend.hasher),
+			cache:   newStemStateCache(backend.config.StemCacheLimit, backend.config.StemCacheBytesLimit),
 		}
 	}
 	return backend.stemView, nil
@@ -524,6 +526,14 @@ func (t *StemTrie) Backend() *Trie {
 		return nil
 	}
 	return t.backend
+}
+
+// CacheDiagnostics returns the current decoded active-stem cache state.
+func (t *StemTrie) CacheDiagnostics() StemCacheDiagnostics {
+	if t == nil {
+		return StemCacheDiagnostics{}
+	}
+	return t.cache.diagnostics()
 }
 
 // Get returns one suffix value without activating an archived stem.
@@ -583,9 +593,9 @@ func (t *StemTrie) put(key, value []byte, replace bool) error {
 	)
 	loadStart := time.Now()
 	if replace {
-		oldStem, split, loadedBytes, err = t.loadStoredStem(stemKey, false)
+		oldStem, split, loadedBytes, err = t.loadStoredStemForUpdate(stemKey, false)
 	} else {
-		stem, split, loadedBytes, err = t.loadStoredStem(stemKey, true)
+		stem, split, loadedBytes, err = t.loadStoredStemForUpdate(stemKey, true)
 	}
 	loadTime = time.Since(loadStart)
 	if err != nil && !errors.Is(err, ErrNodeNotFound) {
@@ -654,6 +664,9 @@ func (t *StemTrie) put(key, value []byte, replace bool) error {
 	}
 	err = t.backend.PutValueRef(stemKey, root)
 	backendTime = time.Since(backendStart)
+	if err == nil {
+		t.cache.addOwned(stemKey, stem, true)
+	}
 	return err
 }
 
@@ -725,6 +738,7 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 		outerDelete []byte
 		flatPuts    []KeyValue
 		flatDeletes [][]byte
+		cachedStem  *Stem
 		loadTime    time.Duration
 		encodeTime  time.Duration
 		err         error
@@ -738,7 +752,7 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 			}
 		}
 		loadStart := time.Now()
-		stem, split, _, err := t.loadStoredStem(group.key, lastReplace < 0)
+		stem, split, _, err := t.loadStoredStemForUpdate(group.key, lastReplace < 0)
 		result.loadTime = time.Since(loadStart)
 		if err != nil && !errors.Is(err, ErrNodeNotFound) {
 			result.err = err
@@ -842,6 +856,7 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 		}
 		result.encodeTime = time.Since(encodeStart)
 		result.refPut = &KeyValue{Key: group.key, Value: root}
+		result.cachedStem = stem
 		return result
 	}
 
@@ -903,6 +918,13 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 			return err
 		}
 	}
+	for i, result := range results {
+		if result.outerDelete != nil {
+			t.cache.remove(groups[i].key)
+		} else if result.cachedStem != nil {
+			t.cache.addOwned(groups[i].key, result.cachedStem, true)
+		}
+	}
 	backendTime += time.Since(backendStart)
 	return nil
 }
@@ -958,8 +980,10 @@ func (t *StemTrie) DeleteBatchWithValues(keys [][]byte) (StemDeleteBatchResult, 
 	outerDeletes := make([][]byte, 0, len(groups))
 	flatPuts := make([]KeyValue, 0, len(groups))
 	flatDeletes := make([][]byte, 0, len(keys))
-	for _, group := range groups {
-		stem, split, _, err := t.loadStoredStem(group.key, true)
+	cachedStems := make([]*Stem, len(groups))
+	cacheDeletes := make([]bool, len(groups))
+	for groupIndex, group := range groups {
+		stem, split, _, err := t.loadStoredStemForUpdate(group.key, true)
 		if err != nil {
 			return StemDeleteBatchResult{}, err
 		}
@@ -977,6 +1001,7 @@ func (t *StemTrie) DeleteBatchWithValues(keys [][]byte) (StemDeleteBatchResult, 
 		}
 		if stem.Len() == 0 {
 			outerDeletes = append(outerDeletes, group.key)
+			cacheDeletes[groupIndex] = true
 			if split {
 				seen := make(map[byte]struct{})
 				for _, suffix := range group.suffixes {
@@ -1009,6 +1034,7 @@ func (t *StemTrie) DeleteBatchWithValues(keys [][]byte) (StemDeleteBatchResult, 
 			}
 		}
 		refPuts = append(refPuts, KeyValue{Key: group.key, Value: stem.ValuesRoot(t.backend.hasher)})
+		cachedStems[groupIndex] = stem
 	}
 	if err := t.backend.StageFlatBatch(flatPuts, flatDeletes); err != nil {
 		return StemDeleteBatchResult{}, err
@@ -1019,6 +1045,13 @@ func (t *StemTrie) DeleteBatchWithValues(keys [][]byte) (StemDeleteBatchResult, 
 	for _, key := range outerDeletes {
 		if err := t.backend.Delete(key); err != nil {
 			return StemDeleteBatchResult{}, err
+		}
+	}
+	for i, group := range groups {
+		if cacheDeletes[i] {
+			t.cache.remove(group.key)
+		} else if cachedStems[i] != nil {
+			t.cache.addOwned(group.key, cachedStems[i], true)
 		}
 	}
 	return result, nil
@@ -1035,7 +1068,7 @@ func (t *StemTrie) Delete(key []byte) error {
 	lock.Lock()
 	defer lock.Unlock()
 
-	stem, split, _, err := t.loadStoredStem(stemKey, true)
+	stem, split, _, err := t.loadStoredStemForUpdate(stemKey, true)
 	if errors.Is(err, ErrNodeNotFound) {
 		return nil
 	}
@@ -1051,7 +1084,11 @@ func (t *StemTrie) Delete(key []byte) error {
 				return err
 			}
 		}
-		return t.backend.Delete(stemKey)
+		if err := t.backend.Delete(stemKey); err != nil {
+			return err
+		}
+		t.cache.remove(stemKey)
+		return nil
 	}
 	flatPuts := []KeyValue{{Key: stemKey, Value: encodeStemMetadata(stem)}}
 	var flatDeletes [][]byte
@@ -1068,7 +1105,11 @@ func (t *StemTrie) Delete(key []byte) error {
 	if err := t.backend.StageFlatBatch(flatPuts, flatDeletes); err != nil {
 		return err
 	}
-	return t.backend.PutValueRef(stemKey, stem.ValuesRoot(t.backend.hasher))
+	if err := t.backend.PutValueRef(stemKey, stem.ValuesRoot(t.backend.hasher)); err != nil {
+		return err
+	}
+	t.cache.addOwned(stemKey, stem, true)
+	return nil
 }
 
 // Activate restores the entire archived stem containing key to the hot tree.
@@ -1082,7 +1123,7 @@ func (t *StemTrie) Activate(key []byte) error {
 	lock.Lock()
 	defer lock.Unlock()
 
-	stem, split, _, err := t.loadStoredStem(stemKey, true)
+	stem, split, _, err := t.loadStoredStemForUpdate(stemKey, true)
 	if err != nil {
 		return err
 	}
@@ -1098,7 +1139,11 @@ func (t *StemTrie) Activate(key []byte) error {
 			return err
 		}
 	}
-	return t.backend.ActivateValueRef(stemKey, stem.ValuesRoot(t.backend.hasher))
+	if err := t.backend.ActivateValueRef(stemKey, stem.ValuesRoot(t.backend.hasher)); err != nil {
+		return err
+	}
+	t.cache.addOwned(stemKey, stem, true)
+	return nil
 }
 
 // Prove returns the current ValuesRoot and an eight-hash suffix proof.
@@ -1127,7 +1172,7 @@ func (t *StemTrie) ForEach(fn func(key, value []byte) bool) error {
 		lock := &t.locks[stemKey[0]]
 		lock.Lock()
 		defer lock.Unlock()
-		stem, err := t.loadStem(stemKey)
+		stem, _, _, err := t.loadStoredStemWithCache(stemKey, true, false, false)
 		if err != nil {
 			iterErr = err
 			return false
@@ -1161,8 +1206,24 @@ func (t *StemTrie) loadStem(stemKey []byte) (*Stem, error) {
 // layout. Split stems keep only a bitmap under the 31-byte stem key and store
 // each value under its complete 32-byte key.
 func (t *StemTrie) loadStoredStem(stemKey []byte, loadValues bool) (*Stem, bool, int, error) {
+	return t.loadStoredStemWithCache(stemKey, loadValues, true, true)
+}
+
+// loadStoredStemForUpdate uses a cached stem when present but does not admit a
+// database miss. Successful update paths install the mutated stem afterward,
+// avoiding a clone and an immediately superseded cache entry on every miss.
+func (t *StemTrie) loadStoredStemForUpdate(stemKey []byte, loadValues bool) (*Stem, bool, int, error) {
+	return t.loadStoredStemWithCache(stemKey, loadValues, true, false)
+}
+
+func (t *StemTrie) loadStoredStemWithCache(stemKey []byte, loadValues, useCache, admit bool) (*Stem, bool, int, error) {
 	if t == nil || t.backend == nil {
 		return nil, false, 0, ErrNilStemTrie
+	}
+	if useCache {
+		if stem, split, ok := t.cache.get(stemKey); ok {
+			return stem, split, 0, nil
+		}
 	}
 	payload, err := t.backend.GetFlatValue(stemKey)
 	if err != nil {
@@ -1197,6 +1258,9 @@ func (t *StemTrie) loadStoredStem(stemKey []byte, loadValues bool) (*Stem, bool,
 		if !bytes.Equal(stem.ValuesRoot(t.backend.hasher), valueRef) {
 			return nil, true, loadedBytes, fmt.Errorf("%w: root mismatch for %x", ErrInvalidStem, stemKey)
 		}
+		if useCache && admit {
+			t.cache.add(stemKey, stem, true)
+		}
 		return stem, true, loadedBytes, nil
 	}
 	valueRef, _, err := t.backend.GetValueRef(stemKey)
@@ -1209,6 +1273,9 @@ func (t *StemTrie) loadStoredStem(stemKey []byte, loadValues bool) (*Stem, bool,
 	stem, err := decodeStemWithEmpty(payload, t.backend.hasher, &t.empty)
 	if err != nil {
 		return nil, false, loadedBytes, fmt.Errorf("%w for %x", err, stemKey)
+	}
+	if useCache && admit {
+		t.cache.add(stemKey, stem, false)
 	}
 	return stem, false, loadedBytes, nil
 }

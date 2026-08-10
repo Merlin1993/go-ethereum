@@ -73,7 +73,9 @@ var (
 	cuckooSlots                 = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
 	binaryNodeCacheLimit        = flag.Int("binaryNodeCacheLimit", archivetrie.DefaultNodeCacheLimit, "Binary trie process node cache entry limit; 0 uses default, negative disables cache")
 	binaryNodeCacheBytesLimitMB = flag.Int("binaryNodeCacheBytesLimitMB", 512, "Binary trie process node cache byte limit in MiB; 0 uses default, negative disables byte cap")
-	binaryNodeCacheWarmPathBits = flag.Int("binaryNodeCacheWarmPathBits", archivetrie.DefaultNodeCacheWarmPathBits, "Path-mode write-through cache depth; -1 retains shard roots only, <-1 disables")
+	binaryNodeCacheWarmPathBits = flag.Int("binaryNodeCacheWarmPathBits", archivetrie.DefaultNodeCacheWarmPathBits, "Path-mode write-through cache depth; -1 retains shard roots only, <-1 disables (default)")
+	binaryStemCacheLimit        = flag.Int("binaryStemCacheLimit", archivetrie.DefaultStemCacheLimit, "Decoded active-stem cache entry limit; 0 uses default, negative disables")
+	binaryStemCacheBytesLimitMB = flag.Int("binaryStemCacheBytesLimitMB", int(archivetrie.DefaultStemCacheBytesLimit/(1024*1024)), "Decoded active-stem cache approximate byte limit in MiB; 0 uses default, negative disables byte cap")
 	binaryPathDiagnostics       = flag.Bool("binaryPathDiagnostics", false, "Enable binary trie path/cache diagnostics")
 	binaryPruneShardMetrics     = flag.Bool("binaryPruneShardMetrics", false, "Write per-prune binary shard pressure metrics CSV")
 	binaryFilterFPSamples       = flag.Int("binaryFilterFPSamplesPerBucket", 1, "Known-negative Cuckoo-filter probes per archive bucket during exact trie scans; 0 disables")
@@ -126,6 +128,8 @@ type ProcessorConfig struct {
 	BinaryNodeCacheLimit        int
 	BinaryNodeCacheBytesLimitMB int
 	BinaryNodeCacheWarmPathBits int
+	BinaryStemCacheLimit        int
+	BinaryStemCacheBytesLimitMB int
 	BinaryPathDiagnostics       bool
 	BinaryPruneShardMetrics     bool
 	BinaryFilterFPSamples       int
@@ -301,6 +305,8 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 			NodeCacheLimit:        cfg.BinaryNodeCacheLimit,
 			NodeCacheBytesLimit:   int64(cfg.BinaryNodeCacheBytesLimitMB) * 1024 * 1024,
 			NodeCacheWarmPathBits: cfg.BinaryNodeCacheWarmPathBits,
+			StemCacheLimit:        cfg.BinaryStemCacheLimit,
+			StemCacheBytesLimit:   int64(cfg.BinaryStemCacheBytesLimitMB) * 1024 * 1024,
 			EnablePathDiagnostics: cfg.BinaryPathDiagnostics,
 			AsyncPrune:            cfg.BinaryAsyncPrune,
 			CommitWorkers:         cfg.BinaryCommitWorkers,
@@ -406,6 +412,8 @@ func TestExpireStateProcessor(t *testing.T) {
 		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,
 		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
 		BinaryNodeCacheWarmPathBits: *binaryNodeCacheWarmPathBits,
+		BinaryStemCacheLimit:        *binaryStemCacheLimit,
+		BinaryStemCacheBytesLimitMB: *binaryStemCacheBytesLimitMB,
 		BinaryPathDiagnostics:       *binaryPathDiagnostics,
 		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
 		BinaryFilterFPSamples:       *binaryFilterFPSamples,
@@ -425,8 +433,9 @@ func TestExpireStateProcessor(t *testing.T) {
 		MaxItemArchiveProofBytes:    *maxItemArchiveProofBytes,
 		MaxArchiveProofVerifyMs:     *maxArchiveProofVerifyMs,
 	}
-	fmt.Printf("[ASCT_CONFIG] stemArchive=%t shardDepth=%d bucketSize=%d nodeStorage=%s pruneInterval=%d nodeCacheWarmPathBits=%d\n",
-		cfg.BinaryStemArchive, cfg.ShardDepth, cfg.ArchiveBucketSize, cfg.BinaryNodeStorage, cfg.PruneInterval, cfg.BinaryNodeCacheWarmPathBits)
+	fmt.Printf("[ASCT_CONFIG] stemArchive=%t shardDepth=%d bucketSize=%d nodeStorage=%s pruneInterval=%d nodeCacheWarmPathBits=%d stemCacheLimit=%d stemCacheMB=%d\n",
+		cfg.BinaryStemArchive, cfg.ShardDepth, cfg.ArchiveBucketSize, cfg.BinaryNodeStorage, cfg.PruneInterval,
+		cfg.BinaryNodeCacheWarmPathBits, cfg.BinaryStemCacheLimit, cfg.BinaryStemCacheBytesLimitMB)
 
 	common.UseVerkle = cfg.UseVerkle
 	if cfg.UseVerkle {
@@ -824,6 +833,11 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Flat_Read_IO_us_Per_Get", "NodeCache_DB_Get_us_Per_Get", "NodeCache_DB_Load_Bytes_Per_Get",
 		"NodeCache_Total_Entry_Evictions", "NodeCache_Total_Byte_Evictions", "NodeCache_Total_Oversized_Rejects",
 		"NodeCache_Window_Entry_Evictions", "NodeCache_Window_Byte_Evictions", "NodeCache_Window_Oversized_Rejects",
+		"StemCache_Entry_Limit", "StemCache_Bytes_Limit", "StemCache_Entries", "StemCache_Bytes",
+		"StemCache_Total_Hits", "StemCache_Total_Misses", "StemCache_Total_Evictions",
+		"StemCache_Window_Hits", "StemCache_Window_Misses", "StemCache_Window_Evictions",
+		"StemCache_Total_Entry_Evictions", "StemCache_Total_Byte_Evictions", "StemCache_Total_Oversized_Rejects",
+		"StemCache_Window_Entry_Evictions", "StemCache_Window_Byte_Evictions", "StemCache_Window_Oversized_Rejects",
 		"Shard_GetValueRef_Calls", "Shard_GetValueRef_Lock_Wait_ms", "Shard_GetValueRef_Lock_Wait_us_Per_Call",
 	}
 	writer.Write(metricsHeader)
@@ -1123,6 +1137,14 @@ func TestExpireStateProcessor(t *testing.T) {
 		updateDiagnosticsNow := archivetrie.LastUpdateDiagnostics()
 		windowUpdateDiagnostics := updateDiagnosticsNow.Sub(lastUpdateDiagnostics)
 		lastUpdateDiagnostics = updateDiagnosticsNow
+		stemCacheDiag := archivetrie.StemCacheDiagnostics{}
+		if cfg.UseBinaryTrie && host.trieDB != nil {
+			if active := host.trieDB.GetArchiveTrie(); active != nil {
+				if trie, ok := active.(*archivetrie.Trie); ok {
+					stemCacheDiag = trie.StemCacheDiagnostics()
+				}
+			}
+		}
 		commitP50, commitP95, commitP99 := durationPercentiles(commitLatencySamples)
 		preCommitP50, preCommitP95, preCommitP99 := durationPercentiles(preCommitLatencySamples)
 		rootPipelineP50, rootPipelineP95, rootPipelineP99 := durationPercentiles(rootPipelineLatencySamples)
@@ -1679,6 +1701,22 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatInt(cacheWindowEntryEvictions, 10),
 			strconv.FormatInt(cacheWindowByteEvictions, 10),
 			strconv.FormatInt(cacheWindowOversizedRejects, 10),
+			strconv.FormatInt(stemCacheDiag.EntryLimit, 10),
+			strconv.FormatInt(stemCacheDiag.BytesLimit, 10),
+			strconv.FormatInt(stemCacheDiag.Entries, 10),
+			strconv.FormatInt(stemCacheDiag.Bytes, 10),
+			strconv.FormatInt(stemCacheDiag.Hits, 10),
+			strconv.FormatInt(stemCacheDiag.Misses, 10),
+			strconv.FormatInt(stemCacheDiag.Evictions, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemCacheHits, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemCacheMisses, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemCacheEvictions, 10),
+			strconv.FormatInt(stemCacheDiag.EntryEvictions, 10),
+			strconv.FormatInt(stemCacheDiag.ByteEvictions, 10),
+			strconv.FormatInt(stemCacheDiag.OversizedRejects, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemCacheEntryEvicts, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemCacheByteEvicts, 10),
+			strconv.FormatInt(windowUpdateDiagnostics.StemCacheOversized, 10),
 			strconv.FormatInt(windowUpdateDiagnostics.ValueRefCalls, 10),
 			fmt.Sprintf("%.3f", float64(windowUpdateDiagnostics.ValueRefLockWaitNanos)/float64(time.Millisecond)),
 			fmt.Sprintf("%.3f", microsPer(windowUpdateDiagnostics.ValueRefLockWaitNanos, windowUpdateDiagnostics.ValueRefCalls)),
@@ -2748,6 +2786,8 @@ func TestBinaryTrieConsistency(t *testing.T) {
 		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,
 		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
 		BinaryNodeCacheWarmPathBits: *binaryNodeCacheWarmPathBits,
+		BinaryStemCacheLimit:        *binaryStemCacheLimit,
+		BinaryStemCacheBytesLimitMB: *binaryStemCacheBytesLimitMB,
 		BinaryPathDiagnostics:       *binaryPathDiagnostics,
 		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
 		BinaryFilterFPSamples:       *binaryFilterFPSamples,

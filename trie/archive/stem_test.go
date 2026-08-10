@@ -577,6 +577,7 @@ func TestStemTrieBatchHashesStemOnce(t *testing.T) {
 		hasher := &stemCountingHasher{inner: NewPooledKeccakHasher()}
 		config := DefaultConfig()
 		config.ShardDepth = 0
+		config.StemCacheLimit = -1
 		backend := NewTrie(nil, NewMemoryDBAdapter(), hasher, config, false)
 		stem, err := NewStemTrie(backend)
 		if err != nil {
@@ -600,6 +601,79 @@ func TestStemTrieBatchHashesStemOnce(t *testing.T) {
 	}
 	if got, wantMax := batchedHasher.calls.Load(), sequentialHasher.calls.Load()/4; got >= wantMax {
 		t.Fatalf("batch still rehashed the stem per suffix: batched=%d sequential=%d", got, sequentialHasher.calls.Load())
+	}
+}
+
+func TestStemCacheAvoidsReloadOnRepeatedUpdate(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		cacheLimit int
+		wantGets   bool
+	}{
+		{name: "enabled", cacheLimit: 128, wantGets: false},
+		{name: "disabled", cacheLimit: -1, wantGets: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := NewMemoryDBAdapter()
+			config := DefaultConfig()
+			config.ShardDepth = 8
+			config.StemCacheLimit = test.cacheLimit
+			config.StemCacheBytesLimit = 4 * 1024 * 1024
+			backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, false)
+			trie, err := NewStemTrie(backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := stemTestKey(0x6a, 1)
+			second := stemTestKey(0x6a, 2)
+			if err := trie.Put(first, []byte("first")); err != nil {
+				t.Fatal(err)
+			}
+			batch := db.NewBatch()
+			if _, err := backend.CommitToBatch(batch, true); err != nil {
+				t.Fatal(err)
+			}
+			if err := batch.Write(); err != nil {
+				t.Fatal(err)
+			}
+
+			before := LastUpdateDiagnostics()
+			if err := trie.Put(second, []byte("second")); err != nil {
+				t.Fatal(err)
+			}
+			window := LastUpdateDiagnostics().Sub(before)
+			if test.wantGets && window.FlatValueGets == 0 {
+				t.Fatal("expected disabled stem cache to reload flat suffix records")
+			}
+			if !test.wantGets && window.FlatValueGets != 0 {
+				t.Fatalf("cached stem update performed %d flat reads", window.FlatValueGets)
+			}
+			if !test.wantGets && window.StemCacheHits == 0 {
+				t.Fatal("expected repeated stem update to hit decoded cache")
+			}
+			for key, want := range map[string]string{string(first): "first", string(second): "second"} {
+				got, err := trie.Get([]byte(key))
+				if err != nil || string(got) != want {
+					t.Fatalf("cached value mismatch: got %q want %q err %v", got, want, err)
+				}
+			}
+		})
+	}
+}
+
+func TestStemForEachDoesNotPolluteCache(t *testing.T) {
+	trie, _ := newStemTestTrie(t, false)
+	for i := 0; i < 8; i++ {
+		if err := trie.Put(stemTestKey(byte(0x80+i), 1), []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	trie.cache.clear()
+	if err := trie.ForEach(func(_, _ []byte) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	if diag := trie.CacheDiagnostics(); diag.Entries != 0 {
+		t.Fatalf("full traversal populated %d hot stem cache entries", diag.Entries)
 	}
 }
 
@@ -653,7 +727,7 @@ func TestStemTrieSkipsUnchangedPut(t *testing.T) {
 	if window.StemPutCalls != 1 || window.StemPutNoops != 1 {
 		t.Fatalf("unchanged put diagnostics: calls=%d noops=%d", window.StemPutCalls, window.StemPutNoops)
 	}
-	if window.StemPutCommitmentHashes != 9 {
+	if window.StemPutCommitmentHashes != 0 {
 		t.Fatalf("unchanged value rebuilt commitment: hashes=%d", window.StemPutCommitmentHashes)
 	}
 	if window.ShardPutCalls != 1 {

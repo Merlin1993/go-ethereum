@@ -31,6 +31,8 @@ type BinaryConfig struct {
 	NodeCacheLimit            int   // Max binary trie node blobs cached in process; 0 uses default, negative disables cache
 	NodeCacheBytesLimit       int64 // Max binary trie node blob bytes cached in process; 0 uses default, negative disables byte cap
 	NodeCacheWarmPathBits     int   // Path-mode eager warming depth; 0 uses binary default, -1 keeps root-only, <-1 disables eager warming
+	StemCacheLimit            int   // Max decoded active stems cached in process; 0 uses default, negative disables
+	StemCacheBytesLimit       int64 // Approximate decoded active-stem cache bytes; 0 uses default, negative disables byte cap
 	CommitmentPointCacheLimit int   // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
 	ArchiveStubMaxBucketsPath int   // Max side-mounted archive buckets at one node before pressure-sinking; 0 uses binary default, negative disables
 	AsyncPrune                bool  // Run binary shard pruning in the background and apply it before root commit

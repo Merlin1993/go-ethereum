@@ -437,6 +437,12 @@ func NewArchiveTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Da
 			if dbConf.NodeCacheWarmPathBits != 0 {
 				config.NodeCacheWarmPathBits = dbConf.NodeCacheWarmPathBits
 			}
+			if dbConf.StemCacheLimit != 0 {
+				config.StemCacheLimit = dbConf.StemCacheLimit
+			}
+			if dbConf.StemCacheBytesLimit != 0 {
+				config.StemCacheBytesLimit = dbConf.StemCacheBytesLimit
+			}
 			if dbConf.CommitmentPointCacheLimit != 0 {
 				config.CommitmentPointCacheLimit = dbConf.CommitmentPointCacheLimit
 			}

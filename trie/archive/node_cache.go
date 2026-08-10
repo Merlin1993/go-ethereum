@@ -25,12 +25,11 @@ const nodeCacheShardCount = 64
 // archive metadata nodes can vary widely in size.
 const DefaultNodeCacheBytesLimit int64 = 512 * 1024 * 1024
 
-// DefaultNodeCacheWarmPathBits retains only the freshly persisted shard root in
-// path mode. Destructive commits unload the in-memory shard, so keeping the
-// serialized root avoids immediately reading the same record back from disk.
-// Descendants remain demand-loaded to avoid filling the cache with write-once
-// commit output.
-const DefaultNodeCacheWarmPathBits = -1
+// DefaultNodeCacheWarmPathBits disables commit-time write-through in path mode.
+// A 4M-block A/B showed that retaining serialized shard roots reduced DB gets
+// but filled the byte budget with large root records and did not improve commit
+// latency. Clean nodes are still cached when they are loaded on demand.
+const DefaultNodeCacheWarmPathBits = -2
 
 // DefaultCommitmentPointCacheLimit keeps decoded ECMH commitment-point caching
 // disabled by default. Long destructive path runs showed near-zero reuse for

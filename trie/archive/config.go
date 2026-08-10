@@ -31,6 +31,8 @@ type Config struct {
 	NodeCacheLimit            int   // Max serialized node blobs cached in process; 0 uses default, negative disables
 	NodeCacheBytesLimit       int64 // Max serialized node blob bytes cached in process; 0 uses default, negative disables byte cap
 	NodeCacheWarmPathBits     int   // Path-mode eager warming depth; 0 uses default, -1 keeps root-only, <-1 disables eager warming
+	StemCacheLimit            int   // Max decoded active stems cached in process; 0 uses default, negative disables
+	StemCacheBytesLimit       int64 // Approximate decoded active-stem cache bytes; 0 uses default, negative disables byte cap
 	CommitmentPointCacheLimit int   // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
 	EnablePathDiagnostics     bool  // Record path/cache diagnostics; disabled by default for hot experiments
 	CompactArchiveStubs       bool  // Merge adjacent archive stubs synchronously; expensive on hot pruning paths
@@ -55,6 +57,8 @@ func DefaultConfig() *Config {
 		NodeCacheLimit:            DefaultNodeCacheLimit,
 		NodeCacheBytesLimit:       DefaultNodeCacheBytesLimit,
 		NodeCacheWarmPathBits:     DefaultNodeCacheWarmPathBits,
+		StemCacheLimit:            DefaultStemCacheLimit,
+		StemCacheBytesLimit:       DefaultStemCacheBytesLimit,
 		CommitmentPointCacheLimit: DefaultCommitmentPointCacheLimit,
 		CompactArchiveStubs:       true,
 		ArchiveStubMaxBucketsPath: 64,

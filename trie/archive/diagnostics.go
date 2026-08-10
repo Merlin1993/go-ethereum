@@ -233,6 +233,12 @@ type UpdateDiagnostics struct {
 	StemApplyLoadNanos    int64
 	StemApplyEncodeNanos  int64
 	StemApplyBackendNanos int64
+	StemCacheHits         int64
+	StemCacheMisses       int64
+	StemCacheEvictions    int64
+	StemCacheEntryEvicts  int64
+	StemCacheByteEvicts   int64
+	StemCacheOversized    int64
 
 	ShardPutCalls          int64
 	ShardPutValues         int64
@@ -322,6 +328,12 @@ func (d UpdateDiagnostics) Sub(previous UpdateDiagnostics) UpdateDiagnostics {
 		StemApplyLoadNanos:      d.StemApplyLoadNanos - previous.StemApplyLoadNanos,
 		StemApplyEncodeNanos:    d.StemApplyEncodeNanos - previous.StemApplyEncodeNanos,
 		StemApplyBackendNanos:   d.StemApplyBackendNanos - previous.StemApplyBackendNanos,
+		StemCacheHits:           d.StemCacheHits - previous.StemCacheHits,
+		StemCacheMisses:         d.StemCacheMisses - previous.StemCacheMisses,
+		StemCacheEvictions:      d.StemCacheEvictions - previous.StemCacheEvictions,
+		StemCacheEntryEvicts:    d.StemCacheEntryEvicts - previous.StemCacheEntryEvicts,
+		StemCacheByteEvicts:     d.StemCacheByteEvicts - previous.StemCacheByteEvicts,
+		StemCacheOversized:      d.StemCacheOversized - previous.StemCacheOversized,
 		ShardPutCalls:           d.ShardPutCalls - previous.ShardPutCalls,
 		ShardPutValues:          d.ShardPutValues - previous.ShardPutValues,
 		ShardPutNanos:           d.ShardPutNanos - previous.ShardPutNanos,
@@ -407,6 +419,12 @@ var (
 	updateStemApplyLoadNanos           int64
 	updateStemApplyEncodeNanos         int64
 	updateStemApplyBackendNanos        int64
+	updateStemCacheHits                int64
+	updateStemCacheMisses              int64
+	updateStemCacheEvictions           int64
+	updateStemCacheEntryEvicts         int64
+	updateStemCacheByteEvicts          int64
+	updateStemCacheOversized           int64
 	updateShardPutCalls                int64
 	updateShardPutValues               int64
 	updateShardPutNanos                int64
@@ -456,6 +474,12 @@ func LastUpdateDiagnostics() UpdateDiagnostics {
 		StemApplyLoadNanos:      atomic.LoadInt64(&updateStemApplyLoadNanos),
 		StemApplyEncodeNanos:    atomic.LoadInt64(&updateStemApplyEncodeNanos),
 		StemApplyBackendNanos:   atomic.LoadInt64(&updateStemApplyBackendNanos),
+		StemCacheHits:           atomic.LoadInt64(&updateStemCacheHits),
+		StemCacheMisses:         atomic.LoadInt64(&updateStemCacheMisses),
+		StemCacheEvictions:      atomic.LoadInt64(&updateStemCacheEvictions),
+		StemCacheEntryEvicts:    atomic.LoadInt64(&updateStemCacheEntryEvicts),
+		StemCacheByteEvicts:     atomic.LoadInt64(&updateStemCacheByteEvicts),
+		StemCacheOversized:      atomic.LoadInt64(&updateStemCacheOversized),
 		ShardPutCalls:           atomic.LoadInt64(&updateShardPutCalls),
 		ShardPutValues:          atomic.LoadInt64(&updateShardPutValues),
 		ShardPutNanos:           atomic.LoadInt64(&updateShardPutNanos),
@@ -525,6 +549,27 @@ func recordStemApplyDiagnostics(updates, stems, puts, deletes int, total, load, 
 	atomic.AddInt64(&updateStemApplyEncodeNanos, encode.Nanoseconds())
 	atomic.AddInt64(&updateStemApplyBackendNanos, backend.Nanoseconds())
 	recordLatency(&updateStemApplyLatencyBuckets, &updateStemApplyLatencyCount, total)
+}
+
+func recordStemCacheLookup(hit bool) {
+	if hit {
+		atomic.AddInt64(&updateStemCacheHits, 1)
+		return
+	}
+	atomic.AddInt64(&updateStemCacheMisses, 1)
+}
+
+func recordStemCacheEviction(entryLimit bool) {
+	atomic.AddInt64(&updateStemCacheEvictions, 1)
+	if entryLimit {
+		atomic.AddInt64(&updateStemCacheEntryEvicts, 1)
+		return
+	}
+	atomic.AddInt64(&updateStemCacheByteEvicts, 1)
+}
+
+func recordStemCacheOversizedReject() {
+	atomic.AddInt64(&updateStemCacheOversized, 1)
 }
 
 func snapshotLatencyHistogram(buckets *[latencyHistogramBuckets]int64, count *int64) LatencyHistogram {

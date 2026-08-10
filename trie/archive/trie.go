@@ -281,6 +281,11 @@ func (t *Trie) Load(rootHash []byte) error {
 	}
 	t.dirtyShards = make(map[int]struct{})
 	t.dirtyShardList = nil
+	t.stemViewMu.Lock()
+	if t.stemView != nil {
+		t.stemView.cache.clear()
+	}
+	t.stemViewMu.Unlock()
 	return nil
 }
 
@@ -1250,6 +1255,19 @@ func (t *Trie) NodeCacheDiagnostics() NodeCacheDiagnostics {
 		return NodeCacheDiagnostics{}
 	}
 	return t.nodeCache.diagnostics()
+}
+
+// StemCacheDiagnostics returns the decoded active-stem cache state.
+func (t *Trie) StemCacheDiagnostics() StemCacheDiagnostics {
+	if t == nil {
+		return StemCacheDiagnostics{}
+	}
+	t.stemViewMu.Lock()
+	defer t.stemViewMu.Unlock()
+	if t.stemView == nil {
+		return StemCacheDiagnostics{}
+	}
+	return t.stemView.CacheDiagnostics()
 }
 
 type memBatchOp struct {
