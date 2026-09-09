@@ -1131,7 +1131,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			}
 			pruneDur = dur
 		}
-		if *traceStressPruneEveryBlocks > 0 {
+		if !*traceStressDisableArchive && *traceStressPruneEveryBlocks > 0 {
 			if batchNumber == 1 {
 				dur, err := pruneOne()
 				if err != nil {
