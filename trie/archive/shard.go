@@ -577,12 +577,19 @@ func (s *Shard) archiveBucketFilter(bucket *ArchiveBucketNode) *cuckoo.Filter {
 
 // Get 在单个 shard 内查找 key。顺序是先走热 child，再查侧挂 StubList，
 // 最后处理直接命中的 ArchiveBucketNode。
-func (s *Shard) Get(key []byte) ([]byte, error) {
+func (s *Shard) Get(key []byte) (value []byte, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var fromArchive bool
+	defer func() {
+		// The legacy field names are retained for CSV compatibility. In AMT
+		// mode these counters describe ordinary key-level reads.
+		if s.config == nil || !s.config.StemMode {
+			recordStemGetOutcome(fromArchive, err)
+		}
+	}()
 
 	if s.root == nil && len(s.rootHash) > 0 {
-		var err error
 		s.root, err = s.loadNode(s.rootHash)
 		if err != nil {
 			return nil, err
@@ -593,22 +600,31 @@ func (s *Shard) Get(key []byte) ([]byte, error) {
 		return nil, ErrNodeNotFound
 	}
 	// Shards start at certain depth.
-	valueRef, fromArchive, err := s.findValueRef(s.root, key, s.config.ShardDepth)
+	var valueRef []byte
+	valueRef, fromArchive, err = s.findValueRef(s.root, key, s.config.ShardDepth)
 	if err != nil {
 		atomic.AddInt64(&common.BinaryMissNonExistentCount, 1)
 		return nil, err
 	}
-	val, err := s.getFlatValue(key)
+	value, err = s.getFlatValue(key)
 	if err != nil {
 		return nil, err
 	}
 	if fromArchive && len(valueRef) == common.HashLength {
-		actual, err := s.storedValueRef(key, val)
+		actual, err := s.storedValueRef(key, value)
 		if err != nil || !bytes.Equal(valueRef, actual) {
 			return nil, errors.New("archive bucket valueRef verification failed")
 		}
 	}
-	return val, nil
+	if fromArchive && s.config != nil && !s.config.StemMode && s.config.ActivateArchivedKeyOnRead {
+		promotionStart := time.Now()
+		if err := s.activateValueRef(key, valueRef); err != nil {
+			recordArchiveReadPromotion(time.Since(promotionStart), false)
+			return nil, err
+		}
+		recordArchiveReadPromotion(time.Since(promotionStart), true)
+	}
+	return value, nil
 }
 
 // GetValueRef returns the value commitment stored in the hot leaf or archive

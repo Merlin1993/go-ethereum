@@ -43,6 +43,7 @@ type Config struct {
 	PhysicalDelete             bool  // Physically delete obsolete trie nodes; false leaves unreachable path nodes for offline cleanup
 	StemMode                   bool  // Group 32-byte binary-tree keys by their 31-byte stem for whole-stem archiving
 	ActivateArchivedStemOnRead bool  // Restore an archived stem to the hot tree when a read finds it
+	ActivateArchivedKeyOnRead  bool  // Restore an archived non-stem key to the hot tree when a read finds it
 	FlatReader                 FlatValueReader
 	CuckooBuckets              int // Number of buckets in cuckoo filter (default 32)
 	CuckooSlots                int // Slots per bucket in cuckoo filter (default 4)

@@ -39,6 +39,7 @@ var (
 	traceStressEndBlock                   = flag.Uint64("traceStressEndBlock", 0, "Last inclusive trace block; zero disables an explicit end boundary")
 	traceStressBlocks                     = flag.Uint64("traceStressBlocks", 0, "Replay this many blocks from the first selected block; incompatible with traceStressEndBlock")
 	traceStressShardDepth                 = flag.Int("traceStressShardDepth", 20, "ASCT shard depth")
+	traceStressStemMode                   = flag.Bool("traceStressStemMode", false, "Route 32-byte trace keys through StemTrie; false uses the key-level AMT")
 	traceStressStemCacheLimit             = flag.Int("traceStressStemCacheLimit", DefaultStemCacheLimit, "Decoded stem cache entry limit; negative disables")
 	traceStressStemCacheMB                = flag.Int("traceStressStemCacheMB", 128, "Decoded stem cache byte limit in MiB; negative disables")
 	traceStressNodeCacheLimit             = flag.Int("traceStressNodeCacheLimit", DefaultNodeCacheLimit, "Serialized node cache entry limit; negative disables")
@@ -51,6 +52,10 @@ var (
 	traceStressFinalStats                 = flag.Bool("traceStressFinalStats", true, "Run an exact structural scan after the workload")
 	traceStressAccessSampleEvery          = flag.Int64("traceStressAccessSampleEvery", 1000, "Sample logical hot/archive access state every N operations; zero disables")
 	traceStressActivateArchivedStemOnRead = flag.Bool("traceStressActivateArchivedStemOnRead", false, "Activate an archived stem when a read finds it")
+	traceStressActivateArchivedKeyOnRead  = flag.Bool("traceStressActivateArchivedKeyOnRead", false, "Activate an archived AMT key when a read finds it")
+	traceStressDisableArchive             = flag.Bool("traceStressDisableArchive", false, "Do not call PruneNextShard during the trace run")
+	traceStressCuckooBuckets              = flag.Int("traceStressCuckooBuckets", 32, "Archive cuckoo filter bucket count")
+	traceStressCuckooSlots                = flag.Int("traceStressCuckooSlots", 4, "Archive cuckoo filter slots per bucket")
 	traceStatsBaseDir                     = flag.String("traceStatsBaseDir", "", "Existing TestArchiveStemTraceStress base directory for TestArchiveStemTraceStorageStats")
 	traceStatsRoot                        = flag.String("traceStatsRoot", "", "Final trie root for TestArchiveStemTraceStorageStats")
 	traceStatsOutput                      = flag.String("traceStatsOutput", "", "Output JSON path for TestArchiveStemTraceStorageStats")
@@ -436,6 +441,17 @@ func classifyTraceStressAccess(backend *Trie, key []byte) (bool, error) {
 	return fromArchive, nil
 }
 
+// classifyTraceStressAccessAMT classifies a complete key without reading its
+// flat payload. GetValueRef reports whether the reference came from the hot
+// leaf or an archive bucket, which is the only distinction AMT needs.
+func classifyTraceStressAccessAMT(backend *Trie, key []byte) (bool, error) {
+	if len(key) != common.HashLength {
+		return false, ErrInvalidStemKey
+	}
+	_, fromArchive, err := backend.GetValueRef(key)
+	return fromArchive, err
+}
+
 func (s *traceStressAccessStats) merge(other traceStressAccessStats) {
 	s.Samples += other.Samples
 	s.ReadHot += other.ReadHot
@@ -696,7 +712,7 @@ func TestTraceStressAccessClassifier(t *testing.T) {
 	db := NewMemoryDBAdapter()
 	config := DefaultConfig()
 	config.ShardDepth = 8
-	config.StemMode = true
+	config.StemMode = *traceStressStemMode
 	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
 	trie, err := NewStemTrie(backend)
 	if err != nil {
@@ -742,7 +758,9 @@ func TestTraceStressAccessClassifier(t *testing.T) {
 }
 
 // TestArchiveStemTraceStress replays ordered mainnet access rows directly
-// against StemTrie. CSV/gzip parsing is outside the measured operation path.
+// against the configured archive trie (AMT by default, or StemTrie when
+// traceStressStemMode is enabled). CSV/gzip parsing is outside the measured
+// operation path.
 func TestArchiveStemTraceStress(t *testing.T) {
 	if *traceStressInputDir == "" {
 		t.Skip("set -traceStressInputDir to run the trace workload")
@@ -775,6 +793,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	if *traceStressShardDepth < 1 || *traceStressShardDepth > 30 {
 		t.Fatalf("invalid traceStressShardDepth %d", *traceStressShardDepth)
 	}
+	if *traceStressCuckooBuckets <= 0 || *traceStressCuckooSlots <= 0 {
+		t.Fatalf("traceStressCuckooBuckets and traceStressCuckooSlots must be positive")
+	}
 	if *traceStressPruneEveryBatches < 0 {
 		t.Fatal("traceStressPruneEveryBatches cannot be negative")
 	}
@@ -802,28 +823,60 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	}
 	defer reader.Close()
 
+	archivePeriodOps := (int64(1) << uint(*traceStressShardDepth)) * int64(*traceStressBatchSize)
+	stemCacheLimitMetadata := any(*traceStressStemCacheLimit)
+	stemCacheMBMetadata := any(*traceStressStemCacheMB)
+	stemActivationMetadata := any(*traceStressActivateArchivedStemOnRead)
+	if !*traceStressStemMode {
+		stemCacheLimitMetadata = "not_applicable"
+		stemCacheMBMetadata = "not_applicable"
+		stemActivationMetadata = "not_applicable"
+	}
 	metadata := map[string]any{
-		"generated_at":                   time.Now().Format(time.RFC3339),
-		"input_dir":                      *traceStressInputDir,
-		"source_files":                   reader.files,
-		"operations":                     *traceStressOps,
-		"start_block":                    *traceStressStartBlock,
-		"end_block":                      *traceStressEndBlock,
-		"block_count":                    *traceStressBlocks,
-		"batch_size":                     *traceStressBatchSize,
-		"metrics_batches":                *traceStressMetricsBatches,
-		"shard_depth":                    *traceStressShardDepth,
-		"stem_cache_limit":               *traceStressStemCacheLimit,
-		"stem_cache_mb":                  *traceStressStemCacheMB,
-		"node_cache_limit":               *traceStressNodeCacheLimit,
-		"node_cache_mb":                  *traceStressNodeCacheMB,
-		"commit_workers":                 *traceStressCommitWorkers,
-		"async_prune":                    *traceStressAsyncPrune,
-		"prune_every_batches":            *traceStressPruneEveryBatches,
-		"prune_every_blocks":             *traceStressPruneEveryBlocks,
+		"generated_at":          time.Now().Format(time.RFC3339),
+		"base_dir":              *traceStressBaseDir,
+		"input_dir":             *traceStressInputDir,
+		"source_files":          reader.files,
+		"start_file":            *traceStressStartFile,
+		"requested_start_file":  *traceStressStartFile,
+		"file_limit":            *traceStressFileLimit,
+		"operations":            *traceStressOps,
+		"start_block":           *traceStressStartBlock,
+		"requested_start_block": *traceStressStartBlock,
+		"effective_start_file":  *traceStressStartFile,
+		"effective_start_block": nil,
+		"end_block":             *traceStressEndBlock,
+		"block_count":           *traceStressBlocks,
+		"batch_size":            *traceStressBatchSize,
+		"metrics_batches":       *traceStressMetricsBatches,
+		"shard_depth":           *traceStressShardDepth,
+		"stem_mode":             *traceStressStemMode,
+		"stem_cache_limit":      stemCacheLimitMetadata,
+		"stem_cache_mb":         stemCacheMBMetadata,
+		"node_cache_limit":      *traceStressNodeCacheLimit,
+		"node_cache_mb":         *traceStressNodeCacheMB,
+		"commit_workers":        *traceStressCommitWorkers,
+		"async_prune":           *traceStressAsyncPrune,
+		"prune_every_batches":   *traceStressPruneEveryBatches,
+		"prune_every_blocks":    *traceStressPruneEveryBlocks,
+		"disable_archive":       *traceStressDisableArchive,
+		"archive_period_ops":    archivePeriodOps,
+		"cuckoo_buckets":        *traceStressCuckooBuckets,
+		"cuckoo_slots":          *traceStressCuckooSlots,
+		"archive_bucket_size": func() int {
+			c := DefaultConfig()
+			c.CuckooBuckets = *traceStressCuckooBuckets
+			c.CuckooSlots = *traceStressCuckooSlots
+			return c.ResolveArchiveBucketSize()
+		}(),
+		"leveldb_cache_mb":               512,
+		"leveldb_handles":                256,
+		"leveldb":                        map[string]any{"cache_mb": 512, "handles": 256},
 		"destructive_commit":             *traceStressDestructiveCommit,
 		"access_sample_every":            *traceStressAccessSampleEvery,
-		"activate_archived_stem_on_read": *traceStressActivateArchivedStemOnRead,
+		"final_stats":                    *traceStressFinalStats,
+		"activate_archived_stem_on_read": stemActivationMetadata,
+		"activate_archived_key_on_read":  *traceStressActivateArchivedKeyOnRead,
 		"node_storage":                   NodeStoragePath,
 		"physical_delete":                false,
 		"value_rule":                     "32-byte value_hash; deterministic key/op hash when absent",
@@ -848,19 +901,33 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	config.NodeStorageScheme = NodeStoragePath
 	config.NodeCacheLimit = *traceStressNodeCacheLimit
 	config.NodeCacheBytesLimit = int64(*traceStressNodeCacheMB) * 1024 * 1024
-	config.StemMode = true
+	config.StemMode = *traceStressStemMode
 	config.ActivateArchivedStemOnRead = *traceStressActivateArchivedStemOnRead
+	config.ActivateArchivedKeyOnRead = *traceStressActivateArchivedKeyOnRead
 	config.StemCacheLimit = *traceStressStemCacheLimit
 	config.StemCacheBytesLimit = int64(*traceStressStemCacheMB) * 1024 * 1024
 	config.CommitWorkers = *traceStressCommitWorkers
 	config.AsyncPrune = *traceStressAsyncPrune
 	config.PhysicalDelete = false
-	config.CuckooBuckets = 16
-	config.CuckooSlots = 4
+	config.CuckooBuckets = *traceStressCuckooBuckets
+	config.CuckooSlots = *traceStressCuckooSlots
 	backend := NewTrie(nil, &stressDBAdapter{db}, NewPooledKeccakHasher(), config, true)
-	stemTrie, err := NewStemTrie(backend)
-	if err != nil {
-		t.Fatal(err)
+	var stemTrie *StemTrie
+	getValue := backend.Get
+	putValue := backend.Put
+	deleteValue := backend.Delete
+	cacheDiagnostics := func() StemCacheDiagnostics { return StemCacheDiagnostics{} }
+	classifyAccess := classifyTraceStressAccessAMT
+	if *traceStressStemMode {
+		stemTrie, err = NewStemTrie(backend)
+		if err != nil {
+			t.Fatal(err)
+		}
+		getValue = stemTrie.Get
+		putValue = stemTrie.Put
+		deleteValue = stemTrie.Delete
+		cacheDiagnostics = stemTrie.CacheDiagnostics
+		classifyAccess = classifyTraceStressAccess
 	}
 	batch := newStressBatcher(backend.db.NewBatch())
 	defer batch.Reset()
@@ -874,7 +941,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	metrics := csv.NewWriter(metricsFile)
 	defer metrics.Flush()
 	header := []string{
-		"Window_Start_Batch", "Window_End_Batch", "Total_Batches", "Total_Operations", "First_Block", "Last_Block",
+		"Window_Start_Batch", "Window_End_Batch", "Total_Batches", "Archive_Round_Completed", "Archive_Round_Progress", "Total_Operations", "First_Block", "Last_Block",
 		"Window_Operations", "Reads", "Touches", "Writes", "Creates", "Deletes",
 		"Executed_Gets", "Executed_Puts", "Executed_Deletes",
 		"StemGet_Hot_Hits", "StemGet_Archive_Hits", "StemGet_Missing", "StemGet_Errors",
@@ -926,24 +993,39 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		totalClassificationFilter traceStressFilterStats
 		totalColdMaintenance      time.Duration
 		lastRoot                  []byte
-		prevCache                 = stemTrie.CacheDiagnostics()
+		prevCache                 = cacheDiagnostics()
 		initialUpdateDiag         = LastUpdateDiagnostics()
 		prevUpdateDiag            = initialUpdateDiag
 		started                   = time.Now()
 		totalBatches              int64
+		prunesDone                int64
 		nextPruneBlock            uint64
 		executedOperations        int64
 	)
+	pruneOne := func() (time.Duration, error) {
+		if *traceStressDisableArchive {
+			return 0, nil
+		}
+		pruneStart := time.Now()
+		if err := backend.PruneNextShard(); err != nil {
+			return 0, err
+		}
+		prunesDone++
+		return time.Since(pruneStart), nil
+	}
 
 	flushWindow := func(batchNumber int64) {
-		cache := stemTrie.CacheDiagnostics()
+		cache := cacheDiagnostics()
 		window.stemHits = cache.Hits - prevCache.Hits
 		window.stemMisses = cache.Misses - prevCache.Misses
 		window.stemEvictions = cache.Evictions - prevCache.Evictions
 		prevCache = cache
 		measured := window.operations + window.prune + window.commit + window.write
 		comparative := window.operations + window.commit + window.write
-		opsPerSec := float64(window.counts.total()) / comparative.Seconds()
+		opsPerSec := float64(0)
+		if comparative > 0 {
+			opsPerSec = float64(window.counts.total()) / comparative.Seconds()
+		}
 		var mem runtime.MemStats
 		runtime.ReadMemStats(&mem)
 		var rss uint64
@@ -960,8 +1042,11 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		workloadFilter := filterStatsFromDiagnostics(updateDiag).sub(window.classificationFilter)
 		hotReadRate := traceStressRatio(window.access.ReadHot, sampledExistingReads)
 		runtimeFilterFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.Positives)
+		archiveRoundSize := int64(1) << uint(*traceStressShardDepth)
+		archiveRoundCompleted := prunesDone / archiveRoundSize
+		archiveRoundProgress := prunesDone % archiveRoundSize
 		row := []string{
-			strconv.FormatInt(batchNumber-int64(len(window.batchWall))+1, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(totalCounts.total(), 10),
+			strconv.FormatInt(batchNumber-int64(len(window.batchWall))+1, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(archiveRoundCompleted, 10), strconv.FormatInt(archiveRoundProgress, 10), strconv.FormatInt(totalCounts.total(), 10),
 			strconv.FormatUint(window.firstBlock, 10), strconv.FormatUint(window.lastBlock, 10), strconv.FormatInt(window.counts.total(), 10),
 			strconv.FormatInt(window.counts.Reads, 10), strconv.FormatInt(window.counts.Touches, 10), strconv.FormatInt(window.counts.Writes, 10), strconv.FormatInt(window.counts.Creates, 10), strconv.FormatInt(window.counts.Deletes, 10),
 			strconv.FormatInt(window.gets, 10), strconv.FormatInt(window.puts, 10), strconv.FormatInt(window.deletes, 10),
@@ -1021,6 +1106,13 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			break
 		}
 		totalBatches = batchNumber
+		if metadata["effective_start_block"] == nil {
+			metadata["effective_start_block"] = ops[0].block
+			metadata["start_block"] = ops[0].block
+			if err := writeTraceStressJSON(filepath.Join(*traceStressBaseDir, "metadata.json"), metadata); err != nil {
+				t.Fatal(err)
+			}
+		}
 		window.firstBlock = ops[0].block
 		window.lastBlock = ops[len(ops)-1].block
 		for _, op := range ops {
@@ -1033,27 +1125,27 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		batchStart := time.Now()
 		var pruneDur time.Duration
 		if *traceStressPruneEveryBatches > 0 && (batchNumber-1)%int64(*traceStressPruneEveryBatches) == 0 {
-			pruneStart := time.Now()
-			if err := backend.PruneNextShard(); err != nil {
+			dur, err := pruneOne()
+			if err != nil {
 				t.Fatalf("batch %d prune: %v", batchNumber, err)
 			}
-			pruneDur = time.Since(pruneStart)
+			pruneDur = dur
 		}
 		if *traceStressPruneEveryBlocks > 0 {
 			if batchNumber == 1 {
-				pruneStart := time.Now()
-				if err := backend.PruneNextShard(); err != nil {
+				dur, err := pruneOne()
+				if err != nil {
 					t.Fatalf("batch %d prune at block %d: %v", batchNumber, window.lastBlock, err)
 				}
-				pruneDur += time.Since(pruneStart)
+				pruneDur += dur
 				nextPruneBlock = window.firstBlock + *traceStressPruneEveryBlocks
 			}
 			for window.lastBlock >= nextPruneBlock {
-				pruneStart := time.Now()
-				if err := backend.PruneNextShard(); err != nil {
+				dur, err := pruneOne()
+				if err != nil {
 					t.Fatalf("batch %d prune at block %d: %v", batchNumber, window.lastBlock, err)
 				}
-				pruneDur += time.Since(pruneStart)
+				pruneDur += dur
 				nextPruneBlock += *traceStressPruneEveryBlocks
 			}
 		}
@@ -1068,7 +1160,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			if sample {
 				beforeSampleDiag := LastUpdateDiagnostics()
 				sampleStart := time.Now()
-				fromArchive, sampleErr = classifyTraceStressAccess(backend, op.key)
+				fromArchive, sampleErr = classifyAccess(backend, op.key)
 				sampleDur := time.Since(sampleStart)
 				window.classificationFilter.add(filterStatsFromDiagnostics(LastUpdateDiagnostics()).sub(filterStatsFromDiagnostics(beforeSampleDiag)))
 				window.accessSample += sampleDur
@@ -1079,7 +1171,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			case traceStressGet:
 				window.gets++
 				totalGets++
-				_, err := stemTrie.Get(op.key)
+				_, err := getValue(op.key)
 				executionDur := time.Since(executionStart)
 				if sample {
 					window.access.add(op.kind, fromArchive, sampleErr, executionDur)
@@ -1090,7 +1182,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			case traceStressPut:
 				window.puts++
 				totalPuts++
-				err := stemTrie.Put(op.key, op.value)
+				err := putValue(op.key, op.value)
 				executionDur := time.Since(executionStart)
 				if sample {
 					window.access.add(op.kind, fromArchive, sampleErr, executionDur)
@@ -1101,7 +1193,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			case traceStressDelete:
 				window.deletes++
 				totalDeletes++
-				err := stemTrie.Delete(op.key)
+				err := deleteValue(op.key)
 				executionDur := time.Since(executionStart)
 				if sample {
 					window.access.add(op.kind, fromArchive, sampleErr, executionDur)
@@ -1163,7 +1255,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		finalStats = backend.Stats()
 		finalStatsDur = time.Since(statsStart)
 	}
-	cache := stemTrie.CacheDiagnostics()
+	cache := cacheDiagnostics()
 	actualBlockCount := uint64(0)
 	if selection.endBlock >= selection.firstBlock && selection.firstBlock > 0 {
 		actualBlockCount = selection.endBlock - selection.firstBlock + 1
@@ -1179,6 +1271,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			return 0
 		}
 		return float64(total) / float64(count)
+	}
+	opsPerSecond := func(ops int64, elapsed time.Duration) float64 {
+		if elapsed <= 0 {
+			return 0
+		}
+		return float64(ops) / elapsed.Seconds()
 	}
 	accessAverageNanos := map[string]float64{
 		"read_hot":        average(totalAccess.ReadHotNanos, totalAccess.ReadHot),
@@ -1213,6 +1311,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"elapsed_ms":                            float64(time.Since(started)) / float64(time.Millisecond),
 		"operations":                            totalCounts.total(),
 		"batches":                               totalBatches,
+		"prunes_done":                           prunesDone,
+		"archive_round_completed":               prunesDone / (int64(1) << uint(*traceStressShardDepth)),
+		"archive_round_progress":                prunesDone % (int64(1) << uint(*traceStressShardDepth)),
 		"requested_operations":                  *traceStressOps,
 		"first_block":                           selection.firstBlock,
 		"last_block":                            selection.lastBlock,
@@ -1229,8 +1330,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"cold_maintenance_ms":                   float64(totalColdMaintenance) / float64(time.Millisecond),
 		"cold_maintenance_estimate_ms":          float64(coldMaintenanceEstimate) / float64(time.Millisecond),
 		"operations_excluding_cold_estimate_ms": float64(operationsExcludingColdEstimate) / float64(time.Millisecond),
-		"measured_ops_excluding_cold_estimate_per_s": float64(totalCounts.total()) / (operationsExcludingColdEstimate + totalCommit + totalWrite).Seconds(),
-		"measured_ops_per_s":                         float64(totalCounts.total()) / (totalOpsDur + totalCommit + totalWrite).Seconds(),
+		"measured_ops_excluding_cold_estimate_per_s": opsPerSecond(totalCounts.total(), operationsExcludingColdEstimate+totalCommit+totalWrite),
+		"measured_ops_per_s":                         opsPerSecond(totalCounts.total(), totalOpsDur+totalCommit+totalWrite),
 		"last_root":                                  common.BytesToHash(lastRoot).Hex(),
 		"state_bytes":                                getDirSize(stateDir),
 		"stem_cache":                                 cache,
@@ -1297,10 +1398,10 @@ func TestArchiveStemTraceInspectStem(t *testing.T) {
 	config := DefaultConfig()
 	config.ShardDepth = *traceStressShardDepth
 	config.NodeStorageScheme = NodeStoragePath
-	config.StemMode = true
+	config.StemMode = *traceStressStemMode
 	config.PhysicalDelete = false
-	config.CuckooBuckets = 16
-	config.CuckooSlots = 4
+	config.CuckooBuckets = *traceStressCuckooBuckets
+	config.CuckooSlots = *traceStressCuckooSlots
 	backend := NewTrie(nil, &stressDBAdapter{db}, hasher, config, true)
 	if err := backend.Load(root); err != nil {
 		t.Fatalf("load committed root %x: %v", root, err)
@@ -1547,9 +1648,9 @@ func TestArchiveStemTraceStorageStats(t *testing.T) {
 	config := DefaultConfig()
 	config.ShardDepth = *traceStressShardDepth
 	config.NodeStorageScheme = NodeStoragePath
-	config.StemMode = true
-	config.CuckooBuckets = 16
-	config.CuckooSlots = 4
+	config.StemMode = *traceStressStemMode
+	config.CuckooBuckets = *traceStressCuckooBuckets
+	config.CuckooSlots = *traceStressCuckooSlots
 	backend := NewTrie(root.Bytes(), &stressDBAdapter{db}, NewPooledKeccakHasher(), config, true)
 
 	started := time.Now()
