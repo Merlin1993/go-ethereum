@@ -1,6 +1,12 @@
 # AMT 16-Way Fallback Design
 
-Status: design only. This round does not implement the fallback.
+Status: implementation started on `codex/amt-mpt-hot-layer-20260909`.
+
+The first implementation is intentionally isolated in
+`trie/archive/mpt`: it is benchmarkable without changing the default AMT
+wrapper or creating an import cycle with the parent `trie` package. The
+remaining integration work is to adapt the state wrapper and the production
+trace driver after the standalone module's measurements are reviewed.
 
 ## Decision Gate
 
@@ -48,3 +54,11 @@ Migration is limited to two paths:
 
 No Verkle, MPT comparison-driver, Cuckoo calibration, or checkpoint work is
 part of this fallback design.
+
+## First implementation slice
+
+`trie/archive/mpt` now provides a shard-routed native hexary MPT hot layer,
+flat value records, persisted archive records with Cuckoo membership filters,
+round-robin whole-shard pruning, aggregate shard-root MPTs, reload support,
+and optional read activation. The aggregate root is intentionally distinct
+from the binary AMT root; no byte-for-byte root compatibility is claimed.
