@@ -536,7 +536,8 @@ func (t *StemTrie) CacheDiagnostics() StemCacheDiagnostics {
 	return t.cache.diagnostics()
 }
 
-// Get returns one suffix value without activating an archived stem.
+// Get returns one suffix value. When configured, an archived stem is restored
+// to the hot tree after the value has been loaded successfully.
 func (t *StemTrie) Get(key []byte) ([]byte, error) {
 	stemKey, suffix, err := splitStemKey(key)
 	if err != nil {
@@ -545,14 +546,26 @@ func (t *StemTrie) Get(key []byte) ([]byte, error) {
 	lock := &t.locks[stemKey[0]]
 	lock.Lock()
 	defer lock.Unlock()
-	stem, err := t.loadStem(stemKey)
+	stem, fromArchive, split, _, err := t.loadStemForGet(stemKey)
 	if err != nil {
+		recordStemGetOutcome(fromArchive, err)
 		return nil, err
 	}
 	value, ok := stem.Get(suffix)
 	if !ok {
+		recordStemGetOutcome(fromArchive, ErrNodeNotFound)
 		return nil, ErrNodeNotFound
 	}
+	if fromArchive && t.backend.config != nil && t.backend.config.ActivateArchivedStemOnRead {
+		promotionStart := time.Now()
+		if err := t.activateLoadedStem(stemKey, stem, split); err != nil {
+			recordArchiveReadPromotion(time.Since(promotionStart), false)
+			recordStemGetOutcome(fromArchive, err)
+			return nil, err
+		}
+		recordArchiveReadPromotion(time.Since(promotionStart), true)
+	}
+	recordStemGetOutcome(fromArchive, nil)
 	return value, nil
 }
 
@@ -590,12 +603,15 @@ func (t *StemTrie) put(key, value []byte, replace bool) error {
 		oldStem    *Stem
 		split      bool
 		wasPresent bool
+		oldUnknown bool
 	)
 	loadStart := time.Now()
 	if replace {
 		oldStem, split, loadedBytes, err = t.loadStoredStemForUpdate(stemKey, false)
 	} else {
-		stem, split, loadedBytes, err = t.loadStoredStemForUpdate(stemKey, true)
+		var overwritten [StemSuffixCount / 8]byte
+		overwritten[suffix/8] |= byte(1) << (suffix % 8)
+		stem, split, loadedBytes, err = t.loadStoredStemForMutations(stemKey, true, &overwritten)
 	}
 	loadTime = time.Since(loadStart)
 	if err != nil && !errors.Is(err, ErrNodeNotFound) {
@@ -609,8 +625,21 @@ func (t *StemTrie) put(key, value []byte, replace bool) error {
 	}
 	if !replace {
 		wasPresent = stem.has(suffix)
+		if wasPresent {
+			_, loaded := stem.values[suffix]
+			oldUnknown = !loaded
+			if oldUnknown {
+				stem.setPresent(suffix, false)
+				stem.count--
+			}
+		}
 	}
-	noop = !stem.put(suffix, value)
+	if oldUnknown {
+		stem.put(suffix, value)
+		noop = false
+	} else {
+		noop = !stem.put(suffix, value)
+	}
 
 	encodeStart := time.Now()
 	root := stem.ValuesRoot(t.backend.hasher)
@@ -751,8 +780,19 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 				lastReplace = i
 			}
 		}
+		// Every mutation overwrites the previous state of its suffix. If all
+		// suffixes currently present in a split stem are covered by this batch,
+		// their old payloads are not needed to calculate the new commitment.
+		// This is the common sparse-stem case (one stem, one suffix).
+		var overwritten [StemSuffixCount / 8]byte
+		if lastReplace < 0 {
+			for _, update := range group.updates {
+				suffix := update.Key[0]
+				overwritten[suffix/8] |= byte(1) << (suffix % 8)
+			}
+		}
 		loadStart := time.Now()
-		stem, split, _, err := t.loadStoredStemForUpdate(group.key, lastReplace < 0)
+		stem, split, _, err := t.loadStoredStemForMutations(group.key, lastReplace < 0, &overwritten)
 		result.loadTime = time.Since(loadStart)
 		if err != nil && !errors.Is(err, ErrNodeNotFound) {
 			result.err = err
@@ -771,6 +811,7 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 			beforePresent = oldStem.present
 		}
 		beforeValues := make(map[byte][]byte)
+		unknownBefore := make(map[byte]struct{})
 		touched := make(map[byte]struct{})
 		effectiveUpdates := group.updates
 		if lastReplace >= 0 {
@@ -782,10 +823,20 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 				if lastReplace < 0 {
 					if value, present := stem.Get(suffix); present {
 						beforeValues[suffix] = value
+						if _, loaded := stem.values[suffix]; !loaded {
+							unknownBefore[suffix] = struct{}{}
+						}
 					}
 				}
 				touched[suffix] = struct{}{}
 			}
+		}
+		// Metadata-only loads retain the old bitmap but intentionally omit
+		// payloads. Remove those placeholders before applying the overwrites so
+		// empty byte slices remain valid present values.
+		for suffix := range unknownBefore {
+			stem.setPresent(suffix, false)
+			stem.count--
 		}
 		for _, update := range effectiveUpdates {
 			if update.Replace {
@@ -843,8 +894,9 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 			for suffix := range touched {
 				value, present := stem.Get(suffix)
 				oldValue, wasPresent := beforeValues[suffix]
+				_, oldValueUnknown := unknownBefore[suffix]
 				switch {
-				case present && (!wasPresent || !bytes.Equal(value, oldValue)):
+				case present && (oldValueUnknown || !wasPresent || !bytes.Equal(value, oldValue)):
 					result.flatPuts = append(result.flatPuts, KeyValue{Key: joinStemKey(group.key, suffix), Value: value})
 				case !present && wasPresent:
 					result.flatDeletes = append(result.flatDeletes, joinStemKey(group.key, suffix))
@@ -904,19 +956,9 @@ func (t *StemTrie) ApplyBatch(updates []StemUpdate) error {
 	putCount = len(refPuts)
 	deleteCount = len(outerDeletes)
 	backendStart := time.Now()
-	if err := t.backend.StageFlatBatch(flatPuts, flatDeletes); err != nil {
+	if err := t.backend.applyStemBatch(refPuts, outerDeletes, flatPuts, flatDeletes); err != nil {
 		backendTime += time.Since(backendStart)
 		return err
-	}
-	if err := t.backend.PutValueRefBatch(refPuts); err != nil {
-		backendTime += time.Since(backendStart)
-		return err
-	}
-	for _, key := range outerDeletes {
-		if err := t.backend.Delete(key); err != nil {
-			backendTime += time.Since(backendStart)
-			return err
-		}
 	}
 	for i, result := range results {
 		if result.outerDelete != nil {
@@ -1127,6 +1169,12 @@ func (t *StemTrie) Activate(key []byte) error {
 	if err != nil {
 		return err
 	}
+	return t.activateLoadedStem(stemKey, stem, split)
+}
+
+// activateLoadedStem restores an already loaded stem without taking the
+// per-stem lock. Callers must hold the lock for stemKey.
+func (t *StemTrie) activateLoadedStem(stemKey []byte, stem *Stem, split bool) error {
 	if !split {
 		flatPuts := []KeyValue{{Key: stemKey, Value: encodeStemMetadata(stem)}}
 		for i := 0; i < StemSuffixCount; i++ {
@@ -1202,6 +1250,23 @@ func (t *StemTrie) loadStem(stemKey []byte) (*Stem, error) {
 	return stem, err
 }
 
+func (t *StemTrie) loadStemForGet(stemKey []byte) (*Stem, bool, bool, int, error) {
+	if t == nil || t.backend == nil {
+		return nil, false, false, 0, ErrNilStemTrie
+	}
+	if stem, split, ok := t.cache.get(stemKey); ok {
+		return stem, false, split, 0, nil
+	}
+	valueRef, fromArchive, err := t.backend.GetValueRef(stemKey)
+	if err != nil {
+		return nil, false, false, 0, err
+	}
+	// The active-stem cache must not turn an archived read into a reported hot
+	// hit. A configured read promotion admits the stem only after activation.
+	stem, split, loadedBytes, err := t.loadStoredStemFromFlat(stemKey, true, !fromArchive, valueRef, nil)
+	return stem, fromArchive, split, loadedBytes, err
+}
+
 // loadStoredStem loads either the split layout or the legacy single-blob
 // layout. Split stems keep only a bitmap under the 31-byte stem key and store
 // each value under its complete 32-byte key.
@@ -1213,7 +1278,26 @@ func (t *StemTrie) loadStoredStem(stemKey []byte, loadValues bool) (*Stem, bool,
 // database miss. Successful update paths install the mutated stem afterward,
 // avoiding a clone and an immediately superseded cache entry on every miss.
 func (t *StemTrie) loadStoredStemForUpdate(stemKey []byte, loadValues bool) (*Stem, bool, int, error) {
-	return t.loadStoredStemWithCache(stemKey, loadValues, true, false)
+	return t.loadStoredStemForMutations(stemKey, loadValues, nil)
+}
+
+// loadStoredStemForMutations resolves the outer leaf before consulting the
+// split flat store. A missing outer leaf therefore avoids a guaranteed-miss
+// flat lookup for brand-new stems. When overwritten is supplied and covers
+// every present suffix, only metadata is loaded: the old payloads cannot
+// affect the post-update commitment.
+func (t *StemTrie) loadStoredStemForMutations(stemKey []byte, loadValues bool, overwritten *[StemSuffixCount / 8]byte) (*Stem, bool, int, error) {
+	if t == nil || t.backend == nil {
+		return nil, false, 0, ErrNilStemTrie
+	}
+	if stem, split, ok := t.cache.get(stemKey); ok {
+		return stem, split, 0, nil
+	}
+	valueRef, _, err := t.backend.GetValueRef(stemKey)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	return t.loadStoredStemFromFlat(stemKey, loadValues, false, valueRef, overwritten)
 }
 
 func (t *StemTrie) loadStoredStemWithCache(stemKey []byte, loadValues, useCache, admit bool) (*Stem, bool, int, error) {
@@ -1225,6 +1309,10 @@ func (t *StemTrie) loadStoredStemWithCache(stemKey []byte, loadValues, useCache,
 			return stem, split, 0, nil
 		}
 	}
+	return t.loadStoredStemFromFlat(stemKey, loadValues, useCache && admit, nil, nil)
+}
+
+func (t *StemTrie) loadStoredStemFromFlat(stemKey []byte, loadValues, admit bool, valueRef []byte, overwritten *[StemSuffixCount / 8]byte) (*Stem, bool, int, error) {
 	payload, err := t.backend.GetFlatValue(stemKey)
 	if err != nil {
 		return nil, false, 0, err
@@ -1235,12 +1323,17 @@ func (t *StemTrie) loadStoredStemWithCache(stemKey []byte, loadValues, useCache,
 		if err != nil {
 			return nil, true, loadedBytes, fmt.Errorf("%w for %x", err, stemKey)
 		}
+		if loadValues && overwritten != nil && stemPresentCovered(stem.present, *overwritten) {
+			loadValues = false
+		}
 		if !loadValues {
 			return stem, true, loadedBytes, nil
 		}
-		valueRef, _, err := t.backend.GetValueRef(stemKey)
-		if err != nil {
-			return nil, true, loadedBytes, err
+		if len(valueRef) == 0 {
+			valueRef, _, err = t.backend.GetValueRef(stemKey)
+			if err != nil {
+				return nil, true, loadedBytes, err
+			}
 		}
 		for i := 0; i < StemSuffixCount; i++ {
 			suffix := byte(i)
@@ -1258,14 +1351,16 @@ func (t *StemTrie) loadStoredStemWithCache(stemKey []byte, loadValues, useCache,
 		if !bytes.Equal(stem.ValuesRoot(t.backend.hasher), valueRef) {
 			return nil, true, loadedBytes, fmt.Errorf("%w: root mismatch for %x", ErrInvalidStem, stemKey)
 		}
-		if useCache && admit {
+		if admit {
 			t.cache.add(stemKey, stem, true)
 		}
 		return stem, true, loadedBytes, nil
 	}
-	valueRef, _, err := t.backend.GetValueRef(stemKey)
-	if err != nil {
-		return nil, false, loadedBytes, err
+	if len(valueRef) == 0 {
+		valueRef, _, err = t.backend.GetValueRef(stemKey)
+		if err != nil {
+			return nil, false, loadedBytes, err
+		}
 	}
 	if !bytes.Equal(valueRefForKeyValue(stemKey, payload), valueRef) {
 		return nil, false, loadedBytes, fmt.Errorf("%w: legacy value reference mismatch for %x", ErrInvalidStem, stemKey)
@@ -1274,10 +1369,19 @@ func (t *StemTrie) loadStoredStemWithCache(stemKey []byte, loadValues, useCache,
 	if err != nil {
 		return nil, false, loadedBytes, fmt.Errorf("%w for %x", err, stemKey)
 	}
-	if useCache && admit {
+	if admit {
 		t.cache.add(stemKey, stem, false)
 	}
 	return stem, false, loadedBytes, nil
+}
+
+func stemPresentCovered(present, overwritten [StemSuffixCount / 8]byte) bool {
+	for i := range present {
+		if present[i]&^overwritten[i] != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func splitStemKey(key []byte) ([]byte, byte, error) {

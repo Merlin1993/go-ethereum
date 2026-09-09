@@ -4,8 +4,10 @@ This document is the handoff guide for replay experiments that compare MPT,
 Verkle, and ASCT on Ethereum transaction data. Use it when starting a fresh
 Codex thread.
 
-Do not put passwords in this file. Server credentials live in the local-only
-file `.agent/asct_remote_servers.local.json`.
+Server credentials, including SSH passwords, are written in the local-only file
+`.agent/asct_remote_servers.local.json`. That file is excluded from git via
+`.git/info/exclude`. Do not copy those passwords into public reports, plots, or
+commit messages.
 
 ## 1. Directory Rules
 
@@ -24,8 +26,10 @@ D: has filled up before.
 Remote:
 
 - MPT / ASCT server: `192.168.3.51`, workdir `/root/asct_codex`
-- Verkle server: `192.168.0.144`, workdir `/home/zkjg/asct_codex`
-- Read `.agent/asct_remote_servers.local.json` for usernames/passwords.
+- Verkle server: `192.168.0.144`, writable workdir `/home/zkjg/amt_codex`
+- Verkle server ethdata is read-only input at `/home/zkjg/asct_codex/ethdata`.
+- Read `.agent/asct_remote_servers.local.json` for usernames/passwords. It is
+  the source of truth for server login details.
 - Only operate under the configured workdir on each server.
 
 Run directory naming:
@@ -174,6 +178,20 @@ Proof acceptance limits can be enforced without changing code:
 A zero limit disables that guard. Record the chosen limits before starting the
 run; do not infer an SLA after seeing the result.
 
+For long-term product-trend replays, use zero for all three in-process proof
+limits and keep the declared proof thresholds in metadata plus the external
+audit guard. A single maximum-latency outlier is an alert, not a reason to lose
+the later performance and storage curve. Stop for performance only after block
+2,000,000 when charged root is at least 5x MPT and 3x Verkle for three
+consecutive 100k-block windows. Correctness, resource, false-negative, and
+structural-invariant failures remain immediate stop conditions.
+
+Transaction success must be compared with the aligned MPT and Verkle replay
+windows. The mainnet input has a few ApplyMessage failures shared by all three
+trees; these are baseline-matched input/execution outcomes and must not stop an
+ASCT replay. Stop only when ASCT's interval success/total pair differs from the
+available aligned baselines.
+
 Recommended local guard thresholds:
 
 - Stop if F: free space drops below `100 GiB`.
@@ -262,15 +280,17 @@ Known good result:
 
 ## 5. Remote Verkle Replay
 
-Run Verkle on `192.168.0.144` under `/home/zkjg/asct_codex`.
+Run Verkle on `192.168.0.144` under the writable workdir
+`/home/zkjg/amt_codex`. Reuse `/home/zkjg/asct_codex/ethdata` as read-only
+input; do not modify the old `asct_codex` code, results, or data.
 
 ```bash
 go test ./core/tree_test -run TestExpireStateProcessor -count=1 -timeout 0 -v -args \
   -useBinaryTrie2=false -useVerkle2=true -useKV2=false \
   -dataDir2 /home/zkjg/asct_codex/ethdata \
-  -dbDir2 /home/zkjg/asct_codex/results/mainnet/verkle/<run-name>/state_db \
-  -binaryArchiveDir2 /home/zkjg/asct_codex/results/mainnet/verkle/<run-name>/archive_db \
-  -metricsDir2 /home/zkjg/asct_codex/results/mainnet/verkle/<run-name> \
+  -dbDir2 /home/zkjg/amt_codex/results/mainnet/verkle/<run-name>/state_db \
+  -binaryArchiveDir2 /home/zkjg/amt_codex/results/mainnet/verkle/<run-name>/archive_db \
+  -metricsDir2 /home/zkjg/amt_codex/results/mainnet/verkle/<run-name> \
   -startFileIdx2 1 -endFileIdx2 11 -statsInterval2 100000 -blocks 0 \
   -trieCommitInterval2 10
 ```
@@ -413,7 +433,7 @@ D:\go_workspace\go-ethereum\.agent\asct_replay_experiment_guide.md
 D:\go_workspace\go-ethereum\.agent\asct_experiment_runbook.md
 D:\go_workspace\go-ethereum\.agent\asct_remote_servers.local.json
 
-不要把密码写进日志或回复。所有本机实验输出放到 F:\codex_asct，不要写到 D:\go_workspace\go-ethereum\results。
+服务器账号密码已经写在 asct_remote_servers.local.json 里面。不要把密码复制到公开报告、绘图文件、commit message 或普通日志里。所有本机实验输出放到 F:\codex_asct，不要写到 D:\go_workspace\go-ethereum\results。
 
 当前目标是重新验证 ASCT depth20 async-prune workers16 重放。上一轮有效失败：
 

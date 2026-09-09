@@ -606,6 +606,116 @@ func (t *Trie) Delete(key []byte) error {
 	return shard.Delete(key)
 }
 
+// applyStemBatch stages split payload changes and updates the corresponding
+// outer stem leaves with one grouping pass and one shard lock per affected
+// shard. StemTrie previously grouped and locked the same random shard set once
+// for flat records and again for value references.
+func (t *Trie) applyStemBatch(refPuts []KeyValue, outerDeletes [][]byte, flatPuts []KeyValue, flatDeletes [][]byte) error {
+	if len(refPuts) == 0 && len(outerDeletes) == 0 && len(flatPuts) == 0 && len(flatDeletes) == 0 {
+		return nil
+	}
+	totalStart := time.Now()
+	type shardChanges struct {
+		id           int
+		refPuts      []KeyValue
+		outerDeletes [][]byte
+		flatPuts     []KeyValue
+		flatDeletes  [][]byte
+	}
+	groupIndex := make(map[int]int)
+	groups := make([]shardChanges, 0)
+	groupFor := func(key []byte) *shardChanges {
+		id := t.GetShardID(key)
+		index, ok := groupIndex[id]
+		if !ok {
+			index = len(groups)
+			groupIndex[id] = index
+			groups = append(groups, shardChanges{id: id})
+		}
+		return &groups[index]
+	}
+	for _, entry := range flatPuts {
+		group := groupFor(entry.Key)
+		group.flatPuts = append(group.flatPuts, entry)
+	}
+	for _, key := range flatDeletes {
+		group := groupFor(key)
+		group.flatDeletes = append(group.flatDeletes, key)
+	}
+	for _, entry := range refPuts {
+		group := groupFor(entry.Key)
+		group.refPuts = append(group.refPuts, entry)
+	}
+	for _, key := range outerDeletes {
+		group := groupFor(key)
+		group.outerDeletes = append(group.outerDeletes, key)
+	}
+	for _, group := range groups {
+		if err := t.finishAsyncPruneForShard(group.id); err != nil {
+			return err
+		}
+	}
+
+	groupWork := make([]int64, len(groups))
+	errs := make([]error, len(groups))
+	workers := t.parallelWorkerCount(len(groups))
+	jobs := make(chan int, len(groups))
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				groupStart := time.Now()
+				group := &groups[index]
+				shard, err := t.getOrCreateShard(group.id)
+				if err == nil {
+					t.markDirtyShard(group.id)
+					shard.mu.Lock()
+					for _, key := range group.flatDeletes {
+						shard.stageFlatDeleteForKey(key)
+					}
+					for _, entry := range group.flatPuts {
+						shard.stageFlatValueForKey(entry.Key, entry.Value)
+					}
+					for _, entry := range group.refPuts {
+						if err = shard.putValueRefLocked(entry.Key, entry.Value); err != nil {
+							break
+						}
+					}
+					if err == nil {
+						for _, key := range group.outerDeletes {
+							deleteStart := time.Now()
+							err = shard.deleteLocked(key)
+							recordShardDeleteDiagnostics(time.Since(deleteStart))
+							if err != nil {
+								break
+							}
+						}
+					}
+					shard.mu.Unlock()
+				}
+				groupWork[index] = time.Since(groupStart).Nanoseconds()
+				errs[index] = err
+			}
+		}()
+	}
+	for index := range groups {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+	var work time.Duration
+	for index, err := range errs {
+		work += time.Duration(groupWork[index])
+		if err != nil {
+			return err
+		}
+	}
+	recordShardPutBatchDiagnostics(len(refPuts), len(groups), time.Since(totalStart), work)
+	return nil
+}
+
 // BatchDelete is an alias for Delete, used by some tests.
 func (t *Trie) BatchDelete(key []byte) error {
 	return t.Delete(key)

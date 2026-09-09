@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"errors"
 	"fmt"
 	"math/bits"
 	"math/rand"
@@ -224,6 +225,11 @@ type UpdateDiagnostics struct {
 	StemPutEncodeNanos      int64
 	StemPutBackendNanos     int64
 
+	StemGetCalls          int64
+	StemGetHotHits        int64
+	StemGetArchiveHits    int64
+	StemGetMissing        int64
+	StemGetErrors         int64
 	StemApplyCalls        int64
 	StemApplyUpdates      int64
 	StemApplyStems        int64
@@ -251,16 +257,26 @@ type UpdateDiagnostics struct {
 	ShardDeleteCalls       int64
 	ShardDeleteNanos       int64
 
-	FlatValueGets          int64
-	FlatValueReadIONanos   int64
-	FlatValueReadIOBytes   int64
-	FlatValuePuts          int64
-	FlatValueDeletes       int64
-	FlatValueWriteNanos    int64
-	ArchivePromotionChecks int64
-	ArchivePromotionHits   int64
-	ValueRefCalls          int64
-	ValueRefLockWaitNanos  int64
+	FlatValueGets               int64
+	FlatValueGetHits            int64
+	FlatValueGetMisses          int64
+	FlatValueReadIONanos        int64
+	FlatValueReadIOBytes        int64
+	FlatValuePuts               int64
+	FlatValueDeletes            int64
+	FlatValueWriteNanos         int64
+	ArchivePromotionChecks      int64
+	ArchivePromotionHits        int64
+	ArchivePromotionNanos       int64
+	ArchiveReadPromotionCalls   int64
+	ArchiveReadPromotionHits    int64
+	ArchiveReadPromotionNanos   int64
+	ArchiveFilterLookups        int64
+	ArchiveFilterNegatives      int64
+	ArchiveFilterPositives      int64
+	ArchiveFilterFalsePositives int64
+	ValueRefCalls               int64
+	ValueRefLockWaitNanos       int64
 }
 
 // Keep hot counters on separate cache lines so parallel stem workers do not
@@ -309,51 +325,66 @@ func (h LatencyHistogram) Percentile(percent int) time.Duration {
 
 func (d UpdateDiagnostics) Sub(previous UpdateDiagnostics) UpdateDiagnostics {
 	return UpdateDiagnostics{
-		StemPutCalls:            d.StemPutCalls - previous.StemPutCalls,
-		StemPutNoops:            d.StemPutNoops - previous.StemPutNoops,
-		StemPutLoadedBytes:      d.StemPutLoadedBytes - previous.StemPutLoadedBytes,
-		StemPutEncodedBytes:     d.StemPutEncodedBytes - previous.StemPutEncodedBytes,
-		StemPutCommitmentHashes: d.StemPutCommitmentHashes - previous.StemPutCommitmentHashes,
-		StemPutTotalNanos:       d.StemPutTotalNanos - previous.StemPutTotalNanos,
-		StemPutLoadNanos:        d.StemPutLoadNanos - previous.StemPutLoadNanos,
-		StemPutDecodeNanos:      d.StemPutDecodeNanos - previous.StemPutDecodeNanos,
-		StemPutEncodeNanos:      d.StemPutEncodeNanos - previous.StemPutEncodeNanos,
-		StemPutBackendNanos:     d.StemPutBackendNanos - previous.StemPutBackendNanos,
-		StemApplyCalls:          d.StemApplyCalls - previous.StemApplyCalls,
-		StemApplyUpdates:        d.StemApplyUpdates - previous.StemApplyUpdates,
-		StemApplyStems:          d.StemApplyStems - previous.StemApplyStems,
-		StemApplyPuts:           d.StemApplyPuts - previous.StemApplyPuts,
-		StemApplyDeletes:        d.StemApplyDeletes - previous.StemApplyDeletes,
-		StemApplyTotalNanos:     d.StemApplyTotalNanos - previous.StemApplyTotalNanos,
-		StemApplyLoadNanos:      d.StemApplyLoadNanos - previous.StemApplyLoadNanos,
-		StemApplyEncodeNanos:    d.StemApplyEncodeNanos - previous.StemApplyEncodeNanos,
-		StemApplyBackendNanos:   d.StemApplyBackendNanos - previous.StemApplyBackendNanos,
-		StemCacheHits:           d.StemCacheHits - previous.StemCacheHits,
-		StemCacheMisses:         d.StemCacheMisses - previous.StemCacheMisses,
-		StemCacheEvictions:      d.StemCacheEvictions - previous.StemCacheEvictions,
-		StemCacheEntryEvicts:    d.StemCacheEntryEvicts - previous.StemCacheEntryEvicts,
-		StemCacheByteEvicts:     d.StemCacheByteEvicts - previous.StemCacheByteEvicts,
-		StemCacheOversized:      d.StemCacheOversized - previous.StemCacheOversized,
-		ShardPutCalls:           d.ShardPutCalls - previous.ShardPutCalls,
-		ShardPutValues:          d.ShardPutValues - previous.ShardPutValues,
-		ShardPutNanos:           d.ShardPutNanos - previous.ShardPutNanos,
-		ShardPutBatchCalls:      d.ShardPutBatchCalls - previous.ShardPutBatchCalls,
-		ShardPutBatchValues:     d.ShardPutBatchValues - previous.ShardPutBatchValues,
-		ShardPutBatchShards:     d.ShardPutBatchShards - previous.ShardPutBatchShards,
-		ShardPutBatchWallNanos:  d.ShardPutBatchWallNanos - previous.ShardPutBatchWallNanos,
-		ShardPutBatchWorkNanos:  d.ShardPutBatchWorkNanos - previous.ShardPutBatchWorkNanos,
-		ShardDeleteCalls:        d.ShardDeleteCalls - previous.ShardDeleteCalls,
-		ShardDeleteNanos:        d.ShardDeleteNanos - previous.ShardDeleteNanos,
-		FlatValueGets:           d.FlatValueGets - previous.FlatValueGets,
-		FlatValueReadIONanos:    d.FlatValueReadIONanos - previous.FlatValueReadIONanos,
-		FlatValueReadIOBytes:    d.FlatValueReadIOBytes - previous.FlatValueReadIOBytes,
-		FlatValuePuts:           d.FlatValuePuts - previous.FlatValuePuts,
-		FlatValueDeletes:        d.FlatValueDeletes - previous.FlatValueDeletes,
-		FlatValueWriteNanos:     d.FlatValueWriteNanos - previous.FlatValueWriteNanos,
-		ArchivePromotionChecks:  d.ArchivePromotionChecks - previous.ArchivePromotionChecks,
-		ArchivePromotionHits:    d.ArchivePromotionHits - previous.ArchivePromotionHits,
-		ValueRefCalls:           d.ValueRefCalls - previous.ValueRefCalls,
-		ValueRefLockWaitNanos:   d.ValueRefLockWaitNanos - previous.ValueRefLockWaitNanos,
+		StemPutCalls:                d.StemPutCalls - previous.StemPutCalls,
+		StemPutNoops:                d.StemPutNoops - previous.StemPutNoops,
+		StemPutLoadedBytes:          d.StemPutLoadedBytes - previous.StemPutLoadedBytes,
+		StemPutEncodedBytes:         d.StemPutEncodedBytes - previous.StemPutEncodedBytes,
+		StemPutCommitmentHashes:     d.StemPutCommitmentHashes - previous.StemPutCommitmentHashes,
+		StemPutTotalNanos:           d.StemPutTotalNanos - previous.StemPutTotalNanos,
+		StemPutLoadNanos:            d.StemPutLoadNanos - previous.StemPutLoadNanos,
+		StemPutDecodeNanos:          d.StemPutDecodeNanos - previous.StemPutDecodeNanos,
+		StemPutEncodeNanos:          d.StemPutEncodeNanos - previous.StemPutEncodeNanos,
+		StemPutBackendNanos:         d.StemPutBackendNanos - previous.StemPutBackendNanos,
+		StemGetCalls:                d.StemGetCalls - previous.StemGetCalls,
+		StemGetHotHits:              d.StemGetHotHits - previous.StemGetHotHits,
+		StemGetArchiveHits:          d.StemGetArchiveHits - previous.StemGetArchiveHits,
+		StemGetMissing:              d.StemGetMissing - previous.StemGetMissing,
+		StemGetErrors:               d.StemGetErrors - previous.StemGetErrors,
+		StemApplyCalls:              d.StemApplyCalls - previous.StemApplyCalls,
+		StemApplyUpdates:            d.StemApplyUpdates - previous.StemApplyUpdates,
+		StemApplyStems:              d.StemApplyStems - previous.StemApplyStems,
+		StemApplyPuts:               d.StemApplyPuts - previous.StemApplyPuts,
+		StemApplyDeletes:            d.StemApplyDeletes - previous.StemApplyDeletes,
+		StemApplyTotalNanos:         d.StemApplyTotalNanos - previous.StemApplyTotalNanos,
+		StemApplyLoadNanos:          d.StemApplyLoadNanos - previous.StemApplyLoadNanos,
+		StemApplyEncodeNanos:        d.StemApplyEncodeNanos - previous.StemApplyEncodeNanos,
+		StemApplyBackendNanos:       d.StemApplyBackendNanos - previous.StemApplyBackendNanos,
+		StemCacheHits:               d.StemCacheHits - previous.StemCacheHits,
+		StemCacheMisses:             d.StemCacheMisses - previous.StemCacheMisses,
+		StemCacheEvictions:          d.StemCacheEvictions - previous.StemCacheEvictions,
+		StemCacheEntryEvicts:        d.StemCacheEntryEvicts - previous.StemCacheEntryEvicts,
+		StemCacheByteEvicts:         d.StemCacheByteEvicts - previous.StemCacheByteEvicts,
+		StemCacheOversized:          d.StemCacheOversized - previous.StemCacheOversized,
+		ShardPutCalls:               d.ShardPutCalls - previous.ShardPutCalls,
+		ShardPutValues:              d.ShardPutValues - previous.ShardPutValues,
+		ShardPutNanos:               d.ShardPutNanos - previous.ShardPutNanos,
+		ShardPutBatchCalls:          d.ShardPutBatchCalls - previous.ShardPutBatchCalls,
+		ShardPutBatchValues:         d.ShardPutBatchValues - previous.ShardPutBatchValues,
+		ShardPutBatchShards:         d.ShardPutBatchShards - previous.ShardPutBatchShards,
+		ShardPutBatchWallNanos:      d.ShardPutBatchWallNanos - previous.ShardPutBatchWallNanos,
+		ShardPutBatchWorkNanos:      d.ShardPutBatchWorkNanos - previous.ShardPutBatchWorkNanos,
+		ShardDeleteCalls:            d.ShardDeleteCalls - previous.ShardDeleteCalls,
+		ShardDeleteNanos:            d.ShardDeleteNanos - previous.ShardDeleteNanos,
+		FlatValueGets:               d.FlatValueGets - previous.FlatValueGets,
+		FlatValueGetHits:            d.FlatValueGetHits - previous.FlatValueGetHits,
+		FlatValueGetMisses:          d.FlatValueGetMisses - previous.FlatValueGetMisses,
+		FlatValueReadIONanos:        d.FlatValueReadIONanos - previous.FlatValueReadIONanos,
+		FlatValueReadIOBytes:        d.FlatValueReadIOBytes - previous.FlatValueReadIOBytes,
+		FlatValuePuts:               d.FlatValuePuts - previous.FlatValuePuts,
+		FlatValueDeletes:            d.FlatValueDeletes - previous.FlatValueDeletes,
+		FlatValueWriteNanos:         d.FlatValueWriteNanos - previous.FlatValueWriteNanos,
+		ArchivePromotionChecks:      d.ArchivePromotionChecks - previous.ArchivePromotionChecks,
+		ArchivePromotionHits:        d.ArchivePromotionHits - previous.ArchivePromotionHits,
+		ArchivePromotionNanos:       d.ArchivePromotionNanos - previous.ArchivePromotionNanos,
+		ArchiveReadPromotionCalls:   d.ArchiveReadPromotionCalls - previous.ArchiveReadPromotionCalls,
+		ArchiveReadPromotionHits:    d.ArchiveReadPromotionHits - previous.ArchiveReadPromotionHits,
+		ArchiveReadPromotionNanos:   d.ArchiveReadPromotionNanos - previous.ArchiveReadPromotionNanos,
+		ArchiveFilterLookups:        d.ArchiveFilterLookups - previous.ArchiveFilterLookups,
+		ArchiveFilterNegatives:      d.ArchiveFilterNegatives - previous.ArchiveFilterNegatives,
+		ArchiveFilterPositives:      d.ArchiveFilterPositives - previous.ArchiveFilterPositives,
+		ArchiveFilterFalsePositives: d.ArchiveFilterFalsePositives - previous.ArchiveFilterFalsePositives,
+		ValueRefCalls:               d.ValueRefCalls - previous.ValueRefCalls,
+		ValueRefLockWaitNanos:       d.ValueRefLockWaitNanos - previous.ValueRefLockWaitNanos,
 	}
 }
 
@@ -410,6 +441,11 @@ var (
 	updateStemPutDecodeNanos           int64
 	updateStemPutEncodeNanos           int64
 	updateStemPutBackendNanos          int64
+	updateStemGetCalls                 int64
+	updateStemGetHotHits               int64
+	updateStemGetArchiveHits           int64
+	updateStemGetMissing               int64
+	updateStemGetErrors                int64
 	updateStemApplyCalls               int64
 	updateStemApplyUpdates             int64
 	updateStemApplyStems               int64
@@ -436,6 +472,8 @@ var (
 	updateShardDeleteCalls             int64
 	updateShardDeleteNanos             int64
 	updateFlatValueGets                int64
+	updateFlatValueGetHits             int64
+	updateFlatValueGetMisses           int64
 	updateFlatValueReadIONanos         int64
 	updateFlatValueReadIOBytes         int64
 	updateFlatValuePuts                int64
@@ -443,6 +481,14 @@ var (
 	updateFlatValueWriteNanos          int64
 	updateArchivePromotionChecks       int64
 	updateArchivePromotionHits         int64
+	updateArchivePromotionNanos        int64
+	updateArchiveReadPromotionCalls    int64
+	updateArchiveReadPromotionHits     int64
+	updateArchiveReadPromotionNanos    int64
+	updateArchiveFilterLookups         int64
+	updateArchiveFilterNegatives       int64
+	updateArchiveFilterPositives       int64
+	updateArchiveFilterFalsePositives  int64
 	updateStemPutLatencyBuckets        [latencyHistogramBuckets]int64
 	updateStemPutLatencyCount          int64
 	updateStemApplyLatencyBuckets      [latencyHistogramBuckets]int64
@@ -455,49 +501,64 @@ var (
 
 func LastUpdateDiagnostics() UpdateDiagnostics {
 	diag := UpdateDiagnostics{
-		StemPutCalls:            atomic.LoadInt64(&updateStemPutCalls),
-		StemPutNoops:            atomic.LoadInt64(&updateStemPutNoops),
-		StemPutLoadedBytes:      atomic.LoadInt64(&updateStemPutLoadedBytes),
-		StemPutEncodedBytes:     atomic.LoadInt64(&updateStemPutEncodedBytes),
-		StemPutCommitmentHashes: atomic.LoadInt64(&updateStemPutCommitmentHashes),
-		StemPutTotalNanos:       atomic.LoadInt64(&updateStemPutTotalNanos),
-		StemPutLoadNanos:        atomic.LoadInt64(&updateStemPutLoadNanos),
-		StemPutDecodeNanos:      atomic.LoadInt64(&updateStemPutDecodeNanos),
-		StemPutEncodeNanos:      atomic.LoadInt64(&updateStemPutEncodeNanos),
-		StemPutBackendNanos:     atomic.LoadInt64(&updateStemPutBackendNanos),
-		StemApplyCalls:          atomic.LoadInt64(&updateStemApplyCalls),
-		StemApplyUpdates:        atomic.LoadInt64(&updateStemApplyUpdates),
-		StemApplyStems:          atomic.LoadInt64(&updateStemApplyStems),
-		StemApplyPuts:           atomic.LoadInt64(&updateStemApplyPuts),
-		StemApplyDeletes:        atomic.LoadInt64(&updateStemApplyDeletes),
-		StemApplyTotalNanos:     atomic.LoadInt64(&updateStemApplyTotalNanos),
-		StemApplyLoadNanos:      atomic.LoadInt64(&updateStemApplyLoadNanos),
-		StemApplyEncodeNanos:    atomic.LoadInt64(&updateStemApplyEncodeNanos),
-		StemApplyBackendNanos:   atomic.LoadInt64(&updateStemApplyBackendNanos),
-		StemCacheHits:           atomic.LoadInt64(&updateStemCacheHits),
-		StemCacheMisses:         atomic.LoadInt64(&updateStemCacheMisses),
-		StemCacheEvictions:      atomic.LoadInt64(&updateStemCacheEvictions),
-		StemCacheEntryEvicts:    atomic.LoadInt64(&updateStemCacheEntryEvicts),
-		StemCacheByteEvicts:     atomic.LoadInt64(&updateStemCacheByteEvicts),
-		StemCacheOversized:      atomic.LoadInt64(&updateStemCacheOversized),
-		ShardPutCalls:           atomic.LoadInt64(&updateShardPutCalls),
-		ShardPutValues:          atomic.LoadInt64(&updateShardPutValues),
-		ShardPutNanos:           atomic.LoadInt64(&updateShardPutNanos),
-		ShardPutBatchCalls:      atomic.LoadInt64(&updateShardPutBatchCalls),
-		ShardPutBatchValues:     atomic.LoadInt64(&updateShardPutBatchValues),
-		ShardPutBatchShards:     atomic.LoadInt64(&updateShardPutBatchShards),
-		ShardPutBatchWallNanos:  atomic.LoadInt64(&updateShardPutBatchWallNanos),
-		ShardPutBatchWorkNanos:  atomic.LoadInt64(&updateShardPutBatchWorkNanos),
-		ShardDeleteCalls:        atomic.LoadInt64(&updateShardDeleteCalls),
-		ShardDeleteNanos:        atomic.LoadInt64(&updateShardDeleteNanos),
-		FlatValueGets:           atomic.LoadInt64(&updateFlatValueGets),
-		FlatValueReadIONanos:    atomic.LoadInt64(&updateFlatValueReadIONanos),
-		FlatValueReadIOBytes:    atomic.LoadInt64(&updateFlatValueReadIOBytes),
-		FlatValuePuts:           atomic.LoadInt64(&updateFlatValuePuts),
-		FlatValueDeletes:        atomic.LoadInt64(&updateFlatValueDeletes),
-		FlatValueWriteNanos:     atomic.LoadInt64(&updateFlatValueWriteNanos),
-		ArchivePromotionChecks:  atomic.LoadInt64(&updateArchivePromotionChecks),
-		ArchivePromotionHits:    atomic.LoadInt64(&updateArchivePromotionHits),
+		StemPutCalls:                atomic.LoadInt64(&updateStemPutCalls),
+		StemPutNoops:                atomic.LoadInt64(&updateStemPutNoops),
+		StemPutLoadedBytes:          atomic.LoadInt64(&updateStemPutLoadedBytes),
+		StemPutEncodedBytes:         atomic.LoadInt64(&updateStemPutEncodedBytes),
+		StemPutCommitmentHashes:     atomic.LoadInt64(&updateStemPutCommitmentHashes),
+		StemPutTotalNanos:           atomic.LoadInt64(&updateStemPutTotalNanos),
+		StemPutLoadNanos:            atomic.LoadInt64(&updateStemPutLoadNanos),
+		StemPutDecodeNanos:          atomic.LoadInt64(&updateStemPutDecodeNanos),
+		StemPutEncodeNanos:          atomic.LoadInt64(&updateStemPutEncodeNanos),
+		StemPutBackendNanos:         atomic.LoadInt64(&updateStemPutBackendNanos),
+		StemGetCalls:                atomic.LoadInt64(&updateStemGetCalls),
+		StemGetHotHits:              atomic.LoadInt64(&updateStemGetHotHits),
+		StemGetArchiveHits:          atomic.LoadInt64(&updateStemGetArchiveHits),
+		StemGetMissing:              atomic.LoadInt64(&updateStemGetMissing),
+		StemGetErrors:               atomic.LoadInt64(&updateStemGetErrors),
+		StemApplyCalls:              atomic.LoadInt64(&updateStemApplyCalls),
+		StemApplyUpdates:            atomic.LoadInt64(&updateStemApplyUpdates),
+		StemApplyStems:              atomic.LoadInt64(&updateStemApplyStems),
+		StemApplyPuts:               atomic.LoadInt64(&updateStemApplyPuts),
+		StemApplyDeletes:            atomic.LoadInt64(&updateStemApplyDeletes),
+		StemApplyTotalNanos:         atomic.LoadInt64(&updateStemApplyTotalNanos),
+		StemApplyLoadNanos:          atomic.LoadInt64(&updateStemApplyLoadNanos),
+		StemApplyEncodeNanos:        atomic.LoadInt64(&updateStemApplyEncodeNanos),
+		StemApplyBackendNanos:       atomic.LoadInt64(&updateStemApplyBackendNanos),
+		StemCacheHits:               atomic.LoadInt64(&updateStemCacheHits),
+		StemCacheMisses:             atomic.LoadInt64(&updateStemCacheMisses),
+		StemCacheEvictions:          atomic.LoadInt64(&updateStemCacheEvictions),
+		StemCacheEntryEvicts:        atomic.LoadInt64(&updateStemCacheEntryEvicts),
+		StemCacheByteEvicts:         atomic.LoadInt64(&updateStemCacheByteEvicts),
+		StemCacheOversized:          atomic.LoadInt64(&updateStemCacheOversized),
+		ShardPutCalls:               atomic.LoadInt64(&updateShardPutCalls),
+		ShardPutValues:              atomic.LoadInt64(&updateShardPutValues),
+		ShardPutNanos:               atomic.LoadInt64(&updateShardPutNanos),
+		ShardPutBatchCalls:          atomic.LoadInt64(&updateShardPutBatchCalls),
+		ShardPutBatchValues:         atomic.LoadInt64(&updateShardPutBatchValues),
+		ShardPutBatchShards:         atomic.LoadInt64(&updateShardPutBatchShards),
+		ShardPutBatchWallNanos:      atomic.LoadInt64(&updateShardPutBatchWallNanos),
+		ShardPutBatchWorkNanos:      atomic.LoadInt64(&updateShardPutBatchWorkNanos),
+		ShardDeleteCalls:            atomic.LoadInt64(&updateShardDeleteCalls),
+		ShardDeleteNanos:            atomic.LoadInt64(&updateShardDeleteNanos),
+		FlatValueGets:               atomic.LoadInt64(&updateFlatValueGets),
+		FlatValueGetHits:            atomic.LoadInt64(&updateFlatValueGetHits),
+		FlatValueGetMisses:          atomic.LoadInt64(&updateFlatValueGetMisses),
+		FlatValueReadIONanos:        atomic.LoadInt64(&updateFlatValueReadIONanos),
+		FlatValueReadIOBytes:        atomic.LoadInt64(&updateFlatValueReadIOBytes),
+		FlatValuePuts:               atomic.LoadInt64(&updateFlatValuePuts),
+		FlatValueDeletes:            atomic.LoadInt64(&updateFlatValueDeletes),
+		FlatValueWriteNanos:         atomic.LoadInt64(&updateFlatValueWriteNanos),
+		ArchivePromotionChecks:      atomic.LoadInt64(&updateArchivePromotionChecks),
+		ArchivePromotionHits:        atomic.LoadInt64(&updateArchivePromotionHits),
+		ArchivePromotionNanos:       atomic.LoadInt64(&updateArchivePromotionNanos),
+		ArchiveReadPromotionCalls:   atomic.LoadInt64(&updateArchiveReadPromotionCalls),
+		ArchiveReadPromotionHits:    atomic.LoadInt64(&updateArchiveReadPromotionHits),
+		ArchiveReadPromotionNanos:   atomic.LoadInt64(&updateArchiveReadPromotionNanos),
+		ArchiveFilterLookups:        atomic.LoadInt64(&updateArchiveFilterLookups),
+		ArchiveFilterNegatives:      atomic.LoadInt64(&updateArchiveFilterNegatives),
+		ArchiveFilterPositives:      atomic.LoadInt64(&updateArchiveFilterPositives),
+		ArchiveFilterFalsePositives: atomic.LoadInt64(&updateArchiveFilterFalsePositives),
 	}
 	for i := range updateValueRefDiagnostics {
 		diag.ValueRefCalls += updateValueRefDiagnostics[i].calls.Load()
@@ -642,6 +703,36 @@ func recordShardDeleteDiagnostics(elapsed time.Duration) {
 }
 
 func recordFlatValueGet() { atomic.AddInt64(&updateFlatValueGets, 1) }
+
+func recordFlatValueGetOutcome(hit bool) {
+	if hit {
+		atomic.AddInt64(&updateFlatValueGetHits, 1)
+		return
+	}
+	atomic.AddInt64(&updateFlatValueGetMisses, 1)
+}
+
+func recordStemGetOutcome(fromArchive bool, err error) {
+	atomic.AddInt64(&updateStemGetCalls, 1)
+	switch {
+	case err == nil && fromArchive:
+		atomic.AddInt64(&updateStemGetArchiveHits, 1)
+	case err == nil:
+		atomic.AddInt64(&updateStemGetHotHits, 1)
+	case errors.Is(err, ErrNodeNotFound):
+		atomic.AddInt64(&updateStemGetMissing, 1)
+	default:
+		atomic.AddInt64(&updateStemGetErrors, 1)
+	}
+}
+
+func recordArchiveReadPromotion(elapsed time.Duration, hit bool) {
+	atomic.AddInt64(&updateArchiveReadPromotionCalls, 1)
+	if hit {
+		atomic.AddInt64(&updateArchiveReadPromotionHits, 1)
+	}
+	atomic.AddInt64(&updateArchiveReadPromotionNanos, elapsed.Nanoseconds())
+}
 
 func recordFlatValueReadIO(elapsed time.Duration, bytes int) {
 	atomic.AddInt64(&updateFlatValueReadIONanos, elapsed.Nanoseconds())
@@ -1227,11 +1318,12 @@ func recordPathDBGetIfEnabled(config *Config) {
 	}
 }
 
-func recordArchivePromotionCheckIfEnabled(config *Config, hit bool) {
+func recordArchivePromotionCheckIfEnabled(config *Config, hit bool, elapsed time.Duration) {
 	atomic.AddInt64(&updateArchivePromotionChecks, 1)
 	if hit {
 		atomic.AddInt64(&updateArchivePromotionHits, 1)
 	}
+	atomic.AddInt64(&updateArchivePromotionNanos, elapsed.Nanoseconds())
 	if config == nil || !config.EnablePathDiagnostics {
 		return
 	}
@@ -1239,6 +1331,19 @@ func recordArchivePromotionCheckIfEnabled(config *Config, hit bool) {
 	if hit {
 		atomic.AddInt64(&commitDiagArchivePromotionHits, 1)
 	}
+}
+
+func recordArchiveFilterLookup(positive bool) {
+	atomic.AddInt64(&updateArchiveFilterLookups, 1)
+	if positive {
+		atomic.AddInt64(&updateArchiveFilterPositives, 1)
+		return
+	}
+	atomic.AddInt64(&updateArchiveFilterNegatives, 1)
+}
+
+func recordArchiveFilterFalsePositive() {
+	atomic.AddInt64(&updateArchiveFilterFalsePositives, 1)
 }
 
 func recordBucketRecomputeIfEnabled(config *Config) {

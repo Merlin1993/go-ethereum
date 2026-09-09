@@ -798,7 +798,9 @@ func (s *Shard) findValueRefFromBucket(bucket *ArchiveBucketNode, key []byte, _ 
 		shardKey := s.getSuffix(key, innerDepth, nil)
 		suffixBits := len(key)*8 - innerDepth
 		keyWithLen := archiveItemKey(suffixBits, shardKey)
-		if !filter.Lookup(keyWithLen) {
+		filterPositive := filter.Lookup(keyWithLen)
+		recordArchiveFilterLookup(filterPositive)
+		if !filterPositive {
 			return nil, false, ErrNodeNotFound
 		}
 	}
@@ -828,6 +830,7 @@ func (s *Shard) findValueRefFromBucket(bucket *ArchiveBucketNode, key []byte, _ 
 		s.statsMut.Lock()
 		s.stats.FalsePositiveCount++
 		s.statsMut.Unlock()
+		recordArchiveFilterFalsePositive()
 		atomic.AddInt64(&common.BinaryCycleFPCount, 1)
 		atomic.AddInt64(&common.BinaryTrieFPInBlock, 1)
 		common.BinaryStatsMu.Lock()
@@ -917,8 +920,9 @@ func (s *Shard) putValueRefLocked(key, valueRef []byte) error {
 		}
 	}
 	if s.archiveMayContainKey(s.root, key, s.config.ShardDepth) {
+		promotionStart := time.Now()
 		removed, err := s.removeArchivedVersionForWrite(key)
-		recordArchivePromotionCheckIfEnabled(s.config, removed)
+		recordArchivePromotionCheckIfEnabled(s.config, removed, time.Since(promotionStart))
 		if err != nil {
 			return err
 		}
@@ -1402,7 +1406,10 @@ func (s *Shard) insert(node Node, key []byte, depth int, valueHash []byte) (Node
 func (s *Shard) Delete(key []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.deleteLocked(key)
+}
 
+func (s *Shard) deleteLocked(key []byte) error {
 	if s.root == nil && len(s.rootHash) > 0 {
 		var err error
 		s.root, err = s.loadNode(s.rootHash)

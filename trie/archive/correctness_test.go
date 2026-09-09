@@ -612,6 +612,66 @@ func TestBlindAppendDeduplicatesExistingBucketKey(t *testing.T) {
 	}
 }
 
+func TestFullBucketAbsorbsDuplicateWithoutTakingNewKey(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 0
+	config.ArchiveBucketSize = 4
+	config.CuckooBuckets = 64
+	config.CuckooSlots = 4
+	shard, err := NewShard(0, db, NewPooledKeccakHasher(), config, nil, true, func() byte { return 0 })
+	if err != nil {
+		t.Fatalf("new shard: %v", err)
+	}
+
+	duplicateKey := bytes.Repeat([]byte{0x70}, 32)
+	currentRef := shard.stageValueForKey(duplicateKey, []byte("current-value"))
+	items := []ArchivedKV{{
+		Suffix:     common.CopyBytes(duplicateKey),
+		SuffixBits: len(duplicateKey) * 8,
+		Value:      valueRefForKeyValue(duplicateKey, []byte("stale-value")),
+	}}
+	for i := 1; i < config.ArchiveBucketSize; i++ {
+		key := bytes.Repeat([]byte{byte(0x70 + i)}, 32)
+		items = append(items, ArchivedKV{
+			Suffix:     key,
+			SuffixBits: len(key) * 8,
+			Value:      valueRefForKeyValue(key, []byte{byte(i)}),
+		})
+	}
+	bucket := shard.buildArchiveBucket(items, nil, 0).(*ArchiveBucketNode)
+	newKey := bytes.Repeat([]byte{0x7f}, 32)
+	incoming := []ArchivedKV{
+		{
+			Suffix:     common.CopyBytes(duplicateKey),
+			SuffixBits: len(duplicateKey) * 8,
+			Value:      currentRef,
+		},
+		{
+			Suffix:     common.CopyBytes(newKey),
+			SuffixBits: len(newKey) * 8,
+			Value:      valueRefForKeyValue(newKey, []byte("new-value")),
+		},
+	}
+
+	remaining, absorbed := shard.absorbArchiveItemsIntoBucket(bucket, incoming, nil, 0)
+	if absorbed != 1 || len(remaining) != 1 || !bytes.Equal(remaining[0].Suffix, newKey) {
+		t.Fatalf("full bucket absorption: absorbed=%d remaining=%+v", absorbed, remaining)
+	}
+	if bucket.Count != uint64(config.ArchiveBucketSize) || len(bucket.Keys) != config.ArchiveBucketSize {
+		t.Fatalf("full bucket size changed: count=%d keys=%d", bucket.Count, len(bucket.Keys))
+	}
+	for _, key := range bucket.Keys {
+		if key.SuffixBits == len(duplicateKey)*8 && bytes.Equal(key.Suffix, duplicateKey) {
+			if !bytes.Equal(key.ValueRef, currentRef) {
+				t.Fatalf("duplicate retained stale valueRef")
+			}
+			return
+		}
+	}
+	t.Fatalf("duplicate key disappeared from full bucket")
+}
+
 func setupTrie() (*Trie, Hasher) {
 	db := NewMemoryDBAdapter()
 	hasher := NewPooledKeccakHasher()

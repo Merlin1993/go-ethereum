@@ -102,6 +102,15 @@ func (s *Shard) getFlatValue(key []byte) ([]byte, error) {
 	if recordDiagnostics {
 		recordFlatValueGet()
 	}
+	value, err := s.getFlatValueUncounted(key)
+	if recordDiagnostics {
+		recordFlatValueGetOutcome(err == nil)
+	}
+	return value, err
+}
+
+func (s *Shard) getFlatValueUncounted(key []byte) ([]byte, error) {
+	recordDiagnostics := s.config == nil || !s.config.statsView
 	if len(key) == 0 {
 		return nil, ErrNodeNotFound
 	}

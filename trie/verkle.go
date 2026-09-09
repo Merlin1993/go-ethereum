@@ -190,6 +190,25 @@ func (t *VerkleTrie) UpdateRaw(key, value []byte) error {
 	return t.root.Insert(key, v[:], t.nodeResolver)
 }
 
+// GetRaw reads a raw 32-byte Verkle tree key. It is intended for
+// structure-level KV benchmarks.
+func (t *VerkleTrie) GetRaw(key []byte) ([]byte, error) {
+	if len(key) != verkle.KeySize {
+		return nil, fmt.Errorf("GetRaw expects %d-byte key, got %d", verkle.KeySize, len(key))
+	}
+	return t.root.Get(key, t.nodeResolver)
+}
+
+// DeleteRaw removes a raw 32-byte Verkle tree key. It is intended for
+// structure-level KV benchmarks.
+func (t *VerkleTrie) DeleteRaw(key []byte) error {
+	if len(key) != verkle.KeySize {
+		return fmt.Errorf("DeleteRaw expects %d-byte key, got %d", verkle.KeySize, len(key))
+	}
+	_, err := t.root.Delete(key, t.nodeResolver)
+	return err
+}
+
 // DeleteAccount leaves the account untouched, as no account deletion can happen
 // in verkle.
 // There is a special corner case, in which an account that is prefunded, CREATE2-d

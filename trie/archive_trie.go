@@ -459,6 +459,7 @@ func NewArchiveTrie(root common.Hash, db database.NodeDatabase, archive ethdb.Da
 			config.EnablePathDiagnostics = dbConf.EnablePathDiagnostics
 			config.PhysicalDelete = dbConf.PhysicalDelete
 			config.StemMode = dbConf.StemMode
+			config.ActivateArchivedStemOnRead = dbConf.ActivateArchivedStemOnRead
 			if dbConf.NodeStorageScheme == archivetrie.NodeStorageHash || dbConf.NodeStorageScheme == archivetrie.NodeStoragePath {
 				config.NodeStorageScheme = dbConf.NodeStorageScheme
 			}
@@ -781,19 +782,21 @@ type rawBatchBuffer struct {
 	ops []rawBatchOp
 }
 
-// Put 记录一条 raw put 操作，并复制 key/value 避免调用方复用切片。
+// Put borrows commit-owned immutable slices until replay completes. All
+// producers are internal shard commit paths, so this avoids copying every raw
+// path node and flat value into a second temporary buffer.
 func (b *rawBatchBuffer) Put(key, value []byte) error {
 	b.ops = append(b.ops, rawBatchOp{
-		key:   common.CopyBytes(key),
-		value: common.CopyBytes(value),
+		key:   key,
+		value: value,
 	})
 	return nil
 }
 
-// Delete 记录一条 raw delete 操作，并复制 key 避免调用方复用切片。
+// Delete uses the same commit-scoped ownership rule as Put.
 func (b *rawBatchBuffer) Delete(key []byte) error {
 	b.ops = append(b.ops, rawBatchOp{
-		key:    common.CopyBytes(key),
+		key:    key,
 		delete: true,
 	})
 	return nil
@@ -1559,7 +1562,7 @@ func (t *ArchiveTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) 
 					for index := range jobs {
 						id := dirtyShards[index]
 						nodes := trienode.NewNodeSet(common.Hash{})
-						raw := new(rawBatchBuffer)
+						raw := &rawBatchBuffer{ops: make([]rawBatchOp, 0, 32)}
 						batch := &nodeSetBatcher{adapter: adapter, nodes: nodes, rawBatch: raw}
 						shardStart := time.Now()
 						// 使用 destructive commit：提交后 shard 只保留 rootHash，不再把整棵

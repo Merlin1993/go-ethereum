@@ -67,33 +67,34 @@ var (
 	maxBlocks             = flag.Int("blocks", 0, "Maximum number of blocks to process during processor or consistency tests (0 = all)")
 
 	// Binary Trie Ablation flags
-	shardDepth                  = flag.Int("shardDepth", 8, "Binary trie shard depth")
-	archiveBucketSize           = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
-	cuckooBuckets               = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
-	cuckooSlots                 = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
-	binaryNodeCacheLimit        = flag.Int("binaryNodeCacheLimit", archivetrie.DefaultNodeCacheLimit, "Binary trie process node cache entry limit; 0 uses default, negative disables cache")
-	binaryNodeCacheBytesLimitMB = flag.Int("binaryNodeCacheBytesLimitMB", 512, "Binary trie process node cache byte limit in MiB; 0 uses default, negative disables byte cap")
-	binaryNodeCacheWarmPathBits = flag.Int("binaryNodeCacheWarmPathBits", archivetrie.DefaultNodeCacheWarmPathBits, "Path-mode write-through cache depth; -1 retains shard roots only, <-1 disables (default)")
-	binaryStemCacheLimit        = flag.Int("binaryStemCacheLimit", archivetrie.DefaultStemCacheLimit, "Decoded active-stem cache entry limit; 0 uses default, negative disables")
-	binaryStemCacheBytesLimitMB = flag.Int("binaryStemCacheBytesLimitMB", int(archivetrie.DefaultStemCacheBytesLimit/(1024*1024)), "Decoded active-stem cache approximate byte limit in MiB; 0 uses default, negative disables byte cap")
-	binaryPathDiagnostics       = flag.Bool("binaryPathDiagnostics", false, "Enable binary trie path/cache diagnostics")
-	binaryPruneShardMetrics     = flag.Bool("binaryPruneShardMetrics", false, "Write per-prune binary shard pressure metrics CSV")
-	binaryFilterFPSamples       = flag.Int("binaryFilterFPSamplesPerBucket", 1, "Known-negative Cuckoo-filter probes per archive bucket during exact trie scans; 0 disables")
-	binaryFilterFPSeed          = flag.Int64("binaryFilterFPSeed", 1, "Deterministic seed for archive filter probes")
-	binaryStorageBreakdownFinal = flag.Bool("binaryStorageBreakdownFinal", true, "Read every reachable suffix at the final exact scan to measure active/archive logical bytes")
-	binaryAsyncPrune            = flag.Bool("binaryAsyncPrune", false, "Run binary shard pruning asynchronously and wait before root commit")
-	binaryCommitWorkers         = flag.Int("binaryCommitWorkers", 0, "Max parallel binary shard commit workers; 0 uses binary default cap")
-	binaryCommitWatchdog        = flag.Int("binaryCommitWatchdogSec", 0, "Dump goroutines if one binary wrapper commit exceeds this many seconds; 0 disables")
-	binaryPhysicalDelete        = flag.Bool("binaryPhysicalDelete", false, "Physically delete obsolete binary trie state nodes from stateDB")
-	binaryStemArchive           = flag.Bool("binaryStemArchive", false, "Group binary-tree state by 31-byte stem and archive all 256 suffixes together")
-	binaryNodeStorage           = flag.String("binaryNodeStorage", "path", "Binary trie node storage scheme: hash or path")
-	archiveOverlapBudgetMs      = flag.Int("archiveOverlapBudgetMs", 8000, "Async archive wait budget that can overlap block interval and is not charged to root compute")
-	maxRootPipelineMs           = flag.Int("maxRootPipelineMs", 0, "Abort if any block root pipeline exceeds this many milliseconds; 0 disables")
-	maxHandleDestructMs         = flag.Int("maxHandleDestructionMs", 0, "Abort if any block handleDestruction exceeds this many milliseconds; 0 disables")
-	maxPruningMs                = flag.Int("maxPruningMs", 0, "Abort if any binary pruning step exceeds this many milliseconds; 0 disables")
-	maxAvgArchiveProofBytes     = flag.Int("maxAvgArchiveProofBytes", 0, "Abort if an interval's average archive proof exceeds this many bytes; 0 disables")
-	maxItemArchiveProofBytes    = flag.Int("maxItemArchiveProofBytes", 0, "Abort if an archive item proof exceeds this many bytes; 0 disables")
-	maxArchiveProofVerifyMs     = flag.Int("maxArchiveProofVerifyMs", 0, "Abort if archive proof verification exceeds this many milliseconds; 0 disables")
+	shardDepth                       = flag.Int("shardDepth", 8, "Binary trie shard depth")
+	archiveBucketSize                = flag.Int("archiveBucketSize", 100, "Binary trie archive bucket size")
+	cuckooBuckets                    = flag.Int("cuckooBuckets", 16, "Binary trie cuckoo filter buckets")
+	cuckooSlots                      = flag.Int("cuckooSlots", 4, "Binary trie cuckoo filter slots")
+	binaryNodeCacheLimit             = flag.Int("binaryNodeCacheLimit", archivetrie.DefaultNodeCacheLimit, "Binary trie process node cache entry limit; 0 uses default, negative disables cache")
+	binaryNodeCacheBytesLimitMB      = flag.Int("binaryNodeCacheBytesLimitMB", 512, "Binary trie process node cache byte limit in MiB; 0 uses default, negative disables byte cap")
+	binaryNodeCacheWarmPathBits      = flag.Int("binaryNodeCacheWarmPathBits", archivetrie.DefaultNodeCacheWarmPathBits, "Path-mode write-through cache depth; -1 retains shard roots only, <-1 disables (default)")
+	binaryStemCacheLimit             = flag.Int("binaryStemCacheLimit", archivetrie.DefaultStemCacheLimit, "Decoded active-stem cache entry limit; 0 uses default, negative disables")
+	binaryStemCacheBytesLimitMB      = flag.Int("binaryStemCacheBytesLimitMB", int(archivetrie.DefaultStemCacheBytesLimit/(1024*1024)), "Decoded active-stem cache approximate byte limit in MiB; 0 uses default, negative disables byte cap")
+	binaryPathDiagnostics            = flag.Bool("binaryPathDiagnostics", false, "Enable binary trie path/cache diagnostics")
+	binaryPruneShardMetrics          = flag.Bool("binaryPruneShardMetrics", false, "Write per-prune binary shard pressure metrics CSV")
+	binaryFilterFPSamples            = flag.Int("binaryFilterFPSamplesPerBucket", 1, "Known-negative Cuckoo-filter probes per archive bucket during exact trie scans; 0 disables")
+	binaryFilterFPSeed               = flag.Int64("binaryFilterFPSeed", 1, "Deterministic seed for archive filter probes")
+	binaryStorageBreakdownFinal      = flag.Bool("binaryStorageBreakdownFinal", true, "Read every reachable suffix at the final exact scan to measure active/archive logical bytes")
+	binaryAsyncPrune                 = flag.Bool("binaryAsyncPrune", false, "Run binary shard pruning asynchronously and wait before root commit")
+	binaryCommitWorkers              = flag.Int("binaryCommitWorkers", 0, "Max parallel binary shard commit workers; 0 uses binary default cap")
+	binaryCommitWatchdog             = flag.Int("binaryCommitWatchdogSec", 0, "Dump goroutines if one binary wrapper commit exceeds this many seconds; 0 disables")
+	binaryPhysicalDelete             = flag.Bool("binaryPhysicalDelete", false, "Physically delete obsolete binary trie state nodes from stateDB")
+	binaryStemArchive                = flag.Bool("binaryStemArchive", false, "Group binary-tree state by 31-byte stem and archive all 256 suffixes together")
+	binaryActivateArchivedStemOnRead = flag.Bool("binaryActivateArchivedStemOnRead", false, "Activate an archived stem when a read finds it")
+	binaryNodeStorage                = flag.String("binaryNodeStorage", "path", "Binary trie node storage scheme: hash or path")
+	archiveOverlapBudgetMs           = flag.Int("archiveOverlapBudgetMs", 8000, "Async archive wait budget that can overlap block interval and is not charged to root compute")
+	maxRootPipelineMs                = flag.Int("maxRootPipelineMs", 0, "Abort if any block root pipeline exceeds this many milliseconds; 0 disables")
+	maxHandleDestructMs              = flag.Int("maxHandleDestructionMs", 0, "Abort if any block handleDestruction exceeds this many milliseconds; 0 disables")
+	maxPruningMs                     = flag.Int("maxPruningMs", 0, "Abort if any binary pruning step exceeds this many milliseconds; 0 disables")
+	maxAvgArchiveProofBytes          = flag.Int("maxAvgArchiveProofBytes", 0, "Abort if an interval's average archive proof exceeds this many bytes; 0 disables")
+	maxItemArchiveProofBytes         = flag.Int("maxItemArchiveProofBytes", 0, "Abort if an archive item proof exceeds this many bytes; 0 disables")
+	maxArchiveProofVerifyMs          = flag.Int("maxArchiveProofVerifyMs", 0, "Abort if archive proof verification exceeds this many milliseconds; 0 disables")
 )
 
 func TestMain(m *testing.M) {
@@ -121,33 +122,34 @@ type ProcessorConfig struct {
 	FullTrieStatsInterval int
 
 	// Ablation params
-	ShardDepth                  int
-	ArchiveBucketSize           int
-	CuckooBuckets               int
-	CuckooSlots                 int
-	BinaryNodeCacheLimit        int
-	BinaryNodeCacheBytesLimitMB int
-	BinaryNodeCacheWarmPathBits int
-	BinaryStemCacheLimit        int
-	BinaryStemCacheBytesLimitMB int
-	BinaryPathDiagnostics       bool
-	BinaryPruneShardMetrics     bool
-	BinaryFilterFPSamples       int
-	BinaryFilterFPSeed          int64
-	BinaryStorageBreakdownFinal bool
-	BinaryAsyncPrune            bool
-	BinaryCommitWorkers         int
-	BinaryCommitWatchdog        int
-	BinaryPhysicalDelete        bool
-	BinaryStemArchive           bool
-	BinaryNodeStorage           string
-	ArchiveOverlapBudgetMs      int
-	MaxRootPipelineMs           int
-	MaxHandleDestructMs         int
-	MaxPruningMs                int
-	MaxAvgArchiveProofBytes     int
-	MaxItemArchiveProofBytes    int
-	MaxArchiveProofVerifyMs     int
+	ShardDepth                       int
+	ArchiveBucketSize                int
+	CuckooBuckets                    int
+	CuckooSlots                      int
+	BinaryNodeCacheLimit             int
+	BinaryNodeCacheBytesLimitMB      int
+	BinaryNodeCacheWarmPathBits      int
+	BinaryStemCacheLimit             int
+	BinaryStemCacheBytesLimitMB      int
+	BinaryPathDiagnostics            bool
+	BinaryPruneShardMetrics          bool
+	BinaryFilterFPSamples            int
+	BinaryFilterFPSeed               int64
+	BinaryStorageBreakdownFinal      bool
+	BinaryAsyncPrune                 bool
+	BinaryCommitWorkers              int
+	BinaryCommitWatchdog             int
+	BinaryPhysicalDelete             bool
+	BinaryStemArchive                bool
+	BinaryActivateArchivedStemOnRead bool
+	BinaryNodeStorage                string
+	ArchiveOverlapBudgetMs           int
+	MaxRootPipelineMs                int
+	MaxHandleDestructMs              int
+	MaxPruningMs                     int
+	MaxAvgArchiveProofBytes          int
+	MaxItemArchiveProofBytes         int
+	MaxArchiveProofVerifyMs          int
 }
 
 type finalStorageBreakdownReport struct {
@@ -298,22 +300,23 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 		StartNum:         cfg.StartNum,
 		BinaryArchiveDir: cfg.BinaryArchiveDir,
 		BinaryAblationConfig: &database.BinaryConfig{
-			ShardDepth:            cfg.ShardDepth,
-			ArchiveBucketSize:     cfg.ArchiveBucketSize,
-			CuckooBuckets:         cfg.CuckooBuckets,
-			CuckooSlots:           cfg.CuckooSlots,
-			NodeCacheLimit:        cfg.BinaryNodeCacheLimit,
-			NodeCacheBytesLimit:   int64(cfg.BinaryNodeCacheBytesLimitMB) * 1024 * 1024,
-			NodeCacheWarmPathBits: cfg.BinaryNodeCacheWarmPathBits,
-			StemCacheLimit:        cfg.BinaryStemCacheLimit,
-			StemCacheBytesLimit:   int64(cfg.BinaryStemCacheBytesLimitMB) * 1024 * 1024,
-			EnablePathDiagnostics: cfg.BinaryPathDiagnostics,
-			AsyncPrune:            cfg.BinaryAsyncPrune,
-			CommitWorkers:         cfg.BinaryCommitWorkers,
-			CommitWatchdogSeconds: cfg.BinaryCommitWatchdog,
-			PhysicalDelete:        cfg.BinaryPhysicalDelete,
-			StemMode:              cfg.BinaryStemArchive,
-			NodeStorageScheme:     cfg.BinaryNodeStorage,
+			ShardDepth:                 cfg.ShardDepth,
+			ArchiveBucketSize:          cfg.ArchiveBucketSize,
+			CuckooBuckets:              cfg.CuckooBuckets,
+			CuckooSlots:                cfg.CuckooSlots,
+			NodeCacheLimit:             cfg.BinaryNodeCacheLimit,
+			NodeCacheBytesLimit:        int64(cfg.BinaryNodeCacheBytesLimitMB) * 1024 * 1024,
+			NodeCacheWarmPathBits:      cfg.BinaryNodeCacheWarmPathBits,
+			StemCacheLimit:             cfg.BinaryStemCacheLimit,
+			StemCacheBytesLimit:        int64(cfg.BinaryStemCacheBytesLimitMB) * 1024 * 1024,
+			EnablePathDiagnostics:      cfg.BinaryPathDiagnostics,
+			AsyncPrune:                 cfg.BinaryAsyncPrune,
+			CommitWorkers:              cfg.BinaryCommitWorkers,
+			CommitWatchdogSeconds:      cfg.BinaryCommitWatchdog,
+			PhysicalDelete:             cfg.BinaryPhysicalDelete,
+			StemMode:                   cfg.BinaryStemArchive,
+			ActivateArchivedStemOnRead: cfg.BinaryActivateArchivedStemOnRead,
+			NodeStorageScheme:          cfg.BinaryNodeStorage,
 		},
 		PathDB: pdb,
 		HashDB: hdb,
@@ -391,47 +394,48 @@ func TestExpireStateProcessor(t *testing.T) {
 		flag.Parse()
 	}
 	cfg := &ProcessorConfig{
-		DbDir:                       *dbDir,
-		DataDir:                     *dataDir,
-		StartFileIdx:                *startIdx,
-		EndFileIdx:                  *endIdx,
-		UseVerkle:                   *useVerkle,
-		UseBinaryTrie:               *useBinaryTrie && !*useKV,
-		UseKV:                       *useKV,
-		UseMemory:                   *useMemory,
-		BinaryArchiveDir:            *binaryArchiveDir,
-		MetricsDir:                  *metricsDir,
-		StartNum:                    46147,
-		PruneInterval:               *pruneInterval,
-		MaxBlocks:                   *maxBlocks,
-		FullTrieStatsInterval:       *fullTrieStatsInterval,
-		ShardDepth:                  *shardDepth,
-		ArchiveBucketSize:           *archiveBucketSize,
-		CuckooBuckets:               *cuckooBuckets,
-		CuckooSlots:                 *cuckooSlots,
-		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,
-		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
-		BinaryNodeCacheWarmPathBits: *binaryNodeCacheWarmPathBits,
-		BinaryStemCacheLimit:        *binaryStemCacheLimit,
-		BinaryStemCacheBytesLimitMB: *binaryStemCacheBytesLimitMB,
-		BinaryPathDiagnostics:       *binaryPathDiagnostics,
-		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
-		BinaryFilterFPSamples:       *binaryFilterFPSamples,
-		BinaryFilterFPSeed:          *binaryFilterFPSeed,
-		BinaryStorageBreakdownFinal: *binaryStorageBreakdownFinal,
-		BinaryAsyncPrune:            *binaryAsyncPrune,
-		BinaryCommitWorkers:         *binaryCommitWorkers,
-		BinaryCommitWatchdog:        *binaryCommitWatchdog,
-		BinaryPhysicalDelete:        *binaryPhysicalDelete,
-		BinaryStemArchive:           *binaryStemArchive,
-		BinaryNodeStorage:           *binaryNodeStorage,
-		ArchiveOverlapBudgetMs:      *archiveOverlapBudgetMs,
-		MaxRootPipelineMs:           *maxRootPipelineMs,
-		MaxHandleDestructMs:         *maxHandleDestructMs,
-		MaxPruningMs:                *maxPruningMs,
-		MaxAvgArchiveProofBytes:     *maxAvgArchiveProofBytes,
-		MaxItemArchiveProofBytes:    *maxItemArchiveProofBytes,
-		MaxArchiveProofVerifyMs:     *maxArchiveProofVerifyMs,
+		DbDir:                            *dbDir,
+		DataDir:                          *dataDir,
+		StartFileIdx:                     *startIdx,
+		EndFileIdx:                       *endIdx,
+		UseVerkle:                        *useVerkle,
+		UseBinaryTrie:                    *useBinaryTrie && !*useKV,
+		UseKV:                            *useKV,
+		UseMemory:                        *useMemory,
+		BinaryArchiveDir:                 *binaryArchiveDir,
+		MetricsDir:                       *metricsDir,
+		StartNum:                         46147,
+		PruneInterval:                    *pruneInterval,
+		MaxBlocks:                        *maxBlocks,
+		FullTrieStatsInterval:            *fullTrieStatsInterval,
+		ShardDepth:                       *shardDepth,
+		ArchiveBucketSize:                *archiveBucketSize,
+		CuckooBuckets:                    *cuckooBuckets,
+		CuckooSlots:                      *cuckooSlots,
+		BinaryNodeCacheLimit:             *binaryNodeCacheLimit,
+		BinaryNodeCacheBytesLimitMB:      *binaryNodeCacheBytesLimitMB,
+		BinaryNodeCacheWarmPathBits:      *binaryNodeCacheWarmPathBits,
+		BinaryStemCacheLimit:             *binaryStemCacheLimit,
+		BinaryStemCacheBytesLimitMB:      *binaryStemCacheBytesLimitMB,
+		BinaryPathDiagnostics:            *binaryPathDiagnostics,
+		BinaryPruneShardMetrics:          *binaryPruneShardMetrics,
+		BinaryFilterFPSamples:            *binaryFilterFPSamples,
+		BinaryFilterFPSeed:               *binaryFilterFPSeed,
+		BinaryStorageBreakdownFinal:      *binaryStorageBreakdownFinal,
+		BinaryAsyncPrune:                 *binaryAsyncPrune,
+		BinaryCommitWorkers:              *binaryCommitWorkers,
+		BinaryCommitWatchdog:             *binaryCommitWatchdog,
+		BinaryPhysicalDelete:             *binaryPhysicalDelete,
+		BinaryStemArchive:                *binaryStemArchive,
+		BinaryActivateArchivedStemOnRead: *binaryActivateArchivedStemOnRead,
+		BinaryNodeStorage:                *binaryNodeStorage,
+		ArchiveOverlapBudgetMs:           *archiveOverlapBudgetMs,
+		MaxRootPipelineMs:                *maxRootPipelineMs,
+		MaxHandleDestructMs:              *maxHandleDestructMs,
+		MaxPruningMs:                     *maxPruningMs,
+		MaxAvgArchiveProofBytes:          *maxAvgArchiveProofBytes,
+		MaxItemArchiveProofBytes:         *maxItemArchiveProofBytes,
+		MaxArchiveProofVerifyMs:          *maxArchiveProofVerifyMs,
 	}
 	fmt.Printf("[ASCT_CONFIG] stemArchive=%t shardDepth=%d bucketSize=%d nodeStorage=%s pruneInterval=%d nodeCacheWarmPathBits=%d stemCacheLimit=%d stemCacheMB=%d\n",
 		cfg.BinaryStemArchive, cfg.ShardDepth, cfg.ArchiveBucketSize, cfg.BinaryNodeStorage, cfg.PruneInterval,
@@ -2767,41 +2771,42 @@ func TestBinaryTrieConsistency(t *testing.T) {
 
 	// 2. Binary Trie Host setup
 	binCfg := &ProcessorConfig{
-		DbDir:                       filepath.Join(os.TempDir(), "bin_consistency_db"),
-		DataDir:                     *dataDir,
-		StartFileIdx:                *startIdx,
-		EndFileIdx:                  *endIdx,
-		UseVerkle:                   false,
-		UseBinaryTrie:               true,
-		UseMemory:                   false,
-		BinaryArchiveDir:            filepath.Join(os.TempDir(), "bin_consistency_archive"),
-		StartNum:                    46147,
-		PruneInterval:               *pruneInterval,
-		MaxBlocks:                   *maxBlocks,
-		FullTrieStatsInterval:       *fullTrieStatsInterval,
-		ShardDepth:                  *shardDepth,
-		ArchiveBucketSize:           *archiveBucketSize,
-		CuckooBuckets:               *cuckooBuckets,
-		CuckooSlots:                 *cuckooSlots,
-		BinaryNodeCacheLimit:        *binaryNodeCacheLimit,
-		BinaryNodeCacheBytesLimitMB: *binaryNodeCacheBytesLimitMB,
-		BinaryNodeCacheWarmPathBits: *binaryNodeCacheWarmPathBits,
-		BinaryStemCacheLimit:        *binaryStemCacheLimit,
-		BinaryStemCacheBytesLimitMB: *binaryStemCacheBytesLimitMB,
-		BinaryPathDiagnostics:       *binaryPathDiagnostics,
-		BinaryPruneShardMetrics:     *binaryPruneShardMetrics,
-		BinaryFilterFPSamples:       *binaryFilterFPSamples,
-		BinaryFilterFPSeed:          *binaryFilterFPSeed,
-		BinaryStorageBreakdownFinal: *binaryStorageBreakdownFinal,
-		BinaryAsyncPrune:            *binaryAsyncPrune,
-		BinaryCommitWorkers:         *binaryCommitWorkers,
-		BinaryCommitWatchdog:        *binaryCommitWatchdog,
-		BinaryPhysicalDelete:        *binaryPhysicalDelete,
-		BinaryStemArchive:           *binaryStemArchive,
-		BinaryNodeStorage:           *binaryNodeStorage,
-		MaxAvgArchiveProofBytes:     *maxAvgArchiveProofBytes,
-		MaxItemArchiveProofBytes:    *maxItemArchiveProofBytes,
-		MaxArchiveProofVerifyMs:     *maxArchiveProofVerifyMs,
+		DbDir:                            filepath.Join(os.TempDir(), "bin_consistency_db"),
+		DataDir:                          *dataDir,
+		StartFileIdx:                     *startIdx,
+		EndFileIdx:                       *endIdx,
+		UseVerkle:                        false,
+		UseBinaryTrie:                    true,
+		UseMemory:                        false,
+		BinaryArchiveDir:                 filepath.Join(os.TempDir(), "bin_consistency_archive"),
+		StartNum:                         46147,
+		PruneInterval:                    *pruneInterval,
+		MaxBlocks:                        *maxBlocks,
+		FullTrieStatsInterval:            *fullTrieStatsInterval,
+		ShardDepth:                       *shardDepth,
+		ArchiveBucketSize:                *archiveBucketSize,
+		CuckooBuckets:                    *cuckooBuckets,
+		CuckooSlots:                      *cuckooSlots,
+		BinaryNodeCacheLimit:             *binaryNodeCacheLimit,
+		BinaryNodeCacheBytesLimitMB:      *binaryNodeCacheBytesLimitMB,
+		BinaryNodeCacheWarmPathBits:      *binaryNodeCacheWarmPathBits,
+		BinaryStemCacheLimit:             *binaryStemCacheLimit,
+		BinaryStemCacheBytesLimitMB:      *binaryStemCacheBytesLimitMB,
+		BinaryPathDiagnostics:            *binaryPathDiagnostics,
+		BinaryPruneShardMetrics:          *binaryPruneShardMetrics,
+		BinaryFilterFPSamples:            *binaryFilterFPSamples,
+		BinaryFilterFPSeed:               *binaryFilterFPSeed,
+		BinaryStorageBreakdownFinal:      *binaryStorageBreakdownFinal,
+		BinaryAsyncPrune:                 *binaryAsyncPrune,
+		BinaryCommitWorkers:              *binaryCommitWorkers,
+		BinaryCommitWatchdog:             *binaryCommitWatchdog,
+		BinaryPhysicalDelete:             *binaryPhysicalDelete,
+		BinaryStemArchive:                *binaryStemArchive,
+		BinaryActivateArchivedStemOnRead: *binaryActivateArchivedStemOnRead,
+		BinaryNodeStorage:                *binaryNodeStorage,
+		MaxAvgArchiveProofBytes:          *maxAvgArchiveProofBytes,
+		MaxItemArchiveProofBytes:         *maxItemArchiveProofBytes,
+		MaxArchiveProofVerifyMs:          *maxArchiveProofVerifyMs,
 	}
 	os.RemoveAll(binCfg.DbDir)
 	os.RemoveAll(binCfg.BinaryArchiveDir)

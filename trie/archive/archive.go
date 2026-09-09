@@ -103,9 +103,11 @@ func (s *Shard) finishRootArchivePool(root Node, items []ArchivedKV, prefix []by
 	}
 
 	if root != nil {
-		var absorbed int
-		var err error
-		items, absorbed, err = s.absorbArchiveItemsIntoExistingBuckets(root, items, prefix, prefixBits)
+		if _, err := s.removeArchiveItemsFromExistingBuckets(root, items, prefix, prefixBits); err != nil {
+			return root, err
+		}
+
+		items, absorbed, err := s.absorbArchiveItemsIntoExistingBuckets(root, items, prefix, prefixBits)
 		if err != nil {
 			return root, err
 		}
@@ -172,6 +174,134 @@ func (s *Shard) finishRootArchivePool(root Node, items []ArchivedKV, prefix []by
 		return root, err
 	}
 	return s.normalizeRootArchivePlacement(lifted, prefix, prefixBits)
+}
+
+// removeArchiveItemsFromExistingBuckets clears every old membership of the
+// incoming keys. A logical key must have exactly one archive membership before
+// absorbArchiveItemsIntoExistingBuckets inserts its current reference.
+func (s *Shard) removeArchiveItemsFromExistingBuckets(node Node, items []ArchivedKV, nodePath []byte, nodeBits int) (bool, error) {
+	if node == nil || len(items) == 0 {
+		return false, nil
+	}
+
+	switch n := node.(type) {
+	case *ArchiveBucketNode:
+		deletes, err := s.archiveItemsInsideBucket(n, items)
+		if err != nil || len(deletes) == 0 {
+			return false, err
+		}
+		s.blindDeleteFromBucket(n, deletes)
+		return true, nil
+
+	case *InternalNode:
+		currentP, currentB := nodePath, nodeBits
+		if n.PathBits > 0 {
+			currentP, currentB = s.prependPath(n.Path, n.PathBits, nodePath, nodeBits)
+		}
+
+		changed := false
+		kept := n.StubList[:0]
+		for _, bucket := range n.StubList {
+			if bucket == nil {
+				continue
+			}
+			removed, err := s.removeArchiveItemsFromExistingBuckets(bucket, items, currentP, currentB)
+			if err != nil {
+				return false, err
+			}
+			if !removed {
+				kept = append(kept, bucket)
+				continue
+			}
+			changed = true
+			if bucket.Count == 0 {
+				s.markPersistedNodeStale(bucket)
+				continue
+			}
+			kept = append(kept, bucket)
+		}
+		n.StubList = kept
+
+		for bit := byte(0); bit < 2; bit++ {
+			var child Node
+			var childHash []byte
+			if bit == 0 {
+				child, childHash = n.Left, n.LeftHash
+			} else {
+				child, childHash = n.Right, n.RightHash
+			}
+			if child == nil && len(childHash) > 0 {
+				loaded, err := s.loadChildNode(n, bit, childHash)
+				if err != nil {
+					return false, err
+				}
+				child = loaded
+			}
+			if child == nil {
+				continue
+			}
+
+			childPath, childBits := s.appendBit(currentP, currentB, bit)
+			removed, err := s.removeArchiveItemsFromExistingBuckets(child, items, childPath, childBits)
+			if err != nil {
+				return false, err
+			}
+			if !removed {
+				continue
+			}
+			changed = true
+			if bucket, ok := child.(*ArchiveBucketNode); ok && bucket.Count == 0 {
+				s.markPersistedNodeStale(bucket)
+				child = nil
+			}
+			if bit == 0 {
+				n.Left, n.LeftHash, n.LeftEpoch = child, nil, 0
+				if child != nil {
+					n.LeftEpoch = child.Epoch()
+				}
+			} else {
+				n.Right, n.RightHash, n.RightEpoch = child, nil, 0
+				if child != nil {
+					n.RightEpoch = child.Epoch()
+				}
+			}
+		}
+
+		if changed {
+			s.markPersistedNodeStale(n)
+			n.SetDirty(true)
+			s.refreshInternalEpochMask(n)
+		}
+		return changed, nil
+
+	default:
+		return false, nil
+	}
+}
+
+func (s *Shard) archiveItemsInsideBucket(bucket *ArchiveBucketNode, items []ArchivedKV) ([]ArchivedKV, error) {
+	if bucket == nil || len(items) == 0 {
+		return nil, nil
+	}
+	keys, err := s.bucketKeys(bucket)
+	if err != nil {
+		return nil, err
+	}
+
+	deletes := make([]ArchivedKV, 0, len(items))
+	for _, item := range items {
+		if !hasBitPrefix(item.Suffix, item.SuffixBits, bucket.Path, bucket.PathBits) {
+			continue
+		}
+		suffix, suffixBits := s.stripPrefix(item.Suffix, item.SuffixBits, 0, bucket.Path, bucket.PathBits)
+		for _, key := range keys {
+			if key.SuffixBits == suffixBits && bytes.Equal(key.Suffix, suffix) {
+				deletes = append(deletes, ArchivedKV{Suffix: suffix, SuffixBits: suffixBits})
+				break
+			}
+		}
+	}
+	return deletes, nil
 }
 
 func (s *Shard) normalizeRootArchivePlacement(root Node, prefix []byte, prefixBits int) (Node, error) {
@@ -857,7 +987,42 @@ func (s *Shard) absorbArchiveItemsIntoBucket(bucket *ArchiveBucketNode, items []
 	}
 	limit := s.config.ResolveArchiveBucketSize()
 	if limit > 0 && bucket.Count >= uint64(limit) {
-		return items, 0
+		// A full bucket can still absorb a newer version of an existing key:
+		// deduplication replaces the stale valueRef without increasing Count.
+		keys, err := s.bucketKeys(bucket)
+		if err != nil {
+			return items, 0
+		}
+		duplicates := make([]ArchivedKV, 0)
+		remaining := make([]ArchivedKV, 0, len(items))
+		for _, item := range items {
+			if !hasBitPrefix(item.Suffix, item.SuffixBits, minPath, minBits) ||
+				!hasBitPrefix(item.Suffix, item.SuffixBits, bucket.Path, bucket.PathBits) {
+				remaining = append(remaining, item)
+				continue
+			}
+			suffix, suffixBits := s.stripPrefix(item.Suffix, item.SuffixBits, 0, bucket.Path, bucket.PathBits)
+			duplicate := false
+			for _, key := range keys {
+				if key.SuffixBits == suffixBits && bytes.Equal(key.Suffix, suffix) {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				remaining = append(remaining, item)
+				continue
+			}
+			duplicates = append(duplicates, ArchivedKV{
+				Suffix:     suffix,
+				SuffixBits: suffixBits,
+				Value:      item.Value,
+			})
+		}
+		if len(duplicates) == 0 || !s.blindAppendToBucket(bucket, duplicates) {
+			return items, 0
+		}
+		return remaining, len(duplicates)
 	}
 
 	capacity := len(items)

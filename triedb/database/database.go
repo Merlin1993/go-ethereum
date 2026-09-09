@@ -24,24 +24,25 @@ import (
 
 // BinaryConfig holds the configuration parameters for binary trie ablation.
 type BinaryConfig struct {
-	ShardDepth                int   // Shard depth for binary trie
-	ArchiveBucketSize         int   // Archive bucket size for binary trie
-	CuckooBuckets             int   // Cuckoo filter buckets for binary trie
-	CuckooSlots               int   // Cuckoo filter slots for binary trie
-	NodeCacheLimit            int   // Max binary trie node blobs cached in process; 0 uses default, negative disables cache
-	NodeCacheBytesLimit       int64 // Max binary trie node blob bytes cached in process; 0 uses default, negative disables byte cap
-	NodeCacheWarmPathBits     int   // Path-mode eager warming depth; 0 uses binary default, -1 keeps root-only, <-1 disables eager warming
-	StemCacheLimit            int   // Max decoded active stems cached in process; 0 uses default, negative disables
-	StemCacheBytesLimit       int64 // Approximate decoded active-stem cache bytes; 0 uses default, negative disables byte cap
-	CommitmentPointCacheLimit int   // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
-	ArchiveStubMaxBucketsPath int   // Max side-mounted archive buckets at one node before pressure-sinking; 0 uses binary default, negative disables
-	AsyncPrune                bool  // Run binary shard pruning in the background and apply it before root commit
-	CommitWorkers             int   // Max parallel binary shard commit workers; 0 uses binary default
-	CommitWatchdogSeconds     int   // Dump goroutines if one binary wrapper commit exceeds this many seconds; 0 disables
-	EnablePathDiagnostics     bool  // Record path/cache diagnostics during binary trie experiments
-	PhysicalDelete            bool  // Physically delete obsolete binary trie state nodes when requested
-	StemMode                  bool  // Archive unified binary-tree state by 31-byte stem instead of individual wrapper keys
-	NodeStorageScheme         string
+	ShardDepth                 int   // Shard depth for binary trie
+	ArchiveBucketSize          int   // Archive bucket size for binary trie
+	CuckooBuckets              int   // Cuckoo filter buckets for binary trie
+	CuckooSlots                int   // Cuckoo filter slots for binary trie
+	NodeCacheLimit             int   // Max binary trie node blobs cached in process; 0 uses default, negative disables cache
+	NodeCacheBytesLimit        int64 // Max binary trie node blob bytes cached in process; 0 uses default, negative disables byte cap
+	NodeCacheWarmPathBits      int   // Path-mode eager warming depth; 0 uses binary default, -1 keeps root-only, <-1 disables eager warming
+	StemCacheLimit             int   // Max decoded active stems cached in process; 0 uses default, negative disables
+	StemCacheBytesLimit        int64 // Approximate decoded active-stem cache bytes; 0 uses default, negative disables byte cap
+	CommitmentPointCacheLimit  int   // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
+	ArchiveStubMaxBucketsPath  int   // Max side-mounted archive buckets at one node before pressure-sinking; 0 uses binary default, negative disables
+	AsyncPrune                 bool  // Run binary shard pruning in the background and apply it before root commit
+	CommitWorkers              int   // Max parallel binary shard commit workers; 0 uses binary default
+	CommitWatchdogSeconds      int   // Dump goroutines if one binary wrapper commit exceeds this many seconds; 0 disables
+	EnablePathDiagnostics      bool  // Record path/cache diagnostics during binary trie experiments
+	PhysicalDelete             bool  // Physically delete obsolete binary trie state nodes when requested
+	StemMode                   bool  // Archive unified binary-tree state by 31-byte stem instead of individual wrapper keys
+	ActivateArchivedStemOnRead bool  // Restore an archived stem to the hot tree when a read finds it
+	NodeStorageScheme          string
 }
 
 // NodeReader wraps the Node method of a backing trie reader.

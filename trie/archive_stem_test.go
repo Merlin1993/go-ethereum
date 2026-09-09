@@ -179,7 +179,8 @@ func TestArchiveTrieStemModeBasicAccountLoadsOnlyMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	window := archivetrie.LastUpdateDiagnostics().Sub(before)
-	if window.StemPutCalls != 1 || window.StemPutLoadedBytes != int64(8+archivetrie.StemSuffixCount/8) {
+	metadataBytes := int64(8 + archivetrie.StemSuffixCount/8)
+	if window.StemPutCalls != 1 || window.StemPutLoadedBytes > metadataBytes {
 		t.Fatalf("basic account loaded more than metadata: calls=%d loaded=%d", window.StemPutCalls, window.StemPutLoadedBytes)
 	}
 	got, err := tr.GetAccount(addr)

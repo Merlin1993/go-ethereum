@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 const (
@@ -189,6 +190,7 @@ func (t *Trie) applyShardRootLocked(id int, hash []byte) error {
 			branch.childHashes[bit] = hash
 			for _, ancestor := range path {
 				ancestor.dirty = true
+				ancestor.hash = nil
 			}
 			return nil
 		}
@@ -250,7 +252,10 @@ func (t *Trie) hashRootBranchLocked(branch *rootBranch, depth, prefix int, batch
 		return nil, true, nil
 	}
 	data := serializeRootBranch(branch, depth)
-	hash := t.hasher.Hash(data)
+	hash := branch.hash
+	if len(hash) == 0 {
+		hash = t.hasher.Hash(data)
+	}
 	branch.hash = bytes.Clone(hash)
 	if batch != nil {
 		if err := batch.Put(t.rootBranchStorageKey(hash, depth, prefix), data); err != nil {
@@ -260,6 +265,120 @@ func (t *Trie) hashRootBranchLocked(branch *rootBranch, depth, prefix int, batch
 		branch.dirty = false
 	}
 	return bytes.Clone(hash), false, nil
+}
+
+const parallelRootHashShardThreshold = 512
+
+type rootHashWork struct {
+	branch *rootBranch
+	parent *rootBranch
+	bit    int
+	prefix int
+}
+
+type rootHashResult struct {
+	hash  []byte
+	data  []byte
+	empty bool
+}
+
+// hashRootBranchesParallelLocked hashes dirty root branches bottom-up and then
+// persists the already serialized records. Nodes at the same depth are
+// independent. Keeping serialization and persistence in this one pass avoids
+// doing the allocation work again after the parallel hash phase.
+func (t *Trie) hashRootBranchesParallelLocked(batch Batcher) ([]byte, bool, error) {
+	if t.rootBranch == nil || t.config.ShardDepth <= 0 {
+		return nil, true, nil
+	}
+	levels := make([][]rootHashWork, t.config.ShardDepth)
+	var collect func(*rootBranch, *rootBranch, int, int, int)
+	collect = func(branch, parent *rootBranch, bit, depth, prefix int) {
+		if branch == nil || !branch.dirty || depth >= len(levels) {
+			return
+		}
+		levels[depth] = append(levels[depth], rootHashWork{branch: branch, parent: parent, bit: bit, prefix: prefix})
+		if depth == t.config.ShardDepth-1 {
+			return
+		}
+		for childBit, child := range branch.children {
+			collect(child, branch, childBit, depth+1, (prefix<<1)|childBit)
+		}
+	}
+	collect(t.rootBranch, nil, 0, 0, 0)
+	if len(levels[0]) == 0 {
+		return bytes.Clone(t.rootBranch.hash), false, nil
+	}
+
+	levelResults := make([][]rootHashResult, len(levels))
+	for depth := len(levels) - 1; depth >= 0; depth-- {
+		works := levels[depth]
+		if len(works) == 0 {
+			continue
+		}
+		results := make([]rootHashResult, len(works))
+		workers := t.parallelWorkerCount(len(works))
+		if workers <= 1 || len(works) < 64 {
+			for index, work := range works {
+				results[index] = t.hashRootWork(work, depth)
+			}
+		} else {
+			var wg sync.WaitGroup
+			for worker := 0; worker < workers; worker++ {
+				wg.Add(1)
+				go func(offset int) {
+					defer wg.Done()
+					for index := offset; index < len(works); index += workers {
+						results[index] = t.hashRootWork(works[index], depth)
+					}
+				}(worker)
+			}
+			wg.Wait()
+		}
+		for index, work := range works {
+			result := results[index]
+			work.branch.hash = result.hash
+			if work.parent != nil {
+				work.parent.childHashes[work.bit] = result.hash
+			}
+		}
+		levelResults[depth] = results
+	}
+
+	if batch != nil {
+		for depth := len(levels) - 1; depth >= 0; depth-- {
+			for index, work := range levels[depth] {
+				result := levelResults[depth][index]
+				if result.empty {
+					if t.config.UsePathStorage() {
+						if err := batch.Delete(pathRootBranchKey(depth, work.prefix)); err != nil {
+							return nil, false, err
+						}
+					}
+					work.branch.persistedHash = nil
+				} else {
+					if err := batch.Put(t.rootBranchStorageKey(result.hash, depth, work.prefix), result.data); err != nil {
+						return nil, false, err
+					}
+					work.branch.persistedHash = bytes.Clone(result.hash)
+				}
+				work.branch.dirty = false
+				if result.empty && work.parent != nil {
+					work.parent.children[work.bit] = nil
+				}
+			}
+		}
+	}
+	rootResult := levelResults[0][0]
+	return bytes.Clone(rootResult.hash), rootResult.empty, nil
+}
+
+func (t *Trie) hashRootWork(work rootHashWork, depth int) rootHashResult {
+	branch := work.branch
+	if !validRootHash(branch.childHashes[0]) && !validRootHash(branch.childHashes[1]) {
+		return rootHashResult{empty: true}
+	}
+	data := serializeRootBranch(branch, depth)
+	return rootHashResult{hash: t.hasher.Hash(data), data: data}
 }
 
 // computeBinaryRoot applies changed shard roots and hashes only their binary
@@ -284,7 +403,16 @@ func (t *Trie) computeBinaryRoot(shardRoots map[int][]byte, dirtyShards []int, b
 		t.rootHash = nil
 		return nil, nil
 	}
-	root, empty, err := t.hashRootBranchLocked(t.rootBranch, 0, 0, batch)
+	var (
+		root  []byte
+		empty bool
+		err   error
+	)
+	if len(dirtyShards) >= parallelRootHashShardThreshold {
+		root, empty, err = t.hashRootBranchesParallelLocked(batch)
+	} else {
+		root, empty, err = t.hashRootBranchLocked(t.rootBranch, 0, 0, batch)
+	}
 	if err != nil {
 		return nil, err
 	}

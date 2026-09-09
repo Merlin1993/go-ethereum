@@ -37,6 +37,9 @@ var (
 	stressNodeCacheBytesLimitMB     = flag.Int("stressNodeCacheBytesLimitMB", 512, "Serialized archive node blob cache byte limit in MiB; 0 uses default, negative disables byte cap")
 	stressNodeCacheWarmPathBits     = flag.Int("stressNodeCacheWarmPathBits", DefaultNodeCacheWarmPathBits, "Path-mode eager cache warming depth; 0 uses default, -1 keeps root-only, <-1 disables eager warming")
 	stressCommitmentPointCacheLimit = flag.Int("stressCommitmentPointCacheLimit", DefaultCommitmentPointCacheLimit, "Decoded ECMH commitment point cache limit; 0 uses default, negative disables")
+	stressStemMode                  = flag.Bool("stressStemMode", false, "Route 32-byte stress keys through StemTrie and archive whole 31-byte stems")
+	stressStemCacheLimit            = flag.Int("stressStemCacheLimit", DefaultStemCacheLimit, "Decoded active-stem cache entry limit in stem stress mode; 0 uses default, negative disables")
+	stressStemCacheBytesLimitMB     = flag.Int("stressStemCacheBytesLimitMB", 128, "Decoded active-stem cache byte limit in MiB; 0 uses default, negative disables byte cap")
 	stressArchiveStubMaxBucketsPath = flag.Int("stressArchiveStubMaxBucketsPath", 64, "Max side-mounted archive buckets at one node before pressure-sinking; 0 uses default, negative disables")
 	stressPathDiagnostics           = flag.Bool("stressPathDiagnostics", false, "Record path/cache diagnostics during TestArchiveTrieStress")
 	stressFullStatsEvery            = flag.Int("stressFullStatsEvery", 5, "Run exact structural stats every N metrics windows in TestArchiveTrieStress; 0 disables exact stats")
@@ -242,9 +245,22 @@ func TestArchiveTrieStress(t *testing.T) {
 	config.NodeCacheBytesLimit = int64(*stressNodeCacheBytesLimitMB) * 1024 * 1024
 	config.NodeCacheWarmPathBits = *stressNodeCacheWarmPathBits
 	config.CommitmentPointCacheLimit = *stressCommitmentPointCacheLimit
+	config.StemMode = *stressStemMode
+	config.StemCacheLimit = *stressStemCacheLimit
+	config.StemCacheBytesLimit = int64(*stressStemCacheBytesLimitMB) * 1024 * 1024
 	config.ArchiveStubMaxBucketsPath = *stressArchiveStubMaxBucketsPath
 	config.EnablePathDiagnostics = *stressPathDiagnostics
 	trie := NewTrie(nil, &stressDBAdapter{sdb}, hasher, config, true)
+	putBatch := trie.PutBatch
+	getValue := trie.Get
+	if *stressStemMode {
+		stemTrie, err := NewStemTrie(trie)
+		if err != nil {
+			t.Fatal(err)
+		}
+		putBatch = stemTrie.PutBatch
+		getValue = stemTrie.Get
+	}
 
 	// 3. Sliding window setup
 	maxPool := 10000000 // 10M keys
@@ -268,7 +284,7 @@ func TestArchiveTrieStress(t *testing.T) {
 	defer writer.Flush()
 
 	header := []string{
-		"Start_Item", "End_Item", "Total_Injected", "Avg_Root_ms", "Avg_LoopWall_ms", "Prune_ms", "Commit_ms", "Write_ms", "Raw_Write_ms", "Max_Root_ms",
+		"Start_Item", "End_Item", "Total_Injected", "Stem_Mode", "Injected_Items_Per_Sec", "Avg_Root_ms", "Avg_LoopWall_ms", "Prune_ms", "Commit_ms", "Write_ms", "Raw_Write_ms", "Max_Root_ms",
 		"P95_ms", "P99_ms", "Min_ms", "Q1_ms", "Median_ms", "Q3_ms",
 		"State_MB", "Leaf_Count", "Archive_Items", "Bucket_Count", "Max_Buckets_Path", "Bucket_Items_Avg", "Bucket_Items_P50", "Bucket_Items_P95", "Bucket_Items_P99", "Bucket_Items_Max", "RSS_MB", "Heap_MB",
 		"Insert_ms", "Update_ms", "Get_ms", "ShardCommit_ms", "RootHash_ms", "Untracked_ms",
@@ -280,6 +296,7 @@ func TestArchiveTrieStress(t *testing.T) {
 		"Prune_Collected_Leaves", "Prune_Collected_Stubs", "Prune_Build_Items", "Prune_Build_Buckets", "Prune_ArchiveBuild_Parallel",
 		"Max_Prune_Shard_ID", "Max_Prune_Shard_ms", "Max_Prune_Shard_Total_ms", "Max_Prune_Shard_Internal_Visits",
 		"Max_Prune_Shard_Leaves", "Max_Prune_Shard_Stubs", "Max_Prune_Shard_Build_Items", "Max_Prune_Shard_Build_Buckets",
+		"StemCache_Entries", "StemCache_Bytes", "StemCache_Hits", "StemCache_Misses", "StemCache_Evictions",
 	}
 	writer.Write(header)
 	ResetCommitDiagnostics()
@@ -339,7 +356,7 @@ func TestArchiveTrieStress(t *testing.T) {
 					poolIndex = (poolIndex + 1) % maxPool
 				}
 			}
-			if err := trie.PutBatch(inserts); err != nil {
+			if err := putBatch(inserts); err != nil {
 				t.Fatalf("Failed to insert batch: %v", err)
 			}
 			insertDur := time.Since(startInsert)
@@ -360,7 +377,7 @@ func TestArchiveTrieStress(t *testing.T) {
 					keyPool[poolIndex] = key
 					poolIndex = (poolIndex + 1) % maxPool
 				}
-				if err := trie.PutBatch(updates); err != nil {
+				if err := putBatch(updates); err != nil {
 					t.Fatalf("Failed to update batch: %v", err)
 				}
 			}
@@ -374,7 +391,7 @@ func TestArchiveTrieStress(t *testing.T) {
 				} else {
 					rand.Read(key)
 				}
-				_, _ = trie.Get(key)
+				_, _ = getValue(key)
 			}
 			getDur := time.Since(startGet)
 
@@ -485,6 +502,7 @@ func TestArchiveTrieStress(t *testing.T) {
 
 		avgRoot := sumRoot / float64(n)
 		avgWall := sumWall / float64(n)
+		injectedItemsPerSec := float64(BatchSize) * 1000.0 / avgWall
 		avgPrune := sumPrune / float64(n)
 		avgPruneWait := sumPruneWait / float64(n)
 		avgPruneShardOnly := sumPruneShard / float64(n)
@@ -572,6 +590,7 @@ func TestArchiveTrieStress(t *testing.T) {
 		pruneBuildBuckets := diagNow.PruneBuildBuckets - prevDiag.PruneBuildBuckets
 		pruneArchiveBuildParallels := diagNow.PruneArchiveBuildParallels - prevDiag.PruneArchiveBuildParallels
 		prunePressure := LastPrunePressureDiagnostics()
+		stemCache := trie.StemCacheDiagnostics()
 		prevDiag = diagNow
 
 		// 归档增长强校验 (Panic Check)
@@ -600,6 +619,8 @@ func TestArchiveTrieStress(t *testing.T) {
 			fmt.Sprintf("%d", startItem),
 			fmt.Sprintf("%d", endItem),
 			fmt.Sprintf("%d", totalInjected),
+			fmt.Sprintf("%t", *stressStemMode),
+			fmt.Sprintf("%.2f", injectedItemsPerSec),
 			fmt.Sprintf("%.2f", avgRoot),
 			fmt.Sprintf("%.2f", avgWall),
 			fmt.Sprintf("%.2f", avgPrune),
@@ -672,6 +693,11 @@ func TestArchiveTrieStress(t *testing.T) {
 			fmt.Sprintf("%d", prunePressure.MaxStubs),
 			fmt.Sprintf("%d", prunePressure.MaxBuildItems),
 			fmt.Sprintf("%d", prunePressure.MaxBuildBuckets),
+			fmt.Sprintf("%d", stemCache.Entries),
+			fmt.Sprintf("%d", stemCache.Bytes),
+			fmt.Sprintf("%d", stemCache.Hits),
+			fmt.Sprintf("%d", stemCache.Misses),
+			fmt.Sprintf("%d", stemCache.Evictions),
 		}
 		writer.Write(record)
 		writer.Flush()

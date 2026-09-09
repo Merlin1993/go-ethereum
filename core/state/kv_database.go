@@ -22,6 +22,13 @@ const (
 	kvBlocksPerThree = kvBlocksPerYear / 4
 )
 
+// KVSkipKnown disables the in-memory committed-key index (db.known) for
+// long trace runs. When enabled, readValue falls through to the underlying
+// store for keys not in the pending set, and KV recency stats are not
+// maintained. It trades a per-missing-key store lookup for a large reduction
+// in memory usage at tens-of-millions of accounts/slots scale.
+var KVSkipKnown bool
+
 var (
 	kvAccountPrefix = []byte("kvstate:account:")
 	kvStoragePrefix = []byte("kvstate:storage:")
@@ -178,13 +185,17 @@ func (db *KVDatabase) CommitKV(block uint64, update *stateUpdate) error {
 			if err := batch.Delete(pending.key); err != nil {
 				return err
 			}
-			delete(db.known, string(pending.key))
+			if !KVSkipKnown {
+				delete(db.known, string(pending.key))
+			}
 			continue
 		}
 		if err := batch.Put(pending.key, encodeKVStoredValue(block, pending.value)); err != nil {
 			return err
 		}
-		db.known[string(pending.key)] = block
+		if !KVSkipKnown {
+			db.known[string(pending.key)] = block
+		}
 	}
 	for _, code := range update.codes {
 		db.pendingCodes[code.hash] = common.CopyBytes(code.blob)
@@ -256,9 +267,11 @@ func (db *KVDatabase) readValue(key []byte) ([]byte, bool, error) {
 		}
 		return common.CopyBytes(pending.value), true, nil
 	}
-	if _, ok := db.known[id]; !ok {
-		db.lock.RUnlock()
-		return nil, false, nil
+	if !KVSkipKnown {
+		if _, ok := db.known[id]; !ok {
+			db.lock.RUnlock()
+			return nil, false, nil
+		}
 	}
 	db.lock.RUnlock()
 
@@ -282,9 +295,11 @@ func (db *KVDatabase) recordAccess(key []byte, write bool) {
 	if pending, ok := db.pending[string(key)]; ok {
 		exists = !pending.delete
 		updateBlock = db.currentBlock
-	} else if block, ok := db.known[string(key)]; ok {
-		exists = true
-		updateBlock = block
+	} else if !KVSkipKnown {
+		if block, ok := db.known[string(key)]; ok {
+			exists = true
+			updateBlock = block
+		}
 	}
 	db.bumpStats(&db.stats, write, exists, updateBlock)
 }

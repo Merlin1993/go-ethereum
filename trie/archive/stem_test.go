@@ -21,10 +21,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 type stemCountingHasher struct {
@@ -299,8 +302,14 @@ func TestStemArchiveAndUpdateRestoresWholeStem(t *testing.T) {
 	}
 
 	// A read sees the cold data but does not change its archived state.
+	trie.cache.clear()
+	beforeGetDiag := LastUpdateDiagnostics()
 	if got, err := trie.Get(key2); err != nil || string(got) != "old-200" {
 		t.Fatalf("read archived suffix: got %q err %v", got, err)
+	}
+	getDiag := LastUpdateDiagnostics().Sub(beforeGetDiag)
+	if getDiag.StemGetCalls != 1 || getDiag.StemGetHotHits != 0 || getDiag.StemGetArchiveHits != 1 || getDiag.StemGetMissing != 0 {
+		t.Fatalf("unexpected archived-read diagnostics: %+v", getDiag)
 	}
 	if got := trie.Backend().Stats().ArchivedDataSize; got != 1 {
 		t.Fatalf("cold read unexpectedly activated the stem: archived=%d", got)
@@ -308,8 +317,13 @@ func TestStemArchiveAndUpdateRestoresWholeStem(t *testing.T) {
 
 	// Updating one suffix restores the outer stem and carries the untouched
 	// suffix forward in the new payload and ValuesRoot.
+	beforeUpdateDiag := LastUpdateDiagnostics()
 	if err := trie.Put(key1, []byte("new-7")); err != nil {
 		t.Fatalf("update archived suffix: %v", err)
+	}
+	updateDiag := LastUpdateDiagnostics().Sub(beforeUpdateDiag)
+	if updateDiag.ArchivePromotionChecks < 1 || updateDiag.ArchivePromotionHits < 1 {
+		t.Fatalf("unexpected cold-update diagnostics: %+v", updateDiag)
 	}
 	if got := trie.Backend().Stats().ArchivedDataSize; got != 0 {
 		t.Fatalf("whole stem was not restored: archived=%d", got)
@@ -344,6 +358,348 @@ func TestStemArchiveAndUpdateRestoresWholeStem(t *testing.T) {
 	}
 	if got, err := reloaded.Get(key2); err != nil || string(got) != "old-200" {
 		t.Fatalf("reloaded untouched suffix: got %q err %v", got, err)
+	}
+}
+
+func TestStemGetActivatesArchivedStemWhenConfigured(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.StemMode = true
+	config.ActivateArchivedStemOnRead = true
+	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
+	trie, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key1 := stemTestKey(0x52, 7)
+	key2 := stemTestKey(0x52, 200)
+	if err := trie.Put(key1, []byte("value-7")); err != nil {
+		t.Fatal(err)
+	}
+	if err := trie.Put(key2, []byte("value-200")); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := backend.CommitToBatch(batch, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	shardID := backend.GetShardID(key1[:StemSize])
+	backend.SetGlobalEpoch(0)
+	backend.pruneShardIdx = shardID
+	if err := backend.PruneNextShard(); err != nil {
+		t.Fatal(err)
+	}
+	trie.cache.clear()
+
+	before := LastUpdateDiagnostics()
+	if got, err := trie.Get(key2); err != nil || string(got) != "value-200" {
+		t.Fatalf("configured archived read: got %q err %v", got, err)
+	}
+	diag := LastUpdateDiagnostics().Sub(before)
+	if diag.ArchiveReadPromotionCalls != 1 || diag.ArchiveReadPromotionHits != 1 {
+		t.Fatalf("unexpected read-promotion diagnostics: %+v", diag)
+	}
+	if archived := backend.Stats().ArchivedDataSize; archived != 0 {
+		t.Fatalf("configured archived read did not restore stem: archived=%d", archived)
+	}
+	beforeSibling := LastUpdateDiagnostics()
+	if got, err := trie.Get(key1); err != nil || string(got) != "value-7" {
+		t.Fatalf("restored sibling read: got %q err %v", got, err)
+	}
+	if delta := LastUpdateDiagnostics().Sub(beforeSibling); delta.ArchiveReadPromotionCalls != 0 {
+		t.Fatalf("sibling hot read unexpectedly promoted: %+v", delta)
+	}
+	beforeRepeated := LastUpdateDiagnostics()
+	if got, err := trie.Get(key2); err != nil || string(got) != "value-200" {
+		t.Fatalf("repeated restored read: got %q err %v", got, err)
+	}
+	if delta := LastUpdateDiagnostics().Sub(beforeRepeated); delta.ArchiveReadPromotionCalls != 0 || delta.ArchiveReadPromotionHits != 0 {
+		t.Fatalf("repeated hot read unexpectedly promoted: %+v", delta)
+	}
+}
+
+func TestStemRepeatedArchiveMutationKeepsFlatRootConsistent(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 8
+	config.StemMode = true
+	config.StemCacheLimit = -1
+	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
+	trie, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stemKey := bytes.Repeat([]byte{0x51}, StemSize)
+	want := make(map[byte][]byte)
+	rng := rand.New(rand.NewSource(527350))
+
+	commitAndReload := func(cycle int) {
+		t.Helper()
+		batch := db.NewBatch()
+		root, err := backend.CommitToBatch(batch, true)
+		if err != nil {
+			t.Fatalf("cycle %d commit: %v", cycle, err)
+		}
+		if err := batch.Write(); err != nil {
+			t.Fatalf("cycle %d write: %v", cycle, err)
+		}
+		backend = NewTrie(root, db, NewPooledKeccakHasher(), config, true)
+		trie, err = NewStemTrie(backend)
+		if err != nil {
+			t.Fatalf("cycle %d reload: %v", cycle, err)
+		}
+	}
+	check := func(cycle int) {
+		t.Helper()
+		trie.cache.clear()
+		stem, err := trie.loadStem(stemKey)
+		if len(want) == 0 {
+			if !errors.Is(err, ErrNodeNotFound) {
+				t.Fatalf("cycle %d empty stem load: %v", cycle, err)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("cycle %d load stem: %v", cycle, err)
+		}
+		valueRef, _, err := backend.GetValueRef(stemKey)
+		if err != nil {
+			t.Fatalf("cycle %d value ref: %v", cycle, err)
+		}
+		if flatRoot := stem.ValuesRoot(backend.Hasher()); !bytes.Equal(valueRef, flatRoot) {
+			t.Fatalf("cycle %d root mismatch: ref=%x flat=%x", cycle, valueRef, flatRoot)
+		}
+		if stem.Len() != len(want) {
+			t.Fatalf("cycle %d suffix count: got %d want %d", cycle, stem.Len(), len(want))
+		}
+		for suffix, expected := range want {
+			key := joinStemKey(stemKey, suffix)
+			got, err := trie.Get(key)
+			if err != nil || !bytes.Equal(got, expected) {
+				t.Fatalf("cycle %d suffix %d: got %x want %x err %v", cycle, suffix, got, expected, err)
+			}
+		}
+	}
+
+	initial := []StemUpdate{
+		{Key: joinStemKey(stemKey, 7), Value: []byte("initial-7")},
+		{Key: joinStemKey(stemKey, 31), Value: []byte("initial-31")},
+		{Key: joinStemKey(stemKey, 200), Value: []byte("initial-200")},
+	}
+	if err := trie.ApplyBatch(initial); err != nil {
+		t.Fatal(err)
+	}
+	for _, update := range initial {
+		want[update.Key[StemSize]] = bytes.Clone(update.Value)
+	}
+	commitAndReload(0)
+	check(0)
+
+	for cycle := 1; cycle <= 256; cycle++ {
+		backend.SetGlobalEpoch(0)
+		backend.pruneShardIdx = backend.GetShardID(stemKey)
+		if err := backend.PruneNextShard(); err != nil {
+			t.Fatalf("cycle %d archive: %v", cycle, err)
+		}
+		trie.cache.clear()
+
+		updates := make([]StemUpdate, 0, 12)
+		for i := 0; i < 12; i++ {
+			suffix := byte(rng.Intn(8) * 31)
+			key := joinStemKey(stemKey, suffix)
+			if rng.Intn(4) == 0 {
+				updates = append(updates, StemUpdate{Key: key, Delete: true})
+				delete(want, suffix)
+				continue
+			}
+			value := []byte{byte(cycle), byte(i), suffix, byte(rng.Intn(256))}
+			updates = append(updates, StemUpdate{Key: key, Value: value})
+			want[suffix] = bytes.Clone(value)
+		}
+		if err := trie.ApplyBatch(updates); err != nil {
+			t.Fatalf("cycle %d apply: %v", cycle, err)
+		}
+		commitAndReload(cycle)
+		check(cycle)
+	}
+}
+
+func TestStemArchiveFullBucketDuplicateUsesCurrentFlatRoot(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 0
+	config.StemMode = true
+	config.StemCacheLimit = -1
+	config.ArchiveBucketSize = 4
+	config.CuckooBuckets = 64
+	config.CuckooSlots = 4
+	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
+	trie, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard, err := backend.getOrCreateShard(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stemKey := bytes.Repeat([]byte{0x06}, StemSize)
+	fullKey := joinStemKey(stemKey, 0)
+	current := &Stem{
+		values:     map[byte][]byte{0: []byte("current")},
+		commitment: newStemCommitment(backend.hasher, &trie.empty),
+	}
+	current.setPresent(0, true)
+	current.count = 1
+	current.commitment = buildStemCommitment(current, backend.hasher, &trie.empty)
+	currentRef := current.ValuesRoot(backend.hasher)
+
+	stale := &Stem{
+		values:     map[byte][]byte{0: []byte("stale")},
+		commitment: newStemCommitment(backend.hasher, &trie.empty),
+	}
+	stale.setPresent(0, true)
+	stale.count = 1
+	stale.commitment = buildStemCommitment(stale, backend.hasher, &trie.empty)
+	staleRef := stale.ValuesRoot(backend.hasher)
+
+	shard.stageFlatValueForKey(stemKey, encodeStemMetadata(current))
+	shard.stageFlatValueForKey(fullKey, []byte("current"))
+	items := []ArchivedKV{{
+		Suffix:     common.CopyBytes(stemKey),
+		SuffixBits: len(stemKey) * 8,
+		Value:      staleRef,
+	}}
+	for i := 1; i < config.ArchiveBucketSize; i++ {
+		filler := bytes.Clone(stemKey)
+		filler[len(filler)-1] = byte(i)
+		items = append(items, ArchivedKV{
+			Suffix:     filler,
+			SuffixBits: len(filler) * 8,
+			Value:      bytes.Repeat([]byte{byte(i)}, common.HashLength),
+		})
+	}
+	childPath, childBits := shard.appendBit(nil, 0, 0)
+	childBucket := shard.buildArchiveBucket(items, childPath, childBits).(*ArchiveBucketNode)
+	root := &InternalNode{Left: childBucket, dirty: true}
+	root.LeftEpoch = childBucket.Epoch()
+	shard.refreshInternalEpochMask(root)
+
+	shard.root, err = shard.finishRootArchivePool(root, []ArchivedKV{{
+		Suffix:     common.CopyBytes(stemKey),
+		SuffixBits: len(stemKey) * 8,
+		Value:      currentRef,
+	}}, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trie.cache.clear()
+	got, err := trie.Get(fullKey)
+	if err != nil {
+		t.Fatalf("read current archived stem: %v", err)
+	}
+	if !bytes.Equal(got, []byte("current")) {
+		t.Fatalf("archived stem value: got %q want current", got)
+	}
+	stats := &TrieStats{bucketItemHist: make(map[int]int)}
+	shard.nodeStats(shard.root, 0, stats)
+	if stats.ArchivedDataSize != int64(config.ArchiveBucketSize) {
+		t.Fatalf("duplicate archive membership survived: archived=%d want=%d", stats.ArchivedDataSize, config.ArchiveBucketSize)
+	}
+}
+
+func TestStemArchiveCrossBucketDuplicateUsesCurrentFlatRoot(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 0
+	config.StemMode = true
+	config.StemCacheLimit = -1
+	config.ArchiveBucketSize = 4
+	config.CuckooBuckets = 64
+	config.CuckooSlots = 4
+	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, true)
+	trie, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shard, err := backend.getOrCreateShard(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stemKey := bytes.Repeat([]byte{0x06}, StemSize)
+	fullKey := joinStemKey(stemKey, 0)
+	current := &Stem{
+		values:     map[byte][]byte{0: []byte("current")},
+		commitment: newStemCommitment(backend.hasher, &trie.empty),
+	}
+	current.setPresent(0, true)
+	current.count = 1
+	current.commitment = buildStemCommitment(current, backend.hasher, &trie.empty)
+	currentRef := current.ValuesRoot(backend.hasher)
+
+	stale := &Stem{
+		values:     map[byte][]byte{0: []byte("stale")},
+		commitment: newStemCommitment(backend.hasher, &trie.empty),
+	}
+	stale.setPresent(0, true)
+	stale.count = 1
+	stale.commitment = buildStemCommitment(stale, backend.hasher, &trie.empty)
+	staleRef := stale.ValuesRoot(backend.hasher)
+
+	shard.stageFlatValueForKey(stemKey, encodeStemMetadata(current))
+	shard.stageFlatValueForKey(fullKey, []byte("current"))
+
+	archiveItems := func(value []byte, first byte) []ArchivedKV {
+		items := []ArchivedKV{{
+			Suffix:     common.CopyBytes(stemKey),
+			SuffixBits: len(stemKey) * 8,
+			Value:      value,
+		}}
+		for i := 1; i < config.ArchiveBucketSize; i++ {
+			filler := bytes.Clone(stemKey)
+			filler[first] ^= 0x80
+			filler[len(filler)-1] = byte(i)
+			items = append(items, ArchivedKV{
+				Suffix:     filler,
+				SuffixBits: len(filler) * 8,
+				Value:      bytes.Repeat([]byte{byte(i)}, common.HashLength),
+			})
+		}
+		return items
+	}
+
+	rootBucket := shard.buildArchiveBucket(archiveItems(currentRef, 0), nil, 0).(*ArchiveBucketNode)
+	childPath, childBits := shard.appendBit(nil, 0, 0)
+	childBucket := shard.buildArchiveBucket(archiveItems(staleRef, StemSize-1), childPath, childBits).(*ArchiveBucketNode)
+	root := &InternalNode{Left: childBucket, StubList: []*ArchiveBucketNode{rootBucket}, dirty: true}
+	root.LeftEpoch = childBucket.Epoch()
+	shard.refreshInternalEpochMask(root)
+
+	shard.root, err = shard.finishRootArchivePool(root, []ArchivedKV{{
+		Suffix:     common.CopyBytes(stemKey),
+		SuffixBits: len(stemKey) * 8,
+		Value:      currentRef,
+	}}, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trie.cache.clear()
+	got, err := trie.Get(fullKey)
+	if err != nil {
+		t.Fatalf("read current archived stem: %v", err)
+	}
+	if !bytes.Equal(got, []byte("current")) {
+		t.Fatalf("archived stem value: got %q want current", got)
+	}
+	stats := &TrieStats{bucketItemHist: make(map[int]int)}
+	shard.nodeStats(shard.root, 0, stats)
+	if want := int64(2*config.ArchiveBucketSize - 1); stats.ArchivedDataSize != want {
+		t.Fatalf("stale duplicate archive membership survived: archived=%d want=%d", stats.ArchivedDataSize, want)
 	}
 }
 
@@ -658,6 +1014,115 @@ func TestStemCacheAvoidsReloadOnRepeatedUpdate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStemBatchNewStemSkipsFlatMiss(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 0
+	config.StemCacheLimit = -1
+	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, false)
+	trie, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := stemTestKey(0x6b, 9)
+	before := LastUpdateDiagnostics()
+	if err := trie.PutBatch([]KeyValue{{Key: key, Value: []byte("new")}}); err != nil {
+		t.Fatal(err)
+	}
+	if gets := LastUpdateDiagnostics().Sub(before).FlatValueGets; gets != 0 {
+		t.Fatalf("brand-new stem performed %d flat lookups, want 0", gets)
+	}
+}
+
+func TestStemBatchSparseOverwriteLoadsMetadataOnly(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 0
+	config.StemCacheLimit = -1
+	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, false)
+	trie, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := stemTestKey(0x6c, 17)
+	if err := trie.PutBatch([]KeyValue{{Key: key, Value: []byte("old")}}); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := backend.CommitToBatch(batch, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	before := LastUpdateDiagnostics()
+	if err := trie.PutBatch([]KeyValue{{Key: key, Value: []byte("new")}}); err != nil {
+		t.Fatal(err)
+	}
+	if gets := LastUpdateDiagnostics().Sub(before).FlatValueGets; gets != 1 {
+		t.Fatalf("single-suffix overwrite performed %d flat lookups, want metadata only", gets)
+	}
+	if got, err := trie.Get(key); err != nil || string(got) != "new" {
+		t.Fatalf("updated sparse stem: got %q err %v", got, err)
+	}
+	if err := trie.Put(key, []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := trie.Get(key); err != nil || len(got) != 0 {
+		t.Fatalf("empty value lost during metadata-only overwrite: got %x err %v", got, err)
+	}
+}
+
+func TestStemBatchPartialOverwriteStillLoadsSiblings(t *testing.T) {
+	db := NewMemoryDBAdapter()
+	config := DefaultConfig()
+	config.ShardDepth = 0
+	config.StemCacheLimit = -1
+	backend := NewTrie(nil, db, NewPooledKeccakHasher(), config, false)
+	trie, err := NewStemTrie(backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key1 := stemTestKey(0x6d, 1)
+	key2 := stemTestKey(0x6d, 2)
+	if err := trie.PutBatch([]KeyValue{
+		{Key: key1, Value: []byte("one")},
+		{Key: key2, Value: []byte("two")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	batch := db.NewBatch()
+	if _, err := backend.CommitToBatch(batch, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	before := LastUpdateDiagnostics()
+	if err := trie.PutBatch([]KeyValue{{Key: key1, Value: []byte("one-new")}}); err != nil {
+		t.Fatal(err)
+	}
+	if gets := LastUpdateDiagnostics().Sub(before).FlatValueGets; gets != 3 {
+		t.Fatalf("partial overwrite performed %d flat lookups, want metadata plus two suffixes", gets)
+	}
+	if got, err := trie.Get(key2); err != nil || string(got) != "two" {
+		t.Fatalf("untouched sibling changed: got %q err %v", got, err)
+	}
+
+	before = LastUpdateDiagnostics()
+	if err := trie.PutBatch([]KeyValue{
+		{Key: key1, Value: []byte("one-final")},
+		{Key: key2, Value: []byte("two-final")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if gets := LastUpdateDiagnostics().Sub(before).FlatValueGets; gets != 1 {
+		t.Fatalf("full overwrite performed %d flat lookups, want metadata only", gets)
 	}
 }
 

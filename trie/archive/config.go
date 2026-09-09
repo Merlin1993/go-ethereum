@@ -26,27 +26,28 @@ type archiveIndexLogicalSizer interface {
 
 // Config holds the configuration parameters for the Trie.
 type Config struct {
-	ShardDepth                int   // Number of bits for shard routing (default 16)
-	ArchiveBucketSize         int   // Max number of items in an archive bucket before splitting (default 100)
-	NodeCacheLimit            int   // Max serialized node blobs cached in process; 0 uses default, negative disables
-	NodeCacheBytesLimit       int64 // Max serialized node blob bytes cached in process; 0 uses default, negative disables byte cap
-	NodeCacheWarmPathBits     int   // Path-mode eager warming depth; 0 uses default, -1 keeps root-only, <-1 disables eager warming
-	StemCacheLimit            int   // Max decoded active stems cached in process; 0 uses default, negative disables
-	StemCacheBytesLimit       int64 // Approximate decoded active-stem cache bytes; 0 uses default, negative disables byte cap
-	CommitmentPointCacheLimit int   // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
-	EnablePathDiagnostics     bool  // Record path/cache diagnostics; disabled by default for hot experiments
-	CompactArchiveStubs       bool  // Merge adjacent archive stubs synchronously; expensive on hot pruning paths
-	ArchiveStubMaxBucketsPath int   // Max side-mounted archive buckets at one node before pressure-sinking; 0 uses default, negative disables
-	AsyncPrune                bool  // Run shard pruning in the background and apply it before root commit
-	CommitWorkers             int   // Max parallel shard commit workers; 0 uses default
-	CommitWatchdogSeconds     int   // Dump goroutines if one wrapper commit exceeds this many seconds; 0 disables
-	PhysicalDelete            bool  // Physically delete obsolete trie nodes; false leaves unreachable path nodes for offline cleanup
-	StemMode                  bool  // Group 32-byte binary-tree keys by their 31-byte stem for whole-stem archiving
-	FlatReader                FlatValueReader
-	CuckooBuckets             int // Number of buckets in cuckoo filter (default 32)
-	CuckooSlots               int // Slots per bucket in cuckoo filter (default 4)
-	NodeStorageScheme         string
-	statsView                 bool // Internal read-only views must not pollute hot-path diagnostics.
+	ShardDepth                 int   // Number of bits for shard routing (default 16)
+	ArchiveBucketSize          int   // Max number of items in an archive bucket before splitting (default 100)
+	NodeCacheLimit             int   // Max serialized node blobs cached in process; 0 uses default, negative disables
+	NodeCacheBytesLimit        int64 // Max serialized node blob bytes cached in process; 0 uses default, negative disables byte cap
+	NodeCacheWarmPathBits      int   // Path-mode eager warming depth; 0 uses default, -1 keeps root-only, <-1 disables eager warming
+	StemCacheLimit             int   // Max decoded active stems cached in process; 0 uses default, negative disables
+	StemCacheBytesLimit        int64 // Approximate decoded active-stem cache bytes; 0 uses default, negative disables byte cap
+	CommitmentPointCacheLimit  int   // Max decoded ECMH commitment points cached in process; 0 uses default, negative disables
+	EnablePathDiagnostics      bool  // Record path/cache diagnostics; disabled by default for hot experiments
+	CompactArchiveStubs        bool  // Merge adjacent archive stubs synchronously; expensive on hot pruning paths
+	ArchiveStubMaxBucketsPath  int   // Max side-mounted archive buckets at one node before pressure-sinking; 0 uses default, negative disables
+	AsyncPrune                 bool  // Run shard pruning in the background and apply it before root commit
+	CommitWorkers              int   // Max parallel shard commit workers; 0 uses default
+	CommitWatchdogSeconds      int   // Dump goroutines if one wrapper commit exceeds this many seconds; 0 disables
+	PhysicalDelete             bool  // Physically delete obsolete trie nodes; false leaves unreachable path nodes for offline cleanup
+	StemMode                   bool  // Group 32-byte binary-tree keys by their 31-byte stem for whole-stem archiving
+	ActivateArchivedStemOnRead bool  // Restore an archived stem to the hot tree when a read finds it
+	FlatReader                 FlatValueReader
+	CuckooBuckets              int // Number of buckets in cuckoo filter (default 32)
+	CuckooSlots                int // Slots per bucket in cuckoo filter (default 4)
+	NodeStorageScheme          string
+	statsView                  bool // Internal read-only views must not pollute hot-path diagnostics.
 }
 
 // DefaultConfig returns a Config with default values.
