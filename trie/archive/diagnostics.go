@@ -69,8 +69,19 @@ type CommitDiagnostics struct {
 	ShardMaxNodeType          int64
 	ShardMaxNodeBytes         int64
 
-	RawBatchOps               int64
-	RawBatchBytes             int64
+	RawBatchOps   int64
+	RawBatchBytes int64
+
+	// Hot-layer (mpt) commit staging split; zero unless the hot layer is
+	// the MPT fallback. Bytes are key+value sizes staged into the caller
+	// batch, cumulative since Reset.
+	MPTStagedHotNodeBytes     int64
+	MPTStagedAggregateBytes   int64
+	MPTStagedArchiveBytes     int64
+	MPTStagedFlatBytes        int64
+	MPTStagedIndexBytes       int64
+	MPTNodeCacheGets          int64
+	MPTNodeCacheHits          int64
 	RawShardMaxID             int64
 	RawShardMaxOps            int64
 	RawShardMaxBytes          int64
@@ -978,6 +989,13 @@ var (
 	commitDiagShardMaxNodeBytes          int64
 	commitDiagRawBatchOps                int64
 	commitDiagRawBatchBytes              int64
+	commitDiagMPTStagedHotNodeBytes      int64
+	commitDiagMPTStagedAggregateBytes    int64
+	commitDiagMPTStagedArchiveBytes      int64
+	commitDiagMPTStagedFlatBytes         int64
+	commitDiagMPTStagedIndexBytes        int64
+	commitDiagMPTNodeCacheGets           int64
+	commitDiagMPTNodeCacheHits           int64
 	commitDiagRawShardMaxID              int64
 	commitDiagRawShardMaxOps             int64
 	commitDiagRawShardMaxBytes           int64
@@ -1066,6 +1084,13 @@ func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagShardMaxNodeBytes, 0)
 	atomic.StoreInt64(&commitDiagRawBatchOps, 0)
 	atomic.StoreInt64(&commitDiagRawBatchBytes, 0)
+	atomic.StoreInt64(&commitDiagMPTStagedHotNodeBytes, 0)
+	atomic.StoreInt64(&commitDiagMPTStagedAggregateBytes, 0)
+	atomic.StoreInt64(&commitDiagMPTStagedArchiveBytes, 0)
+	atomic.StoreInt64(&commitDiagMPTStagedFlatBytes, 0)
+	atomic.StoreInt64(&commitDiagMPTStagedIndexBytes, 0)
+	atomic.StoreInt64(&commitDiagMPTNodeCacheGets, 0)
+	atomic.StoreInt64(&commitDiagMPTNodeCacheHits, 0)
 	atomic.StoreInt64(&commitDiagRawShardMaxID, 0)
 	atomic.StoreInt64(&commitDiagRawShardMaxOps, 0)
 	atomic.StoreInt64(&commitDiagRawShardMaxBytes, 0)
@@ -1492,6 +1517,13 @@ func LastCommitDiagnostics() CommitDiagnostics {
 		ShardMaxNodeBytes:          atomic.LoadInt64(&commitDiagShardMaxNodeBytes),
 		RawBatchOps:                atomic.LoadInt64(&commitDiagRawBatchOps),
 		RawBatchBytes:              atomic.LoadInt64(&commitDiagRawBatchBytes),
+		MPTStagedHotNodeBytes:      atomic.LoadInt64(&commitDiagMPTStagedHotNodeBytes),
+		MPTStagedAggregateBytes:    atomic.LoadInt64(&commitDiagMPTStagedAggregateBytes),
+		MPTStagedArchiveBytes:      atomic.LoadInt64(&commitDiagMPTStagedArchiveBytes),
+		MPTStagedFlatBytes:         atomic.LoadInt64(&commitDiagMPTStagedFlatBytes),
+		MPTStagedIndexBytes:        atomic.LoadInt64(&commitDiagMPTStagedIndexBytes),
+		MPTNodeCacheGets:           atomic.LoadInt64(&commitDiagMPTNodeCacheGets),
+		MPTNodeCacheHits:           atomic.LoadInt64(&commitDiagMPTNodeCacheHits),
 		RawShardMaxID:              atomic.LoadInt64(&commitDiagRawShardMaxID),
 		RawShardMaxOps:             atomic.LoadInt64(&commitDiagRawShardMaxOps),
 		RawShardMaxBytes:           atomic.LoadInt64(&commitDiagRawShardMaxBytes),
@@ -1882,4 +1914,22 @@ func randomNonMemberArchiveSuffix(rng *rand.Rand, suffixBits int, existing map[s
 		}
 	}
 	return nil, false
+}
+
+// SetMPTCommitStagedBytes adds one hot-layer (mpt) commit's staged-bytes
+// split to the cumulative diagnostics. The mpt subpackage calls it once per
+// CommitToBatch; the trace stress harness snapshots the cumulative counters
+// per window.
+func SetMPTCommitStagedBytes(hotNode, aggregateNode, archive, flat, index int64) {
+	atomic.AddInt64(&commitDiagMPTStagedHotNodeBytes, hotNode)
+	atomic.AddInt64(&commitDiagMPTStagedAggregateBytes, aggregateNode)
+	atomic.AddInt64(&commitDiagMPTStagedArchiveBytes, archive)
+	atomic.AddInt64(&commitDiagMPTStagedFlatBytes, flat)
+	atomic.AddInt64(&commitDiagMPTStagedIndexBytes, index)
+}
+
+// SetMPTNodeCacheStats stores the hot-layer node cache cumulative gets/hits.
+func SetMPTNodeCacheStats(gets, hits int64) {
+	atomic.StoreInt64(&commitDiagMPTNodeCacheGets, gets)
+	atomic.StoreInt64(&commitDiagMPTNodeCacheHits, hits)
 }

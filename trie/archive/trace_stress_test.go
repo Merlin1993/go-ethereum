@@ -300,6 +300,7 @@ type traceStressWindow struct {
 	stemHits, stemMisses       int64
 	stemEvictions              int64
 	rawBatchOps, rawBatchBytes int64
+	mptDiag                    [7]int64 // staged hotNode/aggregate/archive/flat/index bytes, then node-cache gets/hits
 	access                     traceStressAccessStats
 	accessSample               time.Duration
 	classificationFilter       traceStressFilterStats
@@ -1008,6 +1009,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"StemCache_Window_Hits", "StemCache_Window_Misses", "StemCache_Window_Evictions",
 		"StemCache_Total_Hits", "StemCache_Total_Misses", "StemCache_Total_Evictions",
 		"Raw_Batch_Ops", "Raw_Batch_Bytes", "NodeCache_Total_Hits", "NodeCache_Total_Misses", "PathNode_DBGets",
+		"MPT_Staged_HotNode_Bytes", "MPT_Staged_Aggregate_Bytes", "MPT_Staged_Archive_Bytes", "MPT_Staged_Flat_Bytes", "MPT_Staged_Index_Bytes",
+		"MPT_NodeCache_Gets", "MPT_NodeCache_Hits",
 	}
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
@@ -1040,6 +1043,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		prevCache                 = cacheDiagnostics()
 		initialUpdateDiag         = LastUpdateDiagnostics()
 		prevUpdateDiag            = initialUpdateDiag
+		prevMPTDiag               [7]int64
 		started                   = time.Now()
 		totalBatches              int64
 		prunesDone                int64
@@ -1082,6 +1086,11 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		currentUpdateDiag := LastUpdateDiagnostics()
 		updateDiag := currentUpdateDiag.Sub(prevUpdateDiag)
 		prevUpdateDiag = currentUpdateDiag
+		curMPTDiag := [7]int64{diag.MPTStagedHotNodeBytes, diag.MPTStagedAggregateBytes, diag.MPTStagedArchiveBytes, diag.MPTStagedFlatBytes, diag.MPTStagedIndexBytes, diag.MPTNodeCacheGets, diag.MPTNodeCacheHits}
+		for i := range curMPTDiag {
+			window.mptDiag[i] = curMPTDiag[i] - prevMPTDiag[i]
+		}
+		prevMPTDiag = curMPTDiag
 		sampledExistingReads := window.access.ReadHot + window.access.ReadArchived
 		workloadFilter := filterStatsFromDiagnostics(updateDiag).sub(window.classificationFilter)
 		hotReadRate := traceStressRatio(window.access.ReadHot, sampledExistingReads)
@@ -1116,6 +1125,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			strconv.FormatInt(getDirSize(stateDir), 10), strconv.FormatUint(rss, 10), strconv.FormatUint(mem.HeapAlloc, 10), strconv.FormatInt(cache.Entries, 10), strconv.FormatInt(cache.Bytes, 10),
 			strconv.FormatInt(window.stemHits, 10), strconv.FormatInt(window.stemMisses, 10), strconv.FormatInt(window.stemEvictions, 10), strconv.FormatInt(cache.Hits, 10), strconv.FormatInt(cache.Misses, 10), strconv.FormatInt(cache.Evictions, 10),
 			strconv.FormatInt(window.rawBatchOps, 10), strconv.FormatInt(window.rawBatchBytes, 10), strconv.FormatInt(diag.NodeCacheTotalHits, 10), strconv.FormatInt(diag.NodeCacheTotalMisses, 10), strconv.FormatInt(diag.PathNodeDBGets, 10),
+			strconv.FormatInt(window.mptDiag[0], 10), strconv.FormatInt(window.mptDiag[1], 10), strconv.FormatInt(window.mptDiag[2], 10),
+			strconv.FormatInt(window.mptDiag[3], 10), strconv.FormatInt(window.mptDiag[4], 10),
+			strconv.FormatInt(window.mptDiag[5], 10), strconv.FormatInt(window.mptDiag[6], 10),
 		}
 		if err := metrics.Write(row); err != nil {
 			t.Fatal(err)

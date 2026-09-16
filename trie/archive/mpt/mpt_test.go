@@ -2,9 +2,11 @@ package mpt
 
 import (
 	"bytes"
+	"encoding/binary"
 	"sort"
 	"testing"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	archivetrie "github.com/ethereum/go-ethereum/trie/archive"
 )
@@ -297,6 +299,95 @@ func TestMPTIncrementalAggregateMatchesRebuild(t *testing.T) {
 	}
 	check(11)
 }
+
+// TestMPTArchiveIndexCompat loads a v1 (list) index, rewrites it as v2
+// (bitmap) on the next commit, and round-trips through a reload. It also
+// feeds a hand-built v2 index directly to the decoder.
+func TestMPTArchiveIndexCompat(t *testing.T) {
+	db := &testStore{memorydb.New()}
+	// Seed a v1 list index claiming shards 1 and 2 (depth 2 -> 4 shards).
+	v1 := make([]byte, 9+2*4)
+	copy(v1[:4], indexMagic[:])
+	v1[4] = indexVersionList
+	binary.BigEndian.PutUint32(v1[5:9], 2)
+	binary.BigEndian.PutUint32(v1[9:13], 1)
+	binary.BigEndian.PutUint32(v1[13:17], 2)
+	if err := db.Put(indexKey, v1); err != nil {
+		t.Fatal(err)
+	}
+	tr := newTestTrie(t, db, false)
+	if _, ok := tr.archiveIDs[1]; !ok {
+		t.Fatal("v1 index id 1 not loaded")
+	}
+	if _, ok := tr.archiveIDs[2]; !ok {
+		t.Fatal("v1 index id 2 not loaded")
+	}
+	// A commit rewrites the index as v2 only when it is dirty; force the
+	// rewrite by deleting one membership-less id via archiveIndexDirty.
+	tr.archiveIndexDirty = true
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := db.Get(indexKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < 5 || data[4] != indexVersionBitmap {
+		t.Fatalf("index not rewritten as bitmap: version=%d len=%d", data[4], len(data))
+	}
+	// Decode directly and compare id sets.
+	tr2 := newTestTrie(t, db, false)
+	if _, ok := tr2.archiveIDs[1]; !ok {
+		t.Fatal("v2 round-trip lost id 1")
+	}
+	if _, ok := tr2.archiveIDs[2]; !ok {
+		t.Fatal("v2 round-trip lost id 2")
+	}
+	if len(tr2.archiveIDs) != 2 {
+		t.Fatalf("unexpected ids: %v", tr2.archiveIDs)
+	}
+}
+
+// TestMPTStagedBytesAccounting exercises the recording batcher: every staged
+// key must fall into exactly one diagnostic class.
+func TestMPTStagedBytesAccounting(t *testing.T) {
+	staged := &stagedBytes{}
+	rec := &recordingBatcher{Batcher: &countBatcher{}, staged: staged}
+	for _, key := range [][]byte{
+		appendNodeKeyForTest(1), appendNodeKeyForTest(2),
+		archiveKey(3), indexKey,
+		flatKey([]byte("k")),
+	} {
+		if err := rec.Put(key, make([]byte, 16)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec.nodeAsAggregate = true
+	if err := rec.Put(appendNodeKeyForTest(9), make([]byte, 16)); err != nil {
+		t.Fatal(err)
+	}
+	rec.nodeAsAggregate = false
+	if staged.hotNode != 2*(5+32+16) {
+		t.Fatalf("hotNode=%d", staged.hotNode)
+	}
+	if staged.aggregateNode != 5+32+16 {
+		t.Fatalf("aggregate=%d", staged.aggregateNode)
+	}
+	if staged.archive == 0 || staged.flat == 0 || staged.index == 0 {
+		t.Fatalf("missing class: archive=%d flat=%d index=%d", staged.archive, staged.flat, staged.index)
+	}
+}
+
+// countBatcher is a no-op Batcher used by accounting tests.
+type countBatcher struct{ puts int }
+
+func (b *countBatcher) Put([]byte, []byte) error { b.puts++; return nil }
+func (b *countBatcher) Delete([]byte) error      { return nil }
+func (b *countBatcher) ValueSize() int           { return 0 }
+func (b *countBatcher) Write() error             { return nil }
+func (b *countBatcher) Reset()                   {}
+
+func appendNodeKeyForTest(b byte) []byte { return nodeKey(common.Hash{b}) }
 
 func TestMPTArchiveDeleteArchivedKey(t *testing.T) {
 	db := &testStore{memorydb.New()}

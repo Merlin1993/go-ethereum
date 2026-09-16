@@ -20,8 +20,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	gethtrie "github.com/ethereum/go-ethereum/trie"
@@ -56,7 +58,13 @@ type Config struct {
 	CuckooBuckets             int
 	CuckooSlots               int
 	ActivateArchivedKeyOnRead bool
+	// NodeCacheBytes bounds the in-memory cache of serialized trie nodes
+	// shared by all tries over one store. Zero uses defaultNodeCacheBytes.
+	NodeCacheBytes int64
 }
+
+// defaultNodeCacheBytes is the fallback node cache budget (see Config).
+const defaultNodeCacheBytes = 64 << 20
 
 // KeyValue is one ordered MPT write used by PutBatch.
 type KeyValue struct {
@@ -122,10 +130,13 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 	if cfg.ShardDepth < 0 || cfg.ShardDepth > 30 {
 		return nil, fmt.Errorf("mpt archive: shard depth %d out of range", cfg.ShardDepth)
 	}
+	if cfg.NodeCacheBytes == 0 {
+		cfg.NodeCacheBytes = defaultNodeCacheBytes
+	}
 	t := &Trie{
 		db:            db,
 		config:        cfg,
-		ndb:           &nodeDatabase{store: db},
+		ndb:           &nodeDatabase{store: db, cache: newNodeCache(cfg.NodeCacheBytes)},
 		shards:        make(map[int]*gethtrie.Trie),
 		shardRoot:     make(map[int][]byte),
 		dirty:         make(map[int]struct{}),
@@ -246,17 +257,9 @@ func (t *Trie) loadArchiveIndex() error {
 	if len(data) == 0 {
 		return nil
 	}
-	if len(data) < 9 || !bytes.Equal(data[:4], indexMagic[:]) || data[4] != recordVersion {
-		return errors.New("mpt archive: invalid archive index")
-	}
-	count := int(binary.BigEndian.Uint32(data[5:9]))
-	if count < 0 || len(data) != 9+count*4 {
-		return errors.New("mpt archive: invalid archive index length")
-	}
-	for offset := 9; offset < len(data); offset += 4 {
-		t.archiveIDs[int(binary.BigEndian.Uint32(data[offset:offset+4]))] = struct{}{}
-	}
-	return nil
+	return decodeArchiveIndex(data, func(id int) {
+		t.archiveIDs[id] = struct{}{}
+	})
 }
 
 func (t *Trie) hotLocked(id int) (*gethtrie.Trie, error) {
@@ -699,20 +702,105 @@ func (t *Trie) encodeArchive(shard *archiveShard) []byte {
 	return data
 }
 
+// indexVersionBitmap is the second encoding of the archive index: a fixed-size
+// bitmap over all shard ids (2^ShardDepth bits = 4 KiB at depth 15). The v1
+// list encoding grew to ~130 KiB once most shards were archived and was
+// rewritten in full on every batch, which dominated commit cost in B3m2.
+// Readers still accept v1; writers always emit v2.
+const (
+	indexVersionList   = byte(1)
+	indexVersionBitmap = byte(2)
+)
+
 func (t *Trie) encodeArchiveIndex() []byte {
-	ids := make([]int, 0, len(t.archiveIDs))
-	for id := range t.archiveIDs {
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
-	data := make([]byte, 9+len(ids)*4)
+	shards := 1 << uint(t.config.ShardDepth)
+	data := make([]byte, 9+(shards+7)/8)
 	copy(data[:4], indexMagic[:])
-	data[4] = recordVersion
-	binary.BigEndian.PutUint32(data[5:9], uint32(len(ids)))
-	for i, id := range ids {
-		binary.BigEndian.PutUint32(data[9+i*4:13+i*4], uint32(id))
+	data[4] = indexVersionBitmap
+	binary.BigEndian.PutUint32(data[5:9], uint32(shards))
+	for id := range t.archiveIDs {
+		if id >= 0 && id < shards {
+			data[9+id/8] |= 1 << uint(id%8)
+		}
 	}
 	return data
+}
+
+// decodeArchiveIndex accepts both index encodings and reports every archived
+// shard id through insert.
+func decodeArchiveIndex(data []byte, insert func(id int)) error {
+	if len(data) < 9 || !bytes.Equal(data[:4], indexMagic[:]) {
+		return errors.New("mpt archive: invalid archive index")
+	}
+	switch data[4] {
+	case indexVersionList:
+		count := int(binary.BigEndian.Uint32(data[5:9]))
+		if count < 0 || len(data) != 9+count*4 {
+			return errors.New("mpt archive: invalid archive index length")
+		}
+		for offset := 9; offset < len(data); offset += 4 {
+			insert(int(binary.BigEndian.Uint32(data[offset : offset+4])))
+		}
+		return nil
+	case indexVersionBitmap:
+		shards := int(binary.BigEndian.Uint32(data[5:9]))
+		if shards <= 0 || len(data) != 9+(shards+7)/8 {
+			return errors.New("mpt archive: invalid archive bitmap length")
+		}
+		for id := 0; id < shards; id++ {
+			if data[9+id/8]&(1<<uint(id%8)) != 0 {
+				insert(id)
+			}
+		}
+		return nil
+	}
+	return errors.New("mpt archive: unknown archive index version")
+}
+
+// stagedBytes is the per-commit split of staged batch volume by record class,
+// reported to archive.LastCommitDiagnostics so hot-layer commit cost can be
+// attributed (nodes vs archive records vs flat values vs index) without
+// changing any call site's flush semantics.
+type stagedBytes struct {
+	hotNode, aggregateNode, archive, flat, index int64
+}
+
+func (s *stagedBytes) add(key []byte, value []byte, nodeAsAggregate bool) {
+	if len(key) < 4 || key[0] != 'M' || key[1] != 'P' || key[2] != 'T' {
+		return
+	}
+	n := int64(len(key) + len(value))
+	switch key[3] {
+	case 'N':
+		if nodeAsAggregate {
+			s.aggregateNode += n
+		} else {
+			s.hotNode += n
+		}
+	case 'A':
+		s.archive += n
+	case 'I':
+		s.index += n
+	case 'F':
+		s.flat += n
+	}
+}
+
+// recordingBatcher is a pass-through Batcher that tallies staged bytes.
+type recordingBatcher struct {
+	archivetrie.Batcher
+	staged          *stagedBytes
+	nodeAsAggregate bool
+}
+
+func (r *recordingBatcher) Put(key, value []byte) error {
+	r.staged.add(key, value, r.nodeAsAggregate)
+	return r.Batcher.Put(key, value)
+}
+
+func (r *recordingBatcher) Delete(key []byte) error {
+	r.staged.add(key, nil, r.nodeAsAggregate)
+	return r.Batcher.Delete(key)
 }
 
 // CommitToBatch stages dirty MPT nodes, archive records, flat values and the
@@ -748,6 +836,12 @@ func (t *Trie) Commit() ([]byte, error) {
 }
 
 func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
+	staged := &stagedBytes{}
+	rec := &recordingBatcher{Batcher: batch, staged: staged}
+	defer func() {
+		archivetrie.SetMPTCommitStagedBytes(staged.hotNode, staged.aggregateNode, staged.archive, staged.flat, staged.index)
+		archivetrie.SetMPTNodeCacheStats(t.ndb.cache.stats())
+	}()
 	if len(t.dirty) == 0 && len(t.pendingValues) == 0 && len(t.pendingDelete) == 0 && !t.archiveIndexDirty {
 		return bytes.Clone(t.root), nil
 	}
@@ -769,7 +863,7 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 			continue
 		}
 		root, nodes := hot.Commit(false)
-		if err := writeNodeSet(batch, nodes); err != nil {
+		if err := writeNodeSet(rec, nodes); err != nil {
 			return nil, err
 		}
 		if normalized := normalizeRoot(root.Bytes()); normalized != nil {
@@ -791,7 +885,10 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 	// interior nodes come from the node cache — so the incremental cost
 	// stays proportional to this batch's dirty shards.
 	t.aggregate = nil
-	if err := writeNodeSet(batch, nodes); err != nil {
+	rec.nodeAsAggregate = true
+	err := writeNodeSet(rec, nodes)
+	rec.nodeAsAggregate = false
+	if err != nil {
 		return nil, err
 	}
 	for id, shard := range t.archives {
@@ -799,20 +896,20 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 			continue
 		}
 		if len(shard.entries) == 0 {
-			if err := batch.Delete(archiveKey(id)); err != nil {
+			if err := rec.Delete(archiveKey(id)); err != nil {
 				return nil, err
 			}
-		} else if err := batch.Put(archiveKey(id), t.encodeArchive(shard)); err != nil {
+		} else if err := rec.Put(archiveKey(id), t.encodeArchive(shard)); err != nil {
 			return nil, err
 		}
 		shard.dirty = false
 	}
 	if t.archiveIndexDirty {
 		if len(t.archiveIDs) == 0 {
-			if err := batch.Delete(indexKey); err != nil {
+			if err := rec.Delete(indexKey); err != nil {
 				return nil, err
 			}
-		} else if err := batch.Put(indexKey, t.encodeArchiveIndex()); err != nil {
+		} else if err := rec.Put(indexKey, t.encodeArchiveIndex()); err != nil {
 			return nil, err
 		}
 		t.archiveIndexDirty = false
@@ -823,7 +920,7 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		if err := batch.Put(flatKey([]byte(key)), t.pendingValues[key]); err != nil {
+		if err := rec.Put(flatKey([]byte(key)), t.pendingValues[key]); err != nil {
 			return nil, err
 		}
 	}
@@ -833,7 +930,7 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 	}
 	sort.Strings(deleteKeys)
 	for _, key := range deleteKeys {
-		if err := batch.Delete(flatKey([]byte(key))); err != nil {
+		if err := rec.Delete(flatKey([]byte(key))); err != nil {
 			return nil, err
 		}
 	}
@@ -895,15 +992,75 @@ func (t *Trie) ForEach(fn func(key, value []byte) bool) {
 	}
 }
 
-type nodeDatabase struct{ store archivetrie.KVStore }
-
-func (d *nodeDatabase) NodeReader(common.Hash) (database.NodeReader, error) {
-	return nodeReader{store: d.store}, nil
+// nodeDatabase is a read-through adapter from geth's trie node accessor onto
+// the archive KVStore. Committed tries are single-use (T2 drops the aggregate
+// handle every commit and hot shards are released after pruning), so readers
+// reopen them constantly; the embedded size-limited cache absorbs those
+// reads. It is shared by every Trie over the same store (one per New call),
+// so a per-instance cache would thrash the moment a run opens many tries.
+type nodeDatabase struct {
+	store archivetrie.KVStore
+	cache *nodeCache
 }
 
-type nodeReader struct{ store archivetrie.KVStore }
+// nodeCache is a small content-addressed LRU of serialized trie nodes.
+// Zero/negative sizes disable caching.
+type nodeCache struct {
+	enabled bool
+	c       *lru.SizeConstrainedCache[common.Hash, []byte]
+	gets    atomic.Int64
+	hits    atomic.Int64
+}
 
+func newNodeCache(maxBytes int64) *nodeCache {
+	if maxBytes <= 0 {
+		return &nodeCache{}
+	}
+	return &nodeCache{enabled: true, c: lru.NewSizeConstrainedCache[common.Hash, []byte](uint64(maxBytes))}
+}
+
+func (nc *nodeCache) get(hash common.Hash) ([]byte, bool) {
+	if nc == nil || !nc.enabled {
+		return nil, false
+	}
+	nc.gets.Add(1)
+	if blob, ok := nc.c.Get(hash); ok {
+		nc.hits.Add(1)
+		return blob, true
+	}
+	return nil, false
+}
+
+func (nc *nodeCache) put(hash common.Hash, blob []byte) {
+	if nc == nil || !nc.enabled {
+		return
+	}
+	nc.c.Add(hash, blob)
+}
+
+// stats reports cumulative cache gets and hits for diagnostics.
+func (nc *nodeCache) stats() (gets, hits int64) {
+	if nc == nil {
+		return 0, 0
+	}
+	return nc.gets.Load(), nc.hits.Load()
+}
+
+func (d *nodeDatabase) NodeReader(common.Hash) (database.NodeReader, error) {
+	return nodeReader{store: d.store, cache: d.cache}, nil
+}
+
+type nodeReader struct {
+	store archivetrie.KVStore
+	cache *nodeCache
+}
+
+// Node is read-through over the shared node cache: content-addressed, so a
+// hit is always valid regardless of which trie asked.
 func (r nodeReader) Node(_ common.Hash, _ []byte, hash common.Hash) ([]byte, error) {
+	if blob, ok := r.cache.get(hash); ok {
+		return blob, nil
+	}
 	blob, err := r.store.Get(nodeKey(hash))
 	if err != nil {
 		return nil, err
@@ -911,5 +1068,6 @@ func (r nodeReader) Node(_ common.Hash, _ []byte, hash common.Hash) ([]byte, err
 	if len(blob) == 0 {
 		return nil, fmt.Errorf("mpt archive: node %x not found", hash)
 	}
+	r.cache.put(hash, blob)
 	return blob, nil
 }
