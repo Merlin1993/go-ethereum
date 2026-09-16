@@ -54,6 +54,7 @@ var (
 	traceStressActivateArchivedStemOnRead = flag.Bool("traceStressActivateArchivedStemOnRead", false, "Activate an archived stem when a read finds it")
 	traceStressActivateArchivedKeyOnRead  = flag.Bool("traceStressActivateArchivedKeyOnRead", false, "Activate an archived AMT key when a read finds it")
 	traceStressDisableArchive             = flag.Bool("traceStressDisableArchive", false, "Do not call PruneNextShard during the trace run")
+	traceStressHotLayer                   = flag.String("traceStressHotLayer", "amt", `Hot-layer backend: "amt" (binary key-level trie) or "mpt" (A6 hexary MPT fallback)`)
 	traceStressCuckooBuckets              = flag.Int("traceStressCuckooBuckets", 32, "Archive cuckoo filter bucket count")
 	traceStressCuckooSlots                = flag.Int("traceStressCuckooSlots", 4, "Archive cuckoo filter slots per bucket")
 	traceStatsBaseDir                     = flag.String("traceStatsBaseDir", "", "Existing TestArchiveStemTraceStress base directory for TestArchiveStemTraceStorageStats")
@@ -408,7 +409,11 @@ func (s *traceStressAccessStats) add(kind traceStressKind, fromArchive bool, sam
 	}
 }
 
-func classifyTraceStressAccess(backend *Trie, key []byte) (bool, error) {
+func classifyTraceStressAccess(hot TraceHotTrie, key []byte) (bool, error) {
+	backend, ok := hot.(*Trie)
+	if !ok {
+		return false, errors.New("stem-mode access classification requires the AMT hot layer")
+	}
 	if len(key) != StemKeySize {
 		return false, ErrInvalidStemKey
 	}
@@ -444,13 +449,34 @@ func classifyTraceStressAccess(backend *Trie, key []byte) (bool, error) {
 // classifyTraceStressAccessAMT classifies a complete key without reading its
 // flat payload. GetValueRef reports whether the reference came from the hot
 // leaf or an archive bucket, which is the only distinction AMT needs.
-func classifyTraceStressAccessAMT(backend *Trie, key []byte) (bool, error) {
+func classifyTraceStressAccessAMT(hot TraceHotTrie, key []byte) (bool, error) {
 	if len(key) != common.HashLength {
 		return false, ErrInvalidStemKey
 	}
-	_, fromArchive, err := backend.GetValueRef(key)
+	_, fromArchive, err := hot.GetValueRef(key)
 	return fromArchive, err
 }
+
+// TraceHotTrie is the hot-layer surface TestArchiveStemTraceStress drives.
+// *Trie (binary AMT hot layer) implements it directly; the A6 hexary-MPT
+// fallback is wired through TraceHotTrieNew below.
+type TraceHotTrie interface {
+	Get(key []byte) ([]byte, error)
+	Put(key, value []byte) error
+	Delete(key []byte) error
+	GetValueRef(key []byte) ([]byte, bool, error)
+	PruneNextShard() error
+	CommitToBatch(batch Batcher, destructive bool) ([]byte, error)
+}
+
+// TraceHotTrieNew constructs the alternative hot layer named by
+// -traceStressHotLayer. It is nil inside this package to avoid an import
+// cycle (trie/archive/mpt imports trie/archive); the external test package
+// trie/archive_test registers the MPT fallback in its init. A nil hook for a
+// requested backend must fail the run loudly, never fall back silently.
+// Adapters translate "key absent" into ErrNodeNotFound, the sentinel the
+// workload treats as a miss.
+var TraceHotTrieNew func(kind string, db KVStore, shardDepth, cuckooBuckets, cuckooSlots int, activateArchivedKeyOnRead bool) (TraceHotTrie, error)
 
 func (s *traceStressAccessStats) merge(other traceStressAccessStats) {
 	s.Samples += other.Samples
@@ -860,6 +886,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"prune_every_batches":   *traceStressPruneEveryBatches,
 		"prune_every_blocks":    *traceStressPruneEveryBlocks,
 		"disable_archive":       *traceStressDisableArchive,
+		"hot_layer":             *traceStressHotLayer,
 		"archive_period_ops":    archivePeriodOps,
 		"cuckoo_buckets":        *traceStressCuckooBuckets,
 		"cuckoo_slots":          *traceStressCuckooSlots,
@@ -912,10 +939,27 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	config.CuckooBuckets = *traceStressCuckooBuckets
 	config.CuckooSlots = *traceStressCuckooSlots
 	backend := NewTrie(nil, &stressDBAdapter{db}, NewPooledKeccakHasher(), config, true)
+	var hotBackend TraceHotTrie = backend
+	switch *traceStressHotLayer {
+	case "amt":
+	case "mpt":
+		if *traceStressStemMode {
+			t.Fatal("traceStressHotLayer=mpt requires traceStressStemMode=false")
+		}
+		if TraceHotTrieNew == nil {
+			t.Fatal("traceStressHotLayer=mpt requested but the MPT hot-layer hook is not registered (external test package archive_test missing?)")
+		}
+		hotBackend, err = TraceHotTrieNew(*traceStressHotLayer, &stressDBAdapter{db}, *traceStressShardDepth, *traceStressCuckooBuckets, *traceStressCuckooSlots, *traceStressActivateArchivedKeyOnRead)
+		if err != nil {
+			t.Fatalf("hot layer %q: %v", *traceStressHotLayer, err)
+		}
+	default:
+		t.Fatalf("unknown traceStressHotLayer %q", *traceStressHotLayer)
+	}
 	var stemTrie *StemTrie
-	getValue := backend.Get
-	putValue := backend.Put
-	deleteValue := backend.Delete
+	getValue := hotBackend.Get
+	putValue := hotBackend.Put
+	deleteValue := hotBackend.Delete
 	cacheDiagnostics := func() StemCacheDiagnostics { return StemCacheDiagnostics{} }
 	classifyAccess := classifyTraceStressAccessAMT
 	if *traceStressStemMode {
@@ -1007,7 +1051,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			return 0, nil
 		}
 		pruneStart := time.Now()
-		if err := backend.PruneNextShard(); err != nil {
+		if err := hotBackend.PruneNextShard(); err != nil {
 			return 0, err
 		}
 		prunesDone++
@@ -1041,7 +1085,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		sampledExistingReads := window.access.ReadHot + window.access.ReadArchived
 		workloadFilter := filterStatsFromDiagnostics(updateDiag).sub(window.classificationFilter)
 		hotReadRate := traceStressRatio(window.access.ReadHot, sampledExistingReads)
-		runtimeFilterFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.Positives)
+		runtimeFilterFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.Negatives)
 		archiveRoundSize := int64(1) << uint(*traceStressShardDepth)
 		archiveRoundCompleted := prunesDone / archiveRoundSize
 		archiveRoundProgress := prunesDone % archiveRoundSize
@@ -1163,7 +1207,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			if sample {
 				beforeSampleDiag := LastUpdateDiagnostics()
 				sampleStart := time.Now()
-				fromArchive, sampleErr = classifyAccess(backend, op.key)
+				fromArchive, sampleErr = classifyAccess(hotBackend, op.key)
 				sampleDur := time.Since(sampleStart)
 				window.classificationFilter.add(filterStatsFromDiagnostics(LastUpdateDiagnostics()).sub(filterStatsFromDiagnostics(beforeSampleDiag)))
 				window.accessSample += sampleDur
@@ -1214,7 +1258,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		}
 		opDur := time.Since(opStart) - batchAccessSampleDur - coldMaintenanceDur
 		commitStart := time.Now()
-		lastRoot, err = backend.CommitToBatch(batch, *traceStressDestructiveCommit)
+		lastRoot, err = hotBackend.CommitToBatch(batch, *traceStressDestructiveCommit)
 		if err != nil {
 			t.Fatalf("batch %d commit: %v", batchNumber, err)
 		}
@@ -1255,7 +1299,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	var finalStatsDur time.Duration
 	if *traceStressFinalStats {
 		statsStart := time.Now()
-		finalStats = backend.Stats()
+		if amt, ok := hotBackend.(*Trie); ok {
+			finalStats = amt.Stats()
+		}
 		finalStatsDur = time.Since(statsStart)
 	}
 	cache := cacheDiagnostics()
@@ -1268,7 +1314,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	workloadFilter := filterStatsFromDiagnostics(updateDiag).sub(totalClassificationFilter)
 	hotReadRate := traceStressRatio(totalAccess.ReadHot, sampledExistingReads)
 	readArchiveShare := traceStressRatio(totalAccess.ReadArchived, sampledExistingReads)
-	runtimeFilterFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.Positives)
+	runtimeFilterFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.Negatives)
 	average := func(total, count int64) float64 {
 		if count == 0 {
 			return 0
