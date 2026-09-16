@@ -62,6 +62,29 @@ A1-A4 完成、`go test ./trie/archive` 全绿（含 stem 路径）、A5 备份�
 
 归因规则：判 A6 之前先看 `Operations_ms / comparative` 占比。占比 >= 70% 才是树遍历瓶颈；否则先修 commit / DB 写路径，换 16 叉救不了非遍历瓶颈。
 
+### A6 执行记录与调优计划（2026-09-16 补）
+
+**执行状态**：A6 已实现并接线（`trie/archive/mpt` + `-traceStressHotLayer=mpt`，经 `trace_stress_hotlayer_test.go` 外注钩子避开 import 环），校准跑 B3m 至 200M ops 停。结果：**r≈0.06–0.08，比二叉更差，触发门限表的归因规则先响了**——B3m 稳定段 `Operations_ms` 只占 13.3%（2,836 ns/op，比二叉的 22,915 ns/op 便宜约 8 倍，证明 16 叉查路确实有效），而 `Commit_ms` 占 86.7%（18,488 ns/op）。按上面写死的归因规则：**这不是树遍历瓶颈，先修 commit/DB 写路径，不许因 B3m 数字给 16 叉结构判死刑**。
+
+**根因（代码级，两条都在集成层，不在 hex trie 本身）**：
+
+1. 聚合根每批全量重建：`mpt.go` `commitToBatchLocked` 每次提交 `buildAggregate(roots)` 从空树逐个 `Update` 全部 shard 根（D15 ⇒ 32,768 项）再 Commit 一棵新 geth trie——与批次实际脏分片数无关，每批 O(全部分片×树深) 哈希。
+2. 提交不合流：`trace_stress_hotlayer_test.go` `CommitToBatch` 忽略驱动传入的 batch，调 `mpt.Trie.Commit()` 自开 LevelDB batch 自刷盘；驱动共享 batch 形同虚设（所以 B3m `DB_Write_ms=0`，同步写成本全藏进 `Commit_ms`）。
+
+**调优内容（按序做，每步后本地测，全绿再发 B2r 同段复测 r）**：
+
+- T1 提交合流：`mptHotLayer.CommitToBatch(batch, destructive)` 改为把节点/flat/archive 记录写进传入 batch，`Trie.Commit()` 仅保留给独立使用；预期直接砍掉每批独立刷盘。
+  **完成 2026-09-16（本地）**：`mpt.Trie` 新增导出 `CommitToBatch(batch, destructive)`（内部复用 `commitToBatchLocked`，`Commit()` 保留为自管批次路径）；适配器 `trace_stress_hotlayer_test.go` 改走传入 batch。新增单测 `TestMPTCommitToBatchStagesCallerBatch`（暂存内容只进 batch、刷盘前库里不可见、刷盘后可重载）与 `TestMPTCommitToBatchMatchesCommit`（共享批与自管批 root 逐位一致，含 prune+delete 轮）。`go vet` + `go test ./trie/archive/mpt` 5 测全 PASS，`go test -c ./trie/archive` 编译门 OK。注意语义：合流后每批同步写从 2 次（mpt 自刷 + 驱动 batch.Write）变 1 次；B3m 复测时 `Commit_ms` 应显著下降、`DB_Write_ms` 应转非零，两列之和才是新旧可比口径。未发车。
+- T2 聚合根增量化：聚合 trie 常驻（按 root 打开），每批只 `Update` 本批 dirty shard 的根；shard 清空才 `Delete` 对应项。若 geth trie 增量代价仍高，退一步按设计文档"aggregation record 平铺+批量写"方案，root 哈希用轻聚合（拼接哈希）替代全树。
+  **完成 2026-09-16（本地）**：`Trie` 增常驻 `aggregate` 字段 + `ensureAggregateLocked()`（按当前 root 懒打开，节点走 nodeDatabase 缓存，重开零重哈希）；`commitToBatchLocked` 删除 `buildAggregate` 全量重建，改为仅对本批 dirty shard `Update/Delete(shardKey(id))`。关键坑：geth trie `Commit()` 后对象一次性作废（"trie is already committed"），故每轮提交后置空 handle、下轮从新 root 重开。`Hash()`（全量重建口径）保留为交叉校验：新增 `TestMPTIncrementalAggregateMatchesRebuild` 断言每轮 Root==Hash（覆盖 写6轮+prune4轮+重载1轮）。mpt 包 6 测全 PASS，vet/编译门/gofmt 绿。`buildAggregate` 现仅 `Hash()` 使用。
+- T3 修完后复跑 B3m 同配置 200M ops 校准：看 `Commit_ms` 占比是否 <20%、Operations 是否重新成为大头；只有 Operations 占比 ≥70% 时才有资格谈下一步换树。
+  **发车 2026-09-16（B3m2）**：`.agent/run_remote_b3m2_t1t2_20260916.py`（b3m launcher 克隆），StartFile=9、ops=196,608,000 与 B0b/B2r 严格配对（原 B3m 是 StartFile=0，配对基线换重载段）。判定口径提醒：T1 后比较用 `Commit_ms+DB_Write_ms` 之和。
+- T4 （独立于 T1-T3，二叉/16 叉通用）每操作包装层拆账：热路径 Get/Put 里 Cuckoo 探测、shard 定位、valueRef 构造、冷热判断记账逐项计时（bench 或采样），目标把 B0b 段 25 µs/op 的差距定位到具体项。
+- T5 验证口径落地（用户 9/16 裁定）：验证归交易池收集/打包前，不计入状态树生成计时；冷回插只做便宜自查（长度/短指纹），昂贵全量 valueRef 重算改后台抽样或开关关闭。注意重载段热命中 99%，此项单独做完预计只把 r 从 ≈0.25 抬到 ≈0.3，不是主刀。
+- T6 复测通过（重载段 r ≥0.7）才谈 B3 全量与 B4/B5；再次不过则按实验手册 §0 走"归档层出账"的口径重定义，不再自动烧大车。
+
+数据：`.agent/cmp_20260916/b3m_hotmpt.csv`（8 窗）、`b2r.csv`、`b0b_mpt_trace_stress.csv`；分析页 `.agent/amt_perf_handoff_20260916.md`。
+
 ## 明确不做
 
 分段续跑 / checkpoint（预算按"跑 4 天就说明不达标"处理）；stem A/B 对比；合成 Cuckoo FP 标定；状态根一致性校验；Verkle 或 MPT 侧任何代码改动（对比驱动 `core/tree_test/trace_compare_test.go` 现成可用，`-traceCompareOps` 是 int64 支持 20B，另有 `-traceCompareStartFile` / `-traceCompareStartBlock`）。

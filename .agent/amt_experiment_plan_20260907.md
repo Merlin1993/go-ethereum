@@ -92,6 +92,8 @@ python .agent/analyze_trie_compare.py --asct <AMT的baseDir> --mpt <B0的baseDir
 
 ## 4. 阶段（门控串行）
 
+> **2026-09-16 状态修订（权威，取代 §0/§4 旧进行中/达标表述）**：B0/B0b/B1/B2r/B3/B3m 均已跑。G1 在所有诚实配对下不达标：全量早期 r≈0.36→0.15；重载段严格配对（B0b fresh 同预算 vs B2r，196.6M ops）r=0.44→0.25、均值≈0.27。此前"B2≈1.0"作废——那是拿全量 B0 末窗（MPT 背着 22GB 老库）当参照的假象，分段比较必须 fresh 同预算起跑配对（脚本 `run_remote_b0b_mpt_file9_20260916.py`）。B3 全量已在 2.57B ops 处停线；A6 16 叉已接线实测（B3m）反而 r≈0.06，根因是每批次提交（聚合根全量重建+提交不合流），见开发文档 A6 调优节与 `.agent/amt_perf_handoff_20260916.md`。B1 r≈1.71 仅证明无归档时二叉不是瓶颈，不能当 G1 达标证据。B4/B5 未跑，是否值得跑取决于 A6 调优后复测的 r。
+
 | 阶段 | 引擎/配置 | 预算 | 预估 | 产出 / 门 |
 |---|---|---:|---:|---|
 | B0 | MPT 全量 **进行中**（2026-09-08 08:52 发车，`B0_mpt_20242112513_20260908_085221`） | 20,242,112,513 | 12–20 h | 终局参照：末段 10 窗均值 `M_late`、最低窗 `M_min`、`State_Bytes` 曲线 |
@@ -128,6 +130,8 @@ python .agent/analyze_trie_compare.py --asct <AMT的baseDir> --mpt <B0的baseDir
 4. 池化 ops/s 不明显劣化（相对最优 D 低 >15% 视为劣化）。
 
 升级顺序（三档全不达标才动，一次只动一个）：`BatchSize` 4000→2000/8000 → `NodeCacheMB` → Cuckoo 形状（32×4 为基线，16×4 桶容量 60 只作诊断）。
+
+**配对纪律（2026-09-16 补，血的教训）**：B2 与 MPT 比较时，MPT 参照必须是同段 fresh 起跑的 B0b（同 file 9、同预算、空库建树），禁止拿全量 B0 的任意窗口当参照——B0 末窗 MPT 背着 22GB 历史库（~20 万 ops/s），会把 B2 假性抬到 r≈1.0。B0b launcher 模板：`.agent/run_remote_b0b_mpt_file9_20260916.py`（MPT 侧走 `core/tree_test/trace_compare_test.go`，产出列名是 `Root_ms` 而非 `Commit_ms`，对比时注意列名映射）。
 
 ### 4.3 命令
 

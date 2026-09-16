@@ -2,6 +2,21 @@
 
 Status: implementation started on `codex/amt-mpt-hot-layer-20260909`.
 
+> **2026-09-16 calibration result (B3m): hypothesis FALSIFIED as-is.** Wired into
+> trace stress and measured: r(AMT-16way/MPT) ≈ 0.06-0.08, worse than the binary
+> hot layer. Root cause is NOT the tree: per-op cost dropped ~8x (2.8 vs 22.9 µs),
+> but `Commit_ms` = 86.7% of wall — the adapter rebuilds the aggregate shard-root
+> trie from scratch every batch and self-flushes its own LevelDB batch. Fixing
+> those two (incremental aggregate + shared batch) is prerequisite before any
+> further A6 judgment. See `.agent/amt_perf_handoff_20260916.md` §4.
+>
+> **2026-09-16 evening (B3m2): T1 commit-merge + T2 incremental aggregate landed
+> and the prediction held.** Strict pairing vs B0b (file9, 196.6M ops):
+> window-mean r ≈ 0.06 -> 0.357, Commit share 86.7% -> (Commit+DB_Write) ≈ 52%,
+> steady ≈ 255K ops/s. Still below the T6 gate (r ≥ 0.7, Operations share ≥ 70%):
+> the remaining gap is the archive/flat staging volume inside the single shared
+> batch and the ≈ 25 µs/op wrapper cost (T4 territory). No tree-swap verdict yet.
+
 The first implementation is intentionally isolated in
 `trie/archive/mpt`: it is benchmarkable without changing the default AMT
 wrapper or creating an import cycle with the parent `trie` package. The
