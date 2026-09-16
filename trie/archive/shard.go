@@ -56,6 +56,10 @@ type Shard struct {
 
 	// Node pool for reusing internal and leaf nodes
 	pool *NodePool
+
+	// vrefPhase attributes archive membership writes to a code path while
+	// debugging valueRef verification failures (diagnostics only).
+	vrefPhase string
 }
 
 // NewShard 创建一个新的 Shard（若提供 rootHash 则从 DB 加载根节点）。
@@ -449,9 +453,6 @@ func (s *Shard) archiveMayContainKey(node Node, key []byte, depth int) bool {
 	if node == nil {
 		return false
 	}
-	if present, ok := s.subtreeArchivePresence(node); ok && !present {
-		return false
-	}
 
 	switch n := node.(type) {
 	case *ArchiveBucketNode:
@@ -487,10 +488,7 @@ func (s *Shard) archiveMayContainKey(node Node, key []byte, depth int) bool {
 		if child != nil {
 			return s.archiveMayContainKey(child, key, depth+1)
 		}
-		if present, ok := storedSubtreeArchivePresence(childEpoch); ok {
-			if !present {
-				return false
-			}
+		if present, ok := storedSubtreeArchivePresence(childEpoch); ok && present {
 			loaded, err := s.loadChildNode(n, bit, childHashForBit(n, bit))
 			if err != nil || loaded == nil {
 				return true
@@ -575,6 +573,81 @@ func (s *Shard) archiveBucketFilter(bucket *ArchiveBucketNode) *cuckoo.Filter {
 	return filter
 }
 
+// selfHealStaleMembership repairs the cross-bucket duplicate corruption seen
+// in the B3 dumps: one key is archived in several buckets and some copies
+// carry a stale valueRef. It keeps the membership whose ref matches the
+// flat-verified current ref and removes every other membership for the key.
+// Returns true only when a verified membership exists somewhere in the tree,
+// so genuinely unverifiable state still fails loudly. Caller holds s.mu.
+func (s *Shard) selfHealStaleMembership(key, verifiedRef []byte) bool {
+	if s.root == nil || len(verifiedRef) != common.HashLength {
+		return false
+	}
+	var verified, stale []*ArchiveBucketNode
+	var walk func(n Node)
+	walk = func(n Node) {
+		switch t := n.(type) {
+		case nil:
+			return
+		case *ArchiveBucketNode:
+			items, err := s.bucketKeys(t)
+			if err != nil {
+				return
+			}
+			innerDepth := t.PathBits
+			keyBits := len(key) * 8
+			for _, item := range items {
+				if innerDepth+item.SuffixBits != keyBits || !s.suffixMatches(key, innerDepth, item.Suffix, item.SuffixBits) {
+					continue
+				}
+				if bytes.Equal(item.ValueRef, verifiedRef) {
+					verified = append(verified, t)
+				} else {
+					stale = append(stale, t)
+				}
+				return
+			}
+		case *InternalNode:
+			for _, bucket := range t.StubList {
+				walk(bucket)
+			}
+			if t.Left != nil {
+				walk(t.Left)
+			} else if len(t.LeftHash) > 0 {
+				if loaded, err := s.loadNode(t.LeftHash); err == nil {
+					walk(loaded)
+				}
+			}
+			if t.Right != nil {
+				walk(t.Right)
+			} else if len(t.RightHash) > 0 {
+				if loaded, err := s.loadNode(t.RightHash); err == nil {
+					walk(loaded)
+				}
+			}
+		}
+	}
+	walk(s.root)
+	if len(verified) == 0 {
+		return false
+	}
+	for _, bucket := range stale {
+		// Remove every stale occurrence: the same bucket can hold several
+		// memberships for one key and removeArchiveKeyFromBucket deletes one
+		// per call.
+		for {
+			removed, err := s.removeArchiveKeyFromBucket(bucket, key)
+			if err != nil {
+				return false
+			}
+			if !removed {
+				break
+			}
+		}
+	}
+	return true
+}
+
 // Get 在单个 shard 内查找 key。顺序是先走热 child，再查侧挂 StubList，
 // 最后处理直接命中的 ArchiveBucketNode。
 func (s *Shard) Get(key []byte) (value []byte, err error) {
@@ -612,7 +685,28 @@ func (s *Shard) Get(key []byte) (value []byte, err error) {
 	}
 	if fromArchive && len(valueRef) == common.HashLength {
 		actual, err := s.storedValueRef(key, value)
-		if err != nil || !bytes.Equal(valueRef, actual) {
+		if err != nil {
+			return nil, err
+		}
+		if !bytes.Equal(valueRef, actual) {
+			// A bucket membership carries a stale valueRef (cross-bucket
+			// duplicate from an earlier split/absorb). Before failing, try
+			// to self-heal: if the archive tree also contains a membership
+			// for this key matching the flat value's current ref, drop the
+			// corrupted memberships and re-activate with the verified ref.
+			// The returned version stays correct because it is validated
+			// against the flat store; only genuinely unverifiable state
+			// still dumps and fails.
+			if s.selfHealStaleMembership(key, actual) {
+				recordVRefSelfHeal(key, valueRef, actual)
+				if s.config != nil && !s.config.StemMode && s.config.ActivateArchivedKeyOnRead {
+					if err := s.activateValueRef(key, actual); err != nil {
+						return nil, err
+					}
+				}
+				return value, nil
+			}
+			dumpVRefFailure(s, key, valueRef, actual, "shard.Get")
 			return nil, errors.New("archive bucket valueRef verification failed")
 		}
 	}
@@ -774,7 +868,15 @@ func (s *Shard) get(node Node, key []byte, depth int) ([]byte, bool, error) {
 	}
 	if fromArchive && len(valueRef) == common.HashLength {
 		actual, err := s.storedValueRef(key, value)
-		if err != nil || !bytes.Equal(valueRef, actual) {
+		if err != nil {
+			return nil, true, err
+		}
+		if !bytes.Equal(valueRef, actual) {
+			if s.selfHealStaleMembership(key, actual) {
+				recordVRefSelfHeal(key, valueRef, actual)
+				return value, true, nil
+			}
+			dumpVRefFailure(s, key, valueRef, actual, "shard.get")
 			return nil, true, errors.New("archive bucket valueRef verification failed")
 		}
 	}
@@ -869,6 +971,7 @@ func (s *Shard) getFromBucket(bucket *ArchiveBucketNode, key []byte, depth int) 
 	if len(valueRef) == common.HashLength {
 		actual, err := s.storedValueRef(key, value)
 		if err != nil || !bytes.Equal(valueRef, actual) {
+			dumpVRefFailure(s, key, valueRef, actual, "shard.getFromBucket")
 			return nil, true, errors.New("archive bucket valueRef verification failed")
 		}
 	}
@@ -928,6 +1031,9 @@ func (s *Shard) putLocked(key []byte, value []byte) error {
 }
 
 func (s *Shard) putValueRefLocked(key, valueRef []byte) error {
+	prevPhase := s.vrefPhase
+	s.setVRefPhase("write")
+	defer func() { s.vrefPhase = prevPhase }()
 	if s.root == nil && len(s.rootHash) > 0 {
 		var err error
 		s.root, err = s.loadNode(s.rootHash)
@@ -1025,6 +1131,9 @@ func (s *Shard) ActivateValueRef(key, valueRef []byte) error {
 }
 
 func (s *Shard) activateValueRef(key, valueRef []byte) error {
+	prevPhase := s.vrefPhase
+	s.setVRefPhase("activate")
+	defer func() { s.vrefPhase = prevPhase }()
 	if s.root == nil && len(s.rootHash) > 0 {
 		var err error
 		s.root, err = s.loadNode(s.rootHash)

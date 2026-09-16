@@ -389,6 +389,7 @@ func (s *Shard) blindAppendToBucket(bucket *ArchiveBucketNode, newItems []Archiv
 
 	// 3. 更新计数
 	bucket.Count += uint64(len(newItems))
+	s.recordBucketMembershipWrites("append", bucket, newItems)
 	for _, it := range newItems {
 		bucket.Keys = append(bucket.Keys, archivedKeyFromKV(it))
 	}
@@ -440,6 +441,7 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 		bucket.cacheMu.Unlock()
 		return
 	}
+	s.recordBucketMembershipDeletes(bucket, matchedDeletes)
 
 	oldHash := s.ensureBucketHash(bucket)
 	if s.pruning && (s.config == nil || s.config.PhysicalDelete) && len(oldHash) > 0 {
@@ -458,6 +460,7 @@ func (s *Shard) blindDeleteFromBucket(bucket *ArchiveBucketNode, deleteItems []A
 func (s *Shard) recomputeBucket(bucket *ArchiveBucketNode, items []ArchivedKV) {
 	recordBucketRecomputeIfEnabled(s.config)
 	items = s.deduplicateArchiveItems(items, bucket.Path, bucket.PathBits)
+	s.recordBucketMembershipWrites("recompute", bucket, items)
 	bucket.cacheMu.Lock()
 	defer bucket.cacheMu.Unlock()
 	bucket.dirty = true

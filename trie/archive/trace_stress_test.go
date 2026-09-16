@@ -1090,6 +1090,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	}
 
 	for batchNumber := int64(1); ; batchNumber++ {
+		if vRefDebugEnabled() {
+			SetVRefContext(fmt.Sprintf("batch=%d ops=%d", batchNumber, totalCounts.total()))
+		}
 		parseStart := time.Now()
 		remaining := *traceStressOps - totalCounts.total()
 		if *traceStressOps == 0 {

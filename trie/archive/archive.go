@@ -26,8 +26,10 @@ func (s *Shard) PruneWithDiagnostics(global byte) (diag ShardPruneDiagnostics, e
 	diag.DetailedCountersEnabled = s.config != nil && s.config.EnablePathDiagnostics
 	defer func() {
 		diag.TotalNanos = time.Since(totalStart).Nanoseconds()
+		s.vrefPhase = ""
 		s.mu.Unlock()
 	}()
+	s.setVRefPhase("prune")
 
 	loadStart := time.Now()
 	if s.root == nil && len(s.rootHash) > 0 {
@@ -1381,6 +1383,12 @@ func (s *Shard) pruneAndArchive(node Node, prefix []byte, prefixBits int, global
 
 		hasRemainingChildren := n.Left != nil || n.Right != nil || len(n.LeftHash) > 0 || len(n.RightHash) > 0
 		if len(allItems) > 0 && (hasRemainingChildren || len(n.StubList) > 0) {
+			// Absorption consumes matching incoming items. Clear all older
+			// memberships first; otherwise a later root cleanup cannot see the
+			// key and duplicate memberships at valid ancestor paths survive.
+			if _, err := s.removeArchiveItemsFromExistingBuckets(n, allItems, prefix, prefixBits); err != nil {
+				return nil, nil, nil, err
+			}
 			remaining, absorbed, err := s.absorbArchiveItemsIntoExistingBuckets(n, allItems, prefix, prefixBits)
 			if err != nil {
 				return nil, nil, nil, err
