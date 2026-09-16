@@ -128,6 +128,176 @@ func TestMPTArchivePruneReloadAndReadActivation(t *testing.T) {
 	}
 }
 
+func TestMPTCommitToBatchStagesCallerBatch(t *testing.T) {
+	db := &testStore{memorydb.New()}
+	tr := newTestTrie(t, db, false)
+	entries := map[string][]byte{
+		"a": []byte("alpha-value"),
+		"b": []byte("beta-value"),
+		"c": []byte("gamma-value"),
+	}
+	for key, value := range entries {
+		if err := tr.Put([]byte(key), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batch := db.NewBatch()
+	root, err := tr.CommitToBatch(batch, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(root) != 32 {
+		t.Fatalf("CommitToBatch returned root of length %d", len(root))
+	}
+	if batch.ValueSize() == 0 {
+		t.Fatal("CommitToBatch staged nothing into the caller batch")
+	}
+	// The writes must live in the batch, not the store: a flat record read
+	// before the caller's flush must still be missing (T1 commit-merge —
+	// the trie may no longer open a private batch and self-flush).
+	if _, err := db.Get(flatKey([]byte("a"))); err == nil {
+		t.Fatal("flat record visible before batch flush")
+	}
+	if err := batch.Write(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := New(root, db, &Config{ShardDepth: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range entries {
+		got, err := reloaded.Get([]byte(key))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("reloaded Get(%q) = %q, %v; want %q", key, got, err, want)
+		}
+	}
+}
+
+func TestMPTCommitToBatchMatchesCommit(t *testing.T) {
+	// The shared-batch path and the self-managed Commit path must stay
+	// bit-identical, including across a prune round (nodes, archive
+	// records, index and aggregate all ride the caller batch).
+	seed := map[string][]byte{
+		"a": []byte("one"),
+		"b": []byte("two"),
+		"c": []byte("three"),
+		"d": []byte("four"),
+	}
+	run := func(t *testing.T, shared bool) []byte {
+		t.Helper()
+		db := &testStore{memorydb.New()}
+		tr := newTestTrie(t, db, false)
+		for key, value := range seed {
+			if err := tr.Put([]byte(key), value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var root []byte
+		var err error
+		if shared {
+			var batch archivetrie.Batcher = db.NewBatch()
+			root, err = tr.CommitToBatch(batch, false)
+			if err == nil {
+				err = batch.Write()
+			}
+		} else {
+			root, err = tr.Commit()
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tr.PruneNextShard(); err != nil {
+			t.Fatal(err)
+		}
+		if err := tr.Delete([]byte("b")); err != nil {
+			t.Fatal(err)
+		}
+		if shared {
+			batch := db.NewBatch()
+			root, err = tr.CommitToBatch(batch, true)
+			if err == nil {
+				err = batch.Write()
+			}
+		} else {
+			root, err = tr.Commit()
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return root
+	}
+	viaCommit := run(t, false)
+	viaBatch := run(t, true)
+	if !bytes.Equal(viaCommit, viaBatch) {
+		t.Fatalf("root divergence: Commit=%x CommitToBatch=%x", viaCommit, viaBatch)
+	}
+}
+
+func TestMPTIncrementalAggregateMatchesRebuild(t *testing.T) {
+	// T2: Commit stages only this batch's shard roots into the persistent
+	// aggregate trie. Hash() still rebuilds the aggregate from scratch over
+	// all shard roots, so Root==Hash after every round proves the
+	// incremental path cannot diverge from the full rebuild — across writes,
+	// deletes, prunes (aggregate entries removed via the delete branch) and
+	// reloads from the durable root.
+	db := &testStore{memorydb.New()}
+	tr := newTestTrie(t, db, false)
+	key := func(round, i int) []byte {
+		return []byte{byte('a' + round%26), byte('a' + i%26), byte(round*7 + i*13), byte(round)}
+	}
+	check := func(round int) {
+		t.Helper()
+		root, err := tr.Hash()
+		if err != nil {
+			t.Fatalf("round %d Hash: %v", round, err)
+		}
+		got := tr.Root()
+		if (got == nil) != (root == nil) || !bytes.Equal(got, root) {
+			t.Fatalf("round %d: incremental root %x != rebuild root %x", round, got, root)
+		}
+	}
+	for round := 1; round <= 6; round++ {
+		for i := 0; i < 6; i++ {
+			value := []byte{byte(round), byte(i), 'v'}
+			if err := tr.Put(key(round, i), value); err != nil {
+				t.Fatalf("round %d Put: %v", round, err)
+			}
+		}
+		batch := db.NewBatch()
+		if _, err := tr.CommitToBatch(batch, false); err != nil {
+			t.Fatalf("round %d CommitToBatch: %v", round, err)
+		}
+		if err := batch.Write(); err != nil {
+			t.Fatalf("round %d Write: %v", round, err)
+		}
+		check(round)
+	}
+	// Prune drains shard roots from the aggregate via the delete branch.
+	for round := 7; round <= 10; round++ {
+		if err := tr.PruneNextShard(); err != nil {
+			t.Fatalf("round %d Prune: %v", round, err)
+		}
+		if _, err := tr.Commit(); err != nil {
+			t.Fatalf("round %d Commit: %v", round, err)
+		}
+		check(round)
+	}
+	// Reload from the durable root and keep committing on the reopened
+	// aggregate: exercises ensureAggregateLocked's open-from-root path.
+	reloaded, err := New(tr.Root(), db, &Config{ShardDepth: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr = reloaded
+	if err := tr.Put(key(11, 0), []byte("after-reload")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	check(11)
+}
+
 func TestMPTArchiveDeleteArchivedKey(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr := newTestTrie(t, db, false)

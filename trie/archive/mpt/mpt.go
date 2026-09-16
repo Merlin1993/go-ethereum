@@ -80,6 +80,12 @@ type Trie struct {
 	shardRoot map[int][]byte
 	dirty     map[int]struct{}
 
+	// aggregate is the persistent shard-root trie opened from the last
+	// committed root. Commit stages only this batch's shard-root updates
+	// into it (T2 incremental aggregate, 2026-09-16); it replaces the
+	// per-batch full rebuild that cost O(all shards x depth) hashing.
+	aggregate *gethtrie.Trie
+
 	archives          map[int]*archiveShard
 	archiveIDs        map[int]struct{}
 	archiveIndexDirty bool
@@ -272,6 +278,26 @@ func (t *Trie) hotLocked(id int) (*gethtrie.Trie, error) {
 }
 
 func (t *Trie) markDirtyLocked(id int) { t.dirty[id] = struct{}{} }
+
+// ensureAggregateLocked opens (or lazily reopens) the persistent shard-root
+// aggregate at the last committed root. Commit stages only the batch's dirty
+// shard roots into this trie, so each commit rehashes only the touched
+// aggregate paths instead of rebuilding all shard entries (T2, 2026-09-16).
+func (t *Trie) ensureAggregateLocked() error {
+	if t.aggregate != nil {
+		return nil
+	}
+	if len(t.root) == 0 {
+		t.aggregate = gethtrie.NewEmpty(t.ndb)
+		return nil
+	}
+	aggregate, err := gethtrie.New(gethtrie.TrieID(common.BytesToHash(t.root)), t.ndb)
+	if err != nil {
+		return err
+	}
+	t.aggregate = aggregate
+	return nil
+}
 
 func (t *Trie) loadArchiveLocked(id int) (*archiveShard, error) {
 	if shard := t.archives[id]; shard != nil && shard.loaded {
@@ -689,8 +715,23 @@ func (t *Trie) encodeArchiveIndex() []byte {
 	return data
 }
 
+// CommitToBatch stages dirty MPT nodes, archive records, flat values and the
+// aggregate shard-root MPT into the CALLER's batch and returns the new root.
+// The writes become durable only when the caller flushes the batch with
+// Write; the caller owns the batch lifecycle. The trie's in-memory state
+// advances as if committed, so a staged batch must not be discarded after a
+// successful call. destructive is accepted for hot-layer interface parity and
+// is a no-op: committed shard tries are already released.
+func (t *Trie) CommitToBatch(batch archivetrie.Batcher, destructive bool) ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.commitToBatchLocked(batch)
+}
+
 // Commit persists dirty MPT nodes, archive records, flat values and the
-// aggregate shard-root MPT in one database batch.
+// aggregate shard-root MPT in one self-managed database batch. Drivers that
+// already own a shared batch should call CommitToBatch instead so the write
+// rides the driver's flush (T1 commit-merge, 2026-09-16).
 func (t *Trie) Commit() ([]byte, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -710,6 +751,9 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 	if len(t.dirty) == 0 && len(t.pendingValues) == 0 && len(t.pendingDelete) == 0 && !t.archiveIndexDirty {
 		return bytes.Clone(t.root), nil
 	}
+	if err := t.ensureAggregateLocked(); err != nil {
+		return nil, err
+	}
 	ids := make([]int, 0, len(t.dirty))
 	for id := range t.dirty {
 		ids = append(ids, id)
@@ -719,6 +763,9 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		hot := t.shards[id]
 		if hot == nil {
 			delete(t.shardRoot, id)
+			if err := t.aggregate.Delete(shardKey(id)); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		root, nodes := hot.Commit(false)
@@ -727,20 +774,23 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		}
 		if normalized := normalizeRoot(root.Bytes()); normalized != nil {
 			t.shardRoot[id] = normalized
+			if err := t.aggregate.Update(shardKey(id), normalized); err != nil {
+				return nil, err
+			}
 		} else {
 			delete(t.shardRoot, id)
+			if err := t.aggregate.Delete(shardKey(id)); err != nil {
+				return nil, err
+			}
 		}
 		t.shards[id] = nil
 	}
-	roots := make(map[int][]byte, len(t.shardRoot))
-	for id, root := range t.shardRoot {
-		roots[id] = bytes.Clone(root)
-	}
-	aggregate, err := t.buildAggregate(roots)
-	if err != nil {
-		return nil, err
-	}
-	aggregateRoot, nodes := aggregate.Commit(false)
+	aggregateRoot, nodes := t.aggregate.Commit(false)
+	// A committed geth trie is single-use; drop the handle so the next
+	// commit reopens lazily from aggregateRoot. Reopening hashes nothing —
+	// interior nodes come from the node cache — so the incremental cost
+	// stays proportional to this batch's dirty shards.
+	t.aggregate = nil
 	if err := writeNodeSet(batch, nodes); err != nil {
 		return nil, err
 	}
