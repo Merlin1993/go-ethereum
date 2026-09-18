@@ -1932,4 +1932,18 @@ func SetMPTCommitStagedBytes(hotNode, aggregateNode, archive, flat, index int64)
 func SetMPTNodeCacheStats(gets, hits int64) {
 	atomic.StoreInt64(&commitDiagMPTNodeCacheGets, gets)
 	atomic.StoreInt64(&commitDiagMPTNodeCacheHits, hits)
+} // OpTraceProbe reports cumulative per-operation timing breakdowns from the
+// hot layer (plan item T4). The MPT package registers it when MPT_OP_TRACE is
+// set, mirroring the TraceHotTrieNew hook; nil means the probe is unavailable
+// or the gate is closed.
+var OpTraceProbe func() map[string]int64
+
+// RecordMPTReadPromotion lets the MPT hot layer report a read-triggered
+// resurrection with the same semantics the binary layer uses around
+// activateValueRef: the timer covers the promotion itself (archive removal +
+// hot reinsert), hit=true on success. Without this hook the
+// Archive_Read_Promotion_* columns are always zero for mpt runs and the
+// resurrection cost hides unlabeled inside Operations_ms.
+func RecordMPTReadPromotion(elapsed time.Duration, hit bool) {
+	recordArchiveReadPromotion(elapsed, hit)
 }

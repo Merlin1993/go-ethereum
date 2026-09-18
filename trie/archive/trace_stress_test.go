@@ -54,7 +54,13 @@ var (
 	traceStressActivateArchivedStemOnRead = flag.Bool("traceStressActivateArchivedStemOnRead", false, "Activate an archived stem when a read finds it")
 	traceStressActivateArchivedKeyOnRead  = flag.Bool("traceStressActivateArchivedKeyOnRead", false, "Activate an archived AMT key when a read finds it")
 	traceStressDisableArchive             = flag.Bool("traceStressDisableArchive", false, "Do not call PruneNextShard during the trace run")
-	traceStressHotLayer                   = flag.String("traceStressHotLayer", "amt", `Hot-layer backend: "amt" (binary key-level trie) or "mpt" (A6 hexary MPT fallback)`)
+	traceStressHotLayer                   = flag.String("traceStressHotLayer", "mpt", `Hot-layer backend: "amt" (binary key-level trie) or "mpt" (hexary-MPT layer)`)
+	traceStressDomainNibbles              = flag.Int("traceStressDomainNibbles", 4, "Logical archive domain width in nibbles for the MPT hot layer (domains = 16^this)")
+	traceStressArchiveResidentEntries     = flag.Int("traceStressArchiveResidentEntries", 0, "MPT hot layer: cap on memory-resident archived entries across all buckets (0 = engine default)")
+	traceStressTrieBackend                = flag.String("traceStressTrieBackend", "hashdb", `MPT hot-layer node store: "hashdb" (content-addressed) or "pathdb" (triedb.PathDatabase, path-addressed)`)
+	traceStressPathCleanCacheMB           = flag.Int("traceStressPathCleanCacheMB", 64, "pathdb clean cache size in MiB")
+	traceStressPathWriteBufferMB          = flag.Int("traceStressPathWriteBufferMB", 256, "pathdb dirty write buffer size in MiB (larger = fewer, fatter flushes)")
+	traceStressPathFlushEveryBatches      = flag.Int("traceStressPathFlushEveryBatches", 0, "Force a pathdb flush to disk every N commits; 0 lets pathdb decide")
 	traceStressCuckooBuckets              = flag.Int("traceStressCuckooBuckets", 32, "Archive cuckoo filter bucket count")
 	traceStressCuckooSlots                = flag.Int("traceStressCuckooSlots", 4, "Archive cuckoo filter slots per bucket")
 	traceStatsBaseDir                     = flag.String("traceStatsBaseDir", "", "Existing TestArchiveStemTraceStress base directory for TestArchiveStemTraceStorageStats")
@@ -459,8 +465,13 @@ func classifyTraceStressAccessAMT(hot TraceHotTrie, key []byte) (bool, error) {
 }
 
 // TraceHotTrie is the hot-layer surface TestArchiveStemTraceStress drives.
-// *Trie (binary AMT hot layer) implements it directly; the A6 hexary-MPT
-// fallback is wired through TraceHotTrieNew below.
+// *Trie (binary AMT hot layer) implements it directly; the hexary-MPT layer is
+// wired through TraceHotTrieNew below.
+//
+// Flush is deliberately NOT part of this interface. Only the path-backed layer
+// needs one, and adding it here would force every existing implementation to
+// grow a method that does nothing; the driver probes for it with a type
+// assertion instead.
 type TraceHotTrie interface {
 	Get(key []byte) ([]byte, error)
 	Put(key, value []byte) error
@@ -470,6 +481,23 @@ type TraceHotTrie interface {
 	CommitToBatch(batch Batcher, destructive bool) ([]byte, error)
 }
 
+// TraceHotTrieSpec carries every hot-layer construction option. It is a struct
+// rather than a positional argument list because the set keeps growing with each
+// backend experiment, and a positional signature would churn on every addition.
+type TraceHotTrieSpec struct {
+	Kind                      string
+	DB                        KVStore
+	DomainNibbles             int
+	CuckooBuckets             int
+	CuckooSlots               int
+	ActivateArchivedKeyOnRead bool
+	Backend                   string
+	CleanCacheBytes           int
+	WriteBufferBytes          int
+	FlushEveryBatches         int
+	ArchiveResidentEntries    int
+}
+
 // TraceHotTrieNew constructs the alternative hot layer named by
 // -traceStressHotLayer. It is nil inside this package to avoid an import
 // cycle (trie/archive/mpt imports trie/archive); the external test package
@@ -477,7 +505,7 @@ type TraceHotTrie interface {
 // requested backend must fail the run loudly, never fall back silently.
 // Adapters translate "key absent" into ErrNodeNotFound, the sentinel the
 // workload treats as a miss.
-var TraceHotTrieNew func(kind string, db KVStore, shardDepth, cuckooBuckets, cuckooSlots int, activateArchivedKeyOnRead bool) (TraceHotTrie, error)
+var TraceHotTrieNew func(spec TraceHotTrieSpec) (TraceHotTrie, error)
 
 func (s *traceStressAccessStats) merge(other traceStressAccessStats) {
 	s.Samples += other.Samples
@@ -850,7 +878,20 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	}
 	defer reader.Close()
 
-	archivePeriodOps := (int64(1) << uint(*traceStressShardDepth)) * int64(*traceStressBatchSize)
+	// One archive round is one prune per rotation unit, spaced by the prune
+	// cadence. The binary hot layer rotates over 2^ShardDepth shards; the MPT
+	// hot layer rotates over 16^DomainNibbles logical domains. Block-cadence
+	// mode (PruneEveryBlocks) has no fixed ops-per-round; this stays a
+	// batches-mode estimate as before.
+	archiveRoundDomains := int64(1) << uint(*traceStressShardDepth)
+	if *traceStressHotLayer == "mpt" {
+		archiveRoundDomains = int64(1) << uint(4*(*traceStressDomainNibbles))
+	}
+	pruneEveryBatches := int64(*traceStressPruneEveryBatches)
+	if pruneEveryBatches < 1 {
+		pruneEveryBatches = 1
+	}
+	archivePeriodOps := archiveRoundDomains * pruneEveryBatches * int64(*traceStressBatchSize)
 	stemCacheLimitMetadata := any(*traceStressStemCacheLimit)
 	stemCacheMBMetadata := any(*traceStressStemCacheMB)
 	stemActivationMetadata := any(*traceStressActivateArchivedStemOnRead)
@@ -860,37 +901,44 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		stemActivationMetadata = "not_applicable"
 	}
 	metadata := map[string]any{
-		"generated_at":          time.Now().Format(time.RFC3339),
-		"base_dir":              *traceStressBaseDir,
-		"input_dir":             *traceStressInputDir,
-		"source_files":          reader.files,
-		"start_file":            *traceStressStartFile,
-		"requested_start_file":  *traceStressStartFile,
-		"file_limit":            *traceStressFileLimit,
-		"operations":            *traceStressOps,
-		"start_block":           *traceStressStartBlock,
-		"requested_start_block": *traceStressStartBlock,
-		"effective_start_file":  *traceStressStartFile,
-		"effective_start_block": nil,
-		"end_block":             *traceStressEndBlock,
-		"block_count":           *traceStressBlocks,
-		"batch_size":            *traceStressBatchSize,
-		"metrics_batches":       *traceStressMetricsBatches,
-		"shard_depth":           *traceStressShardDepth,
-		"stem_mode":             *traceStressStemMode,
-		"stem_cache_limit":      stemCacheLimitMetadata,
-		"stem_cache_mb":         stemCacheMBMetadata,
-		"node_cache_limit":      *traceStressNodeCacheLimit,
-		"node_cache_mb":         *traceStressNodeCacheMB,
-		"commit_workers":        *traceStressCommitWorkers,
-		"async_prune":           *traceStressAsyncPrune,
-		"prune_every_batches":   *traceStressPruneEveryBatches,
-		"prune_every_blocks":    *traceStressPruneEveryBlocks,
-		"disable_archive":       *traceStressDisableArchive,
-		"hot_layer":             *traceStressHotLayer,
-		"archive_period_ops":    archivePeriodOps,
-		"cuckoo_buckets":        *traceStressCuckooBuckets,
-		"cuckoo_slots":          *traceStressCuckooSlots,
+		"generated_at":             time.Now().Format(time.RFC3339),
+		"base_dir":                 *traceStressBaseDir,
+		"input_dir":                *traceStressInputDir,
+		"source_files":             reader.files,
+		"start_file":               *traceStressStartFile,
+		"requested_start_file":     *traceStressStartFile,
+		"file_limit":               *traceStressFileLimit,
+		"operations":               *traceStressOps,
+		"start_block":              *traceStressStartBlock,
+		"requested_start_block":    *traceStressStartBlock,
+		"effective_start_file":     *traceStressStartFile,
+		"effective_start_block":    nil,
+		"end_block":                *traceStressEndBlock,
+		"block_count":              *traceStressBlocks,
+		"batch_size":               *traceStressBatchSize,
+		"metrics_batches":          *traceStressMetricsBatches,
+		"shard_depth":              *traceStressShardDepth,
+		"stem_mode":                *traceStressStemMode,
+		"stem_cache_limit":         stemCacheLimitMetadata,
+		"stem_cache_mb":            stemCacheMBMetadata,
+		"node_cache_limit":         *traceStressNodeCacheLimit,
+		"node_cache_mb":            *traceStressNodeCacheMB,
+		"commit_workers":           *traceStressCommitWorkers,
+		"async_prune":              *traceStressAsyncPrune,
+		"prune_every_batches":      *traceStressPruneEveryBatches,
+		"prune_every_blocks":       *traceStressPruneEveryBlocks,
+		"disable_archive":          *traceStressDisableArchive,
+		"hot_layer":                *traceStressHotLayer,
+		"domain_nibbles":           *traceStressDomainNibbles,
+		"domain_count":             1 << uint(4**traceStressDomainNibbles),
+		"trie_backend":             *traceStressTrieBackend,
+		"clean_cache_mb":           *traceStressPathCleanCacheMB,
+		"write_buffer_mb":          *traceStressPathWriteBufferMB,
+		"flush_every_batches":      *traceStressPathFlushEveryBatches,
+		"archive_resident_entries": *traceStressArchiveResidentEntries,
+		"archive_period_ops":       archivePeriodOps,
+		"cuckoo_buckets":           *traceStressCuckooBuckets,
+		"cuckoo_slots":             *traceStressCuckooSlots,
 		"archive_bucket_size": func() int {
 			c := DefaultConfig()
 			c.CuckooBuckets = *traceStressCuckooBuckets
@@ -950,7 +998,19 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		if TraceHotTrieNew == nil {
 			t.Fatal("traceStressHotLayer=mpt requested but the MPT hot-layer hook is not registered (external test package archive_test missing?)")
 		}
-		hotBackend, err = TraceHotTrieNew(*traceStressHotLayer, &stressDBAdapter{db}, *traceStressShardDepth, *traceStressCuckooBuckets, *traceStressCuckooSlots, *traceStressActivateArchivedKeyOnRead)
+		hotBackend, err = TraceHotTrieNew(TraceHotTrieSpec{
+			Kind:                      *traceStressHotLayer,
+			DB:                        &stressDBAdapter{db},
+			DomainNibbles:             *traceStressDomainNibbles,
+			CuckooBuckets:             *traceStressCuckooBuckets,
+			CuckooSlots:               *traceStressCuckooSlots,
+			ActivateArchivedKeyOnRead: *traceStressActivateArchivedKeyOnRead,
+			Backend:                   *traceStressTrieBackend,
+			CleanCacheBytes:           *traceStressPathCleanCacheMB << 20,
+			WriteBufferBytes:          *traceStressPathWriteBufferMB << 20,
+			FlushEveryBatches:         *traceStressPathFlushEveryBatches,
+			ArchiveResidentEntries:    *traceStressArchiveResidentEntries,
+		})
 		if err != nil {
 			t.Fatalf("hot layer %q: %v", *traceStressHotLayer, err)
 		}
@@ -985,6 +1045,26 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	defer metricsFile.Close()
 	metrics := csv.NewWriter(metricsFile)
 	defer metrics.Flush()
+
+	// T4 op-trace: a separate per-window CSV so the main metrics schema stays
+	// untouched. Written only when MPT_OP_TRACE is set and the hot layer
+	// registered a probe (OpTraceProbe), and rows are deltas between windows.
+	var opTraceWriter *csv.Writer
+	var opTraceFile *os.File
+	var prevOpTrace map[string]int64
+	if os.Getenv("MPT_OP_TRACE") != "" && OpTraceProbe != nil {
+		opTraceFile, err = os.Create(filepath.Join(resultsDir, "op_trace.csv"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer opTraceFile.Close()
+		opTraceWriter = csv.NewWriter(opTraceFile)
+		defer opTraceWriter.Flush()
+		if err := opTraceWriter.Write([]string{"Window_End_Batch", "Ops", "Hot_ns", "Probe_ns", "Loads", "Load_ns", "Removes", "Remove_ns", "Evictions"}); err != nil {
+			t.Fatal(err)
+		}
+		prevOpTrace = OpTraceProbe()
+	}
 	header := []string{
 		"Window_Start_Batch", "Window_End_Batch", "Total_Batches", "Archive_Round_Completed", "Archive_Round_Progress", "Total_Operations", "First_Block", "Last_Block",
 		"Window_Operations", "Reads", "Touches", "Writes", "Creates", "Deletes",
@@ -1095,9 +1175,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		workloadFilter := filterStatsFromDiagnostics(updateDiag).sub(window.classificationFilter)
 		hotReadRate := traceStressRatio(window.access.ReadHot, sampledExistingReads)
 		runtimeFilterFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.Negatives)
-		archiveRoundSize := int64(1) << uint(*traceStressShardDepth)
-		archiveRoundCompleted := prunesDone / archiveRoundSize
-		archiveRoundProgress := prunesDone % archiveRoundSize
+		archiveRoundCompleted := prunesDone / archiveRoundDomains
+		archiveRoundProgress := prunesDone % archiveRoundDomains
 		row := []string{
 			strconv.FormatInt(batchNumber-int64(len(window.batchWall))+1, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(archiveRoundCompleted, 10), strconv.FormatInt(archiveRoundProgress, 10), strconv.FormatInt(totalCounts.total(), 10),
 			strconv.FormatUint(window.firstBlock, 10), strconv.FormatUint(window.lastBlock, 10), strconv.FormatInt(window.counts.total(), 10),
@@ -1135,6 +1214,21 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		metrics.Flush()
 		if err := metrics.Error(); err != nil {
 			t.Fatal(err)
+		}
+		if opTraceWriter != nil {
+			snap := OpTraceProbe()
+			delta := func(key string) int64 { return snap[key] - prevOpTrace[key] }
+			if err := opTraceWriter.Write([]string{
+				strconv.FormatInt(batchNumber, 10),
+				strconv.FormatInt(delta("ops"), 10), strconv.FormatInt(delta("hot_ns"), 10),
+				strconv.FormatInt(delta("probe_ns"), 10), strconv.FormatInt(delta("loads"), 10),
+				strconv.FormatInt(delta("load_ns"), 10), strconv.FormatInt(delta("removes"), 10),
+				strconv.FormatInt(delta("remove_ns"), 10), strconv.FormatInt(delta("evictions"), 10),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			opTraceWriter.Flush()
+			prevOpTrace = snap
 		}
 		fmt.Printf("[TRACE_STRESS] batches=%d/%d ops=%d block=%d cache=%d hits=%d misses=%d db=%d rate=%.0f ops/s\n",
 			batchNumber, totalBatches, totalCounts.total(), window.lastBlock, cache.Entries, window.stemHits, window.stemMisses, getDirSize(stateDir), opsPerSec)
@@ -1309,6 +1403,15 @@ func TestArchiveStemTraceStress(t *testing.T) {
 
 	var finalStats *TrieStats
 	var finalStatsDur time.Duration
+	// Buffered pathdb writes must reach disk before anything measures what is
+	// actually stored, otherwise the final root is not resolvable from the
+	// database and the storage scan measures nothing. Layers without a buffered
+	// write tier simply do not implement Flush.
+	if flusher, ok := hotBackend.(interface{ Flush() error }); ok {
+		if err := flusher.Flush(); err != nil {
+			t.Fatalf("final hot-layer flush: %v", err)
+		}
+	}
 	if *traceStressFinalStats {
 		statsStart := time.Now()
 		if amt, ok := hotBackend.(*Trie); ok {
@@ -1373,8 +1476,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"operations":                            totalCounts.total(),
 		"batches":                               totalBatches,
 		"prunes_done":                           prunesDone,
-		"archive_round_completed":               prunesDone / (int64(1) << uint(*traceStressShardDepth)),
-		"archive_round_progress":                prunesDone % (int64(1) << uint(*traceStressShardDepth)),
+		"archive_round_domains":                 archiveRoundDomains,
+		"archive_round_completed":               prunesDone / archiveRoundDomains,
+		"archive_round_progress":                prunesDone % archiveRoundDomains,
 		"requested_operations":                  *traceStressOps,
 		"first_block":                           selection.firstBlock,
 		"last_block":                            selection.lastBlock,
@@ -1419,6 +1523,22 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"stem_path_diagnostics": updateDiag,
 		"final_stats_ms":        float64(finalStatsDur) / float64(time.Millisecond),
 		"final_stats":           finalStats,
+	}
+	// G2 accounting: with the path backend the LevelDB directory size misses
+	// nodes still held in pathdb's write buffer and diff layers, so report the
+	// written/buffered/diff components and their sum as the active-layer total.
+	if ps, ok := hotBackend.(interface {
+		PathStats() (written, writes, buffered, diff int64)
+	}); ok {
+		written, writes, buffered, diff := ps.PathStats()
+		summary["path_hot_written_bytes"] = written
+		summary["path_hot_writes"] = writes
+		summary["path_hot_buffered_bytes"] = buffered
+		summary["path_hot_diff_bytes"] = diff
+		summary["active_layer_bytes_total"] = written + buffered + diff
+	}
+	if OpTraceProbe != nil && os.Getenv("MPT_OP_TRACE") != "" {
+		summary["op_trace_total"] = OpTraceProbe()
 	}
 	if err := writeTraceStressJSON(filepath.Join(resultsDir, "summary.json"), summary); err != nil {
 		t.Fatal(err)
