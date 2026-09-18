@@ -85,6 +85,9 @@ const (
 	// (fresh M-sized buckets) and the remainder pushes down by longest common
 	// prefix before materializing a partial bucket.
 	defaultBucketCapacity = 100
+
+	// DefaultBucketCapacity exports M for experiment metadata reporting.
+	DefaultBucketCapacity = defaultBucketCapacity
 )
 
 // Backend selectors for Config.Backend.
@@ -920,7 +923,10 @@ func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []byte, bool, error
 	}
 	value, ok := hit.entries[string(key)]
 	if !ok {
-		return nil, nil, false, nil // cuckoo false positive
+		// The filter claimed the key but the payload denies it: a genuine
+		// cuckoo false positive — feed the G4 telemetry.
+		archivetrie.RecordMPTFilterFalsePositive()
+		return nil, nil, false, nil
 	}
 	return hit, bytes.Clone(value), true, nil
 }

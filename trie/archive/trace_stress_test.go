@@ -319,6 +319,15 @@ type traceStressFilterStats struct {
 	FalsePositives int64
 }
 
+// bucketCapacityMetadata reports the mpt bucket capacity M registered by the
+// hot-layer hook package; nil when the hook is absent (amt runs).
+func bucketCapacityMetadata() any {
+	if TraceMPTBucketCapacity > 0 {
+		return TraceMPTBucketCapacity
+	}
+	return nil
+}
+
 func filterStatsFromDiagnostics(d UpdateDiagnostics) traceStressFilterStats {
 	return traceStressFilterStats{
 		Lookups:        d.ArchiveFilterLookups,
@@ -930,7 +939,11 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"disable_archive":          *traceStressDisableArchive,
 		"hot_layer":                *traceStressHotLayer,
 		"domain_nibbles":           *traceStressDomainNibbles,
+		"domain_depth_nibbles":     *traceStressDomainNibbles, // P6 alias: depth semantics
 		"domain_count":             1 << uint(4**traceStressDomainNibbles),
+		"epoch_bitmap":             *traceStressHotLayer == "mpt",
+		"hot_value_layout":         map[bool]string{true: "inline", false: "flatref"}[*traceStressHotLayer == "mpt"],
+		"archive_bucket_capacity":  bucketCapacityMetadata(),
 		"trie_backend":             *traceStressTrieBackend,
 		"clean_cache_mb":           *traceStressPathCleanCacheMB,
 		"write_buffer_mb":          *traceStressPathWriteBufferMB,

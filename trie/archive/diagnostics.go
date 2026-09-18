@@ -1938,6 +1938,11 @@ func SetMPTNodeCacheStats(gets, hits int64) {
 // or the gate is closed.
 var OpTraceProbe func() map[string]int64
 
+// TraceMPTBucketCapacity mirrors the mpt bucket capacity M into metadata
+// without the in-package stress test importing mpt (import cycle). The
+// external hook package sets it at registration; zero means unavailable.
+var TraceMPTBucketCapacity int
+
 // RecordMPTReadPromotion lets the MPT hot layer report a read-triggered
 // resurrection with the same semantics the binary layer uses around
 // activateValueRef: the timer covers the promotion itself (archive removal +
@@ -1946,4 +1951,11 @@ var OpTraceProbe func() map[string]int64
 // resurrection cost hides unlabeled inside Operations_ms.
 func RecordMPTReadPromotion(elapsed time.Duration, hit bool) {
 	recordArchiveReadPromotion(elapsed, hit)
+}
+
+// RecordMPTFilterFalsePositive lets the MPT hot layer report a cuckoo
+// false positive (filter claimed a key, exact payload check missed) into
+// the shared G4 telemetry counters.
+func RecordMPTFilterFalsePositive() {
+	recordArchiveFilterFalsePositive()
 }

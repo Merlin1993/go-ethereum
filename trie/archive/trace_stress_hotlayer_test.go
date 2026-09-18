@@ -75,6 +75,7 @@ func (h mptHotLayer) PathStats() (written, writes, buffered, diff int64) {
 }
 
 func init() {
+	archive.TraceMPTBucketCapacity = mpt.DefaultBucketCapacity
 	archive.TraceHotTrieNew = func(spec archive.TraceHotTrieSpec) (archive.TraceHotTrie, error) {
 		if spec.Kind != "mpt" {
 			return nil, errors.New("trace hot layer hook: unsupported kind " + spec.Kind)
