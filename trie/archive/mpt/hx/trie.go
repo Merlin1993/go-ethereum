@@ -18,6 +18,7 @@ package hx
 
 import (
 	"bytes"
+	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -448,6 +449,100 @@ func (t *Trie) hashRoot() (node, node) {
 	}()
 	hashed, cached := h.hash(t.root, true)
 	return hashed, cached
+}
+
+// LeafEpoch reports the lifecycle bit of the leaf at key. Diagnostics and
+// tests only; the prune path reads epochs from the nodes it visits directly.
+func (t *Trie) LeafEpoch(key []byte) (byte, bool, error) {
+	if t.committed {
+		return 0, false, ErrCommitted
+	}
+	n := t.root
+	pos := 0
+	hexKey := keybytesToHex(key)
+	for {
+		switch nn := n.(type) {
+		case nil:
+			return 0, false, nil
+		case *shortNode:
+			if !bytes.HasPrefix(hexKey[pos:], nn.Key) {
+				return 0, false, nil
+			}
+			pos += len(nn.Key)
+			if _, ok := nn.Val.(valueNode); ok {
+				return nn.Epoch, true, nil
+			}
+			n = nn.Val
+		case *fullNode:
+			n = nn.Children[hexKey[pos]]
+			pos++
+		case hashNode:
+			resolved, err := t.resolveAndTrack(nn, hexKey[:pos])
+			if err != nil {
+				return 0, false, err
+			}
+			n = resolved
+		case valueNode:
+			return 0, false, nil // branch value: no epoch carrier
+		default:
+			panic("hx: invalid node type")
+		}
+	}
+}
+
+// VerifyAggregates walks the whole tree and checks every aggregate indicator
+// against the actual subtree contents. O(tree size) — tests and audits only.
+func (t *Trie) VerifyAggregates() error {
+	if t.committed {
+		return ErrCommitted
+	}
+	_, err := t.verifyNode(t.root, nil)
+	return err
+}
+
+func (t *Trie) verifyNode(n node, prefix []byte) (uint8, error) {
+	switch n := n.(type) {
+	case nil:
+		return aggEmpty, nil
+	case valueNode:
+		return aggEmpty, nil
+	case *shortNode:
+		if _, isVal := n.Val.(valueNode); isVal {
+			return epochToAgg(n.Epoch), nil
+		}
+		childAgg, err := t.verifyNode(n.Val, concat(prefix, n.Key...))
+		if err != nil {
+			return aggEmpty, err
+		}
+		if n.Agg != childAgg {
+			return aggEmpty, fmt.Errorf("hx: ext at %x agg %d, subtree %d", prefix, n.Agg, childAgg)
+		}
+		return n.Agg, nil
+	case *fullNode:
+		agg, seen := uint8(0), false
+		for i := 0; i < 16; i++ {
+			childAgg, err := t.verifyNode(n.Children[i], concat(prefix, byte(i)))
+			if err != nil {
+				return aggEmpty, err
+			}
+			if got := n.getAgg(i); got != childAgg {
+				return aggEmpty, fmt.Errorf("hx: branch at %x slot %d agg %d, subtree %d", prefix, i, got, childAgg)
+			}
+			agg, seen = combineAgg(agg, seen, childAgg)
+		}
+		if !seen {
+			return aggEmpty, nil
+		}
+		return agg, nil
+	case hashNode:
+		resolved, err := t.resolveAndTrack(n, prefix)
+		if err != nil {
+			return aggEmpty, err
+		}
+		return t.verifyNode(resolved, prefix)
+	default:
+		return aggEmpty, fmt.Errorf("hx: verifyNode on %T", n)
+	}
 }
 
 // CollectLeaves walks the whole tree (resolving from disk as needed) and

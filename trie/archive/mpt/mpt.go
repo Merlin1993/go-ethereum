@@ -87,10 +87,14 @@ const (
 )
 
 var (
-	nodePrefix    = []byte{'M', 'P', 'T', 'N', 1}
-	archivePrefix = []byte{'M', 'P', 'T', 'A', 1}
-	indexPrefix   = []byte{'M', 'P', 'T', 'I', 1}
+	nodePrefix     = []byte{'M', 'P', 'T', 'N', 1}
+	archivePrefix  = []byte{'M', 'P', 'T', 'A', 1}
+	indexPrefix    = []byte{'M', 'P', 'T', 'I', 1}
+	schedulePrefix = []byte{'M', 'P', 'T', 'S', 1}
 )
+
+// scheduleVersion is the on-disk version of the prune-schedule record.
+const scheduleVersion = byte(1)
 
 // Config controls the MPT hot layer. DomainNibbles replaces the old ShardDepth:
 // domains are now counted in hex nibbles rather than bits, because in a single
@@ -200,7 +204,14 @@ type Trie struct {
 	// load per instrumented section (plan item T4).
 	opTrace bool
 
+	// Epoch schedule (P4b, paper's dynamic assignment rule). baseBit is the
+	// globally alternating cycle bit G. The rotation is strictly sequential,
+	// so "domain d already pruned this cycle" is exactly d < pruneDomainIdx;
+	// no per-domain bitmap is needed. The pair (baseBit, pruneDomainIdx) is
+	// persisted at commit so a reload interprets leaf epochs correctly.
+	baseBit       byte
 	pruneDomainIdx int
+	scheduleDirty  bool
 }
 
 type archiveShard struct {
@@ -289,7 +300,58 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 	if err := t.loadArchiveIndex(); err != nil {
 		return nil, err
 	}
+	if err := t.loadSchedule(); err != nil {
+		return nil, err
+	}
 	return t, nil
+}
+
+// scheduleKey is the singleton KV slot for the prune-schedule record.
+func scheduleKey() []byte { return schedulePrefix }
+
+// encodeSchedule serializes (version, baseBit, pruneDomainIdx).
+func (t *Trie) encodeSchedule() []byte {
+	data := make([]byte, 6)
+	data[0] = scheduleVersion
+	data[1] = t.baseBit & 1
+	binary.BigEndian.PutUint32(data[2:6], uint32(t.pruneDomainIdx))
+	return data
+}
+
+// loadSchedule restores the prune schedule persisted by the last commit. A
+// missing record means genesis: baseBit 0, domain 0. A record whose domain
+// index no longer fits the configured domain count (domain depth changed
+// between runs) is reset rather than trusted.
+func (t *Trie) loadSchedule() error {
+	data, err := optionalGet(t.db, scheduleKey())
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	if len(data) != 6 || data[0] != scheduleVersion {
+		return errors.New("mpt archive: invalid prune schedule record")
+	}
+	t.baseBit = data[1] & 1
+	idx := int(binary.BigEndian.Uint32(data[2:6]))
+	if idx < 0 || idx >= t.domainCount() {
+		t.baseBit = 0
+		idx = 0
+	}
+	t.pruneDomainIdx = idx
+	return nil
+}
+
+// epochForKeyLocked implements the paper's dynamic assignment: writes landing
+// in a domain already pruned this cycle get the current base bit; writes to
+// not-yet-pruned domains get the opposite bit. This keeps fresh data alive
+// through its domain's next one-to-two prunings with a single lifecycle bit.
+func (t *Trie) epochForKeyLocked(key []byte) byte {
+	if t.domainID(key) < t.pruneDomainIdx {
+		return t.baseBit
+	}
+	return 1 - t.baseBit
 }
 
 // Root returns the last committed root, or nil for an empty trie.
@@ -402,20 +464,23 @@ func domainKeyRange(id, nibbles int) ([]byte, []byte) {
 }
 
 // ensureHotLocked opens the working tree at the current head root. A committed
-// geth trie cannot be reused, so this runs after every commit and after a prune
-// that invalidates the handle.
+// trie is single-use, so this runs after every commit and after a prune
+// that invalidates the handle. The epoch policy is (re)installed every time:
+// it reads the live schedule fields, so the closure never goes stale.
 func (t *Trie) ensureHotLocked() error {
 	if t.hot != nil {
 		return nil
 	}
 	if t.root == (common.Hash{}) {
 		t.hot = gethtrie.NewEmpty(t.ndb)
+		t.hot.SetEpochPolicy(t.epochForKeyLocked)
 		return nil
 	}
 	hot, err := gethtrie.New(t.root, common.Hash{}, t.ndb)
 	if err != nil {
 		return err
 	}
+	hot.SetEpochPolicy(t.epochForKeyLocked)
 	t.hot = hot
 	return nil
 }
@@ -929,7 +994,16 @@ func (t *Trie) PruneNextShard() error {
 
 func (t *Trie) pruneNextDomainLocked() error {
 	id := t.pruneDomainIdx
-	t.pruneDomainIdx = (t.pruneDomainIdx + 1) % t.domainCount()
+	// The schedule advances only on success; cycle rollover flips the global
+	// base bit, which is what makes last cycle's writes expire under the
+	// epoch == baseBit eviction rule.
+	defer func() {
+		t.pruneDomainIdx = (id + 1) % t.domainCount()
+		if t.pruneDomainIdx == 0 {
+			t.baseBit ^= 1
+		}
+		t.scheduleDirty = true
+	}()
 	if err := t.ensureHotLocked(); err != nil {
 		return err
 	}
@@ -1030,7 +1104,7 @@ func (s *stagedBytes) add(key []byte, value []byte) {
 		s.hotNode += n
 	case 'A':
 		s.archive += n
-	case 'I':
+	case 'I', 'S':
 		s.index += n
 	}
 }
@@ -1140,6 +1214,12 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		}
 	}
 	t.dirtyIndexBlocks = make(map[int]struct{})
+	if t.scheduleDirty {
+		if err := rec.Put(scheduleKey(), t.encodeSchedule()); err != nil {
+			return nil, err
+		}
+		t.scheduleDirty = false
+	}
 	// Committed buckets are clean again: release resident entries over budget.
 	t.evictArchivesLocked()
 	return t.rootBytes(), nil
