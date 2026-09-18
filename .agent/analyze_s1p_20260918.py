@@ -23,14 +23,14 @@ S1_AMT = Path(".agent/cmp_20260918/results/trace_stress/S1_amt_pathdb_nib4_39321
 S1_MPT_GLOB = ".agent/cmp_20260918/results/trie_compare/S1_mpt_ref_393216000_20260918_085636"
 
 
-def fetch(stamp: str) -> Path:
-    run_dir = f"{REMOTE_WORK}/results/trace_stress/S1p_amt_optrace_nib4_393216000_{stamp}"
+def fetch(stamp: str, tag: str = "") -> Path:
+    run_dir = f"{REMOTE_WORK}/results/trace_stress/S1p_amt_optrace_nib4_393216000{tag}_{stamp}"
     credentials = json.loads(Path(".agent/asct_remote_servers.local.json").read_text())["asct_mpt"]
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(HOST, username=credentials["ssh_user"], password=credentials["ssh_password"],
                    look_for_keys=False, allow_agent=False)
-    dest = LOCAL / f"S1p_amt_optrace_nib4_393216000_{stamp}"
+    dest = LOCAL / f"S1p_amt_optrace_nib4_393216000{tag}_{stamp}"
     (dest / "results").mkdir(parents=True, exist_ok=True)
     try:
         sftp = client.open_sftp()
@@ -61,7 +61,8 @@ def num(row: dict, col: str) -> float:
 
 def main() -> None:
     stamp = sys.argv[1]
-    dest = fetch(stamp)
+    tag = sys.argv[2] if len(sys.argv) > 2 else ""  # e.g. "_fl25" sweep tag
+    dest = fetch(stamp, tag)
 
     status = json.loads((dest / "run_status.json").read_text())
     summary = json.loads((dest / "results/summary.json").read_text())

@@ -53,7 +53,11 @@ func (h mptHotLayer) Put(key, value []byte) error { return h.trie.Put(key, value
 func (h mptHotLayer) Delete(key []byte) error { return h.trie.Delete(key) }
 
 func (h mptHotLayer) GetValueRef(key []byte) ([]byte, bool, error) {
-	return h.trie.GetValueRef(key)
+	ref, fromArchive, err := h.trie.GetValueRef(key)
+	if errors.Is(err, mpt.ErrNotFound) {
+		return nil, false, archive.ErrNodeNotFound
+	}
+	return ref, fromArchive, err
 }
 
 func (h mptHotLayer) PruneNextShard() error { return h.trie.PruneNextShard() }

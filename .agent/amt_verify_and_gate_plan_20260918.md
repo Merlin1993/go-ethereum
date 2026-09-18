@@ -127,3 +127,5 @@ S1 r=0.594，距 0.7 差 18%。按 C4：**不烧 B3，先深度归因**。
 验证门基线修正：`go test ./trie/archive` 默认参数下 `TestArchiveTrieStress` 是手动 soak（stressItems 默认 52.4 亿条），永远跑不完——预存现象，非本次回归。验证门改为 `-skip 'TestArchiveTrieStress'`。
 
 下一步：V 门全绿后 commit（B5 收尾）→ 写 S1' B1 复测 launcher（MPT_OP_TRACE=1，file 9 同预算）→ 远端复测拿 T4 拆账。
+
+**S1' 第一轮（20260918_133727，已收）**：exit 0、18 分钟、40 窗。拆账：热树本体（geth 十六叉 Get/Update/Delete）占 Operations 的 **79.2%** 且每窗 ns/op 从 516 涨到 1629（3 倍退化）；归档探测 9.8%、写路径归档清理 2.5%、桶磁盘加载 0%（393M 规模未触发驱逐，loads/evictions=0）；r(S1'/MPT 参考) 末 10 窗 0.577，与 S1 的 0.594 一致（插桩开销约 3%）。异常点：探测总时长 ÷ 抽样推断的归档读次数 ≈ 每次 190µs，与纯内存路径不符——第二轮（140933）加 probes/hot_misses/lock_ns 计数器复跑定位（若实际热未命中率远高于抽样的 0.06%，则 G3 的 Hot_Read_Hit_Rate 抽样口径本身可疑）。另确认：path 后端设计上不用 nodeCache（MPT_NodeCache_*=0 非 bug）；S1' 快照 path_hot_written=0 / buffered=242MB（顶到 256MB 写缓冲上限，FlushEveryBatches=0 全程未 flush——热树退化的头号嫌疑）。

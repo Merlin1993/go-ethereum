@@ -12,6 +12,7 @@ rerun needed). Only the AMT stage runs here.
 """
 import hashlib
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -30,8 +31,12 @@ ROUNDS = 1.5
 OPERATIONS = int(DOMAIN_COUNT * BATCH_SIZE * ROUNDS)
 
 STAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+# C-loop sweep knob: pathdb forced flush cadence (batches). 0 = never (S1/S1'
+# baseline); the run dir carries a _fl<N> tag so sweep variants don't collide.
+FLUSH_BATCHES = int(os.environ.get("S1P_FLUSH_BATCHES", "0"))
+FLUSH_TAG = f"_fl{FLUSH_BATCHES}" if FLUSH_BATCHES else ""
 RESULTS = f"{REMOTE_WORK}/results"
-RUN_AMT = f"{RESULTS}/trace_stress/S1p_amt_optrace_nib{DOMAIN_NIBBLES}_{OPERATIONS}_{STAMP}"
+RUN_AMT = f"{RESULTS}/trace_stress/S1p_amt_optrace_nib{DOMAIN_NIBBLES}_{OPERATIONS}{FLUSH_TAG}_{STAMP}"
 REMOTE_LAUNCHER = f"{REMOTE_WORK}/run_s1p_optrace_{STAMP}.sh"
 REMOTE_GUARD = f"{REMOTE_WORK}/full_replay_disk_guard.sh"
 MIN_FREE_BYTES = 8_000_000_000
@@ -198,7 +203,7 @@ run_stage S1p_amt_optrace '{RUN_AMT}.exit' '{RUN_AMT}.log' \\
       -traceStressDomainNibbles={DOMAIN_NIBBLES} \\
       -traceStressPathCleanCacheMB=256 \\
       -traceStressPathWriteBufferMB=256 \\
-      -traceStressPathFlushEveryBatches=0 \\
+      -traceStressPathFlushEveryBatches={FLUSH_BATCHES} \\
       -traceStressCuckooBuckets=32 \\
       -traceStressCuckooSlots=4 \\
       -traceStressNodeCacheMB=512 \\
@@ -242,6 +247,7 @@ exit "$overall"
             "rounds": ROUNDS,
             "domain_nibbles": DOMAIN_NIBBLES,
             "start_file": 9,
+            "flush_every_batches": FLUSH_BATCHES,
             "windows": OPERATIONS // 10_000_000,
             "run_amt": RUN_AMT,
             "status_log": f"{REMOTE_LAUNCHER}.status.log",

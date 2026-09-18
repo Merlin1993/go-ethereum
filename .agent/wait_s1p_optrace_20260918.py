@@ -19,8 +19,9 @@ REMOTE_WORK = "/root/asct_codex"
 def main() -> None:
     stamp = sys.argv[1]
     max_minutes = float(sys.argv[2]) if len(sys.argv) > 2 else 120.0
+    tag = sys.argv[3] if len(sys.argv) > 3 else ""  # e.g. "_fl25" sweep tag
     launcher = f"{REMOTE_WORK}/run_s1p_optrace_{stamp}.sh"
-    run_dir = f"{REMOTE_WORK}/results/trace_stress/S1p_amt_optrace_nib4_393216000_{stamp}"
+    run_dir = f"{REMOTE_WORK}/results/trace_stress/S1p_amt_optrace_nib4_393216000{tag}_{stamp}"
     credentials = json.loads(Path(".agent/asct_remote_servers.local.json").read_text())["asct_mpt"]
 
     deadline = time.time() + max_minutes * 60

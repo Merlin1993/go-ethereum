@@ -828,8 +828,11 @@ func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
 		opTrace.hotMisses.Add(1)
 	}
 	archived, ok, err := t.archiveLookupLocked(t.domainID(key), key)
-	if err != nil || !ok {
+	if err != nil {
 		return nil, false, err
+	}
+	if !ok {
+		return nil, false, ErrNotFound
 	}
 	return crypto.Keccak256(archived), true, nil
 }

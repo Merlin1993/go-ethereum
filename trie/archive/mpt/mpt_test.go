@@ -766,3 +766,35 @@ func TestMPTArchiveBucketEviction(t *testing.T) {
 		t.Fatalf("post-commit resurrect: value=%x err=%v; want 420001", got, err)
 	}
 }
+
+// TestMPTGetValueRefErrorContract pins the miss signalling the access sampler
+// depends on: a key absent from both hot trie and archive must surface
+// ErrNotFound (previously GetValueRef returned a nil error, so the sampler
+// counted missing reads as hot hits and Hot_Read_Hit_Rate was meaningless).
+func TestMPTGetValueRefErrorContract(t *testing.T) {
+	db := &testStore{memorydb.New()}
+	tr := newTestTrie(t, db, false)
+
+	present := []byte("present-key")
+	if err := tr.Put(present, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	ref, fromArchive, err := tr.GetValueRef(present)
+	if err != nil {
+		t.Fatalf("GetValueRef(present): %v", err)
+	}
+	if fromArchive {
+		t.Fatal("GetValueRef(present) reported archive for a hot key")
+	}
+	if len(ref) != 32 {
+		t.Fatalf("GetValueRef(present) returned ref of length %d", len(ref))
+	}
+
+	missing := []byte("missing-key")
+	if _, _, err := tr.GetValueRef(missing); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetValueRef(missing) err = %v, want ErrNotFound", err)
+	}
+	if _, err := tr.Get(missing); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get(missing) err = %v, want ErrNotFound", err)
+	}
+}
