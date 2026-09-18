@@ -1060,7 +1060,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		defer opTraceFile.Close()
 		opTraceWriter = csv.NewWriter(opTraceFile)
 		defer opTraceWriter.Flush()
-		if err := opTraceWriter.Write([]string{"Window_End_Batch", "Ops", "Hot_ns", "Probe_ns", "Loads", "Load_ns", "Removes", "Remove_ns", "Evictions"}); err != nil {
+		if err := opTraceWriter.Write([]string{"Window_End_Batch", "Ops", "Hot_ns", "Hot_Misses", "Probes", "Probe_ns", "Lock_ns", "Loads", "Load_ns", "Removes", "Remove_ns", "Evictions"}); err != nil {
 			t.Fatal(err)
 		}
 		prevOpTrace = OpTraceProbe()
@@ -1221,7 +1221,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			if err := opTraceWriter.Write([]string{
 				strconv.FormatInt(batchNumber, 10),
 				strconv.FormatInt(delta("ops"), 10), strconv.FormatInt(delta("hot_ns"), 10),
-				strconv.FormatInt(delta("probe_ns"), 10), strconv.FormatInt(delta("loads"), 10),
+				strconv.FormatInt(delta("hot_misses"), 10), strconv.FormatInt(delta("probes"), 10),
+				strconv.FormatInt(delta("probe_ns"), 10), strconv.FormatInt(delta("lock_ns"), 10),
+				strconv.FormatInt(delta("loads"), 10),
 				strconv.FormatInt(delta("load_ns"), 10), strconv.FormatInt(delta("removes"), 10),
 				strconv.FormatInt(delta("remove_ns"), 10), strconv.FormatInt(delta("evictions"), 10),
 			}); err != nil {

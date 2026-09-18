@@ -43,7 +43,10 @@ var opTraceGate atomic.Bool
 var opTrace struct {
 	ops         atomic.Int64 // instrumented Get/Put/Delete/GetValueRef calls
 	hotNanos    atomic.Int64 // geth hexary trie Get/Update/Delete
+	hotMisses   atomic.Int64 // Get/GetValueRef calls where the hot trie returned empty
+	probes      atomic.Int64 // archiveLookupLocked calls
 	probeNanos  atomic.Int64 // archiveLookupLocked: index + filter + map confirm
+	lockNanos   atomic.Int64 // time blocked acquiring t.mu
 	loads       atomic.Int64 // bucket entry-map (re)loads from disk
 	loadNanos   atomic.Int64 // optionalGet + decodeArchive for those loads
 	removes     atomic.Int64 // write-path removals of archived copies
@@ -68,14 +71,17 @@ func (t *Trie) opTraceEnabled() bool { return t.opTrace }
 // durations). Keys are stable: the driver writes them as CSV columns.
 func opTraceSnapshot() map[string]int64 {
 	return map[string]int64{
-		"ops":       opTrace.ops.Load(),
-		"hot_ns":    opTrace.hotNanos.Load(),
-		"probe_ns":  opTrace.probeNanos.Load(),
-		"loads":     opTrace.loads.Load(),
-		"load_ns":   opTrace.loadNanos.Load(),
-		"removes":   opTrace.removes.Load(),
-		"remove_ns": opTrace.removeNanos.Load(),
-		"evictions": opTrace.evictions.Load(),
+		"ops":        opTrace.ops.Load(),
+		"hot_ns":     opTrace.hotNanos.Load(),
+		"hot_misses": opTrace.hotMisses.Load(),
+		"probes":     opTrace.probes.Load(),
+		"probe_ns":   opTrace.probeNanos.Load(),
+		"lock_ns":    opTrace.lockNanos.Load(),
+		"loads":      opTrace.loads.Load(),
+		"load_ns":    opTrace.loadNanos.Load(),
+		"removes":    opTrace.removes.Load(),
+		"remove_ns":  opTrace.removeNanos.Load(),
+		"evictions":  opTrace.evictions.Load(),
 	}
 }
 

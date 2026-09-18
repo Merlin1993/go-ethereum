@@ -723,6 +723,7 @@ func (t *Trie) archiveLookupLocked(id int, key []byte) ([]byte, bool, error) {
 	if !t.opTrace {
 		return t.archiveLookupInnerLocked(id, key)
 	}
+	opTrace.probes.Add(1)
 	start := time.Now()
 	value, ok, err := t.archiveLookupInnerLocked(id, key)
 	opTrace.probeNanos.Add(int64(time.Since(start)))
@@ -754,7 +755,9 @@ func (t *Trie) archiveLookupInnerLocked(id int, key []byte) ([]byte, bool, error
 
 // Get returns a value from the hot tree or from an archived domain bucket.
 func (t *Trie) Get(key []byte) ([]byte, error) {
+	lockStart := t.opTraceStart()
 	t.mu.Lock()
+	opTraceAdd(&opTrace.lockNanos, lockStart)
 	defer t.mu.Unlock()
 	if err := t.ensureHotLocked(); err != nil {
 		return nil, err
@@ -769,7 +772,10 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 		return nil, err
 	}
 	if len(value) != 0 {
-		return value, nil
+		return bytes.Clone(value), nil
+	}
+	if t.opTrace {
+		opTrace.hotMisses.Add(1)
 	}
 	id := t.domainID(key)
 	value, fromArchive, err := t.archiveLookupLocked(id, key)
@@ -799,7 +805,9 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 // commitment is the payload's keccak, matching how the parent driver classifies
 // hot versus cold accesses.
 func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
+	lockStart := t.opTraceStart()
 	t.mu.Lock()
+	opTraceAdd(&opTrace.lockNanos, lockStart)
 	defer t.mu.Unlock()
 	if err := t.ensureHotLocked(); err != nil {
 		return nil, false, err
@@ -816,6 +824,9 @@ func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
 	if len(value) != 0 {
 		return crypto.Keccak256(value), false, nil
 	}
+	if t.opTrace {
+		opTrace.hotMisses.Add(1)
+	}
 	archived, ok, err := t.archiveLookupLocked(t.domainID(key), key)
 	if err != nil || !ok {
 		return nil, false, err
@@ -825,7 +836,9 @@ func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
 
 // Put writes a value into the hot tree, releasing any archived copy first.
 func (t *Trie) Put(key, value []byte) error {
+	lockStart := t.opTraceStart()
 	t.mu.Lock()
+	opTraceAdd(&opTrace.lockNanos, lockStart)
 	defer t.mu.Unlock()
 	if err := t.ensureHotLocked(); err != nil {
 		return err
@@ -861,7 +874,9 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 
 // Delete removes a key from the hot tree and from any archived copy.
 func (t *Trie) Delete(key []byte) error {
+	lockStart := t.opTraceStart()
 	t.mu.Lock()
+	opTraceAdd(&opTrace.lockNanos, lockStart)
 	defer t.mu.Unlock()
 	if err := t.ensureHotLocked(); err != nil {
 		return err
