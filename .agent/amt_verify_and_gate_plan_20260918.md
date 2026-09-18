@@ -135,3 +135,30 @@ S1 r=0.594，距 0.7 差 18%。按 C4：**不烧 B3，先深度归因**。
 **C2 第一刀（fl25，20260918_144442，已收）——flush 假设坐实，G1/G3 双双过门**：每 100K ops 强制 flush 后 hot ns/op 从 526→1629 压平为 304→603，hot 段总时长 447s→195s；**r(AMT/MPT) 末 10 窗 0.891、均值 1.039（S1 为 0.594）**，整墙钟 18→13 分钟。修复后的 G3 口径真实可信：Hot_Read_Hit_Rate 末 10 窗 99.57%（≥90% ✓），Sampled_Read_Missing 6172–7206/窗（修复前恒 0）。代价：Commit_ms 均值 4.6s（flush 落在提交段，不进 Operations/r）。病灶结论：pathdb diff 层堆积（FlushEveryBatches=0 时 9.8 万批不 flush）造成读放大，非归档 wrapper。已发 fl250 边界探测（150413）确定 B3 用档。
 
 **fl250 边界探测（20260918_150413，已收）——不过门**：r 末 10 窗 0.633、均值 0.763，hot ns/op 退化回 1175–1390。临界点在 25–250 批之间。**C 阶段收官结论：B3 正式参数采用 FlushEveryBatches=25（每 100K ops flush）**，余量 27%（0.891/0.7）；优化循环第 1 刀即达标，止损规则下不再追加轮次。待办提醒：Q3 裁定 B3 前必须补 P4/P5（fork 节点/epoch 位图/四阶段裁剪/stub/ECMH/桶容量 100 分裂/O(1) 更新）；G4 的 mpt 桶 FPR 遥测缺口随 P5 桶重做补齐。
+
+---
+
+## P4/P5 实现补完记录（2026-09-18 晚，E-a 前置条件清零）
+
+按"实验让位于实现完整性"最高裁定，P4/P5 全部落地，commit 链：
+`c18ed2e7b`(P4a hx fork+换用) → `25509a38d`(P4b 动态 epoch+调度持久化) → `01e1be0b9`(P4c 算法1+测试迁移+ECMH 原语入库) → `2cee2b161`(P5a-d 桶重构+ECMH 接入) → `2addd344b`(P6 metadata+G4 FPR 钩子)。
+
+| 项 | 落点 | 验收测试 |
+|---|---|---|
+| P4a fork 节点结构（路线 B） | `trie/archive/mpt/hx/`：叶 epoch 1byte header（论文 1bit，实现说明口径）+ 分支每子 2bit 聚合，扩展字段全进编码进哈希 | TestHXEpochAggregatePropagation、TestHXDeterministicRoot、TestHXContentEquivalenceGeth |
+| P4b 动态 epoch 赋值 | 本周期已裁域新写=基准位、未裁域=反位；调度持久化 `MPTS\x01` v2（含桶序号）；rollover 翻转基准位 | TestMPTEpochDynamicAssignment |
+| P4c Algorithm 1 | CanSkip（聚合位排除即零访问）→ 剥叶 → 压实挂载 → Shrink；旧测试迁移 expirePrune 口径（新数据须过完整 epoch 周期） | TestHXCanSkipSubtreeDoesNotTouch、TestHXExtractDomainEpochSelective、hx/prune_test.go |
+| P5a stub 挂载 | shortNode/fullNode stubList（可选第 4/19 元素，进哈希进 root）；桶注册表按 stub.Path；查询/赎回走 StubsOnPath；ReplaceStub 沿路由查找（结构合并把 stub 提升到最高节点，挂载点禁令：永不落在叶子上；stub-only 分支不被收缩） | TestMPTSingleTreeDomainPruneStubResidue、TestHXStubMount*/Replace*/RootCatchAll/MountPointDeepest |
+| P5b ECMH | `ecmh/` 原语包（secp256k1 try-and-increment hash-to-curve，33B 压缩点，无穷远=全零）；挂载 Create、增删 BlindAppend/Delete；赎回审计校验门控 MPT_ECMH_VERIFY=1（C5：正式跑关闭） | TestMPTSingleTreeResurrectionRoundTrip + ecmh 包 8 测试 + 门控开启复跑绿 |
+| P5c M=100 | CanAppend 顶装（cuckoo 软上限 7/8 防溢出）→ ≥M 强制压实 → LCP 下推 → 根兜底 | TestMPTBucketCapacitySplitDown |
+| P5d O(1) 更新 | 承诺点加减只用单条 k‖keccak(v)，不触其它原像 | TestMPTBucketO1CommitmentUpdate（计数 KV 断言赎回恰好 1 次载荷读 + BlindDelete 等式） |
+| P6 metadata | epoch_bitmap / hot_value_layout / domain_depth_nibbles 别名 / archive_bucket_capacity（TraceMPTBucketCapacity 镜像，绕开 archive↔mpt 测试包循环依赖） | 发车时逐项核对 |
+| G4 FPR 遥测 | mpt 探测 CF 命中但载荷缺失 → RecordMPTFilterFalsePositive 进共享计数器 | 随 B3 遥测 |
+
+盘格式迁移：桶载荷记录 v2（filter 移入树内 stub）、调度记录 v2；旧 v1 桶/索引记录孤儿化（开发期数据重放生，正式跑前无迁移负担）。
+
+验证门：mpt/hx/ecmh 三包全绿、`go test ./trie/archive -skip TestArchiveTrieStress` 绿、go vet/gofmt 干净、`go test -c` 编译门过。
+
+已核对的既定口径：① -traceStressHotLayer 默认 mpt（C3）✓；② pathdb 接线 ✓；③ 无 shards map/aggregate + CanSkip 零访问断言 ✓；④ 读激活走 RecordMPTReadPromotion（写侧 recordArchivePromotion 不碰）✓；C5 赎回校验门控 ✓；确定性红线（同序列同 root）✓。
+
+遗留披露（不阻塞）：合同 P4 验收门字面测试名（TestMPTEpoch*）以 hx 层等价名（TestHXEpoch*）落地，覆盖一致、命名不同；根兜底顶装会把多域残余合进同一桶（论文 CanAppend 本意，查询正确性由"桶键必在挂载节点子树内"不变式保证）；launcher 上传清单按目录 glob 自动覆盖 hx/ecmh 新文件（B5 结论仍有效）。
