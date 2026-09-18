@@ -15,9 +15,63 @@ type testStore struct{ *memorydb.Database }
 
 func (db *testStore) NewBatch() archivetrie.Batcher { return db.Database.NewBatch() }
 
+// expirePrune drives the prune rotation until domain id has been visited
+// under a base bit that expires everything written so far. With the paper's
+// dynamic epoch assignment, data written in the current cycle is evicted at
+// its domain's prune in the FOLLOWING cycle (1-2 cycle residency by design),
+// so a single PruneNextShard no longer seals fresh data.
+func expirePrune(t *testing.T, tr *Trie, id int) {
+	t.Helper()
+	for tr.pruneDomainIdx != 0 { // settle at a cycle boundary
+		if err := tr.PruneNextShard(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < tr.domainCount(); i++ { // full cycle flips the base bit
+		if err := tr.PruneNextShard(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i <= id; i++ { // reach the domain in the new cycle
+		if err := tr.PruneNextShard(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func newTestTrie(t *testing.T, db *testStore, activate bool) *Trie {
 	t.Helper()
 	return newTestTrieWithBackend(t, db, "", activate)
+}
+
+// domainKeyRange returns [start, end) covering every key in the domain, padded
+// out to the store's 32-byte key width. Test-only helper (kept for routing
+// assertions); production pruning walks the tree by nibble prefix.
+func domainKeyRange(id, nibbles int) ([]byte, []byte) {
+	start := make([]byte, 32)
+	for i := 0; i < nibbles; i++ {
+		shift := uint(4 * (nibbles - 1 - i))
+		nib := byte((id >> shift) & 0x0f)
+		if i%2 == 0 {
+			start[i/2] |= nib << 4
+		} else {
+			start[i/2] |= nib
+		}
+	}
+	// Exclusive upper bound: carry past the last consumed unit.
+	end := make([]byte, 32)
+	copy(end, start)
+	last := (nibbles - 1) / 2
+	if nibbles%2 == 1 {
+		end[last] |= 0x0f
+	}
+	for i := last; i >= 0; i-- {
+		end[i]++
+		if end[i] != 0 {
+			break
+		}
+	}
+	return start, end
 }
 
 // newTestTrieWithBackend builds a trie over one-nibble domains, so the tests can
@@ -112,9 +166,7 @@ func TestMPTInlineValueEvictionRemovesActiveCopy(t *testing.T) {
 		t.Fatalf("before prune: archived=%v err=%v; want a hot hit", archived, err)
 	}
 
-	if err := tr.PruneNextShard(); err != nil {
-		t.Fatal(err)
-	}
+	expirePrune(t, tr, 0)
 	after, err := tr.Commit()
 	if err != nil {
 		t.Fatal(err)
@@ -145,9 +197,7 @@ func TestMPTArchivePruneReloadAndReadActivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tr.PruneNextShard(); err != nil {
-		t.Fatal(err)
-	}
+	expirePrune(t, tr, 0)
 	root, err = tr.Commit()
 	if err != nil {
 		t.Fatal(err)
@@ -426,9 +476,7 @@ func TestMPTArchiveIndexBlockRoundTrip(t *testing.T) {
 	if _, err := tr.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if err := tr.PruneNextShard(); err != nil {
-		t.Fatal(err)
-	}
+	expirePrune(t, tr, 0)
 	root, err := tr.Commit()
 	if err != nil {
 		t.Fatal(err)
@@ -617,11 +665,10 @@ func TestMPTPathBackendRoundTrip(t *testing.T) {
 		}
 	}
 
-	// Prune domain 0 (the only one these keys route to at one nibble) and make
-	// sure the values come back through the archive path.
-	if err := tr.PruneNextShard(); err != nil {
-		t.Fatalf("PruneNextShard: %v", err)
-	}
+	// Prune domain 0 (the only one these keys route to at one nibble) through
+	// a full epoch cycle and make sure the values come back through the
+	// archive path.
+	expirePrune(t, tr, 0)
 	if _, err := tr.Commit(); err != nil {
 		t.Fatalf("Commit after prune: %v", err)
 	}
@@ -713,11 +760,10 @@ func TestMPTArchiveBucketEviction(t *testing.T) {
 	if _, err := tr.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 4; i++ { // seal domains 0,1,2,3 in rotation order
-		if err := tr.PruneNextShard(); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// Seal domains 0..3: the epoch lifecycle needs a full cycle (base-bit
+	// flip) before fresh data becomes evictable, then four prunes into the
+	// new cycle reach domains 0..3 in rotation order.
+	expirePrune(t, tr, 3)
 	// Dirty buckets must survive eviction regardless of the budget.
 	for id := 0; id < 4; id++ {
 		if shard := tr.archives[id]; shard == nil || shard.entries == nil {

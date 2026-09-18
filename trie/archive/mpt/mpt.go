@@ -209,7 +209,7 @@ type Trie struct {
 	// so "domain d already pruned this cycle" is exactly d < pruneDomainIdx;
 	// no per-domain bitmap is needed. The pair (baseBit, pruneDomainIdx) is
 	// persisted at commit so a reload interprets leaf epochs correctly.
-	baseBit       byte
+	baseBit        byte
 	pruneDomainIdx int
 	scheduleDirty  bool
 }
@@ -428,39 +428,6 @@ func (t *Trie) domainID(key []byte) int {
 		id = id<<4 | int(nib)
 	}
 	return id
-}
-
-// domainKeyRange returns [start, end) covering every key in the domain, padded
-// out to the store's 32-byte key width. Odd nibble counts are handled by letting
-// the final partially-consumed byte run to its upper nibble.
-func domainKeyRange(id, nibbles int) ([]byte, []byte) {
-	start := make([]byte, 32)
-	for i := 0; i < nibbles; i++ {
-		shift := uint(4 * (nibbles - 1 - i))
-		nib := byte((id >> shift) & 0x0f)
-		if i%2 == 0 {
-			start[i/2] |= nib << 4
-		} else {
-			start[i/2] |= nib
-		}
-	}
-	// Exclusive upper bound: carry past the last consumed unit. The carry has to
-	// start on the last *consumed* byte, not the last byte of the padded key —
-	// for one nibble that is byte 0, and carrying anywhere else would put the
-	// boundary a whole key-width away.
-	end := make([]byte, 32)
-	copy(end, start)
-	last := (nibbles - 1) / 2
-	if nibbles%2 == 1 {
-		end[last] |= 0x0f
-	}
-	for i := last; i >= 0; i-- {
-		end[i]++
-		if end[i] != 0 {
-			break
-		}
-	}
-	return start, end
 }
 
 // ensureHotLocked opens the working tree at the current head root. A committed
@@ -1007,19 +974,28 @@ func (t *Trie) pruneNextDomainLocked() error {
 	if err := t.ensureHotLocked(); err != nil {
 		return err
 	}
-	entries, err := t.domainEntriesLocked(id)
+	// Algorithm 1 (epoch-aware pruning): extract leaves whose epoch equals the
+	// current base bit. Fresh leaves (opposite bit) survive; skipped subtrees
+	// are never touched (CanSkip). Bucketing still uses per-domain shards —
+	// stub mounting replaces this in P5a.
+	prefix := make([]byte, t.config.DomainNibbles)
+	for i := range prefix {
+		shift := 4 * (len(prefix) - 1 - i)
+		prefix[i] = byte((id >> shift) & 0xf)
+	}
+	extracted, err := t.hot.ExtractDomain(prefix, t.baseBit)
 	if err != nil {
 		return err
 	}
-	if len(entries) == 0 {
+	if len(extracted) == 0 {
 		return nil
 	}
 	shard, err := t.loadArchiveLocked(id)
 	if err != nil {
 		return err
 	}
-	for key, value := range entries {
-		shard.entries[key] = value
+	for _, e := range extracted {
+		shard.entries[string(e.Key)] = e.Value
 	}
 	t.residentEntries += len(shard.entries) - shard.count
 	shard.count = len(shard.entries)
@@ -1027,34 +1003,10 @@ func (t *Trie) pruneNextDomainLocked() error {
 	shard.dirty = true
 	t.markDomainArchivedLocked(id)
 
-	// Evicting the leaves removes the active copies and leaves nothing behind.
-	// The paper's stub row is mounted on the shared-prefix internal node, which
-	// needs the forked node structure of plan item P4; until then the root
-	// commits to active state only.
-	for key := range entries {
-		if err := t.hot.Delete([]byte(key)); err != nil {
-			return err
-		}
-	}
+	// The extracted leaves are gone from the hot tree; no per-key deletes
+	// needed — ExtractDomain already detached and shrank the paths.
 	t.markDirtyLocked()
 	return nil
-}
-
-// domainEntriesLocked collects every hot leaf whose key falls inside the
-// domain. Pre-P4c fallback: a full tree walk filtered by domainID; Algorithm 1
-// replaces this with epoch-bitmap pruning.
-func (t *Trie) domainEntriesLocked(id int) (map[string][]byte, error) {
-	entries := make(map[string][]byte)
-	err := t.hot.CollectLeaves(func(key, value []byte) bool {
-		if t.domainID(key) == id {
-			entries[string(key)] = bytes.Clone(value)
-		}
-		return true
-	})
-	if err != nil {
-		return nil, err
-	}
-	return entries, nil
 }
 
 // Hash reports the tree root without writing anything.
