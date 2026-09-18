@@ -232,12 +232,27 @@ func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, evict
 		return n, false, nil
 	}
 	if nc == nil {
-		// The entire subtree below vanished; the short node goes with it.
+		// The entire subtree below vanished. Stubs mounted here keep a
+		// stub-only branch alive (bucket mounting must stay addressable);
+		// without stubs the short node goes with its subtree.
+		if len(n.Stubs) > 0 {
+			t.tracer.onDelete(childPath)
+			t.tracer.onInsert(path)
+			return &fullNode{Stubs: n.Stubs, flags: t.newFlag()}, true, nil
+		}
 		t.tracer.onDelete(path)
 		return nil, true, nil
 	}
 	if child, ok := nc.(*shortNode); ok {
-		// Merge the two compressed segments; child metadata wins.
+		// Merging into a leaf would land n's stubs on a leaf, which the
+		// mounting rules forbid — keep the extension above it instead.
+		if _, isVal := child.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+			fresh := &shortNode{Key: n.Key, Val: nc, Agg: subtreeAggOf(nc), Stubs: n.Stubs, flags: t.newFlag()}
+			t.tracer.onInsert(path)
+			return fresh, true, nil
+		}
+		// Merge the two compressed segments; child metadata wins. Stubs ride
+		// the highest node of the merge.
 		t.tracer.onDelete(path)
 		t.tracer.onDelete(childPath)
 		t.tracer.onInsert(path)
@@ -246,10 +261,11 @@ func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, evict
 			Val:   child.Val,
 			Epoch: child.Epoch,
 			Agg:   child.Agg,
+			Stubs: mergeStubs(n.Stubs, child.Stubs),
 			flags: t.newFlag(),
 		}, true, nil
 	}
-	fresh := &shortNode{Key: n.Key, Val: nc, Agg: subtreeAggOf(nc), flags: t.newFlag()}
+	fresh := &shortNode{Key: n.Key, Val: nc, Agg: subtreeAggOf(nc), Stubs: n.Stubs, flags: t.newFlag()}
 	t.tracer.onInsert(path)
 	return fresh, true, nil
 }
@@ -271,6 +287,11 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 		return n, true, nil
 	}
 	if count == 0 {
+		if len(n.Stubs) > 0 {
+			// A stub-only branch: everything below was evicted, but mounted
+			// buckets keep it alive (root catch-all included). Never remove.
+			return n, true, nil
+		}
 		// Domain subtree fully evicted (or only the value slot left, which
 		// cannot happen for fixed-width keys — treat as removal either way).
 		t.tracer.onDelete(path)
@@ -292,6 +313,11 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 		child = resolved
 	}
 	if short, ok := child.(*shortNode); ok {
+		// Merging into a leaf would land n's stubs on a leaf, which the
+		// mounting rules forbid — keep the branch above it instead.
+		if _, isVal := short.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+			return n, true, nil
+		}
 		t.tracer.onDelete(path)
 		t.tracer.onDelete(childPath)
 		t.tracer.onInsert(path)
@@ -300,10 +326,11 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 			Val:   short.Val,
 			Epoch: short.Epoch,
 			Agg:   short.Agg,
+			Stubs: mergeStubs(n.Stubs, short.Stubs),
 			flags: t.newFlag(),
 		}, true, nil
 	}
 	t.tracer.onDelete(childPath)
 	t.tracer.onInsert(path)
-	return &shortNode{Key: []byte{byte(pos)}, Val: child, Agg: subtreeAggOf(child), flags: t.newFlag()}, true, nil
+	return &shortNode{Key: []byte{byte(pos)}, Val: child, Agg: subtreeAggOf(child), Stubs: n.Stubs, flags: t.newFlag()}, true, nil
 }

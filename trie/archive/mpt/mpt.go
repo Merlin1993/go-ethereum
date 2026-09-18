@@ -43,6 +43,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -57,27 +58,33 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	archivetrie "github.com/ethereum/go-ethereum/trie/archive"
 	"github.com/ethereum/go-ethereum/trie/archive/cuckoo"
+	"github.com/ethereum/go-ethereum/trie/archive/mpt/ecmh"
 	gethtrie "github.com/ethereum/go-ethereum/trie/archive/mpt/hx"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/database"
 )
 
+// ecmhVerifyGate enables the audit-mode redemption check (C5): with
+// MPT_ECMH_VERIFY=1 every promotion recomputes the bucket commitment from the
+// full payload and compares it against the in-tree stub. Formal runs leave it
+// off; the audit cost never lands in generated-path timing.
+var ecmhVerifyGate = os.Getenv("MPT_ECMH_VERIFY") == "1"
+
 var (
 	ErrNotFound  = errors.New("mpt archive: key not found")
 	archiveMagic = [4]byte{'M', 'A', 'R', 'C'}
-	indexMagic   = [4]byte{'M', 'I', 'D', 'X'}
 )
 
 const (
-	recordVersion = byte(1)
+	recordVersion = byte(2)
 	maxRecordSize = 1 << 30
 
-	// indexBlockDomains is how many domains one archive-index bitmap covers.
-	// The previous design rewrote a single bitmap over every domain on each
-	// batch; at 2^20 domains that is 128 KiB of pure write amplification per
-	// prune. Sharding the index means a prune touches 512 bytes.
-	indexBlockDomains = 4096
+	// defaultBucketCapacity is the paper's bucket capacity M: a mount point
+	// absorbs up to M entries per bucket; larger batches force compaction
+	// (fresh M-sized buckets) and the remainder pushes down by longest common
+	// prefix before materializing a partial bucket.
+	defaultBucketCapacity = 100
 )
 
 // Backend selectors for Config.Backend.
@@ -89,12 +96,12 @@ const (
 var (
 	nodePrefix     = []byte{'M', 'P', 'T', 'N', 1}
 	archivePrefix  = []byte{'M', 'P', 'T', 'A', 1}
-	indexPrefix    = []byte{'M', 'P', 'T', 'I', 1}
 	schedulePrefix = []byte{'M', 'P', 'T', 'S', 1}
 )
 
-// scheduleVersion is the on-disk version of the prune-schedule record.
-const scheduleVersion = byte(1)
+// scheduleVersion is the on-disk version of the prune-schedule record: v2 adds
+// the bucket sequence counter used to mint unique bucket identifiers.
+const scheduleVersion = byte(2)
 
 // Config controls the MPT hot layer. DomainNibbles replaces the old ShardDepth:
 // domains are now counted in hex nibbles rather than bits, because in a single
@@ -134,6 +141,10 @@ type Config struct {
 	// lookups never reload). Without the bound a long run accumulates every
 	// archived value in RAM. Zero uses defaultArchiveResidentEntries.
 	ArchiveResidentEntries int
+
+	// BucketCapacity is the paper's M: maximum entries per archive bucket.
+	// Zero uses defaultBucketCapacity (100).
+	BucketCapacity int
 }
 
 // defaultNodeCacheBytes is the fallback node cache budget for the hash backend.
@@ -189,9 +200,13 @@ type Trie struct {
 
 	dirty bool
 
-	archives          map[int]*archiveShard
-	archiveIDs        map[int]struct{}
-	dirtyIndexBlocks  map[int]struct{}
+	// buckets is the archive registry keyed by bucket identifier (stub.Path).
+	// Bucket metadata (filter/commitment/count) lives in the tree's stub
+	// lists, covered by the root; only the payload records live in the KV
+	// store under archivePrefix. bucketSeq mints unique identifiers and is
+	// persisted in the schedule record.
+	buckets           map[string]*bucket
+	bucketSeq         uint64
 	commitsSinceFlush int
 
 	// archiveLRU orders resident buckets least-recently-used first;
@@ -214,14 +229,20 @@ type Trie struct {
 	scheduleDirty  bool
 }
 
-type archiveShard struct {
-	// entries is nil when the bucket has been evicted back to disk; filter
-	// and count stay resident so negative lookups never touch the disk.
-	entries map[string][]byte
-	filter  *cuckoo.Filter
-	count   int
-	dirty   bool          // uncommitted mutation; dirty buckets are never evicted
-	elem    *list.Element // non-nil exactly while entries is resident
+// bucket is the in-memory handle for one archive bucket (paper: Stub Bucket
+// B = <Path, CF, C_ECMH, Count>). The authoritative metadata is the stub
+// serialized into the tree; this handle caches the decoded filter/commitment
+// and, while resident, the payload entries.
+type bucket struct {
+	path        []byte // identifier: mount path + sequence discriminator
+	mount       []byte // nibble path of the node carrying the stub
+	entries     map[string][]byte
+	filter      *cuckoo.Filter
+	commitment  ecmh.Commitment
+	count       int
+	dirty       bool          // uncommitted mutation; dirty buckets are never evicted
+	payloadGone bool          // count hit zero: delete the record at commit
+	elem        *list.Element // non-nil exactly while entries is resident
 }
 
 // New constructs the trie. root must be nil or the canonical empty-tree hash:
@@ -268,16 +289,17 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 	if cfg.ArchiveResidentEntries <= 0 {
 		cfg.ArchiveResidentEntries = defaultArchiveResidentEntries
 	}
+	if cfg.BucketCapacity <= 0 {
+		cfg.BucketCapacity = defaultBucketCapacity
+	}
 
 	t := &Trie{
-		db:               db,
-		config:           cfg,
-		root:             normalizeRootHash(root),
-		archives:         make(map[int]*archiveShard),
-		archiveIDs:       make(map[int]struct{}),
-		dirtyIndexBlocks: make(map[int]struct{}),
-		archiveLRU:       list.New(),
-		opTrace:          opTraceGate.Load(),
+		db:         db,
+		config:     cfg,
+		root:       normalizeRootHash(root),
+		buckets:    make(map[string]*bucket),
+		archiveLRU: list.New(),
+		opTrace:    opTraceGate.Load(),
 	}
 	switch cfg.Backend {
 	case BackendPath:
@@ -297,9 +319,6 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 	default:
 		t.ndb = &nodeDatabase{store: db, cache: newNodeCache(cfg.NodeCacheBytes)}
 	}
-	if err := t.loadArchiveIndex(); err != nil {
-		return nil, err
-	}
 	if err := t.loadSchedule(); err != nil {
 		return nil, err
 	}
@@ -309,19 +328,21 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 // scheduleKey is the singleton KV slot for the prune-schedule record.
 func scheduleKey() []byte { return schedulePrefix }
 
-// encodeSchedule serializes (version, baseBit, pruneDomainIdx).
+// encodeSchedule serializes (version, baseBit, pruneDomainIdx, bucketSeq).
 func (t *Trie) encodeSchedule() []byte {
-	data := make([]byte, 6)
+	data := make([]byte, 14)
 	data[0] = scheduleVersion
 	data[1] = t.baseBit & 1
 	binary.BigEndian.PutUint32(data[2:6], uint32(t.pruneDomainIdx))
+	binary.BigEndian.PutUint64(data[6:14], t.bucketSeq)
 	return data
 }
 
 // loadSchedule restores the prune schedule persisted by the last commit. A
 // missing record means genesis: baseBit 0, domain 0. A record whose domain
 // index no longer fits the configured domain count (domain depth changed
-// between runs) is reset rather than trusted.
+// between runs) is reset rather than trusted. The legacy 6-byte v1 record
+// (pre-stub-tree archives) loads with bucketSeq 0.
 func (t *Trie) loadSchedule() error {
 	data, err := optionalGet(t.db, scheduleKey())
 	if err != nil {
@@ -330,7 +351,13 @@ func (t *Trie) loadSchedule() error {
 	if len(data) == 0 {
 		return nil
 	}
-	if len(data) != 6 || data[0] != scheduleVersion {
+	switch {
+	case len(data) == 14 && data[0] == 2:
+		t.bucketSeq = binary.BigEndian.Uint64(data[6:14])
+	case len(data) == 6 && data[0] == 1:
+		// v1: no bucket sequence; any v1 bucket records are orphaned by the
+		// move to in-tree stubs and simply never referenced again.
+	default:
 		return errors.New("mpt archive: invalid prune schedule record")
 	}
 	t.baseBit = data[1] & 1
@@ -396,17 +423,8 @@ func isMissingError(err error) bool {
 	return strings.Contains(message, "not found") || strings.Contains(message, "notfound")
 }
 
-func archiveKey(id int) []byte {
-	var encoded [4]byte
-	binary.BigEndian.PutUint32(encoded[:], uint32(id))
-	return prefixed(archivePrefix, encoded[:])
-}
-
-func indexBlockKey(block int) []byte {
-	var encoded [4]byte
-	binary.BigEndian.PutUint32(encoded[:], uint32(block))
-	return prefixed(indexPrefix, encoded[:])
-}
+// bucketKey maps a bucket identifier onto its payload record slot.
+func bucketKey(path []byte) []byte { return prefixed(archivePrefix, path) }
 
 // domainCount is the number of logical domains: 16^DomainNibbles.
 func (t *Trie) domainCount() int { return 1 << uint(4*t.config.DomainNibbles) }
@@ -454,117 +472,126 @@ func (t *Trie) ensureHotLocked() error {
 
 func (t *Trie) markDirtyLocked() { t.dirty = true }
 
-func (t *Trie) markDomainArchivedLocked(id int) {
-	t.archiveIDs[id] = struct{}{}
-	t.dirtyIndexBlocks[id/indexBlockDomains] = struct{}{}
+// bucketItem is the ECMH multiset element for one entry: k ‖ keccak(v).
+func bucketItem(key, value []byte) []byte {
+	item := make([]byte, 0, len(key)+32)
+	item = append(item, key...)
+	return append(item, crypto.Keccak256(value)...)
 }
 
-func (t *Trie) markDomainUnarchivedLocked(id int) {
-	delete(t.archiveIDs, id)
-	t.dirtyIndexBlocks[id/indexBlockDomains] = struct{}{}
-}
-
-func (t *Trie) loadArchiveIndex() error {
-	blocks := (t.domainCount() + indexBlockDomains - 1) / indexBlockDomains
-	for block := 0; block < blocks; block++ {
-		data, err := optionalGet(t.db, indexBlockKey(block))
-		if err != nil {
-			return err
+// nibbleLCPLen returns the length of the longest common key prefix of the
+// batch, in nibbles (paper's push-down criterion).
+func nibbleLCPLen(entries []gethtrie.ExtractedEntry) int {
+	if len(entries) == 0 {
+		return 0
+	}
+	lcp := len(entries[0].Key) * 2
+	for _, e := range entries[1:] {
+		if n := commonNibblePrefix(entries[0].Key, e.Key); n < lcp {
+			lcp = n
 		}
-		if len(data) == 0 {
+	}
+	return lcp
+}
+
+func commonNibblePrefix(a, b []byte) int {
+	n := 0
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] == b[i] {
+			n += 2
 			continue
 		}
-		if err := decodeIndexBlock(data, block, func(id int) {
-			t.archiveIDs[id] = struct{}{}
-		}); err != nil {
-			return err
+		if a[i]>>4 == b[i]>>4 {
+			n++
 		}
+		return n
 	}
-	return nil
+	return n
 }
 
-func decodeIndexBlock(data []byte, block int, insert func(id int)) error {
-	if len(data) < 9 || !bytes.Equal(data[:4], indexMagic[:]) || data[4] != indexVersionBitmap {
-		return errors.New("mpt archive: invalid archive index block")
-	}
-	count := int(binary.BigEndian.Uint32(data[5:9]))
-	if count <= 0 || len(data) != 9+(count+7)/8 {
-		return errors.New("mpt archive: invalid archive index block length")
-	}
-	for i := 0; i < count; i++ {
-		if data[9+i/8]&(1<<uint(i%8)) != 0 {
-			insert(block*indexBlockDomains + i)
+// keyNibblesPrefix returns the first n nibbles of a raw key.
+func keyNibblesPrefix(key []byte, n int) []byte {
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		if i%2 == 0 {
+			out[i] = key[i/2] >> 4
+		} else {
+			out[i] = key[i/2] & 0x0f
 		}
 	}
-	return nil
+	return out
 }
 
-const indexVersionBitmap = byte(2)
-
-func (t *Trie) encodeIndexBlock(block int) []byte {
-	count := indexBlockDomains
-	if remain := t.domainCount() - block*indexBlockDomains; remain < count {
-		count = remain
+// bucketForStubLocked returns the registry handle for a stub, decoding the
+// filter and commitment on first sight. The stub serialized in the tree is
+// authoritative; this handle is a cache of it plus the resident payload.
+func (t *Trie) bucketForStubLocked(mountPath []byte, st *gethtrie.Stub) (*bucket, error) {
+	if b := t.buckets[string(st.Path)]; b != nil {
+		return b, nil
 	}
-	data := make([]byte, 9+(count+7)/8)
-	copy(data[:4], indexMagic[:])
-	data[4] = indexVersionBitmap
-	binary.BigEndian.PutUint32(data[5:9], uint32(count))
-	base := block * indexBlockDomains
-	for i := 0; i < count; i++ {
-		if _, ok := t.archiveIDs[base+i]; ok {
-			data[9+i/8] |= 1 << uint(i%8)
+	filter := cuckoo.New(0, 0)
+	if len(st.Filter) > 0 {
+		if err := filter.Decode(st.Filter, 0, 0); err != nil {
+			return nil, err
 		}
 	}
-	return data
+	b := &bucket{
+		path:       bytes.Clone(st.Path),
+		mount:      bytes.Clone(mountPath),
+		filter:     filter,
+		commitment: ecmh.Commitment(st.Commitment),
+		count:      int(st.Count),
+	}
+	t.buckets[string(st.Path)] = b
+	return b, nil
 }
 
-// shardForLocked returns the in-memory handle for a domain without loading
-// entry data. The second return reports whether a bucket record exists (or is
-// being built). Domains absent from the archive index never get a handle, so
-// lookups on never-archived domains cost one map probe and no disk read.
-func (t *Trie) shardForLocked(id int) (*archiveShard, bool) {
-	if shard := t.archives[id]; shard != nil {
-		return shard, true
+// stub renders the handle back into its in-tree form after a mutation.
+func (b *bucket) stub() *gethtrie.Stub {
+	return &gethtrie.Stub{
+		Path:       bytes.Clone(b.path),
+		Filter:     b.filter.Encode(),
+		Commitment: [33]byte(b.commitment),
+		Count:      uint32(b.count),
 	}
-	if _, ok := t.archiveIDs[id]; !ok {
-		return nil, false
-	}
-	shard := &archiveShard{}
-	t.archives[id] = shard
-	return shard, true
 }
 
 // makeResidentLocked registers a bucket whose entries map is in memory and
 // enforces the resident-entry budget.
-func (t *Trie) makeResidentLocked(shard *archiveShard) {
-	if shard.elem == nil {
-		shard.elem = t.archiveLRU.PushBack(shard)
-		t.residentEntries += shard.count
+func (t *Trie) makeResidentLocked(b *bucket) {
+	if b.elem == nil {
+		b.elem = t.archiveLRU.PushBack(b)
+		t.residentEntries += b.count
 	} else {
-		t.archiveLRU.MoveToBack(shard.elem)
+		t.archiveLRU.MoveToBack(b.elem)
 	}
-	t.evictArchivesLocked()
+	t.evictArchivesLocked(true)
 }
 
-func (t *Trie) touchResidentLocked(shard *archiveShard) {
-	if shard.elem != nil {
-		t.archiveLRU.MoveToBack(shard.elem)
+func (t *Trie) touchResidentLocked(b *bucket) {
+	if b.elem != nil {
+		t.archiveLRU.MoveToBack(b.elem)
 	}
 }
 
 // evictArchivesLocked drops entry maps of clean least-recently-used buckets
-// until the resident budget holds. Filters and counts stay resident. Dirty
-// buckets are skipped (their in-memory entries are the only uncommitted
-// copy); if everything is dirty the budget is exceeded rather than losing
-// data.
-func (t *Trie) evictArchivesLocked() {
+// until the resident budget holds. Filters, commitments and counts stay
+// resident (they live in the tree). Dirty buckets are skipped (their
+// in-memory entries are the only uncommitted copy); if everything is dirty
+// the budget is exceeded rather than losing data. protectMRU spares the
+// entry-time most-recent bucket: callers that just loaded a bucket for a
+// mutation must not see its map nilled mid-write. Quiescent points (end of
+// commit) pass false so the budget holds exactly.
+func (t *Trie) evictArchivesLocked(protectMRU bool) {
 	limit := t.config.ArchiveResidentEntries
 	// Protect the entry-time MRU bucket by identity, not by position: skipping
 	// dirty buckets rotates them to the back, so a position check against the
 	// live Back() would stop protecting the bucket the caller just loaded and
 	// nil its map mid-write.
-	mru := t.archiveLRU.Back()
+	var mru *list.Element
+	if protectMRU {
+		mru = t.archiveLRU.Back()
+	}
 	// The scan budget is the list length at entry: evictions shrink the list,
 	// so comparing against the live Len() would cut the scan short.
 	budget := t.archiveLRU.Len()
@@ -574,131 +601,105 @@ func (t *Trie) evictArchivesLocked() {
 		if elem == nil {
 			return
 		}
-		shard := elem.Value.(*archiveShard)
+		b := elem.Value.(*bucket)
 		scanned++
-		if shard.dirty || elem == mru {
+		if b.dirty || elem == mru {
 			t.archiveLRU.MoveToBack(elem)
 			continue
 		}
 		t.archiveLRU.Remove(elem)
-		shard.elem = nil
-		t.residentEntries -= shard.count
-		shard.entries = nil
+		b.elem = nil
+		t.residentEntries -= b.count
+		b.entries = nil
 		if t.opTrace {
 			opTrace.evictions.Add(1)
 		}
 	}
 }
 
-// loadArchiveLocked ensures the bucket's entries are resident, reading the
-// record from disk on first use or after an eviction.
-func (t *Trie) loadArchiveLocked(id int) (*archiveShard, error) {
-	shard := t.archives[id]
-	if shard == nil {
-		if _, ok := t.archiveIDs[id]; !ok {
-			// No record exists: start an empty resident bucket (the prune
-			// path is the only caller that creates buckets).
-			shard = &archiveShard{entries: make(map[string][]byte)}
-			t.archives[id] = shard
-			t.makeResidentLocked(shard)
-			return shard, nil
-		}
-		shard = &archiveShard{}
-		t.archives[id] = shard
-	}
-	if shard.entries != nil {
-		t.touchResidentLocked(shard)
-		return shard, nil
+// loadBucketLocked ensures the bucket's entries are resident, reading the
+// payload record from disk on first use or after an eviction. The payload
+// count is cross-checked against the in-tree stub.
+func (t *Trie) loadBucketLocked(b *bucket) error {
+	if b.entries != nil {
+		t.touchResidentLocked(b)
+		return nil
 	}
 	loadStart := t.opTraceStart()
-	data, err := optionalGet(t.db, archiveKey(id))
+	data, err := optionalGet(t.db, bucketKey(b.path))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	shard.entries = make(map[string][]byte)
-	shard.count = 0
+	b.entries = make(map[string][]byte)
 	if len(data) != 0 {
-		if err := t.decodeArchive(data, shard); err != nil {
-			return nil, err
+		if err := t.decodeBucket(data, b); err != nil {
+			return err
 		}
+	}
+	if len(b.entries) != b.count {
+		return fmt.Errorf("mpt archive: bucket %x payload holds %d entries, stub says %d", b.path, len(b.entries), b.count)
 	}
 	opTraceAdd(&opTrace.loadNanos, loadStart)
 	if !loadStart.IsZero() {
 		opTrace.loads.Add(1)
 	}
-	t.makeResidentLocked(shard)
-	return shard, nil
+	t.makeResidentLocked(b)
+	return nil
 }
 
-// decodeArchive reads a bucket record. Entries carry the value preimage, not a
-// hash: since the hot layer now stores values inline, the archive is the only
-// remaining copy once a leaf is evicted, and resurrection has to recover the
-// actual payload.
-func (t *Trie) decodeArchive(data []byte, shard *archiveShard) error {
-	if len(data) < 17 || len(data) > maxRecordSize || !bytes.Equal(data[:4], archiveMagic[:]) || data[4] != recordVersion {
-		return errors.New("mpt archive: invalid archive record")
+// decodeBucket reads a bucket payload record. Entries carry the value
+// preimage, not a hash: since the hot layer stores values inline, the archive
+// is the only remaining copy once a leaf is evicted, and resurrection has to
+// recover the actual payload. Filter and commitment are NOT in the record —
+// they live in the tree's stub (paper: the root covers the commitment).
+func (t *Trie) decodeBucket(data []byte, b *bucket) error {
+	if len(data) < 9 || len(data) > maxRecordSize || !bytes.Equal(data[:4], archiveMagic[:]) || data[4] != recordVersion {
+		return errors.New("mpt archive: invalid bucket record")
 	}
-	filterLen := int(binary.BigEndian.Uint32(data[5:9]))
-	count := int(binary.BigEndian.Uint32(data[9:13]))
-	shard.count = count
-	offset := 13
-	if filterLen < 0 || offset+filterLen+4 > len(data) {
-		return errors.New("mpt archive: invalid archive filter length")
+	count := int(binary.BigEndian.Uint32(data[5:9]))
+	if count != b.count {
+		return fmt.Errorf("mpt archive: bucket %x payload count %d, stub says %d", b.path, count, b.count)
 	}
-	if filterLen > 0 {
-		filter := cuckoo.New(0, 0)
-		if err := filter.Decode(data[offset:offset+filterLen], 0, 0); err != nil {
-			return err
-		}
-		shard.filter = filter
-	}
-	offset += filterLen
+	offset := 9
 	for i := 0; i < count; i++ {
 		if offset+8 > len(data) {
-			return errors.New("mpt archive: truncated archive entry")
+			return errors.New("mpt archive: truncated bucket entry")
 		}
 		keyLen := int(binary.BigEndian.Uint32(data[offset : offset+4]))
 		valLen := int(binary.BigEndian.Uint32(data[offset+4 : offset+8]))
 		offset += 8
 		if keyLen <= 0 || valLen < 0 || offset+keyLen+valLen > len(data) {
-			return errors.New("mpt archive: invalid archive entry")
+			return errors.New("mpt archive: invalid bucket entry")
 		}
 		key := bytes.Clone(data[offset : offset+keyLen])
 		offset += keyLen
 		value := bytes.Clone(data[offset : offset+valLen])
 		offset += valLen
-		shard.entries[string(key)] = value
+		b.entries[string(key)] = value
 	}
 	if offset != len(data) {
-		return errors.New("mpt archive: trailing archive bytes")
+		return errors.New("mpt archive: trailing bucket bytes")
 	}
 	return nil
 }
 
-func (t *Trie) encodeArchive(shard *archiveShard) []byte {
-	keys := make([]string, 0, len(shard.entries))
-	for key := range shard.entries {
+func (t *Trie) encodeBucket(b *bucket) []byte {
+	keys := make([]string, 0, len(b.entries))
+	for key := range b.entries {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	filter := []byte(nil)
-	if shard.filter != nil {
-		filter = shard.filter.Encode()
-	}
-	size := 13 + len(filter)
+	size := 9
 	for _, key := range keys {
-		size += 8 + len(key) + len(shard.entries[key])
+		size += 8 + len(key) + len(b.entries[key])
 	}
 	data := make([]byte, size)
 	copy(data[:4], archiveMagic[:])
 	data[4] = recordVersion
-	binary.BigEndian.PutUint32(data[5:9], uint32(len(filter)))
-	binary.BigEndian.PutUint32(data[9:13], uint32(len(keys)))
-	offset := 13
-	copy(data[offset:], filter)
-	offset += len(filter)
+	binary.BigEndian.PutUint32(data[5:9], uint32(len(keys)))
+	offset := 9
 	for _, key := range keys {
-		value := shard.entries[key]
+		value := b.entries[key]
 		binary.BigEndian.PutUint32(data[offset:offset+4], uint32(len(key)))
 		binary.BigEndian.PutUint32(data[offset+4:offset+8], uint32(len(value)))
 		offset += 8
@@ -710,80 +711,249 @@ func (t *Trie) encodeArchive(shard *archiveShard) []byte {
 	return data
 }
 
-func (t *Trie) rebuildFilter(shard *archiveShard) {
-	if len(shard.entries) == 0 {
-		shard.filter = nil
-		return
-	}
-	filter := cuckoo.New(t.config.CuckooBuckets, t.config.CuckooSlots)
-	for key := range shard.entries {
-		if err := filter.Insert([]byte(key)); err != nil {
-			// The exact map stays authoritative when a deliberately tiny
-			// diagnostic filter fills up.
-			shard.filter = nil
-			return
-		}
-	}
-	shard.filter = filter
+// cuckooSoftCap bounds how many entries a bucket's filter may hold before
+// top-up stops; insertion failures get exponentially likely above ~7/8 load.
+func (t *Trie) cuckooSoftCap() int {
+	return t.config.CuckooBuckets * t.config.CuckooSlots * 7 / 8
 }
 
-func (t *Trie) removeArchivedLocked(id int, key []byte) (bool, error) {
-	if _, ok := t.archiveIDs[id]; !ok {
-		return false, nil
+// createBucketLocked mounts a fresh bucket holding entries at nodePath
+// (paper: forced compaction and partial-bucket materialization).
+func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedEntry) error {
+	filter := cuckoo.New(t.config.CuckooBuckets, t.config.CuckooSlots)
+	items := make([][]byte, 0, len(entries))
+	payload := make(map[string][]byte, len(entries))
+	for _, e := range entries {
+		if err := filter.Insert(e.Key); err != nil {
+			return fmt.Errorf("mpt archive: cuckoo overflow in bucket of %d entries: %w", len(entries), err)
+		}
+		payload[string(e.Key)] = bytes.Clone(e.Value)
+		items = append(items, bucketItem(e.Key, e.Value))
 	}
-	shard, err := t.loadArchiveLocked(id)
+	path := make([]byte, len(nodePath)+8)
+	copy(path, nodePath)
+	binary.BigEndian.PutUint64(path[len(nodePath):], t.bucketSeq)
+	t.bucketSeq++
+	t.scheduleDirty = true // bucketSeq persists in the schedule record
+	b := &bucket{
+		path:       path,
+		entries:    payload,
+		filter:     filter,
+		commitment: ecmh.Create(items),
+		count:      len(entries),
+		dirty:      true,
+	}
+	mp, err := t.hot.MountStub(nodePath, b.stub())
 	if err != nil {
+		return err
+	}
+	b.mount = mp
+	t.buckets[string(path)] = b
+	t.makeResidentLocked(b)
+	t.markDirtyLocked()
+	return nil
+}
+
+// bucketAppendLocked tops up an existing bucket (paper CanAppend): filter,
+// commitment and count update O(1) per entry — BlindAppend touches no other
+// bucket content.
+func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) error {
+	if err := t.loadBucketLocked(b); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := b.filter.Insert(e.Key); err != nil {
+			return fmt.Errorf("mpt archive: cuckoo overflow appending to bucket %x: %w", b.path, err)
+		}
+		b.entries[string(e.Key)] = bytes.Clone(e.Value)
+		b.commitment = ecmh.BlindAppend(b.commitment, bucketItem(e.Key, e.Value))
+	}
+	b.count += len(entries)
+	t.residentEntries += len(entries)
+	b.dirty = true
+	t.touchResidentLocked(b)
+	return t.hot.ReplaceStub(b.mount, b.path, b.stub())
+}
+
+// bucketDeleteLocked removes one entry (paper BlindDelete): the commitment
+// updates by point subtraction over k‖keccak(v) alone, the filter drops the
+// fingerprint, and the stub is rewritten in place. A bucket reaching Count
+// zero is destroyed — the stub leaves the tree and the payload record is
+// deleted at the next commit.
+func (t *Trie) bucketDeleteLocked(b *bucket, key, value []byte) error {
+	b.filter.Delete(key)
+	b.commitment = ecmh.Delete(b.commitment, bucketItem(key, value))
+	delete(b.entries, string(key))
+	b.count--
+	t.residentEntries--
+	b.dirty = true
+	t.touchResidentLocked(b)
+	if b.count == 0 {
+		if err := t.hot.ReplaceStub(b.mount, b.path, nil); err != nil {
+			return err
+		}
+		b.payloadGone = true
+		b.entries = nil
+		if b.elem != nil {
+			t.archiveLRU.Remove(b.elem)
+			b.elem = nil
+		}
+		return nil
+	}
+	return t.hot.ReplaceStub(b.mount, b.path, b.stub())
+}
+
+// mountEntriesLocked hangs the extracted batch on the tree (paper "Stub
+// Mounting"): existing non-full buckets at the mount point absorb first, a
+// remaining batch of at least M forces fresh full buckets, the remainder
+// pushes down by longest common prefix, and whatever cannot descend
+// materializes as a partial bucket at the deepest reachable node — the root
+// catch-all when the domain subtree has shrunk away entirely.
+func (t *Trie) mountEntriesLocked(domainPrefix []byte, entries []gethtrie.ExtractedEntry) error {
+	capacity := t.config.BucketCapacity
+	softCap := t.cuckooSoftCap()
+	nodePath := domainPrefix
+	rest := entries
+	for len(rest) > 0 {
+		mp, err := t.hot.MountPoint(nodePath)
+		if err != nil {
+			return err
+		}
+		nodePath = mp
+		stubs, err := t.hot.StubsAt(nodePath)
+		if err != nil {
+			return err
+		}
+		for _, st := range stubs {
+			if len(rest) == 0 {
+				break
+			}
+			b, err := t.bucketForStubLocked(nodePath, st)
+			if err != nil {
+				return err
+			}
+			room := min(capacity-b.count, softCap-b.count)
+			if room <= 0 {
+				continue
+			}
+			n := min(room, len(rest))
+			if err := t.bucketAppendLocked(b, rest[:n]); err != nil {
+				return err
+			}
+			rest = rest[n:]
+		}
+		if len(rest) == 0 {
+			break
+		}
+		for len(rest) >= capacity {
+			if err := t.createBucketLocked(nodePath, rest[:capacity]); err != nil {
+				return err
+			}
+			rest = rest[capacity:]
+		}
+		if len(rest) == 0 {
+			break
+		}
+		// Push down by longest common prefix of the remaining keys.
+		if lcp := nibbleLCPLen(rest); lcp > len(nodePath) {
+			mp2, err := t.hot.MountPoint(keyNibblesPrefix(rest[0].Key, lcp))
+			if err != nil {
+				return err
+			}
+			if len(mp2) > len(nodePath) {
+				nodePath = mp2
+				continue
+			}
+		}
+		if err := t.createBucketLocked(nodePath, rest); err != nil {
+			return err
+		}
+		rest = nil
+	}
+	return nil
+}
+
+// archiveProbeLocked times the probe when the op-trace gate is open; the
+// wrapper keeps the gated-off path to one field check with no defer.
+func (t *Trie) archiveProbeLocked(key []byte) (*bucket, []byte, bool, error) {
+	if !t.opTrace {
+		return t.archiveProbeInnerLocked(key)
+	}
+	opTrace.probes.Add(1)
+	start := time.Now()
+	b, value, ok, err := t.archiveProbeInnerLocked(key)
+	opTrace.probeNanos.Add(int64(time.Since(start)))
+	return b, value, ok, err
+}
+
+// archiveProbeInnerLocked finds the bucket holding key, if any: the stub
+// lists mounted along the key's path are checked sequentially (paper query
+// processing), the cuckoo filter is a pure negative filter — a miss proves
+// absence without touching the payload record — and a hit is confirmed
+// against the exact entries.
+func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []byte, bool, error) {
+	var hit *bucket
+	var walkErr error
+	err := t.hot.StubsOnPath(key, func(mountPath []byte, st *gethtrie.Stub) bool {
+		b, err := t.bucketForStubLocked(mountPath, st)
+		if err != nil {
+			walkErr = err
+			return true
+		}
+		if b.filter != nil && !b.filter.Lookup(key) {
+			return false
+		}
+		hit = b
+		return true
+	})
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if walkErr != nil {
+		return nil, nil, false, walkErr
+	}
+	if hit == nil {
+		return nil, nil, false, nil
+	}
+	if err := t.loadBucketLocked(hit); err != nil {
+		return nil, nil, false, err
+	}
+	value, ok := hit.entries[string(key)]
+	if !ok {
+		return nil, nil, false, nil // cuckoo false positive
+	}
+	return hit, bytes.Clone(value), true, nil
+}
+
+// removeArchivedEntryLocked deletes key from its archive bucket (Put
+// overwrites and Delete), keeping exactly one live copy of every key.
+func (t *Trie) removeArchivedEntryLocked(key []byte) (bool, error) {
+	b, value, ok, err := t.archiveProbeInnerLocked(key)
+	if err != nil || !ok {
 		return false, err
 	}
-	if _, ok := shard.entries[string(key)]; !ok {
-		return false, nil
-	}
-	delete(shard.entries, string(key))
-	shard.count--
-	t.residentEntries--
-	t.rebuildFilter(shard)
-	shard.dirty = true
-	t.touchResidentLocked(shard)
-	if shard.count == 0 {
-		t.markDomainUnarchivedLocked(id)
+	if err := t.bucketDeleteLocked(b, key, value); err != nil {
+		return false, err
 	}
 	return true, nil
 }
 
-// archiveLookupLocked times the probe when the op-trace gate is open; the
-// wrapper keeps the gated-off path to one field check with no defer.
-func (t *Trie) archiveLookupLocked(id int, key []byte) ([]byte, bool, error) {
-	if !t.opTrace {
-		return t.archiveLookupInnerLocked(id, key)
+// verifyBucketLocked is the audit-mode redemption check (C5, gated by
+// MPT_ECMH_VERIFY=1): the bucket commitment is recomputed from the full
+// payload and compared against the in-tree stub. Excluded from formal-run
+// timing and off by default.
+func (t *Trie) verifyBucketLocked(b *bucket) error {
+	if err := t.loadBucketLocked(b); err != nil {
+		return err
 	}
-	opTrace.probes.Add(1)
-	start := time.Now()
-	value, ok, err := t.archiveLookupInnerLocked(id, key)
-	opTrace.probeNanos.Add(int64(time.Since(start)))
-	return value, ok, err
-}
-
-// archiveLookupInnerLocked returns the archived preimage for a key. The filter
-// is a pure negative filter: a miss proves absence without loading the bucket's
-// entries from disk; a hit must still be confirmed against the exact map.
-func (t *Trie) archiveLookupInnerLocked(id int, key []byte) ([]byte, bool, error) {
-	shard, ok := t.shardForLocked(id)
-	if !ok {
-		return nil, false, nil
+	items := make([][]byte, 0, len(b.entries))
+	for key, value := range b.entries {
+		items = append(items, bucketItem([]byte(key), value))
 	}
-	if shard.filter != nil && !shard.filter.Lookup(key) {
-		return nil, false, nil
+	if !ecmh.Verify(b.commitment, items) {
+		return fmt.Errorf("mpt archive: ECMH commitment mismatch on bucket %x", b.path)
 	}
-	if shard.entries == nil {
-		if _, err := t.loadArchiveLocked(id); err != nil {
-			return nil, false, err
-		}
-	}
-	value, ok := shard.entries[string(key)]
-	if !ok {
-		return nil, false, nil
-	}
-	return bytes.Clone(value), true, nil
+	return nil
 }
 
 // Get returns a value from the hot tree or from an archived domain bucket.
@@ -810,16 +980,24 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 	if t.opTrace {
 		opTrace.hotMisses.Add(1)
 	}
-	id := t.domainID(key)
-	value, fromArchive, err := t.archiveLookupLocked(id, key)
-	if err != nil || !fromArchive {
+	b, value, fromArchive, err := t.archiveProbeLocked(key)
+	if err != nil {
+		return nil, err
+	}
+	if !fromArchive {
 		return nil, ErrNotFound
 	}
 	if t.config.ActivateArchivedKeyOnRead {
 		// Mirror the binary layer's promotion timing: only the promotion
 		// itself (bucket removal + hot reinsert) is measured, not the lookup.
 		promotionStart := time.Now()
-		if _, err := t.removeArchivedLocked(id, key); err != nil {
+		if ecmhVerifyGate {
+			if err := t.verifyBucketLocked(b); err != nil {
+				archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
+				return nil, err
+			}
+		}
+		if err := t.bucketDeleteLocked(b, key, value); err != nil {
 			archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
 			return nil, err
 		}
@@ -860,7 +1038,7 @@ func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
 	if t.opTrace {
 		opTrace.hotMisses.Add(1)
 	}
-	archived, ok, err := t.archiveLookupLocked(t.domainID(key), key)
+	_, archived, ok, err := t.archiveProbeLocked(key)
 	if err != nil {
 		return nil, false, err
 	}
@@ -883,7 +1061,7 @@ func (t *Trie) Put(key, value []byte) error {
 		opTrace.ops.Add(1)
 	}
 	removeStart := t.opTraceStart()
-	if _, err := t.removeArchivedLocked(t.domainID(key), key); err != nil {
+	if _, err := t.removeArchivedEntryLocked(key); err != nil {
 		return err
 	}
 	opTraceAdd(&opTrace.removeNanos, removeStart)
@@ -926,7 +1104,7 @@ func (t *Trie) Delete(key []byte) error {
 	}
 	opTraceAdd(&opTrace.hotNanos, hotStart)
 	removeStart := t.opTraceStart()
-	if _, err := t.removeArchivedLocked(t.domainID(key), key); err != nil {
+	if _, err := t.removeArchivedEntryLocked(key); err != nil {
 		return err
 	}
 	opTraceAdd(&opTrace.removeNanos, removeStart)
@@ -946,13 +1124,14 @@ func (t *Trie) DeleteBatch(keys [][]byte) error {
 	return nil
 }
 
-// PruneNextShard archives every hot leaf of the next round-robin domain. The
-// name is kept for interface parity with the driver's hot-layer contract; the
-// unit it advances over is a logical domain, not a subtree.
+// PruneNextShard archives the expiring leaves of the next round-robin domain.
+// The name is kept for interface parity with the driver's hot-layer contract;
+// the unit it advances over is a logical domain, not a subtree.
 //
-// Currently the whole domain is sealed as one bucket. Per-key expiry based on
-// the epoch bitmap is specified by the paper's Algorithm 1 and is tracked as
-// P4 in the plan; it requires the forked node structure to carry epoch bits.
+// Paper Algorithm 1 in full: leaves whose epoch equals the current base bit
+// are extracted (CanSkip prunes whole subtrees without visiting them), the
+// batch is hung on stub lists along the tree (mountEntriesLocked), and the
+// emptied paths shrink.
 func (t *Trie) PruneNextShard() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -974,10 +1153,6 @@ func (t *Trie) pruneNextDomainLocked() error {
 	if err := t.ensureHotLocked(); err != nil {
 		return err
 	}
-	// Algorithm 1 (epoch-aware pruning): extract leaves whose epoch equals the
-	// current base bit. Fresh leaves (opposite bit) survive; skipped subtrees
-	// are never touched (CanSkip). Bucketing still uses per-domain shards —
-	// stub mounting replaces this in P5a.
 	prefix := make([]byte, t.config.DomainNibbles)
 	for i := range prefix {
 		shift := 4 * (len(prefix) - 1 - i)
@@ -990,23 +1165,9 @@ func (t *Trie) pruneNextDomainLocked() error {
 	if len(extracted) == 0 {
 		return nil
 	}
-	shard, err := t.loadArchiveLocked(id)
-	if err != nil {
-		return err
-	}
-	for _, e := range extracted {
-		shard.entries[string(e.Key)] = e.Value
-	}
-	t.residentEntries += len(shard.entries) - shard.count
-	shard.count = len(shard.entries)
-	t.rebuildFilter(shard)
-	shard.dirty = true
-	t.markDomainArchivedLocked(id)
-
 	// The extracted leaves are gone from the hot tree; no per-key deletes
 	// needed — ExtractDomain already detached and shrank the paths.
-	t.markDirtyLocked()
-	return nil
+	return t.mountEntriesLocked(prefix, extracted)
 }
 
 // Hash reports the tree root without writing anything.
@@ -1124,7 +1285,7 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 			archivetrie.SetMPTNodeCacheStats(0, 0)
 		}
 	}()
-	if !t.dirty && len(t.dirtyIndexBlocks) == 0 {
+	if !t.dirty && !t.scheduleDirty {
 		return t.rootBytes(), nil
 	}
 	if t.dirty {
@@ -1142,30 +1303,22 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		t.block++
 		t.dirty = false
 	}
-	for id, shard := range t.archives {
-		if !shard.dirty {
+	for path, b := range t.buckets {
+		if !b.dirty {
 			continue
 		}
-		if shard.count == 0 {
-			if err := rec.Delete(archiveKey(id)); err != nil {
+		if b.payloadGone {
+			if err := rec.Delete(bucketKey(b.path)); err != nil {
 				return nil, err
 			}
-		} else if err := rec.Put(archiveKey(id), t.encodeArchive(shard)); err != nil {
+			delete(t.buckets, path)
+			continue
+		}
+		if err := rec.Put(bucketKey(b.path), t.encodeBucket(b)); err != nil {
 			return nil, err
 		}
-		shard.dirty = false
+		b.dirty = false
 	}
-	for block := range t.dirtyIndexBlocks {
-		data := t.encodeIndexBlock(block)
-		if emptyIndexBlock(data) {
-			if err := rec.Delete(indexBlockKey(block)); err != nil {
-				return nil, err
-			}
-		} else if err := rec.Put(indexBlockKey(block), data); err != nil {
-			return nil, err
-		}
-	}
-	t.dirtyIndexBlocks = make(map[int]struct{})
 	if t.scheduleDirty {
 		if err := rec.Put(scheduleKey(), t.encodeSchedule()); err != nil {
 			return nil, err
@@ -1173,17 +1326,43 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		t.scheduleDirty = false
 	}
 	// Committed buckets are clean again: release resident entries over budget.
-	t.evictArchivesLocked()
+	t.evictArchivesLocked(false)
 	return t.rootBytes(), nil
 }
 
-func emptyIndexBlock(data []byte) bool {
-	for _, b := range data[9:] {
-		if b != 0 {
-			return false
+// ForEach visits every hot and archived value in key order.
+func (t *Trie) ForEach(fn func(key, value []byte) bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	values := make(map[string][]byte)
+	if hot, err := t.hotTrieLocked(); err == nil {
+		_ = hot.CollectLeaves(func(key, value []byte) bool {
+			values[string(key)] = bytes.Clone(value)
+			return true
+		})
+		_ = hot.AllStubs(func(mountPath []byte, st *gethtrie.Stub) {
+			b, err := t.bucketForStubLocked(mountPath, st)
+			if err != nil {
+				return
+			}
+			if err := t.loadBucketLocked(b); err != nil {
+				return
+			}
+			for key, value := range b.entries {
+				values[key] = value
+			}
+		})
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if !fn([]byte(key), values[key]) {
+			return
 		}
 	}
-	return true
 }
 
 // stageNodesLocked routes dirty nodes to the active backend.
@@ -1274,38 +1453,6 @@ func (t *Trie) PathStats() (written, writes, buffered, diff int64) {
 	written, writes = t.pathWrites.totals()
 	diffs, nodes, _ := t.tdb.Size()
 	return written, writes, int64(nodes), int64(diffs)
-}
-
-// ForEach visits every hot and archived value in key order.
-func (t *Trie) ForEach(fn func(key, value []byte) bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	values := make(map[string][]byte)
-	if hot, err := t.hotTrieLocked(); err == nil {
-		_ = hot.CollectLeaves(func(key, value []byte) bool {
-			values[string(key)] = bytes.Clone(value)
-			return true
-		})
-	}
-	for id := range t.archiveIDs {
-		shard, err := t.loadArchiveLocked(id)
-		if err != nil {
-			continue
-		}
-		for key, value := range shard.entries {
-			values[key] = value
-		}
-	}
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		if !fn([]byte(key), values[key]) {
-			return
-		}
-	}
 }
 
 // hotTrieLocked returns a readable handle without disturbing state. It never

@@ -9,6 +9,8 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	archivetrie "github.com/ethereum/go-ethereum/trie/archive"
+	"github.com/ethereum/go-ethereum/trie/archive/mpt/ecmh"
+	gethtrie "github.com/ethereum/go-ethereum/trie/archive/mpt/hx"
 )
 
 type testStore struct{ *memorydb.Database }
@@ -174,15 +176,30 @@ func TestMPTInlineValueEvictionRemovesActiveCopy(t *testing.T) {
 	if bytes.Equal(before, after) {
 		t.Fatal("pruning left the root unchanged: the value is still committed to the tree")
 	}
-	// The only remaining home for the payload is the archive bucket. Its content
-	// is the preimage itself now, not a hash, because nothing else holds it.
-	shard, err := tr.loadArchiveLocked(0)
-	if err != nil {
+	// The only remaining home for the payload is an archive bucket. Its
+	// content is the preimage itself now, not a hash, because nothing else
+	// holds it.
+	b := bucketOfKey(t, tr, key)
+	if b == nil {
+		t.Fatal("no bucket claims the pruned key")
+	}
+	if err := tr.loadBucketLocked(b); err != nil {
 		t.Fatal(err)
 	}
-	if got := shard.entries[string(key)]; !bytes.Equal(got, value) {
+	if got := b.entries[string(key)]; !bytes.Equal(got, value) {
 		t.Fatalf("archive holds %q; want the original payload %q", got, value)
 	}
+}
+
+// bucketOfKey finds the registered bucket whose filter claims key.
+func bucketOfKey(t *testing.T, tr *Trie, key []byte) *bucket {
+	t.Helper()
+	for _, b := range tr.buckets {
+		if b.filter != nil && b.filter.Lookup(key) {
+			return b
+		}
+	}
+	return nil
 }
 
 func TestMPTArchivePruneReloadAndReadActivation(t *testing.T) {
@@ -462,11 +479,10 @@ func decrementKey(key []byte) []byte {
 	return out
 }
 
-// TestMPTArchiveIndexBlockRoundTrip covers the sharded archive index: a pruned
-// domain is recorded in exactly one index block, survives reload, and disappears
-// again once its bucket empties. The old single full-width bitmap rewrote every
-// domain on every prune, which is the write amplification this replaced.
-func TestMPTArchiveIndexBlockRoundTrip(t *testing.T) {
+// TestMPTSingleTreeDomainPruneStubResidue is the P5a acceptance test: pruning
+// a domain mounts a stub INSIDE the tree (covered by the root), the stub
+// survives a reload, and emptying the bucket removes the stub again.
+func TestMPTSingleTreeDomainPruneStubResidue(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr := newTestTrie(t, db, false)
 	key := []byte{0x00, 'x'}
@@ -481,28 +497,48 @@ func TestMPTArchiveIndexBlockRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := tr.archiveIDs[0]; !ok {
-		t.Fatal("domain 0 not recorded after prune")
+	stubCount := func(tr *Trie) int {
+		n := 0
+		hot, err := tr.hotTrieLocked()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hot.AllStubs(func(_ []byte, _ *gethtrie.Stub) { n++ }); err != nil {
+			t.Fatal(err)
+		}
+		return n
 	}
-	if data, err := db.Get(indexBlockKey(0)); err != nil || len(data) == 0 {
-		t.Fatalf("index block 0 missing after prune: len=%d err=%v", len(data), err)
+	if n := stubCount(tr); n != 1 {
+		t.Fatalf("stubs after prune = %d, want 1", n)
 	}
 
 	reloaded, err := New(root, db, &Config{DomainNibbles: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := reloaded.archiveIDs[0]; !ok {
-		t.Fatal("index lost across reload")
+	if n := stubCount(reloaded); n != 1 {
+		t.Fatalf("stubs after reload = %d, want 1", n)
 	}
+	if _, fromArchive, err := reloaded.GetValueRef(key); err != nil || !fromArchive {
+		t.Fatalf("reloaded GetValueRef: archive=%v err=%v; want an archive hit", fromArchive, err)
+	}
+	// Emptying the bucket destroys it: the stub leaves the tree.
+	b := bucketOfKey(t, reloaded, key)
+	if b == nil {
+		t.Fatal("bucket missing after reload")
+	}
+	payloadKey := bucketKey(b.path)
 	if err := reloaded.Delete(key); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := reloaded.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := reloaded.archiveIDs[0]; ok {
-		t.Fatal("domain still marked archived after its last entry was deleted")
+	if n := stubCount(reloaded); n != 0 {
+		t.Fatalf("stubs after bucket destruction = %d, want 0", n)
+	}
+	if data, err := db.Get(payloadKey); err == nil && len(data) != 0 {
+		t.Fatal("payload record survived bucket destruction")
 	}
 }
 
@@ -516,8 +552,8 @@ func TestMPTStagedBytesAccounting(t *testing.T) {
 	for _, key := range [][]byte{
 		nodeKey(common.Hash{1}),
 		nodeKey(common.Hash{2}),
-		archiveKey(3),
-		indexBlockKey(0),
+		bucketKey([]byte{3}),
+		scheduleKey(),
 		[]byte("not ours"),
 	} {
 		if err := rec.Put(key, make([]byte, 16)); err != nil {
@@ -553,9 +589,7 @@ func TestMPTArchiveDeleteArchivedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tr.PruneNextShard(); err != nil {
-		t.Fatal(err)
-	}
+	expirePrune(t, tr, 0)
 	root, err = tr.Commit()
 	if err != nil {
 		t.Fatal(err)
@@ -563,6 +597,10 @@ func TestMPTArchiveDeleteArchivedKey(t *testing.T) {
 	reloaded, err := New(root, db, &Config{DomainNibbles: 1})
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The key sits in the archive now; deleting it must empty the bucket.
+	if _, fromArchive, err := reloaded.GetValueRef(key); err != nil || !fromArchive {
+		t.Fatalf("before delete: archive=%v err=%v; want an archive hit", fromArchive, err)
 	}
 	if err := reloaded.Delete(key); err != nil {
 		t.Fatal(err)
@@ -764,11 +802,21 @@ func TestMPTArchiveBucketEviction(t *testing.T) {
 	// flip) before fresh data becomes evictable, then four prunes into the
 	// new cycle reach domains 0..3 in rotation order.
 	expirePrune(t, tr, 3)
-	// Dirty buckets must survive eviction regardless of the budget.
-	for id := 0; id < 4; id++ {
-		if shard := tr.archives[id]; shard == nil || shard.entries == nil {
-			t.Fatalf("dirty bucket %d was evicted before commit", id)
+	// Dirty buckets must survive eviction regardless of the budget. The
+	// mounting algorithm merges domains into shared buckets (paper CanAppend
+	// top-up), so assert invariants rather than an exact bucket count.
+	if len(tr.buckets) == 0 {
+		t.Fatal("no buckets after sealing 4 domains")
+	}
+	total := 0
+	for _, b := range tr.buckets {
+		if b.entries == nil {
+			t.Fatalf("dirty bucket %x was evicted before commit", b.path)
 		}
+		total += b.count
+	}
+	if total != 12 {
+		t.Fatalf("archived total = %d, want 12", total)
 	}
 	if _, err := tr.Commit(); err != nil {
 		t.Fatal(err)
@@ -777,14 +825,20 @@ func TestMPTArchiveBucketEviction(t *testing.T) {
 	if tr.residentEntries > 3 {
 		t.Fatalf("resident entries after commit = %d, want <= 3", tr.residentEntries)
 	}
-	// Domain 0's bucket was sealed first, so it is the coldest: entries must be
-	// evicted while the filter and count stay resident for negative lookups.
-	shard := tr.archives[0]
-	if shard == nil || shard.entries != nil || shard.count != 3 || shard.filter == nil {
-		t.Fatalf("domain 0 shard state = %+v; want evicted entries, count 3, resident filter", shard)
+	// Domain 0's keys sit in the first-created bucket, which is the coldest:
+	// entries must be evicted while the filter and count stay resident for
+	// negative lookups.
+	key := []byte{0x00, 'a'}
+	b := bucketOfKey(t, tr, key)
+	if b == nil {
+		t.Fatal("domain 0 bucket not registered")
+	}
+	if b.entries != nil || b.count < 3 || b.filter == nil {
+		t.Fatalf("domain 0 bucket state: entries=%v count=%d filter=%v; want evicted entries, count >= 3, resident filter",
+			b.entries != nil, b.count, b.filter != nil)
 	}
 	// A cold read on an evicted bucket reloads and resurrects the entry.
-	key := []byte{0x00, 'a'}
+	before := b.count
 	value, err := tr.Get(key)
 	if err != nil {
 		t.Fatalf("resurrecting evicted entry: %v", err)
@@ -792,8 +846,8 @@ func TestMPTArchiveBucketEviction(t *testing.T) {
 	if !bytes.Equal(value, []byte{0x42, 0x00, 0x00}) {
 		t.Fatalf("resurrected value %x; want 420000", value)
 	}
-	if shard.count != 2 {
-		t.Fatalf("bucket count after resurrection = %d, want 2", shard.count)
+	if b.count != before-1 {
+		t.Fatalf("bucket count after resurrection = %d, want %d", b.count, before-1)
 	}
 	// The resurrected key is hot again; the archived copy is gone.
 	if _, fromArchive, err := tr.GetValueRef(key); err != nil || fromArchive {
@@ -842,5 +896,233 @@ func TestMPTGetValueRefErrorContract(t *testing.T) {
 	}
 	if _, err := tr.Get(missing); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Get(missing) err = %v, want ErrNotFound", err)
+	}
+}
+
+// ---- P5 acceptance tests ----
+
+// TestMPTSingleTreeResurrectionRoundTrip is the P5b acceptance test: the
+// bucket commitment is built with ECMH Create at mount time, redemption
+// subtracts exactly the redeemed item (BlindDelete), and the remaining
+// multiset still verifies against the rewritten in-tree stub.
+func TestMPTSingleTreeResurrectionRoundTrip(t *testing.T) {
+	db := &testStore{memorydb.New()}
+	tr := newTestTrie(t, db, true)
+	keys := [][]byte{
+		{0x00, 'a'}, {0x00, 'b'}, {0x00, 'c'}, {0x00, 'd'}, {0x00, 'e'},
+	}
+	values := make(map[string][]byte)
+	items := make([][]byte, 0, len(keys))
+	for i, key := range keys {
+		value := []byte{0x77, byte(i)}
+		values[string(key)] = value
+		if err := tr.Put(key, value); err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, bucketItem(key, value))
+	}
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	expirePrune(t, tr, 0)
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	b := bucketOfKey(t, tr, keys[0])
+	if b == nil || b.count != len(keys) {
+		t.Fatalf("bucket = %+v; want one bucket of %d", b, len(keys))
+	}
+	want := ecmh.Create(items)
+	if b.commitment != want {
+		t.Fatal("mount-time commitment != Create(items)")
+	}
+	// Redeem one key: commitment must equal both Delete(c, item) and a fresh
+	// Create over the remaining multiset.
+	if got, err := tr.Get(keys[0]); err != nil || !bytes.Equal(got, values[string(keys[0])]) {
+		t.Fatalf("resurrect: %q, %v", got, err)
+	}
+	after := ecmh.Delete(want, bucketItem(keys[0], values[string(keys[0])]))
+	if b.commitment != after {
+		t.Fatal("post-redemption commitment != BlindDelete(old, item)")
+	}
+	rest := items[1:]
+	if !ecmh.Verify(b.commitment, rest) {
+		t.Fatal("remaining multiset does not verify against the rewritten stub")
+	}
+	// The stub in the tree carries the same commitment (root covers it).
+	hot, err := tr.hotTrieLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stubs []*gethtrie.Stub
+	if err := hot.AllStubs(func(_ []byte, s *gethtrie.Stub) { stubs = append(stubs, s) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(stubs) != 1 || [33]byte(b.commitment) != stubs[0].Commitment || stubs[0].Count != 4 {
+		t.Fatalf("in-tree stub = %+v; want count 4 with the updated commitment", stubs)
+	}
+	// Persistence: reload, resurrect the rest, bucket destroys itself.
+	root, err := tr.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := New(root, db, &Config{DomainNibbles: 1, ActivateArchivedKeyOnRead: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range keys[1:] {
+		if _, err := reloaded.Get(key); err != nil {
+			t.Fatalf("resurrect %x after reload: %v", key, err)
+		}
+	}
+	hot, err = reloaded.hotTrieLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stubs = stubs[:0]
+	if err := hot.AllStubs(func(_ []byte, s *gethtrie.Stub) { stubs = append(stubs, s) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(stubs) != 0 {
+		t.Fatalf("bucket survived full redemption: %+v", stubs)
+	}
+}
+
+// TestMPTBucketCapacitySplitDown is the P5c acceptance test: a batch larger
+// than M forces full M-buckets (forced compaction), an already-full bucket
+// absorbs nothing, and the remainder materializes as a partial bucket — all
+// still retrievable.
+func TestMPTBucketCapacitySplitDown(t *testing.T) {
+	db := &testStore{memorydb.New()}
+	tr, err := New(nil, db, &Config{
+		DomainNibbles:             1,
+		CuckooBuckets:             64,
+		CuckooSlots:               4,
+		BucketCapacity:            3,
+		ActivateArchivedKeyOnRead: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(prefix byte, n int, tag byte) [][]byte {
+		var keys [][]byte
+		for i := 0; i < n; i++ {
+			key := []byte{prefix, 0xBC, tag, byte(i)}
+			keys = append(keys, key)
+			if err := tr.Put(key, []byte{tag, byte(i)}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return keys
+	}
+	// Phase A: 3 keys fill one bucket exactly.
+	keysA := put(0x0A, 3, 0xA0)
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	expirePrune(t, tr, 0)
+	// Phase B: 4 more keys; the full bucket absorbs nothing, 3 force a fresh
+	// full bucket, the last one lands in a partial bucket.
+	keysB := put(0x0A, 4, 0xB0)
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	expirePrune(t, tr, 0)
+	if len(tr.buckets) != 3 {
+		t.Fatalf("buckets = %d, want 3 (3+3+1)", len(tr.buckets))
+	}
+	total := 0
+	for _, b := range tr.buckets {
+		if b.count > 3 {
+			t.Fatalf("bucket %x holds %d entries, over capacity 3", b.path, b.count)
+		}
+		total += b.count
+	}
+	if total != 7 {
+		t.Fatalf("archived total = %d, want 7", total)
+	}
+	for _, key := range append(keysA, keysB...) {
+		if _, fromArchive, err := tr.GetValueRef(key); err != nil || !fromArchive {
+			t.Fatalf("key %x: archive=%v err=%v; want an archive hit", key, fromArchive, err)
+		}
+	}
+}
+
+// countingStore tallies payload-record reads for the O(1) structural test.
+type countingStore struct {
+	*memorydb.Database
+	archiveReads int
+}
+
+func (db *countingStore) NewBatch() archivetrie.Batcher { return db.Database.NewBatch() }
+
+func (db *countingStore) Get(key []byte) ([]byte, error) {
+	if bytes.HasPrefix(key, archivePrefix) {
+		db.archiveReads++
+	}
+	return db.Database.Get(key)
+}
+
+// TestMPTBucketO1CommitmentUpdate is the P5d structural assertion: redemption
+// updates the bucket commitment by point subtraction over the single redeemed
+// item (k‖keccak(v)) — one payload record read for the value itself, no scan
+// of the remaining preimages, and the result matches BlindDelete exactly.
+func TestMPTBucketO1CommitmentUpdate(t *testing.T) {
+	db := &countingStore{Database: memorydb.New()}
+	tr, err := New(nil, db, &Config{
+		DomainNibbles:             1,
+		CuckooBuckets:             32,
+		CuckooSlots:               4,
+		ArchiveResidentEntries:    1, // force payload eviction at commit
+		ActivateArchivedKeyOnRead: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := [][]byte{{0x00, 'a'}, {0x00, 'b'}, {0x00, 'c'}}
+	for i, key := range keys {
+		if err := tr.Put(key, []byte{0x55, byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	expirePrune(t, tr, 0)
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	b := bucketOfKey(t, tr, keys[0])
+	if b == nil {
+		t.Fatal("bucket missing")
+	}
+	c0 := b.commitment
+	// White-box eviction: drop the payload exactly as the LRU would (a
+	// black-box second bucket cannot force this — the root catch-all top-up
+	// would merge any later batch into this same bucket and reload it).
+	tr.mu.Lock()
+	if b.elem != nil {
+		tr.archiveLRU.Remove(b.elem)
+		b.elem = nil
+	}
+	tr.residentEntries -= b.count
+	b.entries = nil
+	tr.mu.Unlock()
+	db.archiveReads = 0
+	if _, err := tr.Get(keys[0]); err != nil {
+		t.Fatal(err)
+	}
+	if db.archiveReads != 1 {
+		t.Fatalf("redemption read %d payload records, want exactly 1 (no preimage scan)", db.archiveReads)
+	}
+	want := ecmh.Delete(c0, bucketItem(keys[0], []byte{0x55, 0x00}))
+	if b.commitment != want {
+		t.Fatal("commitment after redemption != BlindDelete(c0, redeemed item)")
+	}
+	if !ecmh.Verify(b.commitment, [][]byte{
+		bucketItem(keys[1], []byte{0x55, 0x01}),
+		bucketItem(keys[2], []byte{0x55, 0x02}),
+	}) {
+		t.Fatal("remaining multiset does not verify against the updated commitment")
 	}
 }

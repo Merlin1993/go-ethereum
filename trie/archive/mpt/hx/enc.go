@@ -17,6 +17,7 @@
 package hx
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"strings"
@@ -32,8 +33,11 @@ import (
 //	             epochAgg = uint64 (16 slots x 2 bits)
 //	             stubList = [ [pathCompact, filter, commitment33, count], ... ]
 //	shortNode: [ compactKey, valOrRef, meta ]                    (3 elements)
+//	          or [ compactKey, valOrRef, meta, stubList ]        (4, rare)
 //	             leaf (key has terminator): val = value bytes, meta = epoch (0/1)
 //	             extension: val = child ref, meta = subtree aggregate (1..3)
+//	             stubList only when stubs hang on a short node (root catch-all
+//	             or a compressed path with no branch at the mount point)
 
 func nodeToBytes(n node) []byte {
 	w := rlp.NewEncoderBuffer(nil)
@@ -43,12 +47,14 @@ func nodeToBytes(n node) []byte {
 	return result
 }
 
-// encode stubs into the buffer as an RLP list.
+// encode stubs into the buffer as an RLP list. Stub.Path is an opaque bucket
+// identifier (mount path + discriminator), stored raw — membership is decided
+// by the filter, not by path prefix matching.
 func encodeStubs(w rlp.EncoderBuffer, stubs []*Stub) {
 	off := w.List()
 	for _, s := range stubs {
 		soff := w.List()
-		w.WriteBytes(hexToCompactNoTerm(s.Path))
+		w.WriteBytes(s.Path)
 		w.WriteBytes(s.Filter)
 		w.WriteBytes(s.Commitment[:])
 		w.WriteUint64(uint64(s.Count))
@@ -58,7 +64,7 @@ func encodeStubs(w rlp.EncoderBuffer, stubs []*Stub) {
 }
 
 // hexToCompactNoTerm packs a HEX nibble path (no terminator) into compact
-// form without the leaf flag.
+// form without the leaf flag. Kept for future key-prefix-encoded identifiers.
 func hexToCompactNoTerm(hex []byte) []byte {
 	buf := make([]byte, len(hex)/2+1)
 	if len(hex)&1 == 1 {
@@ -134,6 +140,9 @@ func (n *shortNode) encode(w rlp.EncoderBuffer) {
 	} else {
 		w.WriteUint64(uint64(n.Agg))
 	}
+	if len(n.Stubs) > 0 {
+		encodeStubs(w, n.Stubs)
+	}
 	w.ListEnd(offset)
 }
 
@@ -176,7 +185,7 @@ func decodeNode(hash, buf []byte) (node, error) {
 		return nil, fmt.Errorf("hx decode error: %v", err)
 	}
 	switch c, _ := rlp.CountValues(elems); c {
-	case 3:
+	case 3, 4:
 		n, err := decodeShort(hash, elems)
 		return n, wrapError(err, "short")
 	case 19:
@@ -194,26 +203,55 @@ func decodeShort(hash, elems []byte) (node, error) {
 	}
 	key := compactToHex(kbuf)
 	flag := nodeFlag{hash: hash}
+	var sn *shortNode
 	if hasTerm(key) {
-		val, rest, err := rlp.SplitString(rest)
+		val, r, err := rlp.SplitString(rest)
 		if err != nil {
 			return nil, fmt.Errorf("hx: invalid value node: %v", err)
 		}
-		meta, _, err := rlp.SplitUint64(rest)
+		rest = r
+		meta, r, err := rlp.SplitUint64(rest)
 		if err != nil {
 			return nil, fmt.Errorf("hx: invalid leaf epoch: %v", err)
 		}
-		return &shortNode{Key: key, Val: valueNode(val), Epoch: byte(meta), flags: flag}, nil
+		rest = r
+		sn = &shortNode{Key: key, Val: valueNode(val), Epoch: byte(meta), flags: flag}
+	} else {
+		ref, r, err := decodeRef(rest)
+		if err != nil {
+			return nil, wrapError(err, "val")
+		}
+		rest = r
+		meta, r, err := rlp.SplitUint64(rest)
+		if err != nil {
+			return nil, fmt.Errorf("hx: invalid extension aggregate: %v", err)
+		}
+		rest = r
+		sn = &shortNode{Key: key, Val: ref, Agg: uint8(meta), flags: flag}
 	}
-	r, rest, err := decodeRef(rest)
-	if err != nil {
-		return nil, wrapError(err, "val")
+	if len(rest) > 0 { // optional stub list
+		stubs, r, err := rlp.SplitList(rest)
+		if err != nil {
+			return nil, fmt.Errorf("hx: invalid short stub list: %v", err)
+		}
+		rest = r
+		for len(stubs) > 0 {
+			var raw []byte
+			raw, stubs, err = rlp.SplitList(stubs)
+			if err != nil {
+				return nil, fmt.Errorf("hx: invalid stub entry: %v", err)
+			}
+			stub, err := decodeStub(raw)
+			if err != nil {
+				return nil, err
+			}
+			sn.Stubs = append(sn.Stubs, stub)
+		}
 	}
-	meta, _, err := rlp.SplitUint64(rest)
-	if err != nil {
-		return nil, fmt.Errorf("hx: invalid extension aggregate: %v", err)
+	if len(rest) != 0 {
+		return nil, fmt.Errorf("hx: trailing short node bytes")
 	}
-	return &shortNode{Key: key, Val: r, Agg: uint8(meta), flags: flag}, nil
+	return sn, nil
 }
 
 func decodeFull(hash, elems []byte) (*fullNode, error) {
@@ -284,8 +322,8 @@ func decodeStub(elems []byte) (*Stub, error) {
 		return nil, fmt.Errorf("hx: trailing stub bytes")
 	}
 	s := &Stub{
-		Path:   compactToHexNoTerm(path),
-		Filter: filter,
+		Path:   bytes.Clone(path),
+		Filter: bytes.Clone(filter),
 		Count:  uint32(count),
 	}
 	copy(s.Commitment[:], commit)

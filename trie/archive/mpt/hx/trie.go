@@ -186,11 +186,11 @@ func (t *Trie) insert(n node, prefix, key []byte, value node, epoch byte) (bool,
 				// Same-value rewrite of an existing leaf still refreshes the
 				// epoch (paper: epoch marks the most recent update).
 				if _, isVal := n.Val.(valueNode); isVal && n.Epoch != epoch {
-					return true, &shortNode{Key: n.Key, Val: n.Val, Epoch: epoch, flags: t.newFlag()}, nil
+					return true, &shortNode{Key: n.Key, Val: n.Val, Epoch: epoch, Stubs: n.Stubs, flags: t.newFlag()}, nil
 				}
 				return false, n, nil
 			}
-			fresh := &shortNode{Key: n.Key, Val: nn, flags: t.newFlag()}
+			fresh := &shortNode{Key: n.Key, Val: nn, Stubs: n.Stubs, flags: t.newFlag()}
 			if _, isVal := nn.(valueNode); isVal {
 				fresh.Epoch = epoch
 			} else {
@@ -202,6 +202,9 @@ func (t *Trie) insert(n node, prefix, key []byte, value node, epoch byte) (bool,
 		// node is remounted under its diverging nibble with its epoch
 		// metadata PRESERVED — reinserting it through insert() would stamp
 		// it with the new write's epoch and silently resurrect stale data.
+		// Stubs ride the HIGHEST replacement node (the extension above the
+		// branch, or the branch itself), so a mounted bucket always stays on
+		// the route from the root to its keys.
 		branch := &fullNode{flags: t.newFlag()}
 		var err error
 		oldSuffix := n.Key[matchlen+1:]
@@ -218,10 +221,11 @@ func (t *Trie) insert(n node, prefix, key []byte, value node, epoch byte) (bool,
 		branch.refreshAgg(int(n.Key[matchlen]))
 		branch.refreshAgg(int(key[matchlen]))
 		if matchlen == 0 {
+			branch.Stubs = n.Stubs
 			return true, branch, nil
 		}
 		t.tracer.onInsert(append(prefix, key[:matchlen]...))
-		ext := &shortNode{Key: key[:matchlen], Val: branch, flags: t.newFlag()}
+		ext := &shortNode{Key: key[:matchlen], Val: branch, Stubs: n.Stubs, flags: t.newFlag()}
 		ext.Agg = subtreeAggOf(branch)
 		return true, ext, nil
 
@@ -292,11 +296,18 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 		}
 		switch child := child.(type) {
 		case *shortNode:
+			// Merging into a leaf would land n's stubs on a leaf, which the
+			// mounting rules forbid — keep the extension above it instead.
+			if _, isVal := child.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+				fresh := &shortNode{Key: n.Key, Val: child, Stubs: n.Stubs, flags: t.newFlag()}
+				fresh.Agg = subtreeAggOf(child)
+				return true, fresh, nil
+			}
 			t.tracer.onDelete(append(prefix, n.Key...))
-			merged := &shortNode{Key: concat(n.Key, child.Key...), Val: child.Val, Epoch: child.Epoch, Agg: child.Agg, flags: t.newFlag()}
+			merged := &shortNode{Key: concat(n.Key, child.Key...), Val: child.Val, Epoch: child.Epoch, Agg: child.Agg, Stubs: mergeStubs(n.Stubs, child.Stubs), flags: t.newFlag()}
 			return true, merged, nil
 		default:
-			fresh := &shortNode{Key: n.Key, Val: child, flags: t.newFlag()}
+			fresh := &shortNode{Key: n.Key, Val: child, Stubs: n.Stubs, flags: t.newFlag()}
 			fresh.Agg = subtreeAggOf(child)
 			return true, fresh, nil
 		}
@@ -334,17 +345,23 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 					return false, nil, err
 				}
 				if cnode, ok := cnode.(*shortNode); ok {
+					// As above: never land stubs on a leaf through a merge.
+					if _, isVal := cnode.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+						fresh := &shortNode{Key: []byte{byte(pos)}, Val: cnode, Stubs: n.Stubs, flags: t.newFlag()}
+						fresh.Agg = subtreeAggOf(cnode)
+						return true, fresh, nil
+					}
 					t.tracer.onDelete(append(prefix, byte(pos)))
 					k := append([]byte{byte(pos)}, cnode.Key...)
-					return true, &shortNode{Key: k, Val: cnode.Val, Epoch: cnode.Epoch, Agg: cnode.Agg, flags: t.newFlag()}, nil
+					return true, &shortNode{Key: k, Val: cnode.Val, Epoch: cnode.Epoch, Agg: cnode.Agg, Stubs: mergeStubs(n.Stubs, cnode.Stubs), flags: t.newFlag()}, nil
 				}
 				// Child is a branch: the one-nibble extension inherits its aggregate.
-				fresh := &shortNode{Key: []byte{byte(pos)}, Val: n.Children[pos], flags: t.newFlag()}
+				fresh := &shortNode{Key: []byte{byte(pos)}, Val: n.Children[pos], Stubs: n.Stubs, flags: t.newFlag()}
 				fresh.Agg = n.getAgg(pos)
 				return true, fresh, nil
 			}
 			// Branch value (slot 16): unreachable for fixed-width state keys.
-			return true, &shortNode{Key: []byte{byte(pos)}, Val: n.Children[pos], flags: t.newFlag()}, nil
+			return true, &shortNode{Key: []byte{byte(pos)}, Val: n.Children[pos], Stubs: n.Stubs, flags: t.newFlag()}, nil
 		}
 		return true, n, nil
 

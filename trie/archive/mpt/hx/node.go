@@ -58,8 +58,9 @@ type (
 	shortNode struct {
 		Key   []byte
 		Val   node
-		Epoch byte  // leaf only: 1-bit lifecycle indicator (0/1)
-		Agg   uint8 // extension only: 2-bit aggregate of the subtree below
+		Epoch byte    // leaf only: 1-bit lifecycle indicator (0/1)
+		Agg   uint8   // extension only: 2-bit aggregate of the subtree below
+		Stubs []*Stub // rarely used: archive mounts when no branch node exists
 		flags nodeFlag
 	}
 	hashNode  []byte
@@ -181,7 +182,13 @@ func (n *fullNode) copy() *fullNode {
 	}
 	return &c
 }
-func (n *shortNode) copy() *shortNode { copy := *n; return &copy }
+func (n *shortNode) copy() *shortNode {
+	cpy := *n
+	if n.Stubs != nil {
+		cpy.Stubs = append([]*Stub(nil), n.Stubs...)
+	}
+	return &cpy
+}
 
 var indices = []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f", "[17]"}
 
