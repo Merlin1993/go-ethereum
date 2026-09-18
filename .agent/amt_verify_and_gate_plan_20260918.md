@@ -129,3 +129,9 @@ S1 r=0.594，距 0.7 差 18%。按 C4：**不烧 B3，先深度归因**。
 下一步：V 门全绿后 commit（B5 收尾）→ 写 S1' B1 复测 launcher（MPT_OP_TRACE=1，file 9 同预算）→ 远端复测拿 T4 拆账。
 
 **S1' 第一轮（20260918_133727，已收）**：exit 0、18 分钟、40 窗。拆账：热树本体（geth 十六叉 Get/Update/Delete）占 Operations 的 **79.2%** 且每窗 ns/op 从 516 涨到 1629（3 倍退化）；归档探测 9.8%、写路径归档清理 2.5%、桶磁盘加载 0%（393M 规模未触发驱逐，loads/evictions=0）；r(S1'/MPT 参考) 末 10 窗 0.577，与 S1 的 0.594 一致（插桩开销约 3%）。异常点：探测总时长 ÷ 抽样推断的归档读次数 ≈ 每次 190µs，与纯内存路径不符——第二轮（140933）加 probes/hot_misses/lock_ns 计数器复跑定位（若实际热未命中率远高于抽样的 0.06%，则 G3 的 Hot_Read_Hit_Rate 抽样口径本身可疑）。另确认：path 后端设计上不用 nodeCache（MPT_NodeCache_*=0 非 bug）；S1' 快照 path_hot_written=0 / buffered=242MB（顶到 256MB 写缓冲上限，FlushEveryBatches=0 全程未 flush——热树退化的头号嫌疑）。
+
+**S1' 第二轮（20260918_140933，已收）+ G3 口径修复**：新计数器裁决——probes=hot_misses=2.62 亿（66.7% 的操作读不存在的键，主网轨迹固有特征），单次探测仅 0.1–0.3µs，"190µs/次"是分母用错的算术假象；锁等待仅 1.2%（排除锁争用）。顺带坐实指标 bug：`mpt.GetValueRef` 对完全缺失的键返回 `(nil,false,nil)` 无错误，抽样器把全部缺失读记成热命中（Sampled_Read_Missing 恒 0、Hot_Read_Hit_Rate 虚高 99.9%）。已修：GetValueRef 返回 ErrNotFound + 适配层翻译 + `TestMPTGetValueRefErrorContract` 契约测试（commit `1df939b5d`）。**S1/S1' 旧 CSV 的 Hot_Read_Hit_Rate 列作废**。
+
+**C2 第一刀（fl25，20260918_144442，已收）——flush 假设坐实，G1/G3 双双过门**：每 100K ops 强制 flush 后 hot ns/op 从 526→1629 压平为 304→603，hot 段总时长 447s→195s；**r(AMT/MPT) 末 10 窗 0.891、均值 1.039（S1 为 0.594）**，整墙钟 18→13 分钟。修复后的 G3 口径真实可信：Hot_Read_Hit_Rate 末 10 窗 99.57%（≥90% ✓），Sampled_Read_Missing 6172–7206/窗（修复前恒 0）。代价：Commit_ms 均值 4.6s（flush 落在提交段，不进 Operations/r）。病灶结论：pathdb diff 层堆积（FlushEveryBatches=0 时 9.8 万批不 flush）造成读放大，非归档 wrapper。已发 fl250 边界探测（150413）确定 B3 用档。
+
+**fl250 边界探测（20260918_150413，已收）——不过门**：r 末 10 窗 0.633、均值 0.763，hot ns/op 退化回 1175–1390。临界点在 25–250 批之间。**C 阶段收官结论：B3 正式参数采用 FlushEveryBatches=25（每 100K ops flush）**，余量 27%（0.891/0.7）；优化循环第 1 刀即达标，止损规则下不再追加轮次。待办提醒：Q3 裁定 B3 前必须补 P4/P5（fork 节点/epoch 位图/四阶段裁剪/stub/ECMH/桶容量 100 分裂/O(1) 更新）；G4 的 mpt 桶 FPR 遥测缺口随 P5 桶重做补齐。
