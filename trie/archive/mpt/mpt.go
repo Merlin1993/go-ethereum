@@ -55,9 +55,9 @@ import (
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
-	gethtrie "github.com/ethereum/go-ethereum/trie"
 	archivetrie "github.com/ethereum/go-ethereum/trie/archive"
 	"github.com/ethereum/go-ethereum/trie/archive/cuckoo"
+	gethtrie "github.com/ethereum/go-ethereum/trie/archive/mpt/hx"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/database"
@@ -176,7 +176,8 @@ type Trie struct {
 	tdb        *triedb.Database
 	pathWrites *writeCounter
 
-	// hot is the working tree. A geth trie is single-use once committed, so it
+	// hot is the working tree (forked hexary trie with the paper's epoch
+	// bitmap and stubList node fields). A committed trie is single-use, so it
 	// is dropped after every commit and reopened lazily from the head root.
 	hot   *gethtrie.Trie
 	root  common.Hash
@@ -411,7 +412,7 @@ func (t *Trie) ensureHotLocked() error {
 		t.hot = gethtrie.NewEmpty(t.ndb)
 		return nil
 	}
-	hot, err := gethtrie.New(gethtrie.TrieID(t.root), t.ndb)
+	hot, err := gethtrie.New(t.root, common.Hash{}, t.ndb)
 	if err != nil {
 		return err
 	}
@@ -966,28 +967,17 @@ func (t *Trie) pruneNextDomainLocked() error {
 }
 
 // domainEntriesLocked collects every hot leaf whose key falls inside the
-// domain's half-open key range.
+// domain. Pre-P4c fallback: a full tree walk filtered by domainID; Algorithm 1
+// replaces this with epoch-bitmap pruning.
 func (t *Trie) domainEntriesLocked(id int) (map[string][]byte, error) {
-	start, end := domainKeyRange(id, t.config.DomainNibbles)
-	it, err := t.hot.NodeIterator(start)
-	if err != nil {
-		return nil, err
-	}
-	iter := gethtrie.NewIterator(it)
 	entries := make(map[string][]byte)
-	for iter.Next() {
-		if bytes.Compare(iter.Key, end) >= 0 {
-			break
+	err := t.hot.CollectLeaves(func(key, value []byte) bool {
+		if t.domainID(key) == id {
+			entries[string(key)] = bytes.Clone(value)
 		}
-		// end only drives early termination; domainID decides membership. Keeping
-		// the identity check authoritative means a boundary arithmetic slip costs
-		// a little scanning rather than silently sealing the wrong domain.
-		if t.domainID(iter.Key) != id {
-			continue
-		}
-		entries[string(iter.Key)] = bytes.Clone(iter.Value)
-	}
-	if err := iter.Err; err != nil {
+		return true
+	})
+	if err != nil {
 		return nil, err
 	}
 	return entries, nil
@@ -1115,8 +1105,8 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		if err := t.ensureHotLocked(); err != nil {
 			return nil, err
 		}
-		newRoot, nodes := t.hot.Commit(false)
-		// A committed geth trie is single-use; drop it so the next switch to a
+		newRoot, nodes := t.hot.Commit()
+		// A committed trie is single-use; drop it so the next switch to a
 		// write path reopens from the new root.
 		t.hot = nil
 		if err := t.stageNodesLocked(rec, newRoot, nodes); err != nil {
@@ -1260,12 +1250,10 @@ func (t *Trie) ForEach(fn func(key, value []byte) bool) {
 	defer t.mu.Unlock()
 	values := make(map[string][]byte)
 	if hot, err := t.hotTrieLocked(); err == nil {
-		if it, iterErr := hot.NodeIterator(nil); iterErr == nil {
-			iter := gethtrie.NewIterator(it)
-			for iter.Next() {
-				values[string(iter.Key)] = bytes.Clone(iter.Value)
-			}
-		}
+		_ = hot.CollectLeaves(func(key, value []byte) bool {
+			values[string(key)] = bytes.Clone(value)
+			return true
+		})
 	}
 	for id := range t.archiveIDs {
 		shard, err := t.loadArchiveLocked(id)
@@ -1297,7 +1285,7 @@ func (t *Trie) hotTrieLocked() (*gethtrie.Trie, error) {
 	if t.root == (common.Hash{}) {
 		return gethtrie.NewEmpty(t.ndb), nil
 	}
-	return gethtrie.New(gethtrie.TrieID(t.root), t.ndb)
+	return gethtrie.New(t.root, common.Hash{}, t.ndb)
 }
 
 // nodeDatabase is the hash-addressed node store used by the hash backend: a
