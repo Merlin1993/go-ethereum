@@ -895,7 +895,10 @@ func (t *Trie) archiveProbeLocked(key []byte) (*bucket, []byte, bool, error) {
 // absence without touching the payload record — and a hit is confirmed
 // against the exact entries.
 func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []byte, bool, error) {
-	var hit *bucket
+	// Collect EVERY filter-hit bucket on the route: split siblings share one
+	// mount node, and a cuckoo false positive (or a genuinely missing entry)
+	// in one sibling must not mask the bucket that actually holds the key.
+	var hits []*bucket
 	var walkErr error
 	err := t.hot.StubsOnPath(key, func(mountPath []byte, st *gethtrie.Stub) bool {
 		b, err := t.bucketForStubLocked(mountPath, st)
@@ -906,8 +909,8 @@ func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []byte, bool, error
 		if b.filter != nil && !b.filter.Lookup(key) {
 			return false
 		}
-		hit = b
-		return true
+		hits = append(hits, b)
+		return false // keep walking: later stubs may hold the key
 	})
 	if err != nil {
 		return nil, nil, false, err
@@ -915,20 +918,18 @@ func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []byte, bool, error
 	if walkErr != nil {
 		return nil, nil, false, walkErr
 	}
-	if hit == nil {
-		return nil, nil, false, nil
-	}
-	if err := t.loadBucketLocked(hit); err != nil {
-		return nil, nil, false, err
-	}
-	value, ok := hit.entries[string(key)]
-	if !ok {
+	for _, b := range hits {
+		if err := t.loadBucketLocked(b); err != nil {
+			return nil, nil, false, err
+		}
+		if value, ok := b.entries[string(key)]; ok {
+			return b, bytes.Clone(value), true, nil
+		}
 		// The filter claimed the key but the payload denies it: a genuine
-		// cuckoo false positive — feed the G4 telemetry.
+		// cuckoo false positive — feed the G4 telemetry and keep looking.
 		archivetrie.RecordMPTFilterFalsePositive()
-		return nil, nil, false, nil
 	}
-	return hit, bytes.Clone(value), true, nil
+	return nil, nil, false, nil
 }
 
 // removeArchivedEntryLocked deletes key from its archive bucket (Put

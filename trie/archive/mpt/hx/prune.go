@@ -156,13 +156,18 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, out *[]Ex
 				return n, false, nil
 			}
 			cpy := n.copy()
+			// The copy must be dirtied BEFORE any child swap: n.copy() carries
+			// the clean cached hash of a resolved node, and an undirtied mutated
+			// copy would be re-stored under its OLD hash while the child's
+			// deletion marker hits the database — a dangling reference (the D2
+			// nib3 missing-node failure at scale).
+			cpy.flags = t.newFlag()
 			cpy.Children[idx] = nc
 			if nc == nil {
 				t.tracer.onDelete(concat(path, idx))
 				return t.shrinkFull(cpy, path)
 			}
 			cpy.refreshAgg(int(idx))
-			cpy.flags = t.newFlag()
 			return cpy, true, nil
 		}
 		// Extraction mode: per-child CanSkip against the parent's aggregate
@@ -284,12 +289,17 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 		}
 	}
 	if count >= 2 {
+		// Pass-through: a descendant below changed, so this branch must be
+		// rehashed even though its shape is unchanged — a clean cached hash
+		// here would resurrect the removed child's reference.
+		n.flags = t.newFlag()
 		return n, true, nil
 	}
 	if count == 0 {
 		if len(n.Stubs) > 0 {
 			// A stub-only branch: everything below was evicted, but mounted
 			// buckets keep it alive (root catch-all included). Never remove.
+			n.flags = t.newFlag()
 			return n, true, nil
 		}
 		// Domain subtree fully evicted (or only the value slot left, which
@@ -299,6 +309,7 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 	}
 	if pos == 16 {
 		// Lone branch value: keep the node (unreachable for fixed-width keys).
+		n.flags = t.newFlag() // descendant changed: force rehash (see above)
 		return n, true, nil
 	}
 	child := n.Children[pos]
@@ -316,6 +327,7 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 		// Merging into a leaf would land n's stubs on a leaf, which the
 		// mounting rules forbid — keep the branch above it instead.
 		if _, isVal := short.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+			n.flags = t.newFlag() // descendant changed: force rehash
 			return n, true, nil
 		}
 		t.tracer.onDelete(path)
@@ -330,7 +342,9 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 			flags: t.newFlag(),
 		}, true, nil
 	}
-	t.tracer.onDelete(childPath)
-	t.tracer.onInsert(path)
+	// Wrap: the child (fullNode) keeps living at childPath — the short node
+	// references it there. Do NOT mark childPath deleted (that would delete
+	// the blob out from under a live reference — the D2 nib3 dangling-node
+	// failure). The node at `path` is simply overwritten by the committer.
 	return &shortNode{Key: []byte{byte(pos)}, Val: child, Agg: subtreeAggOf(child), Stubs: n.Stubs, flags: t.newFlag()}, true, nil
 }
