@@ -162,3 +162,42 @@ S1 r=0.594，距 0.7 差 18%。按 C4：**不烧 B3，先深度归因**。
 已核对的既定口径：① -traceStressHotLayer 默认 mpt（C3）✓；② pathdb 接线 ✓；③ 无 shards map/aggregate + CanSkip 零访问断言 ✓；④ 读激活走 RecordMPTReadPromotion（写侧 recordArchivePromotion 不碰）✓；C5 赎回校验门控 ✓；确定性红线（同序列同 root）✓。
 
 遗留披露（不阻塞）：合同 P4 验收门字面测试名（TestMPTEpoch*）以 hx 层等价名（TestHXEpoch*）落地，覆盖一致、命名不同；根兜底顶装会把多域残余合进同一桶（论文 CanAppend 本意，查询正确性由"桶键必在挂载节点子树内"不变式保证）；launcher 上传清单按目录 glob 自动覆盖 hx/ecmh 新文件（B5 结论仍有效）。
+
+---
+
+## D 阶段开工与首轮冒烟暴露的 P4/P5 规模级缺陷（2026-09-20）
+
+**事件**：D 阶段（B2 域深度重标定 {3,4,5} nibble，file 9 起 1.5 归档轮/档，fl25）首档 nib3 冒烟在远端 batch 4802（19.2M ops）处崩：`hx: missing trie node 421ae0... path [2,9,7,10,6] loc:dirty blob:nil`——活跃树引用的节点被删除标记覆盖。
+
+**本地确定性复现**（`TestMPTPathDBPruneStressDanglingRegression`，driver 同形：pathdb + 每批一裁 + 强制 flush + 读激活 + 600 批），逐层定位出三个真实缺陷并全部修复（commit `8c0178428`）：
+
+1. **hx shrinkFull wrap 分支误删子节点路径**（主凶）：独子为 fullNode 时 wrap 短节点仍引用 childPath 上的子节点，却对其发 `onDelete(childPath)` → pathdb 删掉活跃引用下的 blob。哈希后端因从不真删数据而长期掩盖此 bug。
+2. **prune.go 变更拷贝未打脏标**（同类残留 5 处）：导航模式 `n.copy()` 与 shrinkFull 透传返回携带解析节点的干净缓存哈希 → hasher 按哈希跳过重算 → 哈希后端出"幽灵叶"（已删键可读）、pathdb 后端哈希错配。修复：所有变更拷贝/透传一律 `t.newFlag()`。
+3. **归档探测短路**（P5c 分裂后生效）：`archiveProbeInnerLocked` 首个 filter 命中桶载荷缺失即返回 NotFound，不查其余兄弟桶 → 分裂桶并存时一个布谷假阳性遮蔽真桶。修复：收集路由上全部命中桶逐一查载荷，每次拒绝记 G4 假阳性遥测。此洞同时影响 Put 覆盖/Delete 归档键的去重正确性。
+
+**方法论记录**：
+- 悬挂引用零污染不变量 `DebugCheckDangling`（hx/debug_repro.go）：仅走内存树（hashNode 不解析），每批 post-ops/post-prune 各查一次，不扰动被测状态。
+- 仪表污染教训：全树解析走查会往 tracer accessList 记读，改变后续 commit 的嵌入删除行为 → 失败批次随仪表漂移。仪表要么零解析，要么用后丢柄。
+- 复现用的 crypto/rand 池导致不可复现失败；键源必须确定性 rng。
+- launcher 上传清单教训复核：hx/ecmh 是 mpt 的**子目录**，旧 glob `mpt/*.go` 不含子目录——D2 launcher 已显式加 `mpt/hx/*.go`、`mpt/ecmh/*.go`。
+
+**当前状态**：修复已全量验证（mpt/hx/ecmh/archive 四包绿、ECMH 校验门控下压力回归绿、vet/gofmt 净）。nib3 冒烟重发后**远端 titanide（192.168.3.51）全网失联**（TCP 22/80 均超时，本地网关正常）——run `D2_amt_nib3_24576000_fl25_20260920_100659` 状态未知，待机器恢复后收割并续跑 nib4/nib5。
+
+### 第四洞与 nib3 通过（2026-09-20 11:10）
+
+修复版 nib3 重发后冲过旧崩点 4802，在 batch 5648（22.5M ops）暴露**第四洞**：`oversized embedded node (98 bytes) (decode path: val<-short)`。
+- **根因**：prune 合并造出相邻短节点链（上游 MPT 规范形绝不存在），而照抄上游的 committer 只塌 fullNode 型 Val → 内层短节点（带 epoch/agg/stub 字段，~98B）被原样内联进父 blob，落盘后解码守卫（<32B 内联上限）拒绝。
+- **修复**（commit `2d10b88d8`）：prune 合并处加 `foldShortChain` 级联压平（每吸收一层补 onDelete）；committer 对 *shortNode Val 也递归塌缩（类级保险——stub 不许挂叶子那条规则本身就会故意造 ext→leaf 短链）。
+- **回归**：`TestHXCommitShortShortChainNoOversizedEmbed`（手工短链 commit→reload 走查）；回退 committer 修复后该测试以与远端完全同源的报错失败，验证其有效性。
+- **远端事件插曲**：titanide 从有线 192.168.3.51 掉线，WiFi 口 DHCP 回 192.168.2.230（同 /22），凭证文件 host 已更新；失败 run 已 `_failed` 存档。
+
+**nib3 收官（run 111009，exit 0，33.9s）**：4096 域、24.576M ops、ops/s 均值 1.39M、G3 热命中 99.92%、G4 FPR 0%（6 假阳性）、State_Bytes 3.59MB、active_layer_bytes_total 40.5MB。metadata 正确记录 domain_depth_nibbles=3。
+
+**方法论**：geth 不变式移植清单新增——「相邻短节点不存在」是上游 delete 收缩级联合并维护的隐性不变式，任何新结构变换（prune 合并/wrap）必须保持或级联恢复；新尺寸类错误由解码守卫兜底，但测试必须真正 commit→reload 走查才触发。
+
+### nib4 通过 + nib5 在跑（2026-09-20 11:25）
+
+- **nib4 收官**（run 111246，exit 0，11m58s）：65,536 域、393.2M ops、ops/s 均值 966K（尾部 710K——库涨到 434MB 后减速）、G3 99.99%、G4 原始假阳性 933 个（≈2.4/M ops）、State_Bytes 434.6MB、active_total 693.7MB。
+- **G4 遥测缺口**：archive_filter_runtime 的 lookups/negatives 恒 0（分母计数器没接进 mpt 探测路径），只有 false_positives 在记。D2 决策用「每百万 ops 假阳性数」过渡；B3 正式发车前须补齐分母接线。
+- **nib5**（run 112514）：1,048,576 域、6.29B ops，ETA≈2h，看门狗后台盯梢。
+- 口径注意：三档 ops 总量不同（1.5 轮×域数×4000），State_Bytes 绝对值跨档不可比；决策用 G3/G4/ops/s 劣化 + 档内增长趋势。
