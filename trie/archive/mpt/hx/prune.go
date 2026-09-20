@@ -261,14 +261,14 @@ func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, evict
 		t.tracer.onDelete(path)
 		t.tracer.onDelete(childPath)
 		t.tracer.onInsert(path)
-		return &shortNode{
+		return t.foldShortChain(&shortNode{
 			Key:   concat(n.Key, child.Key...),
 			Val:   child.Val,
 			Epoch: child.Epoch,
 			Agg:   child.Agg,
 			Stubs: mergeStubs(n.Stubs, child.Stubs),
 			flags: t.newFlag(),
-		}, true, nil
+		}, concat(childPath, child.Key...)), true, nil
 	}
 	fresh := &shortNode{Key: n.Key, Val: nc, Agg: subtreeAggOf(nc), Stubs: n.Stubs, flags: t.newFlag()}
 	t.tracer.onInsert(path)
@@ -333,18 +333,45 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 		t.tracer.onDelete(path)
 		t.tracer.onDelete(childPath)
 		t.tracer.onInsert(path)
-		return &shortNode{
+		return t.foldShortChain(&shortNode{
 			Key:   concat([]byte{byte(pos)}, short.Key...),
 			Val:   short.Val,
 			Epoch: short.Epoch,
 			Agg:   short.Agg,
 			Stubs: mergeStubs(n.Stubs, short.Stubs),
 			flags: t.newFlag(),
-		}, true, nil
+		}, concat(childPath, short.Key...)), true, nil
 	}
 	// Wrap: the child (fullNode) keeps living at childPath — the short node
 	// references it there. Do NOT mark childPath deleted (that would delete
 	// the blob out from under a live reference — the D2 nib3 dangling-node
 	// failure). The node at `path` is simply overwritten by the committer.
 	return &shortNode{Key: []byte{byte(pos)}, Val: child, Agg: subtreeAggOf(child), Stubs: n.Stubs, flags: t.newFlag()}, true, nil
+}
+
+// foldShortChain flattens a merged short node whose Val is itself a
+// shortNode. Adjacent short segments violate the canonical MPT form the
+// geth-derived hasher/committer rely on (the committer never collapses
+// short->short links, so an unflattened chain is embedded raw — with the
+// epoch/agg/stub fields it exceeds the 32-byte embedding limit and the
+// decoder rejects it: the D2 nib3 "oversized embedded node" failure).
+// innerPath is the trie path of the currently absorbed Val node; every
+// folded node's path is marked deleted. Deepest node's metadata wins.
+func (t *Trie) foldShortChain(merged *shortNode, innerPath []byte) *shortNode {
+	for {
+		inner, ok := merged.Val.(*shortNode)
+		if !ok {
+			return merged
+		}
+		t.tracer.onDelete(innerPath)
+		merged = &shortNode{
+			Key:   concat(merged.Key, inner.Key...),
+			Val:   inner.Val,
+			Epoch: inner.Epoch,
+			Agg:   inner.Agg,
+			Stubs: mergeStubs(merged.Stubs, inner.Stubs),
+			flags: t.newFlag(),
+		}
+		innerPath = concat(innerPath, inner.Key...)
+	}
 }

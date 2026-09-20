@@ -226,3 +226,39 @@ func TestHXExtractDomainAbsent(t *testing.T) {
 		t.Fatal("extracted leaf still present")
 	}
 }
+
+// A merged short node whose Val is another shortNode must survive the commit
+// round trip: the geth-derived committer historically only collapsed
+// fullNode values, embedding the raw inner short (~100 bytes with the
+// epoch/agg/stub fields) and tripping the decoder's <32-byte embedding guard
+// on reload — the D2 nib3 "oversized embedded node" failure at batch 5648.
+func TestHXCommitShortShortChainNoOversizedEmbed(t *testing.T) {
+	db := newTestDB()
+	tr := NewEmpty(db)
+	val := valueNode(mkKey(42))
+	leaf := &shortNode{Key: []byte{4, 5, 6, 16}, Val: val, Epoch: 1, flags: tr.newFlag()}
+	inner := &shortNode{Key: []byte{2, 3}, Val: leaf, Epoch: 1, flags: tr.newFlag()}
+	outer := &shortNode{Key: []byte{1}, Val: inner, Epoch: 1, flags: tr.newFlag()}
+	tr.root = outer
+	tr.uncommitted = 3 // below the parallel threshold: sequential committer path
+
+	root := db.commit(t, tr)
+
+	reopened, err := New(root, common.Hash{}, db)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	found := 0
+	if err := reopened.CollectLeaves(func(key, value []byte) bool {
+		found++
+		if string(value) != string(val) {
+			t.Fatalf("value mismatch: %x", value)
+		}
+		return true
+	}); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if found != 1 {
+		t.Fatalf("leaves = %d, want 1", found)
+	}
+}

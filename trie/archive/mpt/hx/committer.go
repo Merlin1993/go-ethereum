@@ -50,7 +50,14 @@ func (c *committer) commit(path []byte, n node, parallel bool) node {
 	switch cn := n.(type) {
 	case *shortNode:
 		collapsed := cn.copy()
-		if _, ok := cn.Val.(*fullNode); ok {
+		// Upstream only commits fullNode children here because the canonical
+		// MPT form has no adjacent shortNodes. hx deliberately keeps
+		// extension->short links in one prune corner (stubs must not land on
+		// leaves), so commit shortNode values too — otherwise the raw inner
+		// short (epoch/agg/stub fields, ~100 bytes) is embedded inline and
+		// the decoder's <32-byte embedding guard rejects the stored blob.
+		switch cn.Val.(type) {
+		case *fullNode, *shortNode:
 			collapsed.Val = c.commit(append(path, cn.Key...), cn.Val, false)
 		}
 		collapsed.Key = hexToCompact(cn.Key)
