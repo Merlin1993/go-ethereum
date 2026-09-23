@@ -46,15 +46,17 @@ func aggExcludesEpoch(agg uint8, evict byte) bool {
 // Phase 3 (compaction/mounting) is driven by the caller: the returned entries
 // feed the bucket mounting logic in the mpt layer.
 //
-// The prefix is a hex-nibble path without terminator. Nodes on the
-// navigation path down to the domain boundary are always resolved (that is
-// the query path, not a skipped subtree).
-func (t *Trie) ExtractDomain(prefix []byte, evictEpoch byte) ([]ExtractedEntry, error) {
+// The prefix is a hex-nibble path without terminator. When the logical domain
+// is bit-granular (depth not a multiple of 4), the prefix covers only the
+// whole nibbles of the domain and inDomain applies the trailing bits: it
+// receives the full leaf key and reports whether the leaf belongs to the
+// target domain. A nil inDomain selects the whole prefix subtree.
+func (t *Trie) ExtractDomain(prefix []byte, evictEpoch byte, inDomain func(key []byte) bool) ([]ExtractedEntry, error) {
 	if t.committed {
 		return nil, ErrCommitted
 	}
 	var out []ExtractedEntry
-	n, _, err := t.extract(t.root, nil, prefix, evictEpoch, &out)
+	n, _, err := t.extract(t.root, nil, prefix, evictEpoch, inDomain, &out)
 	if err != nil {
 		return nil, err
 	}
@@ -65,8 +67,8 @@ func (t *Trie) ExtractDomain(prefix []byte, evictEpoch byte) ([]ExtractedEntry, 
 // extract walks node n at absolute nibble path `path`, removing in-domain
 // leaves with the evict epoch. It returns the replacement node (nil if the
 // subtree vanished) and whether anything changed.
-func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, out *[]ExtractedEntry) (node, bool, error) {
-	inDomain := len(path) >= len(domain)
+func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, inDomain func([]byte) bool, out *[]ExtractedEntry) (node, bool, error) {
+	inside := len(path) >= len(domain)
 	switch n := n.(type) {
 	case nil:
 		return nil, false, nil
@@ -82,7 +84,7 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, out *[]Ex
 		if err != nil {
 			return nil, false, err
 		}
-		nn, changed, err := t.extract(resolved, path, domain, evict, out)
+		nn, changed, err := t.extract(resolved, path, domain, evict, inDomain, out)
 		if err != nil {
 			return nil, false, err
 		}
@@ -99,7 +101,7 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, out *[]Ex
 		return nn, true, nil
 
 	case *shortNode:
-		if !inDomain {
+		if !inside {
 			// Navigation mode: match the remaining domain prefix against the
 			// compressed segment.
 			rest := domain[len(path):]
@@ -115,40 +117,40 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, out *[]Ex
 				// subtree rooted here is inside the domain — switch to
 				// extraction mode at this very node.
 				if _, isLeaf := n.Val.(valueNode); isLeaf {
-					return t.extractLeaf(n, path, evict, out)
+					return t.extractLeaf(n, path, evict, inDomain, out)
 				}
 				// Extension: its aggregate is trustworthy for the whole
 				// subtree — CanSkip applies here too.
 				if aggExcludesEpoch(n.Agg, evict) {
 					return n, false, nil
 				}
-				return t.extractShortChild(n, path, domain, evict, out)
+				return t.extractShortChild(n, path, domain, evict, inDomain, out)
 			}
 			// Fully consumed: descend (leaf check happens at the recursion).
 			if _, isLeaf := n.Val.(valueNode); isLeaf {
 				// Leaf path covers the domain prefix: in-domain by construction.
-				return t.extractLeaf(n, path, evict, out)
+				return t.extractLeaf(n, path, evict, inDomain, out)
 			}
-			return t.extractShortChild(n, path, domain, evict, out)
+			return t.extractShortChild(n, path, domain, evict, inDomain, out)
 		}
 		// Extraction mode.
 		if _, isLeaf := n.Val.(valueNode); isLeaf {
-			return t.extractLeaf(n, path, evict, out)
+			return t.extractLeaf(n, path, evict, inDomain, out)
 		}
 		if aggExcludesEpoch(n.Agg, evict) {
 			return n, false, nil // CanSkip: do not touch the subtree
 		}
-		return t.extractShortChild(n, path, domain, evict, out)
+		return t.extractShortChild(n, path, domain, evict, inDomain, out)
 
 	case *fullNode:
-		if !inDomain {
+		if !inside {
 			// Navigation: follow the single nibble towards the domain.
 			idx := domain[len(path)]
 			child := n.Children[idx]
 			if child == nil {
 				return n, false, nil // empty domain
 			}
-			nc, changed, err := t.extract(child, concat(path, idx), domain, evict, out)
+			nc, changed, err := t.extract(child, concat(path, idx), domain, evict, inDomain, out)
 			if err != nil {
 				return nil, false, err
 			}
@@ -165,6 +167,11 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, out *[]Ex
 			cpy.Children[idx] = nc
 			if nc == nil {
 				t.tracer.onDelete(concat(path, idx))
+				// The slot aggregate must be cleared too: shrinkFull keeps a
+				// branch with >=2 children as-is, and a stale slot agg would
+				// be persisted under the root while the child is gone (the
+				// extraction-mode loop already refreshes nil slots).
+				cpy.refreshAgg(int(idx))
 				return t.shrinkFull(cpy, path)
 			}
 			cpy.refreshAgg(int(idx))
@@ -182,7 +189,7 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, out *[]Ex
 			if aggExcludesEpoch(n.getAgg(i), evict) {
 				continue // CanSkip: zero access to this subtree
 			}
-			nc, childChanged, err := t.extract(child, concat(path, byte(i)), domain, evict, out)
+			nc, childChanged, err := t.extract(child, concat(path, byte(i)), domain, evict, inDomain, out)
 			if err != nil {
 				return nil, false, err
 			}
@@ -210,14 +217,20 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, out *[]Ex
 	}
 }
 
-// extractLeaf evicts a leaf whose epoch matches, recording the entry.
-func (t *Trie) extractLeaf(n *shortNode, path []byte, evict byte, out *[]ExtractedEntry) (node, bool, error) {
+// extractLeaf evicts a leaf whose epoch matches and whose key passes the
+// bit-domain filter (nil filter = the whole prefix subtree), recording the
+// entry.
+func (t *Trie) extractLeaf(n *shortNode, path []byte, evict byte, inDomain func([]byte) bool, out *[]ExtractedEntry) (node, bool, error) {
 	if n.Epoch != evict {
 		return n, false, nil
 	}
 	full := concat(path, n.Key...)
+	key := hexToKeybytes(full)
+	if inDomain != nil && !inDomain(key) {
+		return n, false, nil
+	}
 	*out = append(*out, ExtractedEntry{
-		Key:   hexToKeybytes(full),
+		Key:   key,
 		Value: append([]byte(nil), n.Val.(valueNode)...),
 	})
 	t.tracer.onDelete(path)
@@ -227,9 +240,9 @@ func (t *Trie) extractLeaf(n *shortNode, path []byte, evict byte, out *[]Extract
 // extractShortChild recurses into an extension's child and re-wraps,
 // merging with a shortNode child (path compression) when the child itself
 // became short.
-func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, evict byte, out *[]ExtractedEntry) (node, bool, error) {
+func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, evict byte, inDomain func([]byte) bool, out *[]ExtractedEntry) (node, bool, error) {
 	childPath := concat(path, n.Key...)
-	nc, changed, err := t.extract(n.Val, childPath, domain, evict, out)
+	nc, changed, err := t.extract(n.Val, childPath, domain, evict, inDomain, out)
 	if err != nil {
 		return nil, false, err
 	}

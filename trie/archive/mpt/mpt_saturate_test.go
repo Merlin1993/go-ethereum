@@ -28,7 +28,7 @@ func saturateTestKey(i int) []byte {
 func TestMPTCuckooSaturationRotatesSiblingBuckets(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr, err := New(nil, db, &Config{
-		DomainNibbles:  1,
+		ShardDepthBits: 4,
 		CuckooBuckets:  1,
 		CuckooSlots:    2,
 		BucketCapacity: 3,
@@ -108,7 +108,7 @@ func TestMPTCuckooSaturationRotatesSiblingBuckets(t *testing.T) {
 func TestMPTBucketAppendSaturationKeepsPrefix(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr, err := New(nil, db, &Config{
-		DomainNibbles:  1,
+		ShardDepthBits: 4,
 		CuckooBuckets:  1,
 		CuckooSlots:    3,
 		BucketCapacity: 10,

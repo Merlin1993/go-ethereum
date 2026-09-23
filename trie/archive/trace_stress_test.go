@@ -55,7 +55,7 @@ var (
 	traceStressActivateArchivedKeyOnRead  = flag.Bool("traceStressActivateArchivedKeyOnRead", false, "Activate an archived AMT key when a read finds it")
 	traceStressDisableArchive             = flag.Bool("traceStressDisableArchive", false, "Do not call PruneNextShard during the trace run")
 	traceStressHotLayer                   = flag.String("traceStressHotLayer", "mpt", `Hot-layer backend: "amt" (binary key-level trie) or "mpt" (hexary-MPT layer)`)
-	traceStressDomainNibbles              = flag.Int("traceStressDomainNibbles", 4, "Logical archive domain width in nibbles for the MPT hot layer (domains = 16^this)")
+	traceStressShardDepthBits             = flag.Int("traceStressShardDepthBits", 16, "Logical archive domain width in bits for the MPT hot layer (domains = 2^this)")
 	traceStressArchiveResidentEntries     = flag.Int("traceStressArchiveResidentEntries", 0, "MPT hot layer: cap on memory-resident archived entries across all buckets (0 = engine default)")
 	traceStressTrieBackend                = flag.String("traceStressTrieBackend", "hashdb", `MPT hot-layer node store: "hashdb" (content-addressed) or "pathdb" (triedb.PathDatabase, path-addressed)`)
 	traceStressPathCleanCacheMB           = flag.Int("traceStressPathCleanCacheMB", 64, "pathdb clean cache size in MiB")
@@ -496,7 +496,7 @@ type TraceHotTrie interface {
 type TraceHotTrieSpec struct {
 	Kind                      string
 	DB                        KVStore
-	DomainNibbles             int
+	ShardDepthBits            int
 	CuckooBuckets             int
 	CuckooSlots               int
 	ActivateArchivedKeyOnRead bool
@@ -889,12 +889,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 
 	// One archive round is one prune per rotation unit, spaced by the prune
 	// cadence. The binary hot layer rotates over 2^ShardDepth shards; the MPT
-	// hot layer rotates over 16^DomainNibbles logical domains. Block-cadence
-	// mode (PruneEveryBlocks) has no fixed ops-per-round; this stays a
-	// batches-mode estimate as before.
+	// hot layer rotates over 2^ShardDepthBits logical domains (bit granularity,
+	// the paper's K = 2^k). Block-cadence mode (PruneEveryBlocks) has no fixed
+	// ops-per-round; this stays a batches-mode estimate as before.
 	archiveRoundDomains := int64(1) << uint(*traceStressShardDepth)
 	if *traceStressHotLayer == "mpt" {
-		archiveRoundDomains = int64(1) << uint(4*(*traceStressDomainNibbles))
+		archiveRoundDomains = int64(1) << uint(*traceStressShardDepthBits)
 	}
 	pruneEveryBatches := int64(*traceStressPruneEveryBatches)
 	if pruneEveryBatches < 1 {
@@ -938,9 +938,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"prune_every_blocks":       *traceStressPruneEveryBlocks,
 		"disable_archive":          *traceStressDisableArchive,
 		"hot_layer":                *traceStressHotLayer,
-		"domain_nibbles":           *traceStressDomainNibbles,
-		"domain_depth_nibbles":     *traceStressDomainNibbles, // P6 alias: depth semantics
-		"domain_count":             1 << uint(4**traceStressDomainNibbles),
+		"shard_depth_bits":         *traceStressShardDepthBits,
+		"shard_count":              1 << uint(*traceStressShardDepthBits),
 		"epoch_bitmap":             *traceStressHotLayer == "mpt",
 		"hot_value_layout":         map[bool]string{true: "inline", false: "flatref"}[*traceStressHotLayer == "mpt"],
 		"archive_bucket_capacity":  bucketCapacityMetadata(),
@@ -1014,7 +1013,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		hotBackend, err = TraceHotTrieNew(TraceHotTrieSpec{
 			Kind:                      *traceStressHotLayer,
 			DB:                        &stressDBAdapter{db},
-			DomainNibbles:             *traceStressDomainNibbles,
+			ShardDepthBits:            *traceStressShardDepthBits,
 			CuckooBuckets:             *traceStressCuckooBuckets,
 			CuckooSlots:               *traceStressCuckooSlots,
 			ActivateArchivedKeyOnRead: *traceStressActivateArchivedKeyOnRead,

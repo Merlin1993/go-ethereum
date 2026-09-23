@@ -106,12 +106,14 @@ var (
 // the bucket sequence counter used to mint unique bucket identifiers.
 const scheduleVersion = byte(2)
 
-// Config controls the MPT hot layer. DomainNibbles replaces the old ShardDepth:
-// domains are now counted in hex nibbles rather than bits, because in a single
-// hexary tree a domain boundary has to land on a nibble boundary or it cannot be
-// mapped onto a key range at all.
+// Config controls the MPT hot layer. ShardDepthBits is the paper's shard
+// granularity: the state space is partitioned into 2^ShardDepthBits logical
+// domains (the paper's shards), a domain being the first ShardDepthBits bits
+// of the key, read MSB-first from the big-endian byte stream. Bit granularity
+// matches the paper's K = 2^k exactly and tunes K in 2x steps; the previous
+// nibble granularity (16^N domains) forced 16x steps.
 type Config struct {
-	DomainNibbles int
+	ShardDepthBits int
 
 	CuckooBuckets int
 	CuckooSlots   int
@@ -170,10 +172,10 @@ type KeyValue struct {
 
 func defaultConfig() *Config {
 	return &Config{
-		DomainNibbles: 4,
-		CuckooBuckets: 32,
-		CuckooSlots:   4,
-		Backend:       BackendHash,
+		ShardDepthBits: 16, // 65,536 domains, the previous 4-nibble default
+		CuckooBuckets:  32,
+		CuckooSlots:    4,
+		Backend:        BackendHash,
 	}
 }
 
@@ -268,14 +270,16 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 		if cfg.Backend == "" {
 			cfg.Backend = BackendHash
 		}
-		// An unset width falls back to the default rather than failing: callers
+		// An unset depth falls back to the default rather than failing: callers
 		// legitimately pass a partially populated Config.
-		if cfg.DomainNibbles <= 0 {
-			cfg.DomainNibbles = 4
+		if cfg.ShardDepthBits <= 0 {
+			cfg.ShardDepthBits = 16
 		}
 	}
-	if cfg.DomainNibbles > 8 {
-		return nil, fmt.Errorf("mpt archive: domain nibble count %d exceeds the 32-byte routing key (max 8)", cfg.DomainNibbles)
+	// The prune schedule persists the domain index as a uint32, so the domain
+	// count 2^ShardDepthBits must stay within what that record can address.
+	if cfg.ShardDepthBits > 32 {
+		return nil, fmt.Errorf("mpt archive: shard depth %d bits exceeds the 32-bit prune schedule record (max 32)", cfg.ShardDepthBits)
 	}
 	if cfg.Backend != BackendHash && cfg.Backend != BackendPath {
 		return nil, fmt.Errorf("mpt archive: unknown backend %q", cfg.Backend)
@@ -429,24 +433,26 @@ func isMissingError(err error) bool {
 // bucketKey maps a bucket identifier onto its payload record slot.
 func bucketKey(path []byte) []byte { return prefixed(archivePrefix, path) }
 
-// domainCount is the number of logical domains: 16^DomainNibbles.
-func (t *Trie) domainCount() int { return 1 << uint(4*t.config.DomainNibbles) }
+// domainCount is the number of logical domains: 2^ShardDepthBits.
+func (t *Trie) domainCount() int { return 1 << uint(t.config.ShardDepthBits) }
 
-// domainID routes a key to its logical domain from the leading nibbles. It is
-// purely a scheduling label: unlike the previous per-shard tries, no tree
-// structure follows from it.
-func (t *Trie) domainID(key []byte) int {
+// domainID routes a key to its logical domain: the first ShardDepthBits bits
+// of the key, MSB-first. It is purely a scheduling label: no tree structure
+// follows from it.
+func (t *Trie) domainID(key []byte) int { return domainIDOf(key, t.config.ShardDepthBits) }
+
+// domainIDOf is domainID against an explicit depth. Bits past the end of the
+// key read as zero, so short keys pad with zero bits — the same rule in epoch
+// assignment and in the prune-time domain filter, which is what keeps the two
+// consistent for keys shorter than the domain prefix.
+func domainIDOf(key []byte, depth int) int {
 	id := 0
-	for i := 0; i < t.config.DomainNibbles; i++ {
-		var nib byte
-		if idx := i / 2; idx < len(key) {
-			if i%2 == 0 {
-				nib = key[idx] >> 4
-			} else {
-				nib = key[idx] & 0x0f
-			}
+	for i := 0; i < depth; i++ {
+		var bit byte
+		if idx := i / 8; idx < len(key) {
+			bit = (key[idx] >> (7 - uint(i%8))) & 1
 		}
-		id = id<<4 | int(nib)
+		id = id<<1 | int(bit)
 	}
 	return id
 }
@@ -1242,12 +1248,21 @@ func (t *Trie) pruneNextDomainLocked() error {
 	if err := t.ensureHotLocked(); err != nil {
 		return err
 	}
-	prefix := make([]byte, t.config.DomainNibbles)
+	// Extraction navigates by whole nibbles — the tree's routing unit — so the
+	// prefix covers floor(D/4) nibbles. When D is not a multiple of 4 the
+	// trailing r = D%4 bits inside the boundary nibble are applied as a
+	// per-leaf domain filter: the boundary nibble subtree is shared by up to
+	// 2^(4-r) domains, and CanSkip aggregation stays at nibble granularity
+	// (coarser at the boundary layer, never incorrect).
+	fullNibbles := t.config.ShardDepthBits / 4
+	prefix := make([]byte, fullNibbles)
 	for i := range prefix {
-		shift := 4 * (len(prefix) - 1 - i)
+		shift := uint(t.config.ShardDepthBits - 4*(i+1))
 		prefix[i] = byte((id >> shift) & 0xf)
 	}
-	extracted, err := t.hot.ExtractDomain(prefix, t.baseBit)
+	extracted, err := t.hot.ExtractDomain(prefix, t.baseBit, func(key []byte) bool {
+		return domainIDOf(key, t.config.ShardDepthBits) == id
+	})
 	if err != nil {
 		return err
 	}

@@ -26,7 +26,7 @@ func TestMPTPathDBPruneStressDanglingRegression(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr := newTestTrieWithBackend(t, db, BackendPath, true)
 	tr.config.ForceCommitEveryBatches = 5
-	tr.config.DomainNibbles = 1 // 16 domains: one cycle per 16 batches
+	tr.config.ShardDepthBits = 4 // 16 domains: one cycle per 16 batches
 
 	rng := rand.New(rand.NewPCG(0xdeadbeef, 20260918))
 	mkKey := func() []byte {

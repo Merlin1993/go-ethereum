@@ -48,10 +48,10 @@ func benchStore(b *testing.B) *levelStore {
 // and reported a 2.1x win that was partly an artefact of unequal budgets.
 func benchConfig(backend string) *Config {
 	cfg := &Config{
-		DomainNibbles: 4,
-		CuckooBuckets: 32,
-		CuckooSlots:   4,
-		Backend:       backend,
+		ShardDepthBits: 16,
+		CuckooBuckets:  32,
+		CuckooSlots:    4,
+		Backend:        backend,
 	}
 	switch backend {
 	case BackendHash:
@@ -164,7 +164,7 @@ func BenchmarkPruneCycle(b *testing.B) {
 	const distinct = 1 << 14
 	store := benchStore(b)
 	// One nibble keeps the rotation short so the benchmark stays usable.
-	tr, err := New(nil, store, &Config{DomainNibbles: 1, CuckooBuckets: 32, CuckooSlots: 4, Backend: BackendPath})
+	tr, err := New(nil, store, &Config{ShardDepthBits: 4, CuckooBuckets: 32, CuckooSlots: 4, Backend: BackendPath})
 	if err != nil {
 		b.Fatalf("new trie: %v", err)
 	}

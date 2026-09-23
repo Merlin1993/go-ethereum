@@ -46,26 +46,25 @@ func newTestTrie(t *testing.T, db *testStore, activate bool) *Trie {
 	return newTestTrieWithBackend(t, db, "", activate)
 }
 
-// domainKeyRange returns [start, end) covering every key in the domain, padded
-// out to the store's 32-byte key width. Test-only helper (kept for routing
-// assertions); production pruning walks the tree by nibble prefix.
-func domainKeyRange(id, nibbles int) ([]byte, []byte) {
+// domainKeyRange returns [start, end) covering every key in the bit domain
+// id at the given depth, padded out to the store's 32-byte key width. A depth
+// that is not a multiple of 8 leaves the final byte partly consumed — the
+// boundary case a nibble-based domain could not express.
+// Test-only helper (kept for routing assertions); production pruning walks
+// the tree by nibble prefix plus a per-leaf bit filter.
+func domainKeyRange(id, depth int) ([]byte, []byte) {
 	start := make([]byte, 32)
-	for i := 0; i < nibbles; i++ {
-		shift := uint(4 * (nibbles - 1 - i))
-		nib := byte((id >> shift) & 0x0f)
-		if i%2 == 0 {
-			start[i/2] |= nib << 4
-		} else {
-			start[i/2] |= nib
+	for i := 0; i < depth; i++ {
+		if id>>(uint(depth-1-i))&1 == 1 {
+			start[i/8] |= 1 << (7 - uint(i%8))
 		}
 	}
 	// Exclusive upper bound: carry past the last consumed unit.
 	end := make([]byte, 32)
 	copy(end, start)
-	last := (nibbles - 1) / 2
-	if nibbles%2 == 1 {
-		end[last] |= 0x0f
+	last := (depth - 1) / 8
+	if depth%8 != 0 {
+		end[last] |= (1 << (8 - uint(depth%8))) - 1
 	}
 	for i := last; i >= 0; i-- {
 		end[i]++
@@ -76,13 +75,13 @@ func domainKeyRange(id, nibbles int) ([]byte, []byte) {
 	return start, end
 }
 
-// newTestTrieWithBackend builds a trie over one-nibble domains, so the tests can
-// reach a specific domain with a handful of keys. backend "" means the default
-// (hash) backend.
+// newTestTrieWithBackend builds a trie over four-bit domains (the top nibble,
+// i.e. the previous one-nibble granularity), so the tests can reach a specific
+// domain with a handful of keys. backend "" means the default (hash) backend.
 func newTestTrieWithBackend(t *testing.T, db *testStore, backend string, activate bool) *Trie {
 	t.Helper()
 	tr, err := New(nil, db, &Config{
-		DomainNibbles:             1,
+		ShardDepthBits:            4,
 		CuckooBuckets:             32,
 		CuckooSlots:               4,
 		ActivateArchivedKeyOnRead: activate,
@@ -123,7 +122,7 @@ func TestMPTArchiveRoundTripAndForEach(t *testing.T) {
 		}
 	}
 
-	reloaded, err := New(root, db, &Config{DomainNibbles: 1})
+	reloaded, err := New(root, db, &Config{ShardDepthBits: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +223,7 @@ func TestMPTArchivePruneReloadAndReadActivation(t *testing.T) {
 		t.Fatalf("GetValueRef after prune = %x, archive=%v, err=%v", ref, fromArchive, err)
 	}
 
-	active, err := New(root, db, &Config{DomainNibbles: 1, ActivateArchivedKeyOnRead: true})
+	active, err := New(root, db, &Config{ShardDepthBits: 4, ActivateArchivedKeyOnRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,7 +238,7 @@ func TestMPTArchivePruneReloadAndReadActivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	final, err := New(root, db, &Config{DomainNibbles: 1})
+	final, err := New(root, db, &Config{ShardDepthBits: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +276,7 @@ func TestMPTCommitToBatchStagesCallerBatch(t *testing.T) {
 		t.Fatal("CommitToBatch staged nothing into the caller batch")
 	}
 	// A fresh reader must not see the staged tree yet.
-	if reader, err := New(nil, db, &Config{DomainNibbles: 1}); err == nil {
+	if reader, err := New(nil, db, &Config{ShardDepthBits: 4}); err == nil {
 		if got, err := reader.Get([]byte("a")); err == nil && bytes.Equal(got, entries["a"]) {
 			t.Fatal("staged writes visible before the caller flushed the batch")
 		}
@@ -285,7 +284,7 @@ func TestMPTCommitToBatchStagesCallerBatch(t *testing.T) {
 	if err := batch.Write(); err != nil {
 		t.Fatal(err)
 	}
-	reloaded, err := New(root, db, &Config{DomainNibbles: 1})
+	reloaded, err := New(root, db, &Config{ShardDepthBits: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,47 +411,65 @@ func TestMPTSingleTreeRootMatchesRebuild(t *testing.T) {
 	}
 }
 
-// TestMPTDomainRouting pins the routing change behind plan item D3: domains are
-// counted in nibbles, and the key range must cover exactly that domain for both
-// odd and even nibble counts. An odd count leaves the final byte half consumed,
-// which is the case a bit-based domain could not express.
+// TestMPTDomainRouting pins the bit-granular routing rule: a domain is the
+// first depth bits of the key (MSB-first), and the key range must cover
+// exactly that domain for aligned and misaligned depths. A depth that is not
+// a multiple of 4 ends mid-nibble — the case the old nibble granularity could
+// not express.
 func TestMPTDomainRouting(t *testing.T) {
-	tr := &Trie{config: Config{DomainNibbles: 4}}
+	tr := &Trie{config: Config{ShardDepthBits: 16}}
 	cases := []struct {
-		key     []byte
-		want    int
-		nibbles int
+		key   []byte
+		want  int
+		depth int
 	}{
-		{[]byte{0x12, 0x34}, 0x1234, 4},
-		{[]byte{0xab, 0xcd, 0xef}, 0xabc, 3},
-		{[]byte{0x00}, 0x0, 1},
-		{[]byte{0xf0}, 0xf, 1},
-		{[]byte{}, 0x0, 2},
+		{[]byte{0x12, 0x34}, 0x1234, 16},
+		{[]byte{0xab, 0xcd, 0xef}, 0xabc, 12},
+		{[]byte{0x00}, 0x0, 4},
+		{[]byte{0xf0}, 0xf, 4},
+		// D=13: the 13th bit is the MSB of the fourth nibble — two keys
+		// sharing the first 12 bits split into adjacent domains.
+		{[]byte{0x20, 0x00}, 0x400, 13},
+		{[]byte{0x20, 0x08}, 0x401, 13},
+		{[]byte{}, 0x0, 13}, // short keys pad with zero bits
 	}
 	for _, c := range cases {
-		tr.config.DomainNibbles = c.nibbles
+		tr.config.ShardDepthBits = c.depth
 		if got := tr.domainID(c.key); got != c.want {
-			t.Fatalf("domainID(%x) with %d nibbles = %d, want %d", c.key, c.nibbles, got, c.want)
+			t.Fatalf("domainID(%x) with depth %d = %d, want %d", c.key, c.depth, got, c.want)
 		}
 	}
 
-	for _, nibbles := range []int{1, 2, 3, 4, 5} {
-		for id := 0; id < 1<<uint(nibbles); id++ {
-			start, end := domainKeyRange(id, nibbles)
-			if bytes.Compare(start, end) >= 0 {
-				t.Fatalf("nibbles=%d id=%d: empty range [%x, %x)", nibbles, id, start, end)
+	for _, depth := range []int{1, 4, 5, 8, 13, 16} {
+		// Exhaustive for the shallow depths, a representative sample for
+		// the deeper ones (0, neighbours, mid, alternating bits, max).
+		var ids []int
+		count := 1 << uint(depth)
+		if depth <= 8 {
+			for id := 0; id < count; id++ {
+				ids = append(ids, id)
 			}
-			// Keys inside the domain must route back to it, and neighbours just
-			// outside must not.
-			tr.config.DomainNibbles = nibbles
+		} else {
+			ids = []int{0, 1, 2, 0x400, 0x401, 0xaaa, count / 2, count - 2, count - 1}
+		}
+		for _, id := range ids {
+			start, end := domainKeyRange(id, depth)
+			// An all-zero end means the carry wrapped past the 256-bit
+			// keyspace: the topmost domain extends to the end of the space.
+			if !isAllZero(end) && bytes.Compare(start, end) >= 0 {
+				t.Fatalf("depth=%d id=%d: empty range [%x, %x)", depth, id, start, end)
+			}
+			// Keys inside the domain must route back to it, and neighbours
+			// just outside must not.
+			tr.config.ShardDepthBits = depth
 			if got := tr.domainID(start); got != id {
-				t.Fatalf("nibbles=%d: start key routes to %d, want %d", nibbles, got, id)
+				t.Fatalf("depth=%d: start key routes to %d, want %d", depth, got, id)
 			}
 			if lastInside := decrementKey(end); tr.domainID(lastInside) != id {
-				t.Fatalf("nibbles=%d: last in-range key (%x) routes to %d, want %d", nibbles, lastInside, tr.domainID(lastInside), id)
+				t.Fatalf("depth=%d: last in-range key (%x) routes to %d, want %d", depth, lastInside, tr.domainID(lastInside), id)
 			}
-			if got := tr.domainID(end); nibbles < 8 && got == id && !isAllZero(end) {
-				t.Fatalf("nibbles=%d: end key %x still routes to domain %d", nibbles, end, id)
+			if got := tr.domainID(end); got == id && !isAllZero(end) {
+				t.Fatalf("depth=%d: end key %x still routes to domain %d", depth, end, id)
 			}
 		}
 	}
@@ -512,7 +529,7 @@ func TestMPTSingleTreeDomainPruneStubResidue(t *testing.T) {
 		t.Fatalf("stubs after prune = %d, want 1", n)
 	}
 
-	reloaded, err := New(root, db, &Config{DomainNibbles: 1})
+	reloaded, err := New(root, db, &Config{ShardDepthBits: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +611,7 @@ func TestMPTArchiveDeleteArchivedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reloaded, err := New(root, db, &Config{DomainNibbles: 1})
+	reloaded, err := New(root, db, &Config{ShardDepthBits: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -609,7 +626,7 @@ func TestMPTArchiveDeleteArchivedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	final, err := New(root, db, &Config{DomainNibbles: 1})
+	final, err := New(root, db, &Config{ShardDepthBits: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +650,7 @@ func TestMPTArchiveDeleteArchivedKey(t *testing.T) {
 func TestMPTPathBackendAccountsForOwnWrites(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr, err := New(nil, db, &Config{
-		DomainNibbles:    1,
+		ShardDepthBits:   4,
 		CuckooBuckets:    32,
 		CuckooSlots:      4,
 		Backend:          BackendPath,
@@ -744,20 +761,21 @@ func TestMPTPathBackendRejectsAdoptedRoot(t *testing.T) {
 		0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
 		0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
 		0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d}
-	if _, err := New(adopted.Bytes(), db, &Config{DomainNibbles: 1, Backend: BackendPath}); err == nil {
+	if _, err := New(adopted.Bytes(), db, &Config{ShardDepthBits: 4, Backend: BackendPath}); err == nil {
 		t.Fatal("path backend accepted an existing root it has no layer history for")
 	}
 }
 
-// TestMPTRejectsBadConfig guards the config surfaces callers can get wrong: an
-// over-wide domain and an unknown backend are errors, while an unset width falls
-// back to the default so a partially populated Config still builds.
+// TestMPTRejectsBadConfig guards the config surfaces callers can get wrong: a
+// shard depth beyond the persisted uint32 domain index and an unknown backend
+// are errors, while an unset depth falls back to the default so a partially
+// populated Config still builds.
 func TestMPTRejectsBadConfig(t *testing.T) {
 	db := &testStore{memorydb.New()}
-	if _, err := New(nil, db, &Config{DomainNibbles: 9}); err == nil {
-		t.Error("accepted a 9-nibble domain (beyond the 32-bit routing key)")
+	if _, err := New(nil, db, &Config{ShardDepthBits: 33}); err == nil {
+		t.Error("accepted a 33-bit shard depth (beyond the 32-bit prune schedule record)")
 	}
-	if _, err := New(nil, db, &Config{DomainNibbles: 2, Backend: "leveldb"}); err == nil {
+	if _, err := New(nil, db, &Config{ShardDepthBits: 8, Backend: "leveldb"}); err == nil {
 		t.Error("accepted an unknown backend")
 	}
 	// Defaults must still construct, including from a zero Config.
@@ -765,8 +783,8 @@ func TestMPTRejectsBadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("default config failed to construct: %v", err)
 	}
-	if tr.config.DomainNibbles != 4 || tr.config.Backend != BackendHash {
-		t.Fatalf("defaults = (nibbles %d, backend %q); want (4, %q)", tr.config.DomainNibbles, tr.config.Backend, BackendHash)
+	if tr.config.ShardDepthBits != 16 || tr.config.Backend != BackendHash {
+		t.Fatalf("defaults = (depth bits %d, backend %q); want (16, %q)", tr.config.ShardDepthBits, tr.config.Backend, BackendHash)
 	}
 }
 
@@ -777,7 +795,7 @@ func TestMPTRejectsBadConfig(t *testing.T) {
 func TestMPTArchiveBucketEviction(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr, err := New(nil, db, &Config{
-		DomainNibbles:             1,
+		ShardDepthBits:            4,
 		CuckooBuckets:             32,
 		CuckooSlots:               4,
 		ActivateArchivedKeyOnRead: true,
@@ -966,7 +984,7 @@ func TestMPTSingleTreeResurrectionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reloaded, err := New(root, db, &Config{DomainNibbles: 1, ActivateArchivedKeyOnRead: true})
+	reloaded, err := New(root, db, &Config{ShardDepthBits: 4, ActivateArchivedKeyOnRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -995,7 +1013,7 @@ func TestMPTSingleTreeResurrectionRoundTrip(t *testing.T) {
 func TestMPTBucketCapacitySplitDown(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr, err := New(nil, db, &Config{
-		DomainNibbles:             1,
+		ShardDepthBits:            4,
 		CuckooBuckets:             64,
 		CuckooSlots:               4,
 		BucketCapacity:            3,
@@ -1070,7 +1088,7 @@ func (db *countingStore) Get(key []byte) ([]byte, error) {
 func TestMPTBucketO1CommitmentUpdate(t *testing.T) {
 	db := &countingStore{Database: memorydb.New()}
 	tr, err := New(nil, db, &Config{
-		DomainNibbles:             1,
+		ShardDepthBits:            4,
 		CuckooBuckets:             32,
 		CuckooSlots:               4,
 		ArchiveResidentEntries:    1, // force payload eviction at commit

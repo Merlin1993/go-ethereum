@@ -81,7 +81,7 @@ func init() {
 			return nil, errors.New("trace hot layer hook: unsupported kind " + spec.Kind)
 		}
 		trie, err := mpt.New(nil, spec.DB, &mpt.Config{
-			DomainNibbles:             spec.DomainNibbles,
+			ShardDepthBits:            spec.ShardDepthBits,
 			CuckooBuckets:             spec.CuckooBuckets,
 			CuckooSlots:               spec.CuckooSlots,
 			ActivateArchivedKeyOnRead: spec.ActivateArchivedKeyOnRead,

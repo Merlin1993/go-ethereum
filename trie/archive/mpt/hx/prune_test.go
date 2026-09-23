@@ -90,7 +90,7 @@ func TestHXExtractDomainEpochSelective(t *testing.T) {
 		want[string(key)] = string(val)
 	}
 
-	extracted, err := tr.ExtractDomain([]byte{5}, 0)
+	extracted, err := tr.ExtractDomain([]byte{5}, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestHXCanSkipSubtreeDoesNotTouch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	extracted, err := cold.ExtractDomain([]byte{3}, 0)
+	extracted, err := cold.ExtractDomain([]byte{3}, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestHXCanSkipSubtreeDoesNotTouch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	extracted, err = cold2.ExtractDomain([]byte{3}, 1)
+	extracted, err = cold2.ExtractDomain([]byte{3}, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,12 +204,12 @@ func TestHXCanSkipSubtreeDoesNotTouch(t *testing.T) {
 func TestHXExtractDomainAbsent(t *testing.T) {
 	db := newTestDB()
 	tr := NewEmpty(db)
-	out, err := tr.ExtractDomain([]byte{4}, 0)
+	out, err := tr.ExtractDomain([]byte{4}, 0, nil)
 	if err != nil || len(out) != 0 {
 		t.Fatalf("empty trie: %d entries, err %v", len(out), err)
 	}
 	tr.Update(pruneTestKey(1, 1), []byte("x"))
-	out, err = tr.ExtractDomain([]byte{4}, 0)
+	out, err = tr.ExtractDomain([]byte{4}, 0, nil)
 	if err != nil || len(out) != 0 {
 		t.Fatalf("absent domain: %d entries, err %v", len(out), err)
 	}
@@ -218,12 +218,64 @@ func TestHXExtractDomainAbsent(t *testing.T) {
 	tr2.SetEpochPolicy(func(key []byte) byte { return 0 })
 	only := pruneTestKey(4, 77)
 	tr2.Update(only, []byte("only"))
-	out, err = tr2.ExtractDomain([]byte{4}, 0)
+	out, err = tr2.ExtractDomain([]byte{4}, 0, nil)
 	if err != nil || len(out) != 1 || string(out[0].Value) != "only" {
 		t.Fatalf("single-leaf domain extract: %d entries, err %v", len(out), err)
 	}
 	if val, _ := tr2.Get(only); val != nil {
 		t.Fatal("extracted leaf still present")
+	}
+}
+
+// TestHXExtractDomainBitFilter covers the bit-granular domain split inside a
+// shared nibble subtree: the prefix navigates to the boundary node and the
+// per-leaf filter applies the trailing bits, so exactly the in-domain leaves
+// are removed.
+func TestHXExtractDomainBitFilter(t *testing.T) {
+	db := newTestDB()
+	tr := NewEmpty(db)
+	tr.SetEpochPolicy(func(key []byte) byte { return 0 })
+	// All keys share nibble prefix [2,0,0]; nibble 3 = i, so bit 12 (the MSB
+	// of nibble 3) is i>>3 and splits the subtree in half.
+	for i := 0; i < 16; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x20
+		key[1] = byte(i)
+		if err := tr.Update(key, []byte(fmt.Sprintf("v%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	extracted, err := tr.ExtractDomain([]byte{2, 0, 0}, 0, func(key []byte) bool {
+		return key[1]&0x8 == 0 // first 13 bits have bit 12 clear
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(extracted) != 8 {
+		t.Fatalf("extracted %d, want 8 (bit-12-clear half of the subtree)", len(extracted))
+	}
+	for _, e := range extracted {
+		if e.Key[1]&0x8 != 0 {
+			t.Fatalf("extracted out-of-domain key %x", e.Key)
+		}
+	}
+	for i := 0; i < 16; i++ {
+		key := make([]byte, 32)
+		key[0] = 0x20
+		key[1] = byte(i)
+		val, err := tr.Get(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i < 8 && val != nil {
+			t.Fatalf("in-domain leaf %d survived extraction", i)
+		}
+		if i >= 8 && string(val) != fmt.Sprintf("v%d", i) {
+			t.Fatalf("out-of-domain leaf %d lost: %q", i, val)
+		}
+	}
+	if err := tr.VerifyAggregates(); err != nil {
+		t.Fatalf("aggregates after filtered extract: %v", err)
 	}
 }
 
