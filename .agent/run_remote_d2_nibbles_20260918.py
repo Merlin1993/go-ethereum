@@ -33,6 +33,10 @@ TRACE_INPUT = "/root/asct_codex/mainnet_state_access_trace/range_10m"
 DOMAIN_NIBBLES = int(os.environ.get("D2_NIBBLES", "4"))
 if DOMAIN_NIBBLES not in (3, 4, 5):
     raise SystemExit(f"D2_NIBBLES must be 3/4/5, got {DOMAIN_NIBBLES}")
+# D2_START_FILE: shard index to start from. Default 9 (the calibration segment).
+# Use 0 for the long-horizon variant: shards 0..9 hold ~34B ops, enough for a
+# nib5 round (4.19B ops) to complete — from file 9 the trace dies at ~3.4B.
+START_FILE = int(os.environ.get("D2_START_FILE", "9"))
 DOMAIN_COUNT = 1 << (4 * DOMAIN_NIBBLES)
 BATCH_SIZE = 4000
 ROUNDS = 1.5
@@ -43,7 +47,7 @@ METRICS_BATCHES = {3: 250, 4: 2500, 5: 40000}[DOMAIN_NIBBLES]
 
 STAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 RESULTS = f"{REMOTE_WORK}/results"
-RUN_AMT = f"{RESULTS}/trace_stress/D2_amt_nib{DOMAIN_NIBBLES}_{OPERATIONS}_fl{FLUSH_BATCHES}_{STAMP}"
+RUN_AMT = f"{RESULTS}/trace_stress/D2_amt_nib{DOMAIN_NIBBLES}_{OPERATIONS}_fl{FLUSH_BATCHES}_sf{START_FILE}_{STAMP}"
 REMOTE_LAUNCHER = f"{REMOTE_WORK}/run_d2_nib{DOMAIN_NIBBLES}_{STAMP}.sh"
 REMOTE_GUARD = f"{REMOTE_WORK}/full_replay_disk_guard.sh"
 MIN_FREE_BYTES = 8_000_000_000
@@ -205,8 +209,8 @@ run_stage D2_amt '{RUN_AMT}.exit' '{RUN_AMT}.log' \\
     -args \\
       -traceStressInputDir={TRACE_INPUT} \\
       -traceStressBaseDir='{RUN_AMT}' \\
-      -traceStressOps={OPERATIONS} \\
-      -traceStressStartFile=9 \\
+      -traceStressOps={OPERATIONS} \\\
+      -traceStressStartFile={START_FILE} \\\
       -traceStressBatchSize={BATCH_SIZE} \\
       -traceStressMetricsBatches={METRICS_BATCHES} \\
       -traceStressStemMode=false \\
@@ -260,7 +264,7 @@ exit "$overall"
             "rounds": ROUNDS,
             "domain_nibbles": DOMAIN_NIBBLES,
             "metrics_batches": METRICS_BATCHES,
-            "start_file": 9,
+            "start_file": START_FILE,
             "flush_every_batches": FLUSH_BATCHES,
             "windows": OPERATIONS // (METRICS_BATCHES * BATCH_SIZE),
             "run_amt": RUN_AMT,
