@@ -714,6 +714,13 @@ func (t *Trie) encodeBucket(b *bucket) []byte {
 	return data
 }
 
+// errBucketSaturated signals that a bucket's cuckoo filter cannot absorb
+// another entry. Insertion failures are probabilistic well below the filter's
+// hard capacity (exponentially likely above ~7/8 load), so saturation is a
+// rotation signal, not corruption: the bucket keeps its absorbed prefix and a
+// fresh sibling bucket takes the remainder (paper: forced compaction).
+var errBucketSaturated = errors.New("mpt archive: bucket saturated")
+
 // cuckooSoftCap bounds how many entries a bucket's filter may hold before
 // top-up stops; insertion failures get exponentially likely above ~7/8 load.
 func (t *Trie) cuckooSoftCap() int {
@@ -721,17 +728,33 @@ func (t *Trie) cuckooSoftCap() int {
 }
 
 // createBucketLocked mounts a fresh bucket holding entries at nodePath
-// (paper: forced compaction and partial-bucket materialization).
-func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedEntry) error {
+// (paper: forced compaction and partial-bucket materialization). It returns
+// the number of entries the bucket absorbed; the filter may saturate before
+// the batch runs out, in which case the bucket holds the absorbed prefix and
+// the caller rotates a fresh sibling for the remainder. This also caps
+// BucketCapacity at the filter's true slot count when M exceeds it.
+func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedEntry) (int, error) {
 	filter := cuckoo.New(t.config.CuckooBuckets, t.config.CuckooSlots)
 	items := make([][]byte, 0, len(entries))
 	payload := make(map[string][]byte, len(entries))
+	consumed := 0
 	for _, e := range entries {
 		if err := filter.Insert(e.Key); err != nil {
-			return fmt.Errorf("mpt archive: cuckoo overflow in bucket of %d entries: %w", len(entries), err)
+			if consumed == 0 {
+				// An empty filter always accepts the first insert; refusing
+				// one is real corruption, not saturation.
+				return 0, fmt.Errorf("mpt archive: cuckoo overflow in bucket of %d entries: %w", len(entries), err)
+			}
+			break
 		}
 		payload[string(e.Key)] = bytes.Clone(e.Value)
 		items = append(items, bucketItem(e.Key, e.Value))
+		consumed++
+	}
+	if consumed < len(entries) {
+		// The failed insert permuted the fresh filter's slots; rebuild it
+		// from the absorbed entries so every key stays probe-visible.
+		filter = rebuildFilter(payload, t.config.CuckooBuckets, t.config.CuckooSlots)
 	}
 	path := make([]byte, len(nodePath)+8)
 	copy(path, nodePath)
@@ -743,39 +766,88 @@ func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedE
 		entries:    payload,
 		filter:     filter,
 		commitment: ecmh.Create(items),
-		count:      len(entries),
+		count:      consumed,
 		dirty:      true,
 	}
 	mp, err := t.hot.MountStub(nodePath, b.stub())
 	if err != nil {
-		return err
+		return 0, err
 	}
 	b.mount = mp
 	t.buckets[string(path)] = b
 	t.makeResidentLocked(b)
 	t.markDirtyLocked()
-	return nil
+	return consumed, nil
+}
+
+// rebuildFilter reconstructs a cuckoo filter holding exactly the given keys.
+// A failed Insert permutes occupied slots and drops the last evicted
+// fingerprint (the kick loop returns ErrFull still holding it), which would
+// surface as a probe false negative for a key the bucket actually holds.
+// Rebuilding from the authoritative entries restores every fingerprint; map
+// iteration order randomizes the kick pattern per attempt.
+func rebuildFilter(entries map[string][]byte, buckets, slots int) *cuckoo.Filter {
+	var filter *cuckoo.Filter
+	for attempt := 0; attempt < 8; attempt++ {
+		filter = cuckoo.New(buckets, slots)
+		ok := true
+		for key := range entries {
+			if err := filter.Insert([]byte(key)); err != nil {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return filter
+		}
+	}
+	// Saturation this persistent is a pathological filter geometry; keep the
+	// last build rather than fail the batch.
+	return filter
 }
 
 // bucketAppendLocked tops up an existing bucket (paper CanAppend): filter,
 // commitment and count update O(1) per entry — BlindAppend touches no other
-// bucket content.
-func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) error {
+// bucket content. On filter saturation it keeps the absorbed prefix, reports
+// the consumed count and returns errBucketSaturated so the caller rotates a
+// fresh sibling bucket for the remainder instead of failing the batch.
+func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) (int, error) {
 	if err := t.loadBucketLocked(b); err != nil {
-		return err
+		return 0, err
 	}
+	consumed := 0
+	saturated := false
 	for _, e := range entries {
 		if err := b.filter.Insert(e.Key); err != nil {
-			return fmt.Errorf("mpt archive: cuckoo overflow appending to bucket %x: %w", b.path, err)
+			saturated = true
+			break
 		}
 		b.entries[string(e.Key)] = bytes.Clone(e.Value)
 		b.commitment = ecmh.BlindAppend(b.commitment, bucketItem(e.Key, e.Value))
+		consumed++
 	}
-	b.count += len(entries)
-	t.residentEntries += len(entries)
+	if consumed == 0 {
+		if saturated {
+			return 0, errBucketSaturated
+		}
+		return 0, nil // empty batch: nothing to rewrite
+	}
+	b.count += consumed
+	t.residentEntries += consumed
 	b.dirty = true
 	t.touchResidentLocked(b)
-	return t.hot.ReplaceStub(b.mount, b.path, b.stub())
+	if saturated {
+		// The failed insert permuted the filter's slots; rebuild it from the
+		// authoritative entries so every key stays probe-visible.
+		b.filter = rebuildFilter(b.entries, t.config.CuckooBuckets, t.config.CuckooSlots)
+	}
+	if err := t.hot.ReplaceStub(b.mount, b.path, b.stub()); err != nil {
+		return consumed, err
+	}
+	if saturated {
+		return consumed, errBucketSaturated
+	}
+	return consumed, nil
 }
 
 // bucketDeleteLocked removes one entry (paper BlindDelete): the commitment
@@ -840,19 +912,28 @@ func (t *Trie) mountEntriesLocked(domainPrefix []byte, entries []gethtrie.Extrac
 				continue
 			}
 			n := min(room, len(rest))
-			if err := t.bucketAppendLocked(b, rest[:n]); err != nil {
+			consumed, err := t.bucketAppendLocked(b, rest[:n])
+			rest = rest[consumed:]
+			if err != nil && !errors.Is(err, errBucketSaturated) {
 				return err
 			}
-			rest = rest[n:]
+			// Saturation: the bucket kept its prefix and is full for
+			// rotation purposes — fall through to the next stub at this
+			// mount, exactly like the room<=0 case.
 		}
 		if len(rest) == 0 {
 			break
 		}
 		for len(rest) >= capacity {
-			if err := t.createBucketLocked(nodePath, rest[:capacity]); err != nil {
+			consumed, err := t.createBucketLocked(nodePath, rest[:capacity])
+			if err != nil {
 				return err
 			}
-			rest = rest[capacity:]
+			// createBucketLocked consumes at least one entry (an empty
+			// filter always accepts the first insert), but possibly fewer
+			// than capacity when the filter saturates: the next sibling
+			// picks up the remainder.
+			rest = rest[consumed:]
 		}
 		if len(rest) == 0 {
 			break
@@ -868,10 +949,11 @@ func (t *Trie) mountEntriesLocked(domainPrefix []byte, entries []gethtrie.Extrac
 				continue
 			}
 		}
-		if err := t.createBucketLocked(nodePath, rest); err != nil {
+		consumed, err := t.createBucketLocked(nodePath, rest)
+		if err != nil {
 			return err
 		}
-		rest = nil
+		rest = rest[consumed:]
 	}
 	return nil
 }
