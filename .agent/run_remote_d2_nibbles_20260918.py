@@ -1,17 +1,22 @@
-"""D-stage (B2 recalibration): AMT pathdb hot-mpt at one domain depth, file 9.
+"""D-stage (B2 recalibration): AMT pathdb hot-mpt at one shard depth, file 9.
 
 Why: single-tree 16-ary form invalidated the old D15 conclusion; P4/P5 changed
-the prune/bucket physics again. Pick the depth among {3,4,5} nibble by running
-1.5 archive rounds each and comparing hot-hit (G3) -> FPR (G4) -> State_Bytes
-(G2, PathStats three-sum) -> ops/s (<=15% degradation tolerance).
+the prune/bucket physics again. Pick the depth by running 1.5 archive rounds
+each and comparing hot-hit (G3) -> FPR (G4) -> State_Bytes (G2, PathStats
+three-sum) -> ops/s (<=15% degradation tolerance).
 
-Protocol: file-9 segment, ops = 1.5 * 16^nibbles * 4000 (one domain pruned per
-batch), archive ON, read-activation ON, cuckoo 32x4, NodeCache 512MB, pathdb
-with the C-loop conclusion FlushEveryBatches=25. MPT_OP_TRACE and
-MPT_ECMH_VERIFY stay OFF (formal-run posture per C5).
+2026-09-23: shard granularity moved from nibbles (16^N, 16x steps) to bits
+(2^D, 2x steps, commit bca5bef10) so the archive round lands in the 3-6 month
+key-lifetime window: epoch two-round eviction means key lifetime is [1, 2]
+rounds, so D=19 (524,288 shards, ~86 days/round) gives ~3-5.7 months.
 
-Knob: D2_NIBBLES=3|4|5 (default 4). Launch nib3 first as the smoke run
-(P6 metadata check), then nib4, then nib5.
+Protocol: file-9 segment, ops = 1.5 * 2^D * 4000 (one shard pruned per batch),
+archive ON, read-activation ON, cuckoo 32x4, NodeCache 512MB, pathdb with the
+C-loop conclusion FlushEveryBatches=25. MPT_OP_TRACE and MPT_ECMH_VERIFY stay
+OFF (formal-run posture per C5).
+
+Knob: D2_DEPTH_BITS (default 19). Historical equivalents: nibbles 3/4/5 = bits
+12/16/20.
 
 IMPORTANT: FILES must glob mpt/hx and mpt/ecmh too (P4/P5 added subpackages) —
 the old s1p launcher's `mpt/*.go` glob silently misses them.
@@ -30,25 +35,25 @@ REMOTE_WORK = "/root/asct_codex"
 REMOTE_SOURCE = f"{REMOTE_WORK}/go-ethereum-trace"
 TRACE_INPUT = "/root/asct_codex/mainnet_state_access_trace/range_10m"
 
-DOMAIN_NIBBLES = int(os.environ.get("D2_NIBBLES", "4"))
-if DOMAIN_NIBBLES not in (3, 4, 5):
-    raise SystemExit(f"D2_NIBBLES must be 3/4/5, got {DOMAIN_NIBBLES}")
+DEPTH_BITS = int(os.environ.get("D2_DEPTH_BITS", "19"))
+if DEPTH_BITS < 12 or DEPTH_BITS > 32:
+    raise SystemExit(f"D2_DEPTH_BITS must be 12..32, got {DEPTH_BITS}")
 # D2_START_FILE: shard index to start from. Default 9 (the calibration segment).
 # Use 0 for the long-horizon variant: shards 0..9 hold ~34B ops, enough for a
-# nib5 round (4.19B ops) to complete — from file 9 the trace dies at ~3.4B.
+# D=20 round (4.19B ops) to complete — from file 9 the trace dies at ~3.4B.
 START_FILE = int(os.environ.get("D2_START_FILE", "9"))
-DOMAIN_COUNT = 1 << (4 * DOMAIN_NIBBLES)
+DOMAIN_COUNT = 1 << DEPTH_BITS
 BATCH_SIZE = 4000
 ROUNDS = 1.5
 OPERATIONS = int(DOMAIN_COUNT * BATCH_SIZE * ROUNDS)
-FLUSH_BATCHES = 25  # C-loop conclusion: flush per 100K ops, r=0.891 @nib4
+FLUSH_BATCHES = 25  # C-loop conclusion: flush per 100K ops, r=0.891 @D=16
 # Window sizing: keep ~24-40 windows per run so the CSV stays readable.
-METRICS_BATCHES = {3: 250, 4: 2500, 5: 40000}[DOMAIN_NIBBLES]
+METRICS_BATCHES = max(2500, (DOMAIN_COUNT * 3 // 2) // 40)
 
 STAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 RESULTS = f"{REMOTE_WORK}/results"
-RUN_AMT = f"{RESULTS}/trace_stress/D2_amt_nib{DOMAIN_NIBBLES}_{OPERATIONS}_fl{FLUSH_BATCHES}_sf{START_FILE}_{STAMP}"
-REMOTE_LAUNCHER = f"{REMOTE_WORK}/run_d2_nib{DOMAIN_NIBBLES}_{STAMP}.sh"
+RUN_AMT = f"{RESULTS}/trace_stress/D2_amt_bits{DEPTH_BITS}_{OPERATIONS}_fl{FLUSH_BATCHES}_sf{START_FILE}_{STAMP}"
+REMOTE_LAUNCHER = f"{REMOTE_WORK}/run_d2_bits{DEPTH_BITS}_{STAMP}.sh"
 REMOTE_GUARD = f"{REMOTE_WORK}/full_replay_disk_guard.sh"
 MIN_FREE_BYTES = 8_000_000_000
 
@@ -102,7 +107,7 @@ test ! -e '{REMOTE_LAUNCHER}'
 test ! -e '{REMOTE_LAUNCHER}.status.log'
 free=$(df -B1 --output=avail /root | tail -n 1 | tr -d ' ')
 printf 'FREE_BYTES=%s\\n' "$free"
-ps -eo pid=,comm=,args= | awk '$2 == "go" || $2 == "archive.test" || $2 == "tree.test" {{print}} /run_full_replay_[0-9]+_[0-9]+\\.sh$/ {{print}} /run_s1p_optrace_[0-9]+_[0-9]+\\.sh$/ {{print}} /run_d2_nib[0-9]+_[0-9]+_[0-9]+\\.sh$/ {{print}}' || true
+ps -eo pid=,comm=,args= | awk '$2 == "go" || $2 == "archive.test" || $2 == "tree.test" {{print}} /run_full_replay_[0-9]+_[0-9]+\\.sh$/ {{print}} /run_s1p_optrace_[0-9]+_[0-9]+\\.sh$/ {{print}} /run_d2_(nib|bits)[0-9]+_[0-9]+_[0-9]+\\.sh$/ {{print}}' || true
 """
         code, output, error = run_remote(client, preflight, 30)
         if code != 0:
@@ -187,7 +192,7 @@ run_stage() {{
   return 0
 }}
 
-printf '%s D2: AMT pathdb hot-mpt depth calibration, {ROUNDS} rounds = {OPERATIONS} ops, nibbles={DOMAIN_NIBBLES}, fl{FLUSH_BATCHES}\\n' "$(date --iso-8601=seconds)" >>'{REMOTE_LAUNCHER}.status.log'
+printf '%s D2: AMT pathdb hot-mpt depth calibration, {ROUNDS} rounds = {OPERATIONS} ops, depth_bits={DEPTH_BITS}, fl{FLUSH_BATCHES}\\n' "$(date --iso-8601=seconds)" >>'{REMOTE_LAUNCHER}.status.log'
 
 # Compile gate first: a build failure must not consume hours of trace time.
 set +e
@@ -217,7 +222,7 @@ run_stage D2_amt '{RUN_AMT}.exit' '{RUN_AMT}.log' \\
       -traceStressDisableArchive=false \\
       -traceStressHotLayer=mpt \\
       -traceStressTrieBackend=pathdb \\
-      -traceStressDomainNibbles={DOMAIN_NIBBLES} \\
+      -traceStressShardDepthBits={DEPTH_BITS} \\
       -traceStressPathCleanCacheMB=256 \\
       -traceStressPathWriteBufferMB=256 \\
       -traceStressPathFlushEveryBatches={FLUSH_BATCHES} \\
@@ -262,7 +267,7 @@ exit "$overall"
             "stamp": STAMP,
             "operations": OPERATIONS,
             "rounds": ROUNDS,
-            "domain_nibbles": DOMAIN_NIBBLES,
+            "shard_depth_bits": DEPTH_BITS,
             "metrics_batches": METRICS_BATCHES,
             "start_file": START_FILE,
             "flush_every_batches": FLUSH_BATCHES,
