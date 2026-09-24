@@ -30,7 +30,8 @@ from pathlib import Path
 import paramiko
 
 
-HOST = "192.168.2.230"
+# IP drifts (NIC/DHCP): always take it from the creds JSON, never hardcode.
+HOST = json.loads(Path(".agent/asct_remote_servers.local.json").read_text())["asct_mpt"]["host"]
 REMOTE_WORK = "/root/asct_codex"
 REMOTE_SOURCE = f"{REMOTE_WORK}/go-ethereum-trace"
 TRACE_INPUT = "/root/asct_codex/mainnet_state_access_trace/range_10m"
@@ -214,8 +215,8 @@ run_stage D2_amt '{RUN_AMT}.exit' '{RUN_AMT}.log' \\
     -args \\
       -traceStressInputDir={TRACE_INPUT} \\
       -traceStressBaseDir='{RUN_AMT}' \\
-      -traceStressOps={OPERATIONS} \\\
-      -traceStressStartFile={START_FILE} \\\
+      -traceStressOps={OPERATIONS} \\
+      -traceStressStartFile={START_FILE} \\
       -traceStressBatchSize={BATCH_SIZE} \\
       -traceStressMetricsBatches={METRICS_BATCHES} \\
       -traceStressStemMode=false \\
