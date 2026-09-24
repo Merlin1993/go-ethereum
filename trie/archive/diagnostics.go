@@ -1959,3 +1959,11 @@ func RecordMPTReadPromotion(elapsed time.Duration, hit bool) {
 func RecordMPTFilterFalsePositive() {
 	recordArchiveFilterFalsePositive()
 }
+
+// RecordMPTFilterLookup lets the MPT hot layer report a cuckoo filter
+// lookup outcome (positive = filter claims the key may be present) into
+// the shared G4 telemetry counters, wiring the FPR denominator that the
+// sharded path already feeds via recordArchiveFilterLookup.
+func RecordMPTFilterLookup(positive bool) {
+	recordArchiveFilterLookup(positive)
+}

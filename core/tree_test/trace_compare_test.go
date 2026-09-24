@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -384,6 +385,68 @@ func writeTraceCompareJSON(path string, value any) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+// byteCountingStore wraps the comparison engine's LevelDB to tally the bytes
+// handed to the store — the "written" half of the G2 storage caliber. The
+// per-window State_Bytes column is a directory scan: it misses in-flight
+// batches and everything pathdb still holds in its dirty buffer, so an
+// active-layer size claim built on it alone understates the engine exactly
+// when it matters most (same rationale as the AMT arm's PathStats). Pure
+// measurement: it never alters what the reference engine does.
+type byteCountingStore struct {
+	ethdb.KeyValueStore
+	written atomic.Int64
+}
+
+func (s *byteCountingStore) Put(key, value []byte) error {
+	if err := s.KeyValueStore.Put(key, value); err != nil {
+		return err
+	}
+	s.written.Add(int64(len(key) + len(value)))
+	return nil
+}
+
+func (s *byteCountingStore) Delete(key []byte) error {
+	if err := s.KeyValueStore.Delete(key); err != nil {
+		return err
+	}
+	s.written.Add(int64(len(key)))
+	return nil
+}
+
+func (s *byteCountingStore) NewBatch() ethdb.Batch {
+	return &byteCountingBatch{Batch: s.KeyValueStore.NewBatch(), s: s}
+}
+
+type byteCountingBatch struct {
+	ethdb.Batch
+	s       *byteCountingStore
+	pending int64
+}
+
+func (b *byteCountingBatch) Put(key, value []byte) error {
+	b.pending += int64(len(key) + len(value))
+	return b.Batch.Put(key, value)
+}
+
+func (b *byteCountingBatch) Delete(key []byte) error {
+	b.pending += int64(len(key))
+	return b.Batch.Delete(key)
+}
+
+func (b *byteCountingBatch) Reset() {
+	b.pending = 0
+	b.Batch.Reset()
+}
+
+func (b *byteCountingBatch) Write() error {
+	if err := b.Batch.Write(); err != nil {
+		return err
+	}
+	b.s.written.Add(b.pending)
+	b.pending = 0
+	return nil
+}
+
 func TestTraceCompareSelection(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state_access_trace_000000001_000000003.csv.gz")
@@ -527,7 +590,8 @@ func TestTrieTraceCompare(t *testing.T) {
 	}
 	defer ldb.Close()
 
-	mdb := ethdb.WrapWithStats(ldb)
+	counter := &byteCountingStore{KeyValueStore: ldb}
+	mdb := ethdb.WrapWithStats(counter)
 	diskDB := rawdb.NewDatabase(mdb)
 	cacheConfig := core.DefaultCacheConfigWithScheme(rawdb.PathScheme)
 	cacheConfig.SnapshotLimit = 0
@@ -571,6 +635,7 @@ func TestTrieTraceCompare(t *testing.T) {
 		"key_rule":                    "BinaryTree/Verkle structural key for account, storage, and code",
 		"value_rule":                  "32-byte value_hash; deterministic key/op hash when absent",
 		"storage_zero_hash_is_delete": true,
+		"path_stats":                  "Path_Written_Bytes = bytes handed to the store (wrapping counter, measurement-only); Path_Buffered_Bytes/Path_Diff_Bytes = triedb.Size() dirty buffer / diff layers (public API)",
 		"command":                     strings.Join(os.Args, " "),
 	}
 	if err := writeTraceCompareJSON(filepath.Join(*traceCompareBaseDir, "metadata.json"), metadata); err != nil {
@@ -595,6 +660,7 @@ func TestTrieTraceCompare(t *testing.T) {
 		"Timing_Samples", "Sampled_Reads", "Sampled_Read_ms", "Sampled_Writes", "Sampled_Write_ms", "Sampled_Deletes", "Sampled_Delete_ms",
 		"Measured_Wall_ms", "Operations_Per_Sec", "Batch_P50_ms", "Batch_P95_ms", "Batch_P99_ms", "Batch_Max_ms",
 		"State_Bytes", "RSS_Bytes", "Heap_Bytes",
+		"Path_Written_Bytes", "Path_Buffered_Bytes", "Path_Diff_Bytes",
 	}
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
@@ -633,6 +699,7 @@ func TestTrieTraceCompare(t *testing.T) {
 			}
 		}
 		diskSize, _ := GetDirSize(stateDir)
+		diffs, buffered, _ := trieDB.Size()
 		row := []string{
 			strconv.FormatInt(batchNumber-int64(len(window.batchWall))+1, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(totalCounts.total(), 10),
 			strconv.FormatUint(window.firstBlock, 10), strconv.FormatUint(window.lastBlock, 10), strconv.FormatInt(window.counts.total(), 10),
@@ -644,6 +711,7 @@ func TestTrieTraceCompare(t *testing.T) {
 			strconv.FormatInt(window.timing.Deletes, 10), traceCompareMS(time.Duration(window.timing.DeleteNanos)),
 			strconv.FormatFloat(opsPerSec, 'f', 2, 64), traceCompareMS(traceComparePercentile(window.batchWall, .50)), traceCompareMS(traceComparePercentile(window.batchWall, .95)), traceCompareMS(traceComparePercentile(window.batchWall, .99)), traceCompareMS(traceComparePercentile(window.batchWall, 1)),
 			strconv.FormatInt(diskSize, 10), strconv.FormatUint(rss, 10), strconv.FormatUint(mem.HeapAlloc, 10),
+			strconv.FormatInt(counter.written.Load(), 10), strconv.FormatInt(int64(buffered), 10), strconv.FormatInt(int64(diffs), 10),
 		}
 		if err := metrics.Write(row); err != nil {
 			t.Fatal(err)

@@ -247,6 +247,52 @@ func TestMPTArchivePruneReloadAndReadActivation(t *testing.T) {
 	}
 }
 
+// TestMPTArchiveFilterLookupCounters proves the G4 denominator wiring: an
+// archived bucket's cuckoo filter consult must feed Lookups/Positives on a
+// hit and Lookups/Negatives on a miss. The sharded path always reported
+// these; the mpt probe path only recorded false positives before.
+func TestMPTArchiveFilterLookupCounters(t *testing.T) {
+	db := &testStore{memorydb.New()}
+	tr := newTestTrie(t, db, false)
+	key := []byte{0x00, 'k'}
+	if err := tr.Put(key, []byte("archived")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	expirePrune(t, tr, 0)
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	before := archivetrie.LastUpdateDiagnostics()
+	// Filter positive: the archived key routes to the bucket, the filter
+	// claims it, the payload confirms.
+	if ref, fromArchive, err := tr.GetValueRef(key); err != nil || !fromArchive || len(ref) != 32 {
+		t.Fatalf("GetValueRef archived = %x, archive=%v, err=%v", ref, fromArchive, err)
+	}
+	// Filter negative: same mount path, a key the filter has never seen.
+	// (A confirmed miss surfaces as "key not found" from GetValueRef.)
+	if _, fromArchive, err := tr.GetValueRef([]byte{0x00, 'z'}); fromArchive || err == nil {
+		t.Fatalf("GetValueRef missing = archive=%v, err=%v; want not-found", fromArchive, err)
+	}
+	after := archivetrie.LastUpdateDiagnostics()
+
+	dPos := after.ArchiveFilterPositives - before.ArchiveFilterPositives
+	dNeg := after.ArchiveFilterNegatives - before.ArchiveFilterNegatives
+	dLook := after.ArchiveFilterLookups - before.ArchiveFilterLookups
+	if dPos < 1 || dNeg < 1 {
+		t.Fatalf("filter counters: positives+%d negatives+%d; want both >= 1", dPos, dNeg)
+	}
+	if dLook != dPos+dNeg {
+		t.Fatalf("lookups+%d != positives+negatives (%d+%d)", dLook, dPos, dNeg)
+	}
+	if dFP := after.ArchiveFilterFalsePositives - before.ArchiveFilterFalsePositives; dFP != 0 {
+		t.Fatalf("false positives +%d; want 0 (payload confirmed the hit)", dFP)
+	}
+}
+
 // TestMPTCommitToBatchStagesCallerBatch proves the shared-batch contract: every
 // write rides the caller's batch and nothing reaches the store before the caller
 // flushes. After inline values the "invisible" record is a trie node rather than

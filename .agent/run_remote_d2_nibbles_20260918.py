@@ -45,8 +45,9 @@ if DEPTH_BITS < 12 or DEPTH_BITS > 32:
 START_FILE = int(os.environ.get("D2_START_FILE", "9"))
 DOMAIN_COUNT = 1 << DEPTH_BITS
 BATCH_SIZE = 4000
-ROUNDS = 1.5
-OPERATIONS = int(DOMAIN_COUNT * BATCH_SIZE * ROUNDS)
+ROUNDS = float(os.environ.get("D2_ROUNDS", "1.5"))
+# Explicit ops target wins (E2 full-trace runs); otherwise derive from rounds.
+OPERATIONS = int(os.environ.get("D2_OPS", "0")) or int(DOMAIN_COUNT * BATCH_SIZE * ROUNDS)
 FLUSH_BATCHES = 25  # C-loop conclusion: flush per 100K ops, r=0.891 @D=16
 # Window sizing: keep ~24-40 windows per run so the CSV stays readable.
 METRICS_BATCHES = max(2500, (DOMAIN_COUNT * 3 // 2) // 40)

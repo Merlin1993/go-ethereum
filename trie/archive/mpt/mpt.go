@@ -994,8 +994,12 @@ func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []byte, bool, error
 			walkErr = err
 			return true
 		}
-		if b.filter != nil && !b.filter.Lookup(key) {
-			return false
+		if b.filter != nil {
+			if !b.filter.Lookup(key) {
+				archivetrie.RecordMPTFilterLookup(false)
+				return false
+			}
+			archivetrie.RecordMPTFilterLookup(true)
 		}
 		hits = append(hits, b)
 		return false // keep walking: later stubs may hold the key
