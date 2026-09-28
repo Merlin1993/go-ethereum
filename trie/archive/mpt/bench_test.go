@@ -32,6 +32,10 @@ type levelStore struct{ *leveldb.Database }
 
 func (s *levelStore) NewBatch() archivetrie.Batcher { return s.Database.NewBatch() }
 
+func (s *levelStore) NewBatchWithSize(size int) archivetrie.Batcher {
+	return s.Database.NewBatchWithSize(size)
+}
+
 func benchStore(b *testing.B) *levelStore {
 	b.Helper()
 	ldb, err := leveldb.New(b.TempDir(), 512, 256, "mpt-bench", false)

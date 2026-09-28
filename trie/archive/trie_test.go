@@ -150,6 +150,13 @@ func (db *stressDBAdapter) NewBatch() Batcher {
 	return db.KeyValueStore.NewBatch()
 }
 
+// NewBatchWithSize keeps pathdb's flush-batch size hint intact: the embedded
+// store already supports sized batches, and dropping the hint turns a
+// multi-million-record flush into quadratic batch growth (goleveldb batch.go).
+func (db *stressDBAdapter) NewBatchWithSize(size int) Batcher {
+	return db.KeyValueStore.NewBatchWithSize(size)
+}
+
 func (db *stressDBAdapter) PutBucket(hash []byte, data []byte) error {
 	return db.Put(hash, data)
 }

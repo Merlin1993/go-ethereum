@@ -132,11 +132,19 @@ func (a *kvStoreAdapter) NewBatch() ethdb.Batch {
 	return &batchAdapter{Batcher: a.store.NewBatch(), counter: a.counter}
 }
 
-// NewBatchWithSize ignores its size hint because archive.Batcher exposes no
-// allocation knob. pathdb pre-sizes its own write batch through this entry
-// point (pathdb/buffer.go NewBatchWithSize); the returned batch is otherwise
-// identical to NewBatch.
-func (a *kvStoreAdapter) NewBatchWithSize(int) ethdb.Batch {
+// NewBatchWithSize forwards the size hint when the wrapped store exposes a
+// sized-batch constructor. pathdb pre-sizes its 256MB flush batches through
+// this entry point (pathdb/buffer.go NewBatchWithSize); dropping the hint is
+// not a semantic issue but a performance one: an unsized goleveldb batch
+// grows by repeated whole-buffer copies (batch.go grow), which turns a
+// multi-million-record flush into a quadratic memmove storm.
+func (a *kvStoreAdapter) NewBatchWithSize(size int) ethdb.Batch {
+	type sizedStore interface {
+		NewBatchWithSize(int) archivetrie.Batcher
+	}
+	if store, ok := a.store.(sizedStore); ok {
+		return &batchAdapter{Batcher: store.NewBatchWithSize(size), counter: a.counter}
+	}
 	return a.NewBatch()
 }
 
