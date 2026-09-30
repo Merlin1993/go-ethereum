@@ -39,16 +39,15 @@ TRACE_INPUT = "/root/asct_codex/mainnet_state_access_trace/range_10m"
 DEPTH_BITS = int(os.environ.get("D2_DEPTH_BITS", "19"))
 if DEPTH_BITS < 12 or DEPTH_BITS > 32:
     raise SystemExit(f"D2_DEPTH_BITS must be 12..32, got {DEPTH_BITS}")
-# D2_START_FILE: shard index to start from. Default 9 (the calibration segment).
-# Use 0 for the long-horizon variant: shards 0..9 hold ~34B ops, enough for a
-# D=20 round (4.19B ops) to complete — from file 9 the trace dies at ~3.4B.
-START_FILE = int(os.environ.get("D2_START_FILE", "9"))
+# D2_START_FILE: shard index to start from. Default 0 — 2026-09-29 口径裁定：
+# 验证/标定档一律 file-0 起跑（与正式档同起点），不再用 file-9 短档。
+START_FILE = int(os.environ.get("D2_START_FILE", "0"))
 DOMAIN_COUNT = 1 << DEPTH_BITS
 BATCH_SIZE = 4000
 ROUNDS = float(os.environ.get("D2_ROUNDS", "1.5"))
 # Explicit ops target wins (E2 full-trace runs); otherwise derive from rounds.
 OPERATIONS = int(os.environ.get("D2_OPS", "0")) or int(DOMAIN_COUNT * BATCH_SIZE * ROUNDS)
-FLUSH_BATCHES = 25  # C-loop conclusion: flush per 100K ops, r=0.891 @D=16
+FLUSH_BATCHES = int(os.environ.get("D2_FLUSH_BATCHES", "25"))  # C-loop conclusion: flush per 100K ops, r=0.891 @D=16; D2_FLUSH_BATCHES=1 aligns triedb.Commit cadence with stock B0
 # Window sizing: keep ~24-40 windows per run so the CSV stays readable.
 METRICS_BATCHES = max(2500, (DOMAIN_COUNT * 3 // 2) // 40)
 

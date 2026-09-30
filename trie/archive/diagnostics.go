@@ -75,13 +75,27 @@ type CommitDiagnostics struct {
 	// Hot-layer (mpt) commit staging split; zero unless the hot layer is
 	// the MPT fallback. Bytes are key+value sizes staged into the caller
 	// batch, cumulative since Reset.
-	MPTStagedHotNodeBytes     int64
-	MPTStagedAggregateBytes   int64
-	MPTStagedArchiveBytes     int64
-	MPTStagedFlatBytes        int64
-	MPTStagedIndexBytes       int64
-	MPTNodeCacheGets          int64
-	MPTNodeCacheHits          int64
+	MPTStagedHotNodeBytes   int64
+	MPTStagedAggregateBytes int64
+	MPTStagedArchiveBytes   int64
+	MPTStagedFlatBytes      int64
+	MPTStagedIndexBytes     int64
+	MPTNodeCacheGets        int64
+	MPTNodeCacheHits        int64
+	// Hot-layer (mpt) prune diagnostics, cumulative since Reset: leaves
+	// extracted, nodes the extraction had to resolve, and the extract/mount
+	// phase split.
+	MPTPruneExtracted     int64
+	MPTPruneResolvedNodes int64
+	MPTPruneExtractNanos  int64
+	MPTPruneMountNanos    int64
+	// Hot-layer (mpt) commit-phase split, cumulative nanos since Reset:
+	// hx hash collection, node staging (incl. pathdb Update), the forced
+	// pathdb Commit inside staging, and the archive bucket/schedule loop.
+	MPTCommitHxNanos          int64
+	MPTCommitStageNanos       int64
+	MPTCommitTdbCommitNanos   int64
+	MPTCommitArchiveLoopNanos int64
 	RawShardMaxID             int64
 	RawShardMaxOps            int64
 	RawShardMaxBytes          int64
@@ -996,6 +1010,14 @@ var (
 	commitDiagMPTStagedIndexBytes        int64
 	commitDiagMPTNodeCacheGets           int64
 	commitDiagMPTNodeCacheHits           int64
+	commitDiagMPTPruneExtracted          int64
+	commitDiagMPTPruneResolvedNodes      int64
+	commitDiagMPTPruneExtractNanos       int64
+	commitDiagMPTPruneMountNanos         int64
+	commitDiagMPTCommitHxNanos           int64
+	commitDiagMPTCommitStageNanos        int64
+	commitDiagMPTCommitTdbCommitNanos    int64
+	commitDiagMPTCommitArchiveLoopNanos  int64
 	commitDiagRawShardMaxID              int64
 	commitDiagRawShardMaxOps             int64
 	commitDiagRawShardMaxBytes           int64
@@ -1091,6 +1113,14 @@ func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagMPTStagedIndexBytes, 0)
 	atomic.StoreInt64(&commitDiagMPTNodeCacheGets, 0)
 	atomic.StoreInt64(&commitDiagMPTNodeCacheHits, 0)
+	atomic.StoreInt64(&commitDiagMPTPruneExtracted, 0)
+	atomic.StoreInt64(&commitDiagMPTPruneResolvedNodes, 0)
+	atomic.StoreInt64(&commitDiagMPTPruneExtractNanos, 0)
+	atomic.StoreInt64(&commitDiagMPTPruneMountNanos, 0)
+	atomic.StoreInt64(&commitDiagMPTCommitHxNanos, 0)
+	atomic.StoreInt64(&commitDiagMPTCommitStageNanos, 0)
+	atomic.StoreInt64(&commitDiagMPTCommitTdbCommitNanos, 0)
+	atomic.StoreInt64(&commitDiagMPTCommitArchiveLoopNanos, 0)
 	atomic.StoreInt64(&commitDiagRawShardMaxID, 0)
 	atomic.StoreInt64(&commitDiagRawShardMaxOps, 0)
 	atomic.StoreInt64(&commitDiagRawShardMaxBytes, 0)
@@ -1524,6 +1554,14 @@ func LastCommitDiagnostics() CommitDiagnostics {
 		MPTStagedIndexBytes:        atomic.LoadInt64(&commitDiagMPTStagedIndexBytes),
 		MPTNodeCacheGets:           atomic.LoadInt64(&commitDiagMPTNodeCacheGets),
 		MPTNodeCacheHits:           atomic.LoadInt64(&commitDiagMPTNodeCacheHits),
+		MPTPruneExtracted:          atomic.LoadInt64(&commitDiagMPTPruneExtracted),
+		MPTPruneResolvedNodes:      atomic.LoadInt64(&commitDiagMPTPruneResolvedNodes),
+		MPTPruneExtractNanos:       atomic.LoadInt64(&commitDiagMPTPruneExtractNanos),
+		MPTPruneMountNanos:         atomic.LoadInt64(&commitDiagMPTPruneMountNanos),
+		MPTCommitHxNanos:           atomic.LoadInt64(&commitDiagMPTCommitHxNanos),
+		MPTCommitStageNanos:        atomic.LoadInt64(&commitDiagMPTCommitStageNanos),
+		MPTCommitTdbCommitNanos:    atomic.LoadInt64(&commitDiagMPTCommitTdbCommitNanos),
+		MPTCommitArchiveLoopNanos:  atomic.LoadInt64(&commitDiagMPTCommitArchiveLoopNanos),
 		RawShardMaxID:              atomic.LoadInt64(&commitDiagRawShardMaxID),
 		RawShardMaxOps:             atomic.LoadInt64(&commitDiagRawShardMaxOps),
 		RawShardMaxBytes:           atomic.LoadInt64(&commitDiagRawShardMaxBytes),
@@ -1926,6 +1964,27 @@ func SetMPTCommitStagedBytes(hotNode, aggregateNode, archive, flat, index int64)
 	atomic.AddInt64(&commitDiagMPTStagedArchiveBytes, archive)
 	atomic.AddInt64(&commitDiagMPTStagedFlatBytes, flat)
 	atomic.AddInt64(&commitDiagMPTStagedIndexBytes, index)
+}
+
+// SetMPTPruneDiagnostics adds one hot-layer (mpt) prune's outcome to the
+// cumulative diagnostics: leaves extracted, nodes the extraction resolved,
+// and the extract/mount phase split. Called once per PruneNextShard.
+func SetMPTPruneDiagnostics(extracted, resolvedNodes, extractNanos, mountNanos int64) {
+	atomic.AddInt64(&commitDiagMPTPruneExtracted, extracted)
+	atomic.AddInt64(&commitDiagMPTPruneResolvedNodes, resolvedNodes)
+	atomic.AddInt64(&commitDiagMPTPruneExtractNanos, extractNanos)
+	atomic.AddInt64(&commitDiagMPTPruneMountNanos, mountNanos)
+}
+
+// SetMPTCommitPhaseNanos adds one hot-layer (mpt) commit's phase split to
+// the cumulative diagnostics. Called once per CommitToBatch; the trace
+// stress harness attributes each commit to the intermediate-root (archive
+// maintenance) or final-root (business) phase by diffing around the calls.
+func SetMPTCommitPhaseNanos(hxCommit, stageNodes, tdbCommit, archiveLoop int64) {
+	atomic.AddInt64(&commitDiagMPTCommitHxNanos, hxCommit)
+	atomic.AddInt64(&commitDiagMPTCommitStageNanos, stageNodes)
+	atomic.AddInt64(&commitDiagMPTCommitTdbCommitNanos, tdbCommit)
+	atomic.AddInt64(&commitDiagMPTCommitArchiveLoopNanos, archiveLoop)
 }
 
 // SetMPTNodeCacheStats stores the hot-layer node cache cumulative gets/hits.

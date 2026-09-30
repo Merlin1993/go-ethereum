@@ -46,6 +46,13 @@ type Trie struct {
 	reader *trieReader
 	tracer *tracer
 
+	// resolvedNodes counts store loads through resolveAndTrack since
+	// construction. The mpt layer diffs it around a prune to measure how
+	// many nodes the extraction had to resolve. Not atomic: a Trie is
+	// single-goroutine by contract (the background prefetcher owns its own
+	// Trie and never shares it).
+	resolvedNodes int64
+
 	// epochPolicy assigns the lifecycle bit for newly written leaves. Nil
 	// means "always 0" (used before the mpt layer wires the domain schedule).
 	epochPolicy func(key []byte) byte
@@ -413,7 +420,109 @@ func (t *Trie) resolveAndTrack(n hashNode, prefix []byte) (node, error) {
 	if err != nil {
 		return nil, err
 	}
+	t.resolvedNodes++
 	return decoded, nil
+}
+
+// ResolvedNodes reports how many nodes this trie has loaded from the store
+// since construction (diagnostics only).
+func (t *Trie) ResolvedNodes() int64 { return t.resolvedNodes }
+
+// PrefetchPrefix warms the node store's read cache by resolving up to budget
+// nodes under the given key-nibble prefix. It is read-only: nothing is
+// mutated, so it cannot affect roots, epochs, or aggregates. Best effort —
+// the walk stops silently at the first read error, when the prefix does not
+// exist, or when the budget is spent. The mpt layer runs it on a dedicated
+// background trie to pre-warm the next prune domain's subtree, so the
+// synchronous ExtractDomain meets cache hits instead of disk reads.
+func (t *Trie) PrefetchPrefix(prefix []byte, budget int) (visited int) {
+	if budget <= 0 || t.root == nil {
+		return 0
+	}
+	// Navigate to the node hosting the prefix, resolving along the way.
+	n := t.root
+	pos := 0
+	for pos < len(prefix) {
+		switch node := n.(type) {
+		case *shortNode:
+			if len(prefix)-pos < len(node.Key) || !bytes.Equal(node.Key, prefix[pos:pos+len(node.Key)]) {
+				return visited
+			}
+			pos += len(node.Key)
+			n = node.Val
+		case *fullNode:
+			child := node.Children[prefix[pos]]
+			pos++
+			if child == nil {
+				return visited
+			}
+			n = child
+		case hashNode:
+			resolved, err := t.resolveAndTrack(node, prefix[:pos])
+			if err != nil {
+				return visited
+			}
+			visited++
+			n = resolved
+		default:
+			// nil or valueNode: the prefix runs past the data — nothing to warm.
+			return visited
+		}
+		if visited >= budget {
+			return visited
+		}
+	}
+	if hn, ok := n.(hashNode); ok {
+		resolved, err := t.resolveAndTrack(hn, prefix)
+		if err != nil {
+			return visited
+		}
+		visited++
+		n = resolved
+	}
+	t.prefetchWalk(n, prefix, budget, &visited)
+	return visited
+}
+
+// prefetchWalk depth-first resolves hashNode children under n until the
+// budget is spent. Embedded children are already in memory and cost nothing.
+func (t *Trie) prefetchWalk(n node, prefix []byte, budget int, visited *int) {
+	if *visited >= budget {
+		return
+	}
+	switch node := n.(type) {
+	case *shortNode:
+		if hn, ok := node.Val.(hashNode); ok {
+			resolved, err := t.resolveAndTrack(hn, append(prefix, node.Key...))
+			if err != nil {
+				*visited = budget
+				return
+			}
+			*visited++
+			t.prefetchWalk(resolved, append(prefix, node.Key...), budget, visited)
+			return
+		}
+		t.prefetchWalk(node.Val, append(prefix, node.Key...), budget, visited)
+	case *fullNode:
+		for i := 0; i < 16 && *visited < budget; i++ {
+			child := node.Children[i]
+			if child == nil {
+				continue
+			}
+			childPrefix := append(prefix, byte(i))
+			if hn, ok := child.(hashNode); ok {
+				resolved, err := t.resolveAndTrack(hn, childPrefix)
+				if err != nil {
+					*visited = budget
+					return
+				}
+				*visited++
+				t.prefetchWalk(resolved, childPrefix, budget, visited)
+			} else {
+				t.prefetchWalk(child, childPrefix, budget, visited)
+			}
+		}
+	}
 }
 
 // Hash returns the root hash without writing anything.

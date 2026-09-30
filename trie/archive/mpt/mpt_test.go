@@ -1190,3 +1190,91 @@ func TestMPTBucketO1CommitmentUpdate(t *testing.T) {
 		t.Fatal("remaining multiset does not verify against the updated commitment")
 	}
 }
+
+// TestMPTMountAppendSurvivesEviction pins the mount-append flush fix: leaves
+// appended into an existing bucket during a later prune round must reach the
+// bucket's disk record at that same commit. Without the dirty mark they sat
+// in memory only and the first payload eviction lost them silently — the
+// Cuckoo filter still probed positive and the stub commitment still covered
+// them, but the reloaded payload lacked the entries (and any later append
+// would rebuild the commitment from the incomplete multiset, diverging the
+// state root). This is the scenario that separated the 2026-09-28 sf0 oracle
+// root (pre-fix code) from the fixed pipeline's root on identical op streams.
+func TestMPTMountAppendSurvivesEviction(t *testing.T) {
+	db := &testStore{memorydb.New()}
+	tr := newTestTrie(t, db, false)
+
+	first := [][]byte{{0x00, 'a'}, {0x00, 'b'}, {0x00, 'c'}}
+	for i, key := range first {
+		if err := tr.Put(key, []byte{0x11, byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	expirePrune(t, tr, 0)
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	b := bucketOfKey(t, tr, first[0])
+	if b == nil {
+		t.Fatal("bucket missing after first prune round")
+	}
+
+	// Second prune round: three more leaves of the same domain mount-append
+	// into the existing bucket (the path that previously skipped the dirty
+	// mark).
+	second := [][]byte{{0x00, 'd'}, {0x00, 'e'}, {0x00, 'f'}}
+	for i, key := range second {
+		if err := tr.Put(key, []byte{0x22, byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	expirePrune(t, tr, 0)
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if b.count != 6 {
+		t.Fatalf("bucket count = %d, want 6 after mount-append", b.count)
+	}
+
+	// White-box eviction, exactly as the LRU would drop the payload.
+	tr.mu.Lock()
+	if b.elem != nil {
+		tr.archiveLRU.Remove(b.elem)
+		b.elem = nil
+	}
+	tr.residentEntries -= b.count
+	b.entries = nil
+	tr.mu.Unlock()
+
+	// Every appended entry must survive the eviction: the reload must serve
+	// all six values from the disk record alone.
+	for i, key := range first {
+		if val, err := tr.Get(key); err != nil || !bytes.Equal(val, []byte{0x11, byte(i)}) {
+			t.Fatalf("first-round key %x: val=%x err=%v (lost from disk record)", key, val, err)
+		}
+	}
+	for i, key := range second {
+		if val, err := tr.Get(key); err != nil || !bytes.Equal(val, []byte{0x22, byte(i)}) {
+			t.Fatalf("appended key %x: val=%x err=%v (mount-append never flushed)", key, val, err)
+		}
+	}
+
+	// The commitment must still verify against the full six-item multiset
+	// after the reload.
+	items := make([][]byte, 0, 6)
+	for i, key := range first {
+		items = append(items, bucketItem(key, []byte{0x11, byte(i)}))
+	}
+	for i, key := range second {
+		items = append(items, bucketItem(key, []byte{0x22, byte(i)}))
+	}
+	if !ecmh.Verify(b.commitment, items) {
+		t.Fatal("commitment does not verify against the full six-item multiset after reload")
+	}
+}

@@ -90,6 +90,7 @@ func init() {
 			WriteBufferBytes:          spec.WriteBufferBytes,
 			ForceCommitEveryBatches:   spec.FlushEveryBatches,
 			ArchiveResidentEntries:    spec.ArchiveResidentEntries,
+			AsyncPrune:                spec.AsyncPrune,
 		})
 		if err != nil {
 			return nil, err

@@ -283,3 +283,90 @@ python .agent/remote_full_replay_status.py      # launcher 状态、磁盘、进
 不做：重放/状态根校验；prune 绝对耗时对 G1 的影响；归档层自身的存储优化；ASCT 全量与 stem A/B；并行跑引擎；合成 Cuckoo FP 标定；`TestArchiveStemTraceFilterFPStats`。
 
 限制（论文须写）：值是合成等长 payload 不是真实 RLP；计时构成两边不对称（`Commit_ms` vs `Root_ms`）且冷维护不入分子；G3/G4 对 MPT/Verkle 天然 N/A；单机、串行、无重复实验；三引擎都从创世重建，不是主网快照的真实状态分布；分段负载密度差两个量级（file-0 vs file-9），短阶段成绩不可外推到全量。
+
+## 8. sized-batch 修复与 file-9 验证跑（2026-09-28）
+
+**根因**（commit `502e94816`）：E2 Commit 61% 的主因是 `kvStoreAdapter.NewBatchWithSize` 丢弃 pathdb 的尺寸提示（`triedb/pathdb/buffer.go:136` 每次 flush 都调用），无尺寸 goleveldb batch 按 batch.go grow 每次增长全量拷贝，256MB/约250万条 flush 变 ~50s memmove；B0 走原版 rawdb 有预分配故无此病。修复=适配链透传尺寸提示（ethdb_adapter.go + stressDBAdapter + levelStore 补精确签名方法）。微基准实证：无尺寸 270 万条 Put=51.7s（19µs/条），batch.Write 仅 3.1s。
+
+**验证跑** `D2_amt_bits19_3145728000_fl25_sf9_20260928_112540`（file-9、1.42 轮耗尽、exit 0、1h55m vs 旧档 2h06m）：同 op 数逐窗对齐旧档 `20260924_120346`——Commit 1554s→963s（占比 28%→19%，-38%），flush 窗附加 ~20s→~4.5s，墙钟 5540→4949s（1.12x），吞吐 537.6K→601.8K ops/s。机制指标逐项一致：复活 2402=2402、热命中 99.9846%=99.9846%、State 3.355G≈3.356G、RSS 2.58G≈2.59G；FPR 0.002077%（旧档该值因分母未接线为 0，本档为首个有效 file-9 FPR，与 E2 的 0.0054% 同量级）。CSV 已存档本地同名目录。
+
+**r vs B0 逐轮裁定**（E2 旧档 vs b0_mpt.csv 同区块段池化，B0 墙钟=Parse+Ops+Root+Write 四分量，其 Measured_Wall 列有计时 bug 不可用）：轮1 r=1.38、轮2 0.82、轮3 0.39、轮4-8 0.20-0.27、全程 0.284；修复投影全程 ~0.44，第3轮后仍不过 0.70 → 用户裁定 E2 暂缓。退化解剖：每突变 staged 字节 23→459B（20 倍，读路径不重写叶子已实证，主因=状态扩散后 pathdb 去重衰减+19元素节点/epoch 叶子放大）、ops 路径 1.8x B0、RSS 2→9.5G。下一杠杆：hx 对齐原版（decodeNode 不设 flags.hash、hasher 简化版丢缓存语义）、RSS/GOGC 治理；验证跑法=sf0 跑 3 轮（6.3B ops ~4h）覆盖失败域。
+
+## 9. fl1 提交节拍对齐（2026-09-28）
+
+**动机**：代码对比发现 B0 每批 triedb.Update+Commit（trace_compare_test.go:821-826，diff 栈恒 1-2 层），AMT fl25 每 25 批才 Commit（mpt.go:1499-1505，栈 25 层），pathdb 读节点须穿透全部 diff 层（pprof diffLayer.node 占 CPU 28%）→ ops 路径 1.8-2.6x 与 RSS 的主嫌疑。fl1=节拍对齐 B0，发射脚本加 D2_FLUSH_BATCHES 旋钮。
+
+**file-9 A/B**（D2_amt_bits19_3145728000_fl1_sf9_20260928_135010，exit 0，1h46m）：与 fl25 档（1h55m）同负载 38 窗——wall 4949→4411s（1.12x，601.8K→675.2K ops/s），Commit 占比 19%→23%（每批 Commit 代价符合预期），RSS 2.6→2.5G，复活 2402=2402，**终态根哈希与 fl25 逐位一致**（0xaef5ba48…）。同段前 197M ops vs B0b 原版 MPT（541.3K ops/s）：fl25 r=2.03、fl1 r=2.25（轻载早段，AMT 结构性占优，不可外推）。hx 疑嫌疑更正：hx/enc.go:205/258 解码即设 flags.hash、hasher.go:59 先查缓存、committer.go:47 干净子树 O(1) 短路——与原版对齐，无料可修。
+
+**file-0 口径裁定（用户）**：file-9 空态起步只覆盖轻载早段、与带全量状态的 B0 后段不可比；统一回 file-0 起跑 vs B0 全程同段池化。已发射 D2_amt_bits19_6291456000_fl1_sf0_20260928_153921（sf0、fl1、修复 build、3 轮=6.29B ops、80 窗，预计 7-9h），分母 b0_mpt.csv，判据末 10 窗 r≥0.70。
+
+## 10. sf0 三轮判分：修复+fl1 vs B0（2026-09-29）
+
+run `D2_amt_bits19_6291456000_fl1_sf0_20260928_153921`（exit 0，10.8h，80 窗，6.29B ops，file-0 起跑）。分母 b0_mpt.csv 同区块段池化（Parse+Ops+Root+Write）：
+- R1：AMT 527.1K / B0 290.5K，r=1.814（修复前 1.38），commit 19%
+- R2：AMT 207.3K / B0 202.8K，r=1.022（修复前 0.82），commit 32%
+- R3：AMT 99.6K / B0 218.1K，r=0.457（修复前 0.39），commit 52%
+- **末 10 窗官方判据：r=0.390，FAIL（门 0.70）**，commit 56%；R3 窗内趋势仍在衰减（145K→80K ops/s，commit 43%→58%）
+- 机制正常：热命中 99.51%、FPR 0.0039%、复活 179、State 9.04G、RSS 5.7G
+- 结论：修复大幅改善 R1-R2，但 R3 稳态退化机理未被触动（commit/window 478→411s 仅 -14%）——瓶颈已不在批次拷贝，在 staged 写量增长（去重衰减）与 commit 路径其余构成。CSV 已存档本地同名目录。
+
+## 11. 归档时间口径裁定（用户，2026-09-29）
+
+归档维护时间（摘除/挂桶/桶序列化/ECMH/桶落盘，及 Commit 中"裁剪写脏"部分）**不计入 r 的分子**；分子=关键路径时间（Parse+业务读写含复活 servicing+Commit 中业务写脏与热节点部分）。归档总耗时作为独立后台预算指标照报，不得隐藏。当前同步持锁裁剪违反此口径（修复 A 异步化即对齐）。已报的 r=0.39（末10窗）为含裁剪的保守下界；staged 业务/裁剪分账是口径落地的必要统计，历史 CSV 无此拆分，正式 r 需带新统计重跑。
+
+### 11.1 每批流水线模型（用户裁定 2026-09-29，已记入论文 repo EXPERIMENT_PLAN.md §5）
+
+MPT=执行读写→生成树根；AMT=分片裁剪→**生成中间树根**→执行读写→生成树根。计耗时=读写+树根；不计=裁剪+中间树根（作为归档维护预算逐窗照报）。中间树根必须真实生成——否则下一次树根计算的批量写入被裁剪写脏放大且两账无法分离。工程红利：两次提交天然分账（中间树根提交=staged 裁剪账，树根提交=staged 业务账），无需脏路径快照启发式。
+
+### 11.2 流水线模型落地实现（2026-09-29，门禁全绿）
+
+按 §11.1 裁定实施，HEAD=502e94816 之上的未提交改动：
+
+- **harness 每批流水线**（trace_stress_test.go）：分片裁剪 → 中间树根（独立 batch 提交+落盘，计时归入归档维护预算，不计入耗时分子）→ 业务读写 → 最终树根。开关 `-traceStressMPTIntermediateRoot`（默认 true，仅 mpt 热层生效）。计耗时=读写+最终树根（Comparative_Wall_ms 列语义自然修正）；真实墙钟 Measured_Wall_ms 仍含全部阶段。
+- **mpt 侧**：pruneNextDomainLocked 在挂桶成功后置脏标记（原有缺口：追加进既有桶时无 createBucket 不置脏，写少批次会把裁剪脏推迟到业务提交——违背中间树根设计）；裁剪分相统计（摘出叶子数/解析节点数/摘除与挂桶分相）；Commit 四分量计时（hx 哈希收集/节点暂存/强制 pathdb Commit/归档桶与调度表循环）。
+- **staged 物理分账**：按提交发生阶段归因——中间树根提交的 staged=裁剪账，最终树根提交的 staged=业务账（替代原计划的脏路径快照估算，后者已废弃）。
+- **修复 A 预取**：mpt.Config.AsyncPrune 生效（此前被忽略）。裁完第 N 分片后单flight后台协程用独立只读 hx 树从最近已提交根预算化预热第 N+1 分片子树（预算 8192 节点），锁内摘除从磁盘读变缓存命中。仅 path 后端。
+- **新 CSV 列**（追加尾部，既有列名不变）：Archive_Maint_ms、Intermediate_Root_ms、Prune_Extracted、Prune_Resolved_Nodes、Prune_Extract_ms、Prune_Mount_ms、Commit_Hx_ms、Commit_Stage_ms、Commit_TdbCommit_ms、Commit_ArchiveLoop_ms、Staged_Prune_Bytes、Staged_Ops_Bytes。
+- **门禁**：gofmt/vet/build 干净；archive+mpt+hx 包测试全绿；新增神谕测试 TestMPTIntermediateCommitPreservesRoot（单提交 vs 双提交流水线终态根逐位一致+抽样读一致）、TestMPTPrefetchPreservesRoot（预取开/关终态根一致，-race 干净）。
+- **下一步**：远端 file-0 验证档（口径裁定 2026-09-29：一律 file-0 起跑，不再用 file-9 短档；终态根须逐位等于 sf0 三轮档旧代码根 `0x5040277f10052051c3c23e20df5f6a5718cdcec38432866cfce5ec09ad206ef9`，新统计列同时出数）→ sf0 三轮正式档，出按新口径的正式 r（分子=Comparative_Wall_ms 口径，归档维护预算逐窗照报）。
+
+### 11.3 file-0 三轮验证档发射（2026-09-29 11:24）
+
+- run：`D2_amt_bits19_6291456000_fl1_sf0_20260929_112408`（D=19、fl1、file-0 起跑、3 轮=6,291,456,000 ops、AsyncPrune=true 经 mpt.Config 首次真实生效、中间树根默认开、ECMH 校验关）；远端编译门禁 2s 过后开跑，发射时磁盘余量 671.9GB。
+- 上传文件即本地未提交工作区（diagnostics.go / trace_stress_test.go / trace_stress_hotlayer_test.go / mpt.go / pipeline_oracle_test.go / hx/trie.go，与门禁通过版本一致）。
+- **验收**：①终态根逐位等于 `0x5040277f10052051c3c23e20df5f6a5718cdcec38432866cfce5ec09ad206ef9`（sf0 旧代码三轮档）；②新统计列出数（归档维护预算、中间树根耗时、裁剪分相、Commit 四分量、staged 分账）；③逐窗 r 曲线对照 0928 档（R2/R3 的 Prune_Launch 90s/窗尖峰应被预取压掉）。
+- 预计 ~11h（0928 档旧代码 10.8h）。
+
+### 11.4 归档循环全表扫描缺陷定位+修复（2026-09-29，验证档在跑中读取新列定位）
+
+- **现象**：新统计列显示 R2 尾~R3 计耗时路径里 Commit_ArchiveLoop（桶序列化段）41s→190s/窗陡增，复活 1K→38K/窗。
+- **根因**：commitToBatchLocked 的归档循环 `for range t.buckets` 全表扫描找脏桶；桶句柄（含 Cuckoo 过滤器）从不从 map 删除（淘汰只丢 payload），累计桶数随轮次单调增长（w55 ≈ 22 万个）；每批一次提交扫一遍 ≈ 10ms/批（w44→w55 增量拟合 ~37ns/桶=Go map 迭代速率，拟合严密）。桶脏了之后的真实处理（增量 ECMH O(改动条数)+整桶编码）仅 µs 级。**是 O(累计桶数)/提交 的实现缺陷，非论文机制成本**；中间提交同样扫一遍（其 207s/窗里约一半是扫描）。
+- **修复（零语义改动）**：Trie 新增 dirtyBuckets 清单，三处置脏点（建桶/追加/删条目）改走 markBucketDirtyLocked 入列，提交只遍历清单 O(脏桶数)。本地门禁全绿：gofmt/vet/build、archive+mpt+ecmh+hx 包测试、两个流水线神谕（终态根等价）过。
+- **生效时机**：在跑的 112408 验证档用的是修复前二进制（上传于修复前），其数据仍有效（神谕+账单）；修复随下一档生效。预计计耗时路径的 ArchiveLoop 从 ~10ms/批 降到 µs 级，严格口径 r 的 R3 投影从 0.40-0.45 大幅抬升。
+
+### 11.5 验证档换修复版重跑（2026-09-29 17:32）
+
+- 旧档 `..._20260929_112408`（修复前二进制，70% 进度）已人工终止：其验根价值被修复档覆盖（清单修复零语义、同神谕），账单价值因扫描缺陷失真。杀掉后远端干净、磁盘 662GB。
+- 新档 `D2_amt_bits19_6291456000_fl1_sf0_20260929_173153`：同配置（D=19/fl1/file-0/3轮/ECMH关），仅增量上传 mpt.go（脏桶清单修复）。编译门禁 2s 过，首窗 1.24M ops/s。
+- 验收不变：终态根=`0x5040277f10052051c3c23e20df5f6a5718cdcec38432866cfce5ec09ad206ef9`；末10窗新口径 r；归档维护预算账单。预计 ~8-9h（R3 不再背全表扫描）。
+- 教训记录：pkill -f 的模式会匹配发起命令自身的 bash 命令行（自杀式无输出）；远端脚本里模式须写 'archive[.]test' 形式。
+
+### 11.6 终态根分歧定位：过滤器重建的 map 序泄漏进状态根（2026-09-30）
+
+- **现象**：修复档 `..._173153` 跑完（7.85h，末 10 窗 r=1.02 过门），但终态根 `0xb783240c…` ≠ 神谕 `0x5040277f…`。输入流全等（6.29B ops、增删读计数、复活 2,057,584 次、热读命中率 16 位小数全等）；两档 state_db 的 927,878 个归档桶载荷**逐字节全等**（68,447,655 条目零差异）。
+- **排除链（全部实跑）**：挂桶置脏修复（单测证明旧码该路径本已置脏）；预取/中间树根/脏桶清单（D=4/200万 ops 五配置、D=13/1亿 ops 三配置根全一致）；hx 并行哈希竞态（全配置 -race 零告警）；中间树根×pathdb 陈旧聚合（单元神谕 pathdb 变体 PASS）。
+- **根因**：`rebuildFilter`（桶创建/追加饱和时重建布谷鸟过滤器）用 `for key := range map` 遍历——Go 每次 range 顺序随机。实测：同一组 112 个键按三种顺序插入，序列化字节三种结果（槽位布局依赖插入序）。布局经 `b.stub().Filter` 序列化进 stubList，stub 在节点 blob 里，**blob 是状态根承诺的对象** → 每次重建都是一次随机掷骰。桶创建饱和率实测 0.01%/个 × 全程 92.7 万次创建 ≈ 每档 ~90 次重建 → **每档终态根都是一次独立抽奖**。
+- **关键含义**：09-28 神谕 `0x5040…ef9` 本身就是随机 rollout，不能作验收基准；0928 与 173153 两档无优劣之分，两侧操作语义完全正确（这也正是"操作结果全等、归档载荷全等、只有根不同"的原因）。此前 0925/0928 未曾有两档完成态同配置对比，"根可复现"从未被真正验证过。
+- **修复**：`rebuildFilter` 先 `sort.Strings` 键再插入（规范序）。修复后根重新成为操作流的确定性函数（饱和事件本身由操作流决定，确定性）。审计其余 map 遍历：encodeBucket 先排序 ✓、ECMH 为无序点加和 ✓、桶条目导出先排序 ✓、其余皆切片遍历 ✓——无第二处泄漏。
+- **验证**：新增 `TestMPTRootDeterministicUnderFilterRebuild`（小过滤器几何强制饱和重建，同 workload 两次建根比对）：修复前 **5/5 FAIL**（每次根都不同），修复后 5/5 PASS。`TestFilterPlacementOrderDependence`（cuckoo 包）留档证明布局泄漏机制。门禁：四包+ecmh+hx 全绿，两神谕+桶 ECMH 单测全 PASS。
+- **后续**：修复版重跑 6.29B（档 `..._20260930_*`）建立新神谕；判分口径不变（新根不应对齐 0x5040，对齐"自身可复现+计数器全等"）。
+
+### 11.7 确定性修复档收档：验收通过，新神谕确立（2026-10-01）
+
+- **档卡片**：`D2_amt_bits19_6291456000_fl1_sf0_20260930_143714`；09-30 14:37 发射，22:31 跑完，exit=0，全程 7.9h（与 173153 的 7.85h 持平——排序修复零开销实证）。
+- **①计数器全等 ✓**：gets/puts/deletes/增删读写触五计数/热读命中率（16 位小数）/布谷鸟假阳性数（150,743）与 173153 档逐项全等（过滤器查找数差 18/35 亿=预取时序噪声）。
+- **②新神谕根**：`0x7d5f09c7e3f6462f991c878c74f45e217b82084f437b8886b1fde57f454d556e`。旧神谕 0x5040（旧代码随机 rollout）与 173153 的 0xb783 均作废。可复现性由 `TestMPTRootDeterministicUnderFilterRebuild` 钉死；铁证需第二档同根复现（待用户裁定要不要烧）。
+- **③正式 r（Comparative 口径，末 10 窗）= 1.02 ≥ 0.70 过门 ✓**：R1 1.80 / R2 1.50 / R3 1.11；末 10 窗 AMT 220.8K vs B0 217.2K ops/s。与 173153 读数差 <0.5%（噪声）。
+- **④归档预算账单**：Archive_Maint 合计 4367s = 墙钟 18.3%（173153 为 4355s/18.4%，持平）。
+- **验收三条件总评**：①终态根=新神谕（确立）✓ ②新统计列出数 ✓ ③裁剪尖峰被预取压掉 ✓。**file-0 三轮验证档全绿，E2 是否发射待用户裁定。**
+- 备注：验收 cron（57cc360e09ba）23:30 触发但 error（产物已拉齐到本地后出错，与前一晚同款）；本次判分为人工本地完成。

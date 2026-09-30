@@ -140,6 +140,14 @@ type Config struct {
 	// write buffer fills or when the diff-layer limit caps the tree.
 	ForceCommitEveryBatches int
 
+	// AsyncPrune enables background pre-warming of the next prune domain's
+	// subtree: a single-flight read-only resolve walk fills pathdb's clean
+	// cache, so the synchronous ExtractDomain meets cache hits instead of
+	// disk reads. The prune itself stays synchronous under t.mu; only the
+	// cache warming overlaps with operations. Path backend only (the hash
+	// backend's memory store is not safe for concurrent reads).
+	AsyncPrune bool
+
 	// ArchiveResidentEntries bounds how many archived entries stay memory-
 	// resident across all buckets. Clean buckets beyond the budget are
 	// evicted back to disk (their Cuckoo filters stay resident, so negative
@@ -214,6 +222,11 @@ type Trie struct {
 	bucketSeq         uint64
 	commitsSinceFlush int
 
+	// lastTdbCommitDur records how long the forced pathdb Commit inside
+	// stageNodesLocked took, so commitToBatchLocked can report it as its own
+	// commit-phase component. Reset on read.
+	lastTdbCommitDur time.Duration
+
 	// archiveLRU orders resident buckets least-recently-used first;
 	// residentEntries tallies their entries so eviction can enforce
 	// Config.ArchiveResidentEntries without walking the maps.
@@ -232,6 +245,20 @@ type Trie struct {
 	baseBit        byte
 	pruneDomainIdx int
 	scheduleDirty  bool
+
+	// prefetchBusy guards the single-flight background pre-warm of the next
+	// prune domain (Config.AsyncPrune). The walker owns a dedicated hx trie
+	// and touches nothing of t, so no completion channel is needed — the
+	// flag only prevents pile-up when a batch is shorter than the walk.
+	prefetchMu   sync.Mutex
+	prefetchBusy bool
+
+	// dirtyBuckets lists the buckets with uncommitted mutations, in dirty
+	// order. Committing walks this list instead of scanning t.buckets: the
+	// bucket map grows monotonically (eviction drops payloads, not handles),
+	// so a full-map scan per commit costs O(total buckets) and dominated the
+	// archive loop once the archive filled (~10 ms/batch at ~220K buckets).
+	dirtyBuckets []*bucket
 }
 
 // bucket is the in-memory handle for one archive bucket (paper: Stub Bucket
@@ -480,6 +507,17 @@ func (t *Trie) ensureHotLocked() error {
 }
 
 func (t *Trie) markDirtyLocked() { t.dirty = true }
+
+// markBucketDirtyLocked records a bucket mutation for the next commit. The
+// bucket enters the dirty list exactly once per dirty episode, so the commit
+// loop stays O(dirty buckets) instead of scanning the whole bucket map.
+func (t *Trie) markBucketDirtyLocked(b *bucket) {
+	if b.dirty {
+		return
+	}
+	b.dirty = true
+	t.dirtyBuckets = append(t.dirtyBuckets, b)
+}
 
 // bucketItem is the ECMH multiset element for one entry: k ‖ keccak(v).
 func bucketItem(key, value []byte) []byte {
@@ -781,6 +819,7 @@ func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedE
 	}
 	b.mount = mp
 	t.buckets[string(path)] = b
+	t.dirtyBuckets = append(t.dirtyBuckets, b) // created with dirty: true above
 	t.makeResidentLocked(b)
 	t.markDirtyLocked()
 	return consumed, nil
@@ -793,11 +832,19 @@ func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedE
 // Rebuilding from the authoritative entries restores every fingerprint; map
 // iteration order randomizes the kick pattern per attempt.
 func rebuildFilter(entries map[string][]byte, buckets, slots int) *cuckoo.Filter {
+	// Insert in canonical (sorted) order: the serialized filter placement is
+	// committed to by the state root via the stub, and Go randomizes map
+	// iteration per range — unordered insertion makes the root a dice roll.
+	keys := make([]string, 0, len(entries))
+	for key := range entries {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 	var filter *cuckoo.Filter
 	for attempt := 0; attempt < 8; attempt++ {
 		filter = cuckoo.New(buckets, slots)
 		ok := true
-		for key := range entries {
+		for _, key := range keys {
 			if err := filter.Insert([]byte(key)); err != nil {
 				ok = false
 				break
@@ -840,7 +887,7 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 	}
 	b.count += consumed
 	t.residentEntries += consumed
-	b.dirty = true
+	t.markBucketDirtyLocked(b)
 	t.touchResidentLocked(b)
 	if saturated {
 		// The failed insert permuted the filter's slots; rebuild it from the
@@ -867,7 +914,7 @@ func (t *Trie) bucketDeleteLocked(b *bucket, key, value []byte) error {
 	delete(b.entries, string(key))
 	b.count--
 	t.residentEntries--
-	b.dirty = true
+	t.markBucketDirtyLocked(b)
 	t.touchResidentLocked(b)
 	if b.count == 0 {
 		if err := t.hot.ReplaceStub(b.mount, b.path, nil); err != nil {
@@ -1237,6 +1284,61 @@ func (t *Trie) PruneNextShard() error {
 	return t.pruneNextDomainLocked()
 }
 
+// prunePrefetchNodeBudget bounds how many nodes one background pre-warm
+// resolves for the next prune domain. Sized well above a typical domain
+// subtree (~100M leaves / 2^19 domains ≈ 200 leaves ≈ 2k nodes) so the whole
+// domain fits; the walk costs only clean-cache fills.
+const prunePrefetchNodeBudget = 8192
+
+// domainPrefixNibbles returns the nibble prefix that routes prune domain id,
+// the exact derivation pruneNextDomainLocked extracts by.
+func (t *Trie) domainPrefixNibbles(id int) []byte {
+	fullNibbles := t.config.ShardDepthBits / 4
+	prefix := make([]byte, fullNibbles)
+	for i := range prefix {
+		shift := uint(t.config.ShardDepthBits - 4*(i+1))
+		prefix[i] = byte((id >> shift) & 0xf)
+	}
+	return prefix
+}
+
+// startPrunePrefetchLocked launches the single-flight background pre-warm of
+// prune domain id (Config.AsyncPrune, path backend only). The walker opens
+// its own hx trie from the last committed root and only resolves nodes, so
+// it can never mutate state; a root one or two batches stale still warms the
+// right nodes because consecutive batches rewrite only a thin path set.
+func (t *Trie) startPrunePrefetchLocked(id int) {
+	if !t.config.AsyncPrune || t.tdb == nil || t.root == (common.Hash{}) {
+		return
+	}
+	t.prefetchMu.Lock()
+	if t.prefetchBusy {
+		t.prefetchMu.Unlock()
+		return
+	}
+	t.prefetchBusy = true
+	t.prefetchMu.Unlock()
+
+	root := t.root
+	prefix := t.domainPrefixNibbles(id)
+	ndb := t.ndb
+	go func() {
+		defer func() {
+			// Best-effort warm-up: a panicking walk must never take the run
+			// down, and the single-flight flag must always be released.
+			_ = recover()
+			t.prefetchMu.Lock()
+			t.prefetchBusy = false
+			t.prefetchMu.Unlock()
+		}()
+		hot, err := gethtrie.New(root, common.Hash{}, ndb)
+		if err != nil {
+			return
+		}
+		hot.PrefetchPrefix(prefix, prunePrefetchNodeBudget)
+	}()
+}
+
 func (t *Trie) pruneNextDomainLocked() error {
 	id := t.pruneDomainIdx
 	// The schedule advances only on success; cycle rollover flips the global
@@ -1258,24 +1360,38 @@ func (t *Trie) pruneNextDomainLocked() error {
 	// per-leaf domain filter: the boundary nibble subtree is shared by up to
 	// 2^(4-r) domains, and CanSkip aggregation stays at nibble granularity
 	// (coarser at the boundary layer, never incorrect).
-	fullNibbles := t.config.ShardDepthBits / 4
-	prefix := make([]byte, fullNibbles)
-	for i := range prefix {
-		shift := uint(t.config.ShardDepthBits - 4*(i+1))
-		prefix[i] = byte((id >> shift) & 0xf)
-	}
+	prefix := t.domainPrefixNibbles(id)
+	resolveBefore := t.hot.ResolvedNodes()
+	extractStart := time.Now()
 	extracted, err := t.hot.ExtractDomain(prefix, t.baseBit, func(key []byte) bool {
 		return domainIDOf(key, t.config.ShardDepthBits) == id
 	})
+	extractDur := time.Since(extractStart)
 	if err != nil {
 		return err
 	}
+	pruneResolved := t.hot.ResolvedNodes() - resolveBefore
 	if len(extracted) == 0 {
+		archivetrie.SetMPTPruneDiagnostics(0, pruneResolved, extractDur.Nanoseconds(), 0)
+		t.startPrunePrefetchLocked((id + 1) % t.domainCount())
 		return nil
 	}
 	// The extracted leaves are gone from the hot tree; no per-key deletes
 	// needed — ExtractDomain already detached and shrank the paths.
-	return t.mountEntriesLocked(prefix, extracted)
+	mountStart := time.Now()
+	if err := t.mountEntriesLocked(prefix, extracted); err != nil {
+		return err
+	}
+	mountDur := time.Since(mountStart)
+	archivetrie.SetMPTPruneDiagnostics(int64(len(extracted)), pruneResolved, extractDur.Nanoseconds(), mountDur.Nanoseconds())
+	// Extraction mutated the hot tree even when every entry landed in an
+	// existing bucket (no createBucketLocked to mark it): the intermediate
+	// root must flush the prune's dirt before the batch's operations begin,
+	// otherwise the next root computation restages it (paper pipeline:
+	// prune → intermediate root → operations → root).
+	t.markDirtyLocked()
+	t.startPrunePrefetchLocked((id + 1) % t.domainCount())
+	return nil
 }
 
 // Hash reports the tree root without writing anything.
@@ -1378,7 +1494,9 @@ func (t *Trie) Commit() ([]byte, error) {
 func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 	staged := &stagedBytes{}
 	rec := &recordingBatcher{Batcher: batch, staged: staged}
+	var hxDur, stageDur, tdbCommitDur, archiveDur time.Duration
 	defer func() {
+		archivetrie.SetMPTCommitPhaseNanos(hxDur.Nanoseconds(), stageDur.Nanoseconds(), tdbCommitDur.Nanoseconds(), archiveDur.Nanoseconds())
 		// Fold any pathdb writes made while staging into the same class the hash
 		// backend charges to. Without this the path backend reports zero active
 		// writes and the G2 saving looks better than it is.
@@ -1400,26 +1518,35 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		if err := t.ensureHotLocked(); err != nil {
 			return nil, err
 		}
+		hxStart := time.Now()
 		newRoot, nodes := t.hot.Commit()
+		hxDur = time.Since(hxStart)
 		// A committed trie is single-use; drop it so the next switch to a
 		// write path reopens from the new root.
 		t.hot = nil
+		stageStart := time.Now()
 		if err := t.stageNodesLocked(rec, newRoot, nodes); err != nil {
 			return nil, err
 		}
+		stageDur = time.Since(stageStart)
+		tdbCommitDur = t.lastTdbCommitDur
+		t.lastTdbCommitDur = 0
 		t.root = newRoot
 		t.block++
 		t.dirty = false
 	}
-	for path, b := range t.buckets {
+	archiveStart := time.Now()
+	for _, b := range t.dirtyBuckets {
 		if !b.dirty {
+			// Already flushed by an earlier duplicate list entry (a bucket
+			// re-dirtied after a failed commit can appear twice).
 			continue
 		}
 		if b.payloadGone {
 			if err := rec.Delete(bucketKey(b.path)); err != nil {
 				return nil, err
 			}
-			delete(t.buckets, path)
+			delete(t.buckets, string(b.path))
 			continue
 		}
 		if err := rec.Put(bucketKey(b.path), t.encodeBucket(b)); err != nil {
@@ -1427,12 +1554,14 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		}
 		b.dirty = false
 	}
+	t.dirtyBuckets = t.dirtyBuckets[:0]
 	if t.scheduleDirty {
 		if err := rec.Put(scheduleKey(), t.encodeSchedule()); err != nil {
 			return nil, err
 		}
 		t.scheduleDirty = false
 	}
+	archiveDur = time.Since(archiveStart)
 	// Committed buckets are clean again: release resident entries over budget.
 	t.evictArchivesLocked(false)
 	return t.rootBytes(), nil
@@ -1498,9 +1627,11 @@ func (t *Trie) stageNodesLocked(rec *recordingBatcher, newRoot common.Hash, node
 	}
 	t.commitsSinceFlush++
 	if n := t.config.ForceCommitEveryBatches; n > 0 && t.commitsSinceFlush >= n {
+		commitStart := time.Now()
 		if err := t.tdb.Commit(newRoot, false); err != nil {
 			return err
 		}
+		t.lastTdbCommitDur = time.Since(commitStart)
 		t.commitsSinceFlush = 0
 	}
 	return nil

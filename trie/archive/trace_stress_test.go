@@ -49,6 +49,7 @@ var (
 	traceStressPruneEveryBatches          = flag.Int("traceStressPruneEveryBatches", 1, "Advance prune after this many batches; zero disables pruning")
 	traceStressPruneEveryBlocks           = flag.Uint64("traceStressPruneEveryBlocks", 0, "Advance one prune shard per this many trace blocks; incompatible with traceStressPruneEveryBatches")
 	traceStressDestructiveCommit          = flag.Bool("traceStressDestructiveCommit", true, "Unload committed shard nodes")
+	traceStressMPTIntermediateRoot        = flag.Bool("traceStressMPTIntermediateRoot", true, "AMT pipeline (mpt hot layer): commit the intermediate root right after pruning so prune dirt flushes in the archive-maintenance phase instead of bloating the final root's batch writes; prune+intermediate time is excluded from the counted operations+root time")
 	traceStressFinalStats                 = flag.Bool("traceStressFinalStats", true, "Run an exact structural scan after the workload")
 	traceStressAccessSampleEvery          = flag.Int64("traceStressAccessSampleEvery", 1000, "Sample logical hot/archive access state every N operations; zero disables")
 	traceStressActivateArchivedStemOnRead = flag.Bool("traceStressActivateArchivedStemOnRead", false, "Activate an archived stem when a read finds it")
@@ -299,6 +300,12 @@ type traceStressWindow struct {
 	gets, puts, deletes        int64
 	parse, operations          time.Duration
 	prune, commit, write       time.Duration
+	intermediate               time.Duration // intermediate-root commit (archive maintenance)
+	intermediateWrite          time.Duration // intermediate batch write (archive maintenance)
+	finalCommitPhase           [4]int64      // hx/stage/tdbCommit/archiveLoop nanos of the FINAL commit only
+	stagedPruneBytes           int64         // staged hot-node bytes of the intermediate commit
+	stagedOpsBytes             int64         // staged hot-node bytes of the final commit
+	pruneDiag                  [4]int64      // extracted/resolved/extractNanos/mountNanos, window diff
 	coldMaintenance            time.Duration
 	batchWall                  []time.Duration
 	comparativeBatchWall       []time.Duration
@@ -505,6 +512,7 @@ type TraceHotTrieSpec struct {
 	WriteBufferBytes          int
 	FlushEveryBatches         int
 	ArchiveResidentEntries    int
+	AsyncPrune                bool
 }
 
 // TraceHotTrieNew constructs the alternative hot layer named by
@@ -1022,6 +1030,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			WriteBufferBytes:          *traceStressPathWriteBufferMB << 20,
 			FlushEveryBatches:         *traceStressPathFlushEveryBatches,
 			ArchiveResidentEntries:    *traceStressArchiveResidentEntries,
+			AsyncPrune:                *traceStressAsyncPrune,
 		})
 		if err != nil {
 			t.Fatalf("hot layer %q: %v", *traceStressHotLayer, err)
@@ -1048,6 +1057,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	}
 	batch := newStressBatcher(backend.db.NewBatch())
 	defer batch.Reset()
+	intermediateBatch := newStressBatcher(backend.db.NewBatch())
+	defer intermediateBatch.Reset()
 
 	metricsPath := filepath.Join(resultsDir, "asct_trace_stress.csv")
 	metricsFile, err := os.Create(metricsPath)
@@ -1103,6 +1114,10 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"Raw_Batch_Ops", "Raw_Batch_Bytes", "NodeCache_Total_Hits", "NodeCache_Total_Misses", "PathNode_DBGets",
 		"MPT_Staged_HotNode_Bytes", "MPT_Staged_Aggregate_Bytes", "MPT_Staged_Archive_Bytes", "MPT_Staged_Flat_Bytes", "MPT_Staged_Index_Bytes",
 		"MPT_NodeCache_Gets", "MPT_NodeCache_Hits",
+		"Archive_Maint_ms", "Intermediate_Root_ms",
+		"Prune_Extracted", "Prune_Resolved_Nodes", "Prune_Extract_ms", "Prune_Mount_ms",
+		"Commit_Hx_ms", "Commit_Stage_ms", "Commit_TdbCommit_ms", "Commit_ArchiveLoop_ms",
+		"Staged_Prune_Bytes", "Staged_Ops_Bytes",
 	}
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
@@ -1136,6 +1151,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		initialUpdateDiag         = LastUpdateDiagnostics()
 		prevUpdateDiag            = initialUpdateDiag
 		prevMPTDiag               [7]int64
+		prevPruneDiag             [4]int64
 		started                   = time.Now()
 		totalBatches              int64
 		prunesDone                int64
@@ -1160,8 +1176,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		window.stemMisses = cache.Misses - prevCache.Misses
 		window.stemEvictions = cache.Evictions - prevCache.Evictions
 		prevCache = cache
-		measured := window.operations + window.prune + window.commit + window.write
+		measured := window.operations + window.prune + window.intermediate + window.intermediateWrite + window.commit + window.write
 		comparative := window.operations + window.commit + window.write
+		archiveMaint := window.prune + window.intermediate + window.intermediateWrite
 		opsPerSec := float64(0)
 		if comparative > 0 {
 			opsPerSec = float64(window.counts.total()) / comparative.Seconds()
@@ -1183,6 +1200,11 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			window.mptDiag[i] = curMPTDiag[i] - prevMPTDiag[i]
 		}
 		prevMPTDiag = curMPTDiag
+		curPruneDiag := [4]int64{diag.MPTPruneExtracted, diag.MPTPruneResolvedNodes, diag.MPTPruneExtractNanos, diag.MPTPruneMountNanos}
+		for i := range curPruneDiag {
+			window.pruneDiag[i] = curPruneDiag[i] - prevPruneDiag[i]
+		}
+		prevPruneDiag = curPruneDiag
 		sampledExistingReads := window.access.ReadHot + window.access.ReadArchived
 		workloadFilter := filterStatsFromDiagnostics(updateDiag).sub(window.classificationFilter)
 		hotReadRate := traceStressRatio(window.access.ReadHot, sampledExistingReads)
@@ -1219,6 +1241,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			strconv.FormatInt(window.mptDiag[0], 10), strconv.FormatInt(window.mptDiag[1], 10), strconv.FormatInt(window.mptDiag[2], 10),
 			strconv.FormatInt(window.mptDiag[3], 10), strconv.FormatInt(window.mptDiag[4], 10),
 			strconv.FormatInt(window.mptDiag[5], 10), strconv.FormatInt(window.mptDiag[6], 10),
+			strconv.FormatInt(archiveMaint.Milliseconds(), 10), strconv.FormatInt((window.intermediate + window.intermediateWrite).Milliseconds(), 10),
+			strconv.FormatInt(window.pruneDiag[0], 10), strconv.FormatInt(window.pruneDiag[1], 10),
+			strconv.FormatInt(window.pruneDiag[2]/1e6, 10), strconv.FormatInt(window.pruneDiag[3]/1e6, 10),
+			strconv.FormatInt(window.finalCommitPhase[0]/1e6, 10), strconv.FormatInt(window.finalCommitPhase[1]/1e6, 10),
+			strconv.FormatInt(window.finalCommitPhase[2]/1e6, 10), strconv.FormatInt(window.finalCommitPhase[3]/1e6, 10),
+			strconv.FormatInt(window.stagedPruneBytes, 10), strconv.FormatInt(window.stagedOpsBytes, 10),
 		}
 		if err := metrics.Write(row); err != nil {
 			t.Fatal(err)
@@ -1291,12 +1319,14 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		totalParse += parseDur
 		batchStart := time.Now()
 		var pruneDur time.Duration
+		prunedThisBatch := false
 		if *traceStressPruneEveryBatches > 0 && (batchNumber-1)%int64(*traceStressPruneEveryBatches) == 0 {
 			dur, err := pruneOne()
 			if err != nil {
 				t.Fatalf("batch %d prune: %v", batchNumber, err)
 			}
 			pruneDur = dur
+			prunedThisBatch = true
 		}
 		if !*traceStressDisableArchive && *traceStressPruneEveryBlocks > 0 {
 			if batchNumber == 1 {
@@ -1305,6 +1335,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 					t.Fatalf("batch %d prune at block %d: %v", batchNumber, window.lastBlock, err)
 				}
 				pruneDur += dur
+				prunedThisBatch = true
 				nextPruneBlock = window.firstBlock + *traceStressPruneEveryBlocks
 			}
 			for window.lastBlock >= nextPruneBlock {
@@ -1313,9 +1344,31 @@ func TestArchiveStemTraceStress(t *testing.T) {
 					t.Fatalf("batch %d prune at block %d: %v", batchNumber, window.lastBlock, err)
 				}
 				pruneDur += dur
+				prunedThisBatch = true
 				nextPruneBlock += *traceStressPruneEveryBlocks
 			}
 		}
+		// AMT pipeline (paper): prune → intermediate root → operations → root.
+		// The intermediate root flushes the prune's dirt here, in the archive-
+		// maintenance phase, so the final root's batch writes stay business-only.
+		// Its time is reported under Archive_Maint_ms and excluded from the
+		// counted operations+root time (Comparative_Wall_ms).
+		snapBeforeCommit := LastCommitDiagnostics()
+		var intermediateDur, intermediateWriteDur time.Duration
+		if prunedThisBatch && !*traceStressDisableArchive && *traceStressMPTIntermediateRoot && *traceStressHotLayer == "mpt" {
+			intermediateStart := time.Now()
+			if _, err := hotBackend.CommitToBatch(intermediateBatch, *traceStressDestructiveCommit); err != nil {
+				t.Fatalf("batch %d intermediate root commit: %v", batchNumber, err)
+			}
+			intermediateDur = time.Since(intermediateStart)
+			intermediateWriteStart := time.Now()
+			if err := intermediateBatch.Write(); err != nil {
+				t.Fatalf("batch %d intermediate root write: %v", batchNumber, err)
+			}
+			intermediateWriteDur = time.Since(intermediateWriteStart)
+			intermediateBatch.Reset()
+		}
+		snapMidCommit := LastCommitDiagnostics()
 		beforeUpdateDiag := LastUpdateDiagnostics()
 		opStart := time.Now()
 		batchAccessSampleDur := time.Duration(0)
@@ -1384,6 +1437,15 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		}
 		commitDur := time.Since(commitStart)
 		diag := LastCommitDiagnostics()
+		// Per-phase attribution: the intermediate commit's staged bytes are
+		// archive maintenance; the final commit's staged bytes and phase
+		// split are the counted business root computation.
+		window.stagedPruneBytes += snapMidCommit.MPTStagedHotNodeBytes - snapBeforeCommit.MPTStagedHotNodeBytes
+		window.stagedOpsBytes += diag.MPTStagedHotNodeBytes - snapMidCommit.MPTStagedHotNodeBytes
+		window.finalCommitPhase[0] += diag.MPTCommitHxNanos - snapMidCommit.MPTCommitHxNanos
+		window.finalCommitPhase[1] += diag.MPTCommitStageNanos - snapMidCommit.MPTCommitStageNanos
+		window.finalCommitPhase[2] += diag.MPTCommitTdbCommitNanos - snapMidCommit.MPTCommitTdbCommitNanos
+		window.finalCommitPhase[3] += diag.MPTCommitArchiveLoopNanos - snapMidCommit.MPTCommitArchiveLoopNanos
 		writeStart := time.Now()
 		if err := batch.Write(); err != nil {
 			t.Fatalf("batch %d write: %v", batchNumber, err)
@@ -1392,6 +1454,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		batch.Reset()
 		window.operations += opDur
 		window.prune += pruneDur
+		window.intermediate += intermediateDur
+		window.intermediateWrite += intermediateWriteDur
 		window.commit += commitDur
 		window.write += writeDur
 		window.coldMaintenance += coldMaintenanceDur
