@@ -103,8 +103,9 @@ var (
 )
 
 // scheduleVersion is the on-disk version of the prune-schedule record: v2 adds
-// the bucket sequence counter used to mint unique bucket identifiers.
-const scheduleVersion = byte(2)
+// the bucket sequence counter used to mint unique bucket identifiers; v3 adds
+// the live archive payload byte gauge (Archive_Bytes reporting).
+const scheduleVersion = byte(3)
 
 // Config controls the MPT hot layer. ShardDepthBits is the paper's shard
 // granularity: the state space is partitioned into 2^ShardDepthBits logical
@@ -221,6 +222,13 @@ type Trie struct {
 	buckets           map[string]*bucket
 	bucketSeq         uint64
 	commitsSinceFlush int
+
+	// archiveBytes is the live logical size of all archive bucket payload
+	// records (encoded bytes, uncompressed: 9-byte header plus 8+key+value
+	// per entry). Maintained incrementally at bucket create/append/delete
+	// and persisted in the schedule record so it survives reloads. This is
+	// the Archive_Bytes metric of the experiment plan's storage口径.
+	archiveBytes int64
 
 	// lastTdbCommitDur records how long the forced pathdb Commit inside
 	// stageNodesLocked took, so commitToBatchLocked can report it as its own
@@ -362,13 +370,15 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 // scheduleKey is the singleton KV slot for the prune-schedule record.
 func scheduleKey() []byte { return schedulePrefix }
 
-// encodeSchedule serializes (version, baseBit, pruneDomainIdx, bucketSeq).
+// encodeSchedule serializes (version, baseBit, pruneDomainIdx, bucketSeq,
+// archiveBytes).
 func (t *Trie) encodeSchedule() []byte {
-	data := make([]byte, 14)
+	data := make([]byte, 22)
 	data[0] = scheduleVersion
 	data[1] = t.baseBit & 1
 	binary.BigEndian.PutUint32(data[2:6], uint32(t.pruneDomainIdx))
 	binary.BigEndian.PutUint64(data[6:14], t.bucketSeq)
+	binary.BigEndian.PutUint64(data[14:22], uint64(t.archiveBytes))
 	return data
 }
 
@@ -386,7 +396,13 @@ func (t *Trie) loadSchedule() error {
 		return nil
 	}
 	switch {
+	case len(data) == 22 && data[0] == 3:
+		t.bucketSeq = binary.BigEndian.Uint64(data[6:14])
+		t.archiveBytes = int64(binary.BigEndian.Uint64(data[14:22]))
 	case len(data) == 14 && data[0] == 2:
+		// v2: no archive byte gauge. The counter restarts at zero and
+		// rebuilds from the first mutation; fresh-DB discipline means
+		// pre-v3 databases are never reused for new runs.
 		t.bucketSeq = binary.BigEndian.Uint64(data[6:14])
 	case len(data) == 6 && data[0] == 1:
 		// v1: no bucket sequence; any v1 bucket records are orphaned by the
@@ -459,6 +475,14 @@ func isMissingError(err error) bool {
 
 // bucketKey maps a bucket identifier onto its payload record slot.
 func bucketKey(path []byte) []byte { return prefixed(archivePrefix, path) }
+
+// ArchivePayloadBytes reports the live logical size of all archive bucket
+// payload records (encoded, uncompressed bytes) — the Archive_Bytes metric.
+func (t *Trie) ArchivePayloadBytes() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.archiveBytes
+}
 
 // domainCount is the number of logical domains: 2^ShardDepthBits.
 func (t *Trie) domainCount() int { return 1 << uint(t.config.ShardDepthBits) }
@@ -730,6 +754,18 @@ func (t *Trie) decodeBucket(data []byte, b *bucket) error {
 	return nil
 }
 
+// bucketRecordSize returns the encoded payload record size for a bucket
+// holding entries: 9-byte header plus 8-byte length prefixes and the raw
+// key/value bytes per entry. Mirrors encodeBucket's layout exactly so the
+// incremental archiveBytes gauge always equals the sum of on-disk records.
+func bucketRecordSize(entries map[string][]byte) int64 {
+	size := int64(9)
+	for key, value := range entries {
+		size += int64(8 + len(key) + len(value))
+	}
+	return size
+}
+
 func (t *Trie) encodeBucket(b *bucket) []byte {
 	keys := make([]string, 0, len(b.entries))
 	for key := range b.entries {
@@ -818,6 +854,7 @@ func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedE
 		return 0, err
 	}
 	b.mount = mp
+	t.archiveBytes += bucketRecordSize(b.entries)
 	t.buckets[string(path)] = b
 	t.dirtyBuckets = append(t.dirtyBuckets, b) // created with dirty: true above
 	t.makeResidentLocked(b)
@@ -870,6 +907,7 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 	}
 	consumed := 0
 	saturated := false
+	var added int64
 	for _, e := range entries {
 		if err := b.filter.Insert(e.Key); err != nil {
 			saturated = true
@@ -877,6 +915,7 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 		}
 		b.entries[string(e.Key)] = bytes.Clone(e.Value)
 		b.commitment = ecmh.BlindAppend(b.commitment, bucketItem(e.Key, e.Value))
+		added += int64(8 + len(e.Key) + len(e.Value))
 		consumed++
 	}
 	if consumed == 0 {
@@ -886,6 +925,7 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 		return 0, nil // empty batch: nothing to rewrite
 	}
 	b.count += consumed
+	t.archiveBytes += added
 	t.residentEntries += consumed
 	t.markBucketDirtyLocked(b)
 	t.touchResidentLocked(b)
@@ -913,10 +953,12 @@ func (t *Trie) bucketDeleteLocked(b *bucket, key, value []byte) error {
 	b.commitment = ecmh.Delete(b.commitment, bucketItem(key, value))
 	delete(b.entries, string(key))
 	b.count--
+	t.archiveBytes -= int64(8 + len(key) + len(value))
 	t.residentEntries--
 	t.markBucketDirtyLocked(b)
 	t.touchResidentLocked(b)
 	if b.count == 0 {
+		t.archiveBytes -= 9 // record header
 		if err := t.hot.ReplaceStub(b.mount, b.path, nil); err != nil {
 			return err
 		}
@@ -1492,6 +1534,7 @@ func (t *Trie) Commit() ([]byte, error) {
 }
 
 func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
+	archivetrie.SetMPTArchivePayloadBytes(t.archiveBytes)
 	staged := &stagedBytes{}
 	rec := &recordingBatcher{Batcher: batch, staged: staged}
 	var hxDur, stageDur, tdbCommitDur, archiveDur time.Duration

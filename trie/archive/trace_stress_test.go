@@ -1118,6 +1118,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"Prune_Extracted", "Prune_Resolved_Nodes", "Prune_Extract_ms", "Prune_Mount_ms",
 		"Commit_Hx_ms", "Commit_Stage_ms", "Commit_TdbCommit_ms", "Commit_ArchiveLoop_ms",
 		"Staged_Prune_Bytes", "Staged_Ops_Bytes",
+		"Archive_Bytes", "System_Total_Bytes",
 	}
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
@@ -1192,6 +1193,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			}
 		}
 		diag := LastCommitDiagnostics()
+		stateBytes := getDirSize(stateDir)
 		currentUpdateDiag := LastUpdateDiagnostics()
 		updateDiag := currentUpdateDiag.Sub(prevUpdateDiag)
 		prevUpdateDiag = currentUpdateDiag
@@ -1235,7 +1237,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			durationMS(comparative),
 			strconv.FormatFloat(opsPerSec, 'f', 2, 64), durationMS(percentileDuration(window.batchWall, .50)), durationMS(percentileDuration(window.batchWall, .95)), durationMS(percentileDuration(window.batchWall, .99)), durationMS(percentileDuration(window.batchWall, 1)),
 			durationMS(percentileDuration(window.comparativeBatchWall, .50)), durationMS(percentileDuration(window.comparativeBatchWall, .95)), durationMS(percentileDuration(window.comparativeBatchWall, .99)), durationMS(percentileDuration(window.comparativeBatchWall, 1)),
-			strconv.FormatInt(getDirSize(stateDir), 10), strconv.FormatUint(rss, 10), strconv.FormatUint(mem.HeapAlloc, 10), strconv.FormatInt(cache.Entries, 10), strconv.FormatInt(cache.Bytes, 10),
+			strconv.FormatInt(stateBytes, 10), strconv.FormatUint(rss, 10), strconv.FormatUint(mem.HeapAlloc, 10), strconv.FormatInt(cache.Entries, 10), strconv.FormatInt(cache.Bytes, 10),
 			strconv.FormatInt(window.stemHits, 10), strconv.FormatInt(window.stemMisses, 10), strconv.FormatInt(window.stemEvictions, 10), strconv.FormatInt(cache.Hits, 10), strconv.FormatInt(cache.Misses, 10), strconv.FormatInt(cache.Evictions, 10),
 			strconv.FormatInt(window.rawBatchOps, 10), strconv.FormatInt(window.rawBatchBytes, 10), strconv.FormatInt(diag.NodeCacheTotalHits, 10), strconv.FormatInt(diag.NodeCacheTotalMisses, 10), strconv.FormatInt(diag.PathNodeDBGets, 10),
 			strconv.FormatInt(window.mptDiag[0], 10), strconv.FormatInt(window.mptDiag[1], 10), strconv.FormatInt(window.mptDiag[2], 10),
@@ -1247,6 +1249,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			strconv.FormatInt(window.finalCommitPhase[0]/1e6, 10), strconv.FormatInt(window.finalCommitPhase[1]/1e6, 10),
 			strconv.FormatInt(window.finalCommitPhase[2]/1e6, 10), strconv.FormatInt(window.finalCommitPhase[3]/1e6, 10),
 			strconv.FormatInt(window.stagedPruneBytes, 10), strconv.FormatInt(window.stagedOpsBytes, 10),
+			strconv.FormatInt(diag.MPTArchivePayloadBytes, 10), strconv.FormatInt(stateBytes, 10),
 		}
 		if err := metrics.Write(row); err != nil {
 			t.Fatal(err)
@@ -1577,6 +1580,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"measured_ops_per_s":                         opsPerSecond(totalCounts.total(), totalOpsDur+totalCommit+totalWrite),
 		"last_root":                                  common.BytesToHash(lastRoot).Hex(),
 		"state_bytes":                                getDirSize(stateDir),
+		"archive_bytes":                              LastCommitDiagnostics().MPTArchivePayloadBytes,
+		"system_total_bytes":                         getDirSize(stateDir),
 		"stem_cache":                                 cache,
 		"access_sample":                              totalAccess,
 		"access_sample_every":                        *traceStressAccessSampleEvery,

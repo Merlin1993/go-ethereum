@@ -89,6 +89,11 @@ type CommitDiagnostics struct {
 	MPTPruneResolvedNodes int64
 	MPTPruneExtractNanos  int64
 	MPTPruneMountNanos    int64
+	// MPTArchivePayloadBytes is a gauge (NOT cumulative since Reset): live
+	// logical bytes of all archive bucket payload records (encoded,
+	// uncompressed), as of the last commit. Zero unless the hot layer is
+	// the MPT fallback. Backs the Archive_Bytes CSV column.
+	MPTArchivePayloadBytes int64
 	// Hot-layer (mpt) commit-phase split, cumulative nanos since Reset:
 	// hx hash collection, node staging (incl. pathdb Update), the forced
 	// pathdb Commit inside staging, and the archive bucket/schedule loop.
@@ -1014,6 +1019,7 @@ var (
 	commitDiagMPTPruneResolvedNodes      int64
 	commitDiagMPTPruneExtractNanos       int64
 	commitDiagMPTPruneMountNanos         int64
+	commitDiagMPTArchivePayloadBytes     int64
 	commitDiagMPTCommitHxNanos           int64
 	commitDiagMPTCommitStageNanos        int64
 	commitDiagMPTCommitTdbCommitNanos    int64
@@ -1117,6 +1123,7 @@ func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagMPTPruneResolvedNodes, 0)
 	atomic.StoreInt64(&commitDiagMPTPruneExtractNanos, 0)
 	atomic.StoreInt64(&commitDiagMPTPruneMountNanos, 0)
+	atomic.StoreInt64(&commitDiagMPTArchivePayloadBytes, 0)
 	atomic.StoreInt64(&commitDiagMPTCommitHxNanos, 0)
 	atomic.StoreInt64(&commitDiagMPTCommitStageNanos, 0)
 	atomic.StoreInt64(&commitDiagMPTCommitTdbCommitNanos, 0)
@@ -1558,6 +1565,7 @@ func LastCommitDiagnostics() CommitDiagnostics {
 		MPTPruneResolvedNodes:      atomic.LoadInt64(&commitDiagMPTPruneResolvedNodes),
 		MPTPruneExtractNanos:       atomic.LoadInt64(&commitDiagMPTPruneExtractNanos),
 		MPTPruneMountNanos:         atomic.LoadInt64(&commitDiagMPTPruneMountNanos),
+		MPTArchivePayloadBytes:     atomic.LoadInt64(&commitDiagMPTArchivePayloadBytes),
 		MPTCommitHxNanos:           atomic.LoadInt64(&commitDiagMPTCommitHxNanos),
 		MPTCommitStageNanos:        atomic.LoadInt64(&commitDiagMPTCommitStageNanos),
 		MPTCommitTdbCommitNanos:    atomic.LoadInt64(&commitDiagMPTCommitTdbCommitNanos),
@@ -1974,6 +1982,12 @@ func SetMPTPruneDiagnostics(extracted, resolvedNodes, extractNanos, mountNanos i
 	atomic.AddInt64(&commitDiagMPTPruneResolvedNodes, resolvedNodes)
 	atomic.AddInt64(&commitDiagMPTPruneExtractNanos, extractNanos)
 	atomic.AddInt64(&commitDiagMPTPruneMountNanos, mountNanos)
+}
+
+// SetMPTArchivePayloadBytes publishes the live archive payload gauge (logical
+// encoded bytes of all bucket payload records) at commit time.
+func SetMPTArchivePayloadBytes(v int64) {
+	atomic.StoreInt64(&commitDiagMPTArchivePayloadBytes, v)
 }
 
 // SetMPTCommitPhaseNanos adds one hot-layer (mpt) commit's phase split to

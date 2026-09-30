@@ -370,3 +370,10 @@ MPT=执行读写→生成树根；AMT=分片裁剪→**生成中间树根**→�
 - **④归档预算账单**：Archive_Maint 合计 4367s = 墙钟 18.3%（173153 为 4355s/18.4%，持平）。
 - **验收三条件总评**：①终态根=新神谕（确立）✓ ②新统计列出数 ✓ ③裁剪尖峰被预取压掉 ✓。**file-0 三轮验证档全绿，E2 是否发射待用户裁定。**
 - 备注：验收 cron（57cc360e09ba）23:30 触发但 error（产物已拉齐到本地后出错，与前一晚同款）；本次判分为人工本地完成。
+
+## 12. Archive_Bytes 统计落地 + 计划口径收口（2026-10-01）
+
+- **实现**：mpt 增 archiveBytes 增量计数（建桶 +=桶记录编码尺寸(9 头+Σ8+k+v)、追加 +=8+k+v/条、删条目 -=同、销毁 -=9 头），调度记录升 v3（22B，追加 8 字节计数）持久化跨重载；commit 时发布诊断 gauge；CSV 尾部追加 Archive_Bytes/System_Total_Bytes 两列、summary.json 同步（system_total=state_db du，原型单库故与 state_bytes 等值，单列以便将来分库口径不变）。既有列名/语义不变。
+- **门禁**：gofmt/vet/build/五包测试全绿；新增 TestMPTArchivePayloadBytesAccounting（gauge=Σlen(encodeBucket) 逐字节对拍+重载持久化+复活全归零）与 TestMPTArchivePayloadBytesAppendSplit（250 条强制跨桶轮转合计口径）。
+- **EXPERIMENT_PLAN.md 已更新（论文 repo，未提交，用户自行提交）**：§0 新增 4 条（fl1 口径成文、0x5040 神谕作废标注+0x7d5f 现行神谕、Archive_Bytes 落地、manifest 纪律修订=远端非 git 故以本地冻结提交+台账对应 run↔commit）；§2 补三字节口径定义（含 State−Archive 近似式的压缩口径差注明）；§5.2 fl25→fl1+预取开；§5 窗口指标补两列。
+- **遗留讨论项（待用户裁定）**：RSS 2.70× 按计划字面判 F（GOGC 治理挂账 vs 阈值口径重议）；论文 K=2²⁰ vs 实验 2¹⁹；E3 逐次裁剪统计粒度（CSV 仅窗聚合）；archive-first 持久化不原子。
