@@ -43,8 +43,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,6 +72,20 @@ import (
 // full payload and compares it against the in-tree stub. Formal runs leave it
 // off; the audit cost never lands in generated-path timing.
 var ecmhVerifyGate = os.Getenv("MPT_ECMH_VERIFY") == "1"
+
+// redemptionVerifySample arms the sampled two-party verification audit
+// (paper redemption): every Nth resurrection re-runs the full-node ECMH
+// recompute over the handed-over bucket data and records its latency, so
+// formal runs (C5 gate off) still measure the verification cost without
+// paying it on every redemption. MPT_REDEMPTION_VERIFY_SAMPLE=0 disables;
+// unset defaults to 1000 (amortized cost is negligible).
+var redemptionVerifySample = func() int {
+	v, err := strconv.Atoi(os.Getenv("MPT_REDEMPTION_VERIFY_SAMPLE"))
+	if err != nil {
+		return 1000
+	}
+	return max(v, 0)
+}()
 
 var (
 	ErrNotFound  = errors.New("mpt archive: key not found")
@@ -100,6 +116,10 @@ var (
 	nodePrefix     = []byte{'M', 'P', 'T', 'N', 1}
 	archivePrefix  = []byte{'M', 'P', 'T', 'A', 1}
 	schedulePrefix = []byte{'M', 'P', 'T', 'S', 1}
+	// stubMetaPrefix keys the stub side records: filter/commitment/count
+	// content the node blobs reference by content hash instead of carrying
+	// inline. One record per bucket, rewritten only when the bucket mutates.
+	stubMetaPrefix = []byte{'M', 'P', 'T', 'B', 1}
 )
 
 // scheduleVersion is the on-disk version of the prune-schedule record: v2 adds
@@ -274,15 +294,25 @@ type Trie struct {
 // serialized into the tree; this handle caches the decoded filter/commitment
 // and, while resident, the payload entries.
 type bucket struct {
-	path        []byte // identifier: mount path + sequence discriminator
-	mount       []byte // nibble path of the node carrying the stub
-	entries     map[string][]byte
-	filter      *cuckoo.Filter
-	commitment  ecmh.Commitment
-	count       int
-	dirty       bool          // uncommitted mutation; dirty buckets are never evicted
-	payloadGone bool          // count hit zero: delete the record at commit
-	elem        *list.Element // non-nil exactly while entries is resident
+	path  []byte // identifier: mount path + sequence discriminator
+	mount []byte // nibble path of the node carrying the stub
+	// Coverage: the common bit prefix of every entry key, MSB-first.
+	// Inline fixed-size storage (no per-bucket heap allocation): the probe
+	// path checks the prefix for every inspected stub, and an independent
+	// 2.3M-bucket scatter of tiny allocations cost one cold cache line per
+	// inspection (2026-10-05 tail-regression attribution).
+	prefixBuf    [32]byte
+	prefixBits   uint16
+	entries      map[string][]byte
+	filter       *cuckoo.Filter
+	commitment   ecmh.Commitment
+	count        int
+	dirty        bool          // uncommitted mutation; dirty buckets are never evicted
+	payloadGone  bool          // count hit zero: delete the record at commit
+	elem         *list.Element // non-nil exactly while entries is resident
+	metaBytes    []byte        // rendered side record staged at commit (see stub())
+	metaHash     [32]byte      // content anchor the node blob carries
+	payloadBytes int64         // encoded payload record length (redemption-proof accounting)
 }
 
 // New constructs the trie. root must be nil or the canonical empty-tree hash:
@@ -593,38 +623,216 @@ func keyNibblesPrefix(key []byte, n int) []byte {
 	return out
 }
 
-// bucketForStubLocked returns the registry handle for a stub, decoding the
-// filter and commitment on first sight. The stub serialized in the tree is
-// authoritative; this handle is a cache of it plus the resident payload.
+// keyHasBitPrefix reports whether the raw key starts with the given
+// MSB-first bit prefix. Used to skip sibling buckets whose coverage cannot
+// hold the key without touching their filters. Bit granularity (not
+// nibbles) is what separates the 2^(D%4) shards cohabiting one boundary
+// node: their nibble prefixes are identical, their bit prefixes are not.
+func keyHasBitPrefix(key []byte, prefix *[32]byte, prefixBits uint16) bool {
+	n := int(prefixBits)
+	if n > len(key)*8 {
+		return false
+	}
+	full := n / 8
+	for i := 0; i < full; i++ {
+		if key[i] != prefix[i] {
+			return false
+		}
+	}
+	if rem := uint(n % 8); rem != 0 {
+		mask := byte(0xff << (8 - rem))
+		if key[full]&mask != prefix[full]&mask {
+			return false
+		}
+	}
+	return true
+}
+
+// commonBitPrefixLen returns the length of the longest common prefix of a
+// and b in bits, MSB-first.
+func commonBitPrefixLen(a, b []byte) int {
+	m := min(len(a), len(b))
+	i := 0
+	for i < m && a[i] == b[i] {
+		i++
+	}
+	if i == m {
+		return m * 8
+	}
+	return i*8 + bits.LeadingZeros8(a[i]^b[i])
+}
+
+// coveragePrefixBits computes the common bit prefix of every entry key —
+// the bucket's coverage bound. Probes skip the bucket outright for keys
+// outside it, so sibling buckets sharing one mount cost one filter lookup
+// instead of one each. Recomputed from the authoritative entries after
+// every mutation, so it can only be a true prefix of every stored key.
+// The prefix is capped at 256 bits (the inline buffer); keys longer than
+// 32 bytes simply share a shorter bound, which is conservative and safe.
+func coveragePrefixBits(entries map[string][]byte) ([32]byte, uint16) {
+	var buf [32]byte
+	lcp := -1
+	for key := range entries {
+		k := []byte(key)
+		if lcp < 0 {
+			lcp = min(len(k)*8, 256)
+			copy(buf[:], k)
+			continue
+		}
+		if n := commonBitPrefixLen(buf[:], k); n < lcp {
+			lcp = n
+		}
+	}
+	if lcp <= 0 {
+		return [32]byte{}, 0
+	}
+	// Zero every bit past the LCP so the stored prefix is canonical
+	// regardless of which entry seeded the buffer.
+	if rem := uint(lcp % 8); rem != 0 {
+		buf[lcp/8] &= 0xff << (8 - rem)
+	}
+	for i := (lcp + 7) / 8; i < 32; i++ {
+		buf[i] = 0
+	}
+	return buf, uint16(lcp)
+}
+
+// bucketForStubLocked returns the registry handle for a stub, fetching the
+// filter/commitment/count side record on first sight (the blob carries only
+// the record's content hash, verified against the fetched bytes). The side
+// record is authoritative; this handle is a cache of it plus the resident
+// payload.
 func (t *Trie) bucketForStubLocked(mountPath []byte, st *gethtrie.Stub) (*bucket, error) {
 	if b := t.buckets[string(st.Path)]; b != nil {
 		return b, nil
 	}
+	data, err := optionalGet(t.db, stubMetaKey(st.Path))
+	if err != nil {
+		return nil, err
+	}
+	prefixBuf, prefixBits, filterBytes, commitment, count, err := decodeStubMeta(data)
+	if err != nil {
+		return nil, err
+	}
+	if got := crypto.Keccak256Hash(data); [32]byte(got) != st.ContentHash {
+		return nil, fmt.Errorf("mpt archive: stub %x content hash mismatch: record %x, blob anchors %x", st.Path, got[:], st.ContentHash[:])
+	}
 	filter := cuckoo.New(0, 0)
-	if len(st.Filter) > 0 {
-		if err := filter.Decode(st.Filter, 0, 0); err != nil {
+	if len(filterBytes) > 0 {
+		if err := filter.Decode(filterBytes, 0, 0); err != nil {
 			return nil, err
 		}
 	}
 	b := &bucket{
 		path:       bytes.Clone(st.Path),
 		mount:      bytes.Clone(mountPath),
+		prefixBuf:  prefixBuf,
+		prefixBits: prefixBits,
 		filter:     filter,
-		commitment: ecmh.Commitment(st.Commitment),
-		count:      int(st.Count),
+		commitment: commitment,
+		count:      count,
+		metaBytes:  data,
 	}
 	t.buckets[string(st.Path)] = b
+	archivetrie.RecordMPTStubMetaFetch(int64(len(data)))
 	return b, nil
 }
 
-// stub renders the handle back into its in-tree form after a mutation.
+// stub renders the handle back into its in-tree form after a mutation: the
+// filter/commitment/count content is serialized into the side record staged
+// at commit, and the node blob receives only the record's content hash. The
+// rendered record is cached on the bucket so the commit loop stages exactly
+// the bytes the anchor commits to.
 func (b *bucket) stub() *gethtrie.Stub {
+	filterBytes := b.filter.Encode()
+	pbytes := (int(b.prefixBits) + 7) / 8
+	rec := make([]byte, 0, 1+2+pbytes+4+len(filterBytes)+33+4)
+	rec = append(rec, stubMetaVersion)
+	var plen [2]byte
+	binary.BigEndian.PutUint16(plen[:], b.prefixBits)
+	rec = append(rec, plen[:]...)
+	rec = append(rec, b.prefixBuf[:pbytes]...)
+	var size [4]byte
+	binary.BigEndian.PutUint32(size[:], uint32(len(filterBytes)))
+	rec = append(rec, size[:]...)
+	rec = append(rec, filterBytes...)
+	rec = append(rec, b.commitment[:]...)
+	binary.BigEndian.PutUint32(size[:], uint32(b.count))
+	rec = append(rec, size[:]...)
+	b.metaBytes = rec
+	b.metaHash = [32]byte(crypto.Keccak256Hash(rec))
 	return &gethtrie.Stub{
-		Path:       bytes.Clone(b.path),
-		Filter:     b.filter.Encode(),
-		Commitment: [33]byte(b.commitment),
-		Count:      uint32(b.count),
+		Path:        bytes.Clone(b.path),
+		ContentHash: b.metaHash,
 	}
+}
+
+// stubMetaVersion tags the side record layout; the key prefix carries its
+// own version byte, this one versions the value. v2 added the bucket's
+// coverage prefix (one byte per nibble); v3 stores it bit-packed with a
+// two-byte bit length, because shard granularity is bit-level (D%4 = 3
+// boundary bits) and only a bit prefix separates cohabiting sibling shards.
+const stubMetaVersion = byte(3)
+
+// stubMetaKey returns the side-record key for a bucket path.
+func stubMetaKey(path []byte) []byte { return prefixed(stubMetaPrefix, path) }
+
+// decodeStubMeta parses a stub side record in any of the three layouts:
+//
+//	v1: [1B ver=1][4B filterLen][filter][33B commitment][4B count]
+//	v2: [1B ver=2][1B prefixNibbles][prefix, one byte per nibble][4B filterLen][filter][33B commitment][4B count]
+//	v3: [1B ver=3][2B prefixBits][ceil(bits/8) prefix bytes][4B filterLen][filter][33B commitment][4B count]
+//
+// v1/v2 decode is kept so pre-v3 fixtures and records stay readable; fresh
+// writes are always v3. A v2 nibble prefix converts to 4*len bits. The
+// returned filter slice aliases the input record; the prefix is copied out.
+func decodeStubMeta(data []byte) (prefixBuf [32]byte, prefixBits uint16, filter []byte, commitment ecmh.Commitment, count int, err error) {
+	if len(data) < 1+4+33+4 {
+		return prefixBuf, 0, nil, commitment, 0, errors.New("mpt archive: invalid stub meta record")
+	}
+	rest := data[1:]
+	switch data[0] {
+	case 1:
+		// No coverage prefix.
+	case 2:
+		nibbleLen := int(rest[0])
+		if len(data) < 1+1+nibbleLen+4+33+4 {
+			return prefixBuf, 0, nil, commitment, 0, errors.New("mpt archive: invalid stub meta record")
+		}
+		for i := 0; i < nibbleLen && i < 64; i++ {
+			if i%2 == 0 {
+				prefixBuf[i/2] |= rest[1+i] << 4
+			} else {
+				prefixBuf[i/2] |= rest[1+i] & 0x0f
+			}
+		}
+		prefixBits = uint16(4 * min(nibbleLen, 64))
+		rest = rest[1+nibbleLen:]
+	case 3:
+		if len(data) < 1+2+4+33+4 {
+			return prefixBuf, 0, nil, commitment, 0, errors.New("mpt archive: invalid stub meta record")
+		}
+		prefixBits = binary.BigEndian.Uint16(rest[0:2])
+		pbytes := (int(prefixBits) + 7) / 8
+		if pbytes > 32 || len(data) < 1+2+pbytes+4+33+4 {
+			return prefixBuf, 0, nil, commitment, 0, errors.New("mpt archive: invalid stub meta record")
+		}
+		copy(prefixBuf[:], rest[2:2+pbytes])
+		rest = rest[2+pbytes:]
+	default:
+		return prefixBuf, 0, nil, commitment, 0, errors.New("mpt archive: invalid stub meta record")
+	}
+	if len(rest) < 4 {
+		return prefixBuf, 0, nil, commitment, 0, errors.New("mpt archive: invalid stub meta record")
+	}
+	filterLen := int(binary.BigEndian.Uint32(rest[:4]))
+	if 4+filterLen+33+4 != len(rest) {
+		return prefixBuf, 0, nil, commitment, 0, errors.New("mpt archive: invalid stub meta layout")
+	}
+	filter = rest[4 : 4+filterLen]
+	copy(commitment[:], rest[4+filterLen:4+filterLen+33])
+	count = int(binary.BigEndian.Uint32(rest[4+filterLen+33:]))
+	return prefixBuf, prefixBits, filter, commitment, count, nil
 }
 
 // makeResidentLocked registers a bucket whose entries map is in memory and
@@ -701,6 +909,7 @@ func (t *Trie) loadBucketLocked(b *bucket) error {
 	if err != nil {
 		return err
 	}
+	b.payloadBytes = int64(len(data))
 	b.entries = make(map[string][]byte)
 	if len(data) != 0 {
 		if err := t.decodeBucket(data, b); err != nil {
@@ -722,7 +931,8 @@ func (t *Trie) loadBucketLocked(b *bucket) error {
 // preimage, not a hash: since the hot layer stores values inline, the archive
 // is the only remaining copy once a leaf is evicted, and resurrection has to
 // recover the actual payload. Filter and commitment are NOT in the record —
-// they live in the tree's stub (paper: the root covers the commitment).
+// they live in the stub side record (paper: the root covers the commitment
+// through the in-blob content anchor).
 func (t *Trie) decodeBucket(data []byte, b *bucket) error {
 	if len(data) < 9 || len(data) > maxRecordSize || !bytes.Equal(data[:4], archiveMagic[:]) || data[4] != recordVersion {
 		return errors.New("mpt archive: invalid bucket record")
@@ -841,19 +1051,28 @@ func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedE
 	binary.BigEndian.PutUint64(path[len(nodePath):], t.bucketSeq)
 	t.bucketSeq++
 	t.scheduleDirty = true // bucketSeq persists in the schedule record
+	prefixBuf, prefixBits := coveragePrefixBits(payload)
 	b := &bucket{
-		path:       path,
-		entries:    payload,
-		filter:     filter,
-		commitment: ecmh.Create(items),
-		count:      consumed,
-		dirty:      true,
+		path:         path,
+		prefixBuf:    prefixBuf,
+		prefixBits:   prefixBits,
+		entries:      payload,
+		filter:       filter,
+		commitment:   ecmh.Create(items),
+		count:        consumed,
+		dirty:        true,
+		payloadBytes: bucketRecordSize(payload),
 	}
 	mp, err := t.hot.MountStub(nodePath, b.stub())
 	if err != nil {
 		return 0, err
 	}
 	b.mount = mp
+	// Stub-distribution telemetry: how many stubs the mount node carries
+	// after this one lands (the "how fat can one path get" question).
+	if stubs, err := t.hot.StubsAt(mp); err == nil {
+		archivetrie.RecordMPTNodeStubCount(len(stubs))
+	}
 	t.archiveBytes += bucketRecordSize(b.entries)
 	t.buckets[string(path)] = b
 	t.dirtyBuckets = append(t.dirtyBuckets, b) // created with dirty: true above
@@ -906,9 +1125,28 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 		return 0, err
 	}
 	consumed := 0
+	newKeys := 0
 	saturated := false
 	var added int64
 	for _, e := range entries {
+		if old, ok := b.entries[string(e.Key)]; ok {
+			// Blind rewrite of an already-archived key (the write path
+			// does not probe the archive under the EVM read-before-write
+			// ruling, so a violating workload re-archives the key into
+			// this same bucket). The payload map overwrites in place, so
+			// the commitment must SWAP the item — subtract the old value,
+			// add the new — or the commitment multiset drifts from the
+			// payload (2026-10-06 D=12 batch-12915 ECMH mismatch). The
+			// filter already holds the fingerprint: re-inserting it would
+			// burn a slot on a duplicate. Count and residency are
+			// unchanged: the entry was already here.
+			b.commitment = ecmh.Delete(b.commitment, bucketItem(e.Key, old))
+			b.commitment = ecmh.BlindAppend(b.commitment, bucketItem(e.Key, e.Value))
+			b.entries[string(e.Key)] = bytes.Clone(e.Value)
+			added += int64(len(e.Value) - len(old))
+			consumed++
+			continue
+		}
 		if err := b.filter.Insert(e.Key); err != nil {
 			saturated = true
 			break
@@ -917,6 +1155,7 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 		b.commitment = ecmh.BlindAppend(b.commitment, bucketItem(e.Key, e.Value))
 		added += int64(8 + len(e.Key) + len(e.Value))
 		consumed++
+		newKeys++
 	}
 	if consumed == 0 {
 		if saturated {
@@ -924,9 +1163,13 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 		}
 		return 0, nil // empty batch: nothing to rewrite
 	}
-	b.count += consumed
+	b.count += newKeys
 	t.archiveBytes += added
-	t.residentEntries += consumed
+	b.payloadBytes += added
+	t.residentEntries += newKeys
+	// Coverage can only shrink toward the mount path: recompute from the
+	// authoritative entries so the probe skip never hides a stored key.
+	b.prefixBuf, b.prefixBits = coveragePrefixBits(b.entries)
 	t.markBucketDirtyLocked(b)
 	t.touchResidentLocked(b)
 	if saturated {
@@ -954,11 +1197,13 @@ func (t *Trie) bucketDeleteLocked(b *bucket, key, value []byte) error {
 	delete(b.entries, string(key))
 	b.count--
 	t.archiveBytes -= int64(8 + len(key) + len(value))
+	b.payloadBytes -= int64(8 + len(key) + len(value))
 	t.residentEntries--
 	t.markBucketDirtyLocked(b)
 	t.touchResidentLocked(b)
 	if b.count == 0 {
 		t.archiveBytes -= 9 // record header
+		b.payloadBytes = 0
 		if err := t.hot.ReplaceStub(b.mount, b.path, nil); err != nil {
 			return err
 		}
@@ -1006,7 +1251,23 @@ func (t *Trie) mountEntriesLocked(domainPrefix []byte, entries []gethtrie.Extrac
 			if room <= 0 {
 				continue
 			}
-			n := min(room, len(rest))
+			// Feed only entries inside the bucket's coverage (paper
+			// CanAppend), matched at bit granularity: mixed-prefix entries
+			// would erode the coverage bound that lets probes skip this
+			// bucket, and at D%4=3 shard geometry a nibble-level check
+			// would wave through the sibling shards sharing this mount
+			// node, diluting every prefix back to the shared node path.
+			n := 0
+			if b.prefixBits > 0 {
+				for n < room && n < len(rest) && keyHasBitPrefix(rest[n].Key, &b.prefixBuf, b.prefixBits) {
+					n++
+				}
+			} else {
+				n = min(room, len(rest))
+			}
+			if n == 0 {
+				continue
+			}
 			consumed, err := t.bucketAppendLocked(b, rest[:n])
 			rest = rest[consumed:]
 			if err != nil && !errors.Is(err, errBucketSaturated) {
@@ -1055,33 +1316,53 @@ func (t *Trie) mountEntriesLocked(domainPrefix []byte, entries []gethtrie.Extrac
 
 // archiveProbeLocked times the probe when the op-trace gate is open; the
 // wrapper keeps the gated-off path to one field check with no defer.
-func (t *Trie) archiveProbeLocked(key []byte) (*bucket, []byte, bool, error) {
+func (t *Trie) archiveProbeLocked(key []byte) (*bucket, []*bucket, []byte, bool, error) {
 	if !t.opTrace {
 		return t.archiveProbeInnerLocked(key)
 	}
 	opTrace.probes.Add(1)
 	start := time.Now()
-	b, value, ok, err := t.archiveProbeInnerLocked(key)
+	b, hits, value, ok, err := t.archiveProbeInnerLocked(key)
 	opTrace.probeNanos.Add(int64(time.Since(start)))
-	return b, value, ok, err
+	return b, hits, value, ok, err
+}
+
+// bucketSeqOf extracts the global sequence discriminator minted at bucket
+// creation (the identifier's trailing 8 bytes, big-endian). Among duplicate
+// archived copies of one key the copy in the highest-sequence bucket was
+// archived most recently and therefore holds the newest value.
+func bucketSeqOf(path []byte) uint64 {
+	return binary.BigEndian.Uint64(path[len(path)-8:])
 }
 
 // archiveProbeInnerLocked finds the bucket holding key, if any: the stub
 // lists mounted along the key's path are checked sequentially (paper query
-// processing), the cuckoo filter is a pure negative filter — a miss proves
-// absence without touching the payload record — and a hit is confirmed
-// against the exact entries.
-func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []byte, bool, error) {
+// processing). A bucket whose coverage prefix cannot hold the key is
+// skipped without touching its filter (split siblings share one mount but
+// cover disjoint sub-prefixes); the cuckoo filter is a pure negative
+// filter — a miss proves absence without touching the payload record — and
+// a hit is confirmed against the exact entries.
+//
+// A blind write (one that violates the EVM read-before-write premise) can
+// leave the same key in several buckets with different values. Every
+// genuinely-holding bucket is returned (newest first, by bucket sequence)
+// so the caller can redeem the newest value AND clean the stale copies;
+// returning only the first route hit resurrected stale values and stranded
+// the newer duplicate (2026-10-06 D=12 investigation).
+func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []*bucket, []byte, bool, error) {
 	// Collect EVERY filter-hit bucket on the route: split siblings share one
 	// mount node, and a cuckoo false positive (or a genuinely missing entry)
 	// in one sibling must not mask the bucket that actually holds the key.
-	var hits []*bucket
+	var candidates []*bucket
 	var walkErr error
 	err := t.hot.StubsOnPath(key, func(mountPath []byte, st *gethtrie.Stub) bool {
 		b, err := t.bucketForStubLocked(mountPath, st)
 		if err != nil {
 			walkErr = err
 			return true
+		}
+		if b.prefixBits > 0 && !keyHasBitPrefix(key, &b.prefixBuf, b.prefixBits) {
+			return false // coverage excludes the key: skip the filter lookup
 		}
 		if b.filter != nil {
 			if !b.filter.Lookup(key) {
@@ -1090,40 +1371,51 @@ func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []byte, bool, error
 			}
 			archivetrie.RecordMPTFilterLookup(true)
 		}
-		hits = append(hits, b)
+		candidates = append(candidates, b)
 		return false // keep walking: later stubs may hold the key
 	})
 	if err != nil {
-		return nil, nil, false, err
+		return nil, nil, nil, false, err
 	}
 	if walkErr != nil {
-		return nil, nil, false, walkErr
+		return nil, nil, nil, false, walkErr
 	}
-	for _, b := range hits {
+	var hits []*bucket
+	for _, b := range candidates {
 		if err := t.loadBucketLocked(b); err != nil {
-			return nil, nil, false, err
+			return nil, nil, nil, false, err
 		}
-		if value, ok := b.entries[string(key)]; ok {
-			return b, bytes.Clone(value), true, nil
+		if _, ok := b.entries[string(key)]; ok {
+			hits = append(hits, b)
+			continue
 		}
 		// The filter claimed the key but the payload denies it: a genuine
 		// cuckoo false positive — feed the G4 telemetry and keep looking.
 		archivetrie.RecordMPTFilterFalsePositive()
 	}
-	return nil, nil, false, nil
-}
-
-// removeArchivedEntryLocked deletes key from its archive bucket (Put
-// overwrites and Delete), keeping exactly one live copy of every key.
-func (t *Trie) removeArchivedEntryLocked(key []byte) (bool, error) {
-	b, value, ok, err := t.archiveProbeInnerLocked(key)
-	if err != nil || !ok {
-		return false, err
+	if len(hits) == 0 {
+		return nil, nil, nil, false, nil
 	}
-	if err := t.bucketDeleteLocked(b, key, value); err != nil {
-		return false, err
+	if len(hits) >= 2 {
+		// Zero-cost safety net for the write path's no-probe ruling: the
+		// EVM read-before-write premise guarantees one live copy per key,
+		// so two buckets genuinely holding the same key means the
+		// workload contained a blind write (a Put/Delete that never read
+		// the archived key first). Count it as information telemetry.
+		archivetrie.RecordMPTDuplicateArchivedKey()
 	}
-	return true, nil
+	// Newest copy first: the highest bucket sequence discriminator was
+	// minted last, so it holds the most recently archived value.
+	newest := 0
+	for i := 1; i < len(hits); i++ {
+		if bucketSeqOf(hits[i].path) > bucketSeqOf(hits[newest].path) {
+			newest = i
+		}
+	}
+	if newest != 0 {
+		hits[0], hits[newest] = hits[newest], hits[0]
+	}
+	return hits[0], hits, bytes.Clone(hits[0].entries[string(key)]), true, nil
 }
 
 // verifyBucketLocked is the audit-mode redemption check (C5, gated by
@@ -1168,7 +1460,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 	if t.opTrace {
 		opTrace.hotMisses.Add(1)
 	}
-	b, value, fromArchive, err := t.archiveProbeLocked(key)
+	b, hits, value, fromArchive, err := t.archiveProbeLocked(key)
 	if err != nil {
 		return nil, err
 	}
@@ -1179,15 +1471,34 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 		// Mirror the binary layer's promotion timing: only the promotion
 		// itself (bucket removal + hot reinsert) is measured, not the lookup.
 		promotionStart := time.Now()
-		if ecmhVerifyGate {
+		// Two-party simulation: the archive node hands the full node the
+		// bucket payload record plus the stub side record — that bundle IS
+		// the redemption proof (paper) — and the full node verifies it by
+		// re-running the ECMH audit. The audit runs on a sample so formal
+		// runs measure its cost without paying it on every redemption.
+		// The audited bucket is the one that supplied the value (the
+		// newest copy, hits[0]).
+		proofBytes := int64(len(b.metaBytes)) + b.payloadBytes
+		proofCount, _, _, _ := archivetrie.MPTRedemptionProofStats()
+		if ecmhVerifyGate || (redemptionVerifySample > 0 && proofCount%int64(redemptionVerifySample) == 0) {
+			verifyStart := time.Now()
 			if err := t.verifyBucketLocked(b); err != nil {
 				archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
 				return nil, err
 			}
+			if !ecmhVerifyGate {
+				archivetrie.RecordMPTRedemptionVerify(time.Since(verifyStart))
+			}
 		}
-		if err := t.bucketDeleteLocked(b, key, value); err != nil {
-			archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
-			return nil, err
+		// Redeem from EVERY bucket genuinely holding the key (blind-write
+		// duplicates): each bucket's commitment is decremented by its own
+		// payload value, so the commitment == payload multiset invariant
+		// survives per bucket and no stale copy is left behind.
+		for _, hb := range hits {
+			if err := t.bucketDeleteLocked(hb, key, hb.entries[string(key)]); err != nil {
+				archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
+				return nil, err
+			}
 		}
 		if err := t.hot.Update(key, value); err != nil {
 			archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
@@ -1195,6 +1506,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 		}
 		t.markDirtyLocked()
 		archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), true)
+		archivetrie.RecordMPTRedemptionProof(proofBytes)
 	}
 	return value, nil
 }
@@ -1226,7 +1538,7 @@ func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
 	if t.opTrace {
 		opTrace.hotMisses.Add(1)
 	}
-	_, archived, ok, err := t.archiveProbeLocked(key)
+	_, _, archived, ok, err := t.archiveProbeLocked(key)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1236,7 +1548,15 @@ func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
 	return crypto.Keccak256(archived), true, nil
 }
 
-// Put writes a value into the hot tree, releasing any archived copy first.
+// Put writes a value into the hot tree.
+//
+// Workload premise (user ruling 2026-10-05): the EVM reads every key before
+// writing it, and the read path resurrects an archived key back into the
+// hot layer — so by the time Put runs there is no archived copy to release,
+// and probing the archive here would be pure per-write overhead. A blind
+// write (Put without a preceding read of an archived key) would violate the
+// exactly-one-live-copy invariant; the probe path's DuplicateArchivedKey
+// diagnostic counter is the zero-cost tripwire for such workloads.
 func (t *Trie) Put(key, value []byte) error {
 	lockStart := t.opTraceStart()
 	t.mu.Lock()
@@ -1247,14 +1567,6 @@ func (t *Trie) Put(key, value []byte) error {
 	}
 	if t.opTrace {
 		opTrace.ops.Add(1)
-	}
-	removeStart := t.opTraceStart()
-	if _, err := t.removeArchivedEntryLocked(key); err != nil {
-		return err
-	}
-	opTraceAdd(&opTrace.removeNanos, removeStart)
-	if !removeStart.IsZero() {
-		opTrace.removes.Add(1)
 	}
 	hotStart := t.opTraceStart()
 	if err := t.hot.Update(key, value); err != nil {
@@ -1274,7 +1586,11 @@ func (t *Trie) PutBatch(entries []KeyValue) error {
 	return nil
 }
 
-// Delete removes a key from the hot tree and from any archived copy.
+// Delete removes a key from the hot tree. Like Put it does not probe the
+// archive: the EVM read-before-write premise means the key was already
+// resurrected (or never archived). A blind delete of an archived key leaves
+// the archived copy behind — the probe path's DuplicateArchivedKey counter
+// is the tripwire for that workload violation.
 func (t *Trie) Delete(key []byte) error {
 	lockStart := t.opTraceStart()
 	t.mu.Lock()
@@ -1291,14 +1607,6 @@ func (t *Trie) Delete(key []byte) error {
 		return err
 	}
 	opTraceAdd(&opTrace.hotNanos, hotStart)
-	removeStart := t.opTraceStart()
-	if _, err := t.removeArchivedEntryLocked(key); err != nil {
-		return err
-	}
-	opTraceAdd(&opTrace.removeNanos, removeStart)
-	if !removeStart.IsZero() {
-		opTrace.removes.Add(1)
-	}
 	t.markDirtyLocked()
 	return nil
 }
@@ -1470,7 +1778,7 @@ func writeNodeSet(batch archivetrie.Batcher, set *trienode.NodeSet) error {
 // without changing any call site's flush semantics. The flat and aggregate
 // classes are gone after this rewrite and are always reported as zero.
 type stagedBytes struct {
-	hotNode, archive, index int64
+	hotNode, archive, index, stubMeta int64
 }
 
 func (s *stagedBytes) add(key []byte, value []byte) {
@@ -1485,6 +1793,8 @@ func (s *stagedBytes) add(key []byte, value []byte) {
 		s.archive += n
 	case 'I', 'S':
 		s.index += n
+	case 'B':
+		s.stubMeta += n
 	}
 }
 
@@ -1547,7 +1857,7 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 			written, _ := t.pathWrites.take()
 			staged.hotNode += written
 		}
-		archivetrie.SetMPTCommitStagedBytes(staged.hotNode, 0, staged.archive, 0, staged.index)
+		archivetrie.SetMPTCommitStagedBytes(staged.hotNode, 0, staged.archive, 0, staged.index, staged.stubMeta)
 		if cacheStats, ok := t.ndb.(*nodeDatabase); ok {
 			archivetrie.SetMPTNodeCacheStats(cacheStats.cache.stats())
 		} else {
@@ -1589,10 +1899,22 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 			if err := rec.Delete(bucketKey(b.path)); err != nil {
 				return nil, err
 			}
+			if err := rec.Delete(stubMetaKey(b.path)); err != nil {
+				return nil, err
+			}
 			delete(t.buckets, string(b.path))
 			continue
 		}
 		if err := rec.Put(bucketKey(b.path), t.encodeBucket(b)); err != nil {
+			return nil, err
+		}
+		// The side record stages exactly the bytes the in-blob content
+		// anchor commits to (rendered at mutation time; a dirty bucket
+		// always passed through stub()).
+		if len(b.metaBytes) == 0 {
+			return nil, fmt.Errorf("mpt archive: dirty bucket %x has no rendered stub meta", b.path)
+		}
+		if err := rec.Put(stubMetaKey(b.path), b.metaBytes); err != nil {
 			return nil, err
 		}
 		b.dirty = false

@@ -32,10 +32,10 @@ func mkKey(i int) []byte {
 }
 
 func stubFor(pathNib byte, count uint32) *Stub {
-	s := &Stub{Path: []byte{pathNib, 0x0f}, Count: count}
-	s.Filter = []byte{0x01, pathNib}
-	s.Commitment[0] = 0x02
-	s.Commitment[32] = pathNib
+	s := &Stub{Path: []byte{pathNib, 0x0f}}
+	s.ContentHash[0] = 0x02
+	s.ContentHash[1] = byte(count)
+	s.ContentHash[31] = pathNib
 	return s
 }
 
@@ -84,7 +84,7 @@ func TestHXStubMountHashAndReload(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(found) != 1 || found[0].Count != 7 || !bytes.Equal(found[0].Path, []byte{3, 0x0f}) {
+	if len(found) != 1 || found[0].ContentHash != stubFor(3, 7).ContentHash || !bytes.Equal(found[0].Path, []byte{3, 0x0f}) {
 		t.Fatalf("stub after reload = %+v", found)
 	}
 	if err := reopened.VerifyAggregates(); err != nil {
@@ -109,8 +109,8 @@ func TestHXStubReplaceAndRemove(t *testing.T) {
 	if mp == nil {
 		t.Fatal("mount path nil on non-empty tree")
 	}
-	repl := stubFor(1, 2) // same Path, new count
-	repl.Commitment[1] = 0x99
+	repl := stubFor(1, 2) // same Path, new content anchor
+	repl.ContentHash[2] = 0x99
 	if err := tr.ReplaceStub(mp, []byte{1, 0x0f}, repl); err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +120,7 @@ func TestHXStubReplaceAndRemove(t *testing.T) {
 	if err := reopened.AllStubs(func(_ []byte, s *Stub) { seen = append(seen, s) }); err != nil {
 		t.Fatal(err)
 	}
-	if len(seen) != 1 || seen[0].Count != 2 || seen[0].Commitment[1] != 0x99 {
+	if len(seen) != 1 || seen[0].ContentHash != repl.ContentHash {
 		t.Fatalf("stub after replace = %+v", seen)
 	}
 	// Destroy the bucket: stub leaves the tree, root changes.

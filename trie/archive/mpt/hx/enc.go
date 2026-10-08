@@ -31,7 +31,9 @@ import (
 //	fullNode:  [ c0, ..., c16, epochAgg, stubList ]              (19 elements)
 //	             ci = embedded raw node (<32B) or 32B child hash or empty
 //	             epochAgg = uint64 (16 slots x 2 bits)
-//	             stubList = [ [pathCompact, filter, commitment33, count], ... ]
+//	             stubList = [ [pathCompact, contentHash32], ... ]
+//	             (contentHash anchors the side-stored filter/commitment/count
+//	             record; the blob commits to stub content without carrying it)
 //	shortNode: [ compactKey, valOrRef, meta ]                    (3 elements)
 //	          or [ compactKey, valOrRef, meta, stubList ]        (4, rare)
 //	             leaf (key has terminator): val = value bytes, meta = epoch (0/1)
@@ -49,15 +51,15 @@ func nodeToBytes(n node) []byte {
 
 // encode stubs into the buffer as an RLP list. Stub.Path is an opaque bucket
 // identifier (mount path + discriminator), stored raw — membership is decided
-// by the filter, not by path prefix matching.
+// by the filter, not by path prefix matching. The blob carries only the
+// content anchor: filter/commitment/count live in the side record the hash
+// points at.
 func encodeStubs(w rlp.EncoderBuffer, stubs []*Stub) {
 	off := w.List()
 	for _, s := range stubs {
 		soff := w.List()
 		w.WriteBytes(s.Path)
-		w.WriteBytes(s.Filter)
-		w.WriteBytes(s.Commitment[:])
-		w.WriteUint64(uint64(s.Count))
+		w.WriteBytes(s.ContentHash[:])
 		w.ListEnd(soff)
 	}
 	w.ListEnd(off)
@@ -303,30 +305,20 @@ func decodeStub(elems []byte) (*Stub, error) {
 	if err != nil {
 		return nil, fmt.Errorf("hx: invalid stub path: %v", err)
 	}
-	filter, rest, err := rlp.SplitString(rest)
+	contentHash, rest, err := rlp.SplitString(rest)
 	if err != nil {
-		return nil, fmt.Errorf("hx: invalid stub filter: %v", err)
+		return nil, fmt.Errorf("hx: invalid stub content hash: %v", err)
 	}
-	commit, rest, err := rlp.SplitString(rest)
-	if err != nil {
-		return nil, fmt.Errorf("hx: invalid stub commitment: %v", err)
-	}
-	if len(commit) != 33 {
-		return nil, fmt.Errorf("hx: stub commitment length %d, want 33", len(commit))
-	}
-	count, rest, err := rlp.SplitUint64(rest)
-	if err != nil {
-		return nil, fmt.Errorf("hx: invalid stub count: %v", err)
+	if len(contentHash) != 32 {
+		return nil, fmt.Errorf("hx: stub content hash length %d, want 32", len(contentHash))
 	}
 	if len(rest) != 0 {
 		return nil, fmt.Errorf("hx: trailing stub bytes")
 	}
 	s := &Stub{
-		Path:   bytes.Clone(path),
-		Filter: bytes.Clone(filter),
-		Count:  uint32(count),
+		Path: bytes.Clone(path),
 	}
-	copy(s.Commitment[:], commit)
+	copy(s.ContentHash[:], contentHash)
 	return s, nil
 }
 

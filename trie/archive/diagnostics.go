@@ -82,6 +82,19 @@ type CommitDiagnostics struct {
 	MPTStagedIndexBytes     int64
 	MPTNodeCacheGets        int64
 	MPTNodeCacheHits        int64
+	// Stub side-record telemetry, cumulative since Reset: staged bytes of
+	// the 'MPTB' class (filter/commitment/count records the node blobs now
+	// reference by content hash), and the fetch traffic of first-sight
+	// registry fills (count + record bytes).
+	MPTStagedStubMetaBytes int64
+	MPTStubMetaFetches     int64
+	MPTStubMetaFetchBytes  int64
+	// Stub distribution telemetry: over every node-stub-count observation
+	// (recorded at mount time), the maximum seen on a single node, the
+	// running sum and the observation count (avg = sum/events).
+	MPTStubNodeMax    int64
+	MPTStubNodeSum    int64
+	MPTStubNodeEvents int64
 	// Hot-layer (mpt) prune diagnostics, cumulative since Reset: leaves
 	// extracted, nodes the extraction had to resolve, and the extract/mount
 	// phase split.
@@ -1013,6 +1026,12 @@ var (
 	commitDiagMPTStagedArchiveBytes      int64
 	commitDiagMPTStagedFlatBytes         int64
 	commitDiagMPTStagedIndexBytes        int64
+	commitDiagMPTStagedStubMetaBytes     int64
+	commitDiagMPTStubMetaFetches         int64
+	commitDiagMPTStubMetaFetchBytes      int64
+	commitDiagMPTStubNodeMax             int64
+	commitDiagMPTStubNodeSum             int64
+	commitDiagMPTStubNodeEvents          int64
 	commitDiagMPTNodeCacheGets           int64
 	commitDiagMPTNodeCacheHits           int64
 	commitDiagMPTPruneExtracted          int64
@@ -1559,6 +1578,12 @@ func LastCommitDiagnostics() CommitDiagnostics {
 		MPTStagedArchiveBytes:      atomic.LoadInt64(&commitDiagMPTStagedArchiveBytes),
 		MPTStagedFlatBytes:         atomic.LoadInt64(&commitDiagMPTStagedFlatBytes),
 		MPTStagedIndexBytes:        atomic.LoadInt64(&commitDiagMPTStagedIndexBytes),
+		MPTStagedStubMetaBytes:     atomic.LoadInt64(&commitDiagMPTStagedStubMetaBytes),
+		MPTStubMetaFetches:         atomic.LoadInt64(&commitDiagMPTStubMetaFetches),
+		MPTStubMetaFetchBytes:      atomic.LoadInt64(&commitDiagMPTStubMetaFetchBytes),
+		MPTStubNodeMax:             atomic.LoadInt64(&commitDiagMPTStubNodeMax),
+		MPTStubNodeSum:             atomic.LoadInt64(&commitDiagMPTStubNodeSum),
+		MPTStubNodeEvents:          atomic.LoadInt64(&commitDiagMPTStubNodeEvents),
 		MPTNodeCacheGets:           atomic.LoadInt64(&commitDiagMPTNodeCacheGets),
 		MPTNodeCacheHits:           atomic.LoadInt64(&commitDiagMPTNodeCacheHits),
 		MPTPruneExtracted:          atomic.LoadInt64(&commitDiagMPTPruneExtracted),
@@ -1965,13 +1990,38 @@ func randomNonMemberArchiveSuffix(rng *rand.Rand, suffixBits int, existing map[s
 // SetMPTCommitStagedBytes adds one hot-layer (mpt) commit's staged-bytes
 // split to the cumulative diagnostics. The mpt subpackage calls it once per
 // CommitToBatch; the trace stress harness snapshots the cumulative counters
-// per window.
-func SetMPTCommitStagedBytes(hotNode, aggregateNode, archive, flat, index int64) {
+// per window. stubMeta is the 'MPTB' class: side records holding stub
+// filter/commitment/count content the node blobs reference by hash.
+func SetMPTCommitStagedBytes(hotNode, aggregateNode, archive, flat, index, stubMeta int64) {
 	atomic.AddInt64(&commitDiagMPTStagedHotNodeBytes, hotNode)
 	atomic.AddInt64(&commitDiagMPTStagedAggregateBytes, aggregateNode)
 	atomic.AddInt64(&commitDiagMPTStagedArchiveBytes, archive)
 	atomic.AddInt64(&commitDiagMPTStagedFlatBytes, flat)
 	atomic.AddInt64(&commitDiagMPTStagedIndexBytes, index)
+	atomic.AddInt64(&commitDiagMPTStagedStubMetaBytes, stubMeta)
+}
+
+// RecordMPTStubMetaFetch lets the MPT hot layer report a stub side-record
+// fetch (first-sight registry fill): one call per record read from the KV
+// store, with the record's byte size. The op path must stay at zero here —
+// every fetch beyond cold start signals an unexpected registry miss.
+func RecordMPTStubMetaFetch(recordBytes int64) {
+	atomic.AddInt64(&commitDiagMPTStubMetaFetches, 1)
+	atomic.AddInt64(&commitDiagMPTStubMetaFetchBytes, recordBytes)
+}
+
+// RecordMPTNodeStubCount lets the MPT hot layer report how many stubs a node
+// carries after a mount. Tracks the single-node maximum (the "how fat can
+// one path get" question) plus sum/events for the average.
+func RecordMPTNodeStubCount(count int) {
+	atomic.AddInt64(&commitDiagMPTStubNodeEvents, 1)
+	atomic.AddInt64(&commitDiagMPTStubNodeSum, int64(count))
+	for {
+		cur := atomic.LoadInt64(&commitDiagMPTStubNodeMax)
+		if int64(count) <= cur || atomic.CompareAndSwapInt64(&commitDiagMPTStubNodeMax, cur, int64(count)) {
+			return
+		}
+	}
 }
 
 // SetMPTPruneDiagnostics adds one hot-layer (mpt) prune's outcome to the
@@ -2026,6 +2076,61 @@ func RecordMPTReadPromotion(elapsed time.Duration, hit bool) {
 	recordArchiveReadPromotion(elapsed, hit)
 }
 
+// ---- Redemption proof telemetry (two-party simulation) ----
+// Each read-triggered resurrection reports the size of the verification
+// payload: the bytes the archive node hands the full node so the full node
+// can re-run the ECMH commitment audit — the bucket payload record plus the
+// stub side record (paper redemption proof). The audit itself runs on a
+// sample (mpt's redemptionVerifySample knob) and reports its latency here,
+// so formal runs measure the verification cost without paying it every time.
+var (
+	redemptionProofCount  int64
+	redemptionProofBytes  int64
+	redemptionProofMax    int64
+	redemptionProofLast   int64
+	redemptionVerifyCount int64
+	redemptionVerifyNanos int64
+)
+
+// RecordMPTRedemptionProof lets the MPT hot layer report one redemption's
+// proof size in bytes. The size is stored before the count increments so a
+// same-goroutine reader observing the new count also observes its size.
+func RecordMPTRedemptionProof(proofBytes int64) {
+	atomic.StoreInt64(&redemptionProofLast, proofBytes)
+	atomic.AddInt64(&redemptionProofCount, 1)
+	atomic.AddInt64(&redemptionProofBytes, proofBytes)
+	for {
+		cur := atomic.LoadInt64(&redemptionProofMax)
+		if proofBytes <= cur || atomic.CompareAndSwapInt64(&redemptionProofMax, cur, proofBytes) {
+			return
+		}
+	}
+}
+
+// MPTRedemptionProofStats snapshots the cumulative counters: redemption
+// count, total proof bytes, single-redemption max, and the most recent
+// redemption's size. The harness diffs count/bytes per op to attribute
+// proof traffic to the block its op belongs to.
+func MPTRedemptionProofStats() (count, bytes, max, last int64) {
+	return atomic.LoadInt64(&redemptionProofCount),
+		atomic.LoadInt64(&redemptionProofBytes),
+		atomic.LoadInt64(&redemptionProofMax),
+		atomic.LoadInt64(&redemptionProofLast)
+}
+
+// RecordMPTRedemptionVerify lets the MPT hot layer report one sampled
+// full-node verification audit (ECMH recompute over the handed-over bucket
+// data) with its latency.
+func RecordMPTRedemptionVerify(elapsed time.Duration) {
+	atomic.AddInt64(&redemptionVerifyCount, 1)
+	atomic.AddInt64(&redemptionVerifyNanos, elapsed.Nanoseconds())
+}
+
+// MPTRedemptionVerifyStats snapshots the cumulative sampled-audit counters.
+func MPTRedemptionVerifyStats() (count, nanos int64) {
+	return atomic.LoadInt64(&redemptionVerifyCount), atomic.LoadInt64(&redemptionVerifyNanos)
+}
+
 // RecordMPTFilterFalsePositive lets the MPT hot layer report a cuckoo
 // false positive (filter claimed a key, exact payload check missed) into
 // the shared G4 telemetry counters.
@@ -2039,4 +2144,23 @@ func RecordMPTFilterFalsePositive() {
 // sharded path already feeds via recordArchiveFilterLookup.
 func RecordMPTFilterLookup(positive bool) {
 	recordArchiveFilterLookup(positive)
+}
+
+// mptDuplicateArchivedKeys counts probes that found the same key genuinely
+// held by two or more buckets' payloads. The write path (mpt Put/Delete)
+// does not probe the archive — it relies on the EVM read-before-write
+// premise (the read resurrects the archived copy first) — so a non-zero
+// count here means the workload contained a blind write and the
+// exactly-one-live-copy invariant was violated somewhere upstream.
+var mptDuplicateArchivedKeys int64
+
+// RecordMPTDuplicateArchivedKey lets the MPT hot layer report one probe
+// that found duplicate archived copies of a key.
+func RecordMPTDuplicateArchivedKey() {
+	atomic.AddInt64(&mptDuplicateArchivedKeys, 1)
+}
+
+// MPTDuplicateArchivedKeys snapshots the cumulative duplicate-key counter.
+func MPTDuplicateArchivedKeys() int64 {
+	return atomic.LoadInt64(&mptDuplicateArchivedKeys)
 }

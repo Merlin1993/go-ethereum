@@ -68,12 +68,17 @@ func TestMPTPathDBPruneStressDanglingRegression(t *testing.T) {
 					pool = append(pool, k)
 				}
 				v := mkVal(batch)
+				// Read-before-write (EVM premise): the write path no
+				// longer probes the archive, so a rewrite of an archived
+				// key must first resurrect it via the read path.
+				_, _ = tr.Get(k)
 				if err := tr.Put(k, v); err != nil {
 					t.Fatalf("batch %d put: %v", batch, err)
 				}
 				keys[string(k)] = v
 			case 4: // delete
 				k := pick()
+				_, _ = tr.Get(k) // read-before-write, see above
 				if err := tr.Delete(k); err != nil {
 					t.Fatalf("batch %d delete: %v", batch, err)
 				}
@@ -151,7 +156,7 @@ func dumpKeyWhereabouts(t *testing.T, tr *Trie, k []byte, batch int) {
 	fmt.Printf("LOST KEY %x (batch %d): hot-present=%v hot-err=%v buckets=%d\n", k[:8], batch, hv != nil, herr, len(tr.buckets))
 	fmt.Printf("  stubs actually on the key route:\n")
 	_ = hot.StubsOnPath(k, func(np []byte, s *gethtrie.Stub) bool {
-		fmt.Printf("    route stub at node=%x stubPath=%x count=%d\n", np, s.Path, s.Count)
+		fmt.Printf("    route stub at node=%x stubPath=%x anchor=%x\n", np, s.Path, s.ContentHash[:8])
 		return false
 	})
 	for sp, b := range tr.buckets {

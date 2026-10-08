@@ -147,13 +147,14 @@ func (n *fullNode) refreshAgg(i int) {
 
 // Stub is the compact archival commitment mounted on a branch node
 // (paper: B = <Path, CF, C_ECMH, Count>). The physical preimage set lives in
-// the archive KV store; only this metadata enters the trie and therefore the
-// state root.
+// the archive KV store; the filter/commitment/count metadata lives in a
+// side record keyed by Path, and only this content anchor enters the trie
+// and therefore the state root. Keeping the metadata out of the node blob
+// keeps every business write's dirty path slim — a stub-carrying node is
+// otherwise re-staged in full by each write passing under it.
 type Stub struct {
-	Path       []byte   // bucket path relative to the mounting node, HEX nibbles (no terminator)
-	Filter     []byte   // serialized Cuckoo filter
-	Commitment [33]byte // ECMH commitment (compressed secp256k1 point)
-	Count      uint32   // element count
+	Path        []byte   // bucket path relative to the mounting node, HEX nibbles (no terminator)
+	ContentHash [32]byte // keccak of the side-stored stub content record (filter+commitment+count)
 }
 
 func (s *Stub) copy() *Stub {

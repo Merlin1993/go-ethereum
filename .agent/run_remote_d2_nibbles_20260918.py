@@ -48,6 +48,10 @@ ROUNDS = float(os.environ.get("D2_ROUNDS", "1.5"))
 # Explicit ops target wins (E2 full-trace runs); otherwise derive from rounds.
 OPERATIONS = int(os.environ.get("D2_OPS", "0")) or int(DOMAIN_COUNT * BATCH_SIZE * ROUNDS)
 FLUSH_BATCHES = int(os.environ.get("D2_FLUSH_BATCHES", "25"))  # C-loop conclusion: flush per 100K ops, r=0.891 @D=16; D2_FLUSH_BATCHES=1 aligns triedb.Commit cadence with stock B0
+# MPT_ECMH_VERIFY=1 arms the commitment audit for verification runs (formal
+# posture keeps it off, C5). Passed through as an export in the launcher.
+ECMH_VERIFY = os.environ.get("MPT_ECMH_VERIFY", "0")
+ECMH_EXPORT = "export MPT_ECMH_VERIFY=1" if ECMH_VERIFY == "1" else "# MPT_ECMH_VERIFY off (formal posture C5)"
 # Window sizing: keep ~24-40 windows per run so the CSV stays readable.
 METRICS_BATCHES = max(2500, (DOMAIN_COUNT * 3 // 2) // 40)
 
@@ -195,6 +199,8 @@ run_stage() {{
 
 printf '%s D2: AMT pathdb hot-mpt depth calibration, {ROUNDS} rounds = {OPERATIONS} ops, depth_bits={DEPTH_BITS}, fl{FLUSH_BATCHES}\\n' "$(date --iso-8601=seconds)" >>'{REMOTE_LAUNCHER}.status.log'
 
+{ECMH_EXPORT}
+
 # Compile gate first: a build failure must not consume hours of trace time.
 set +e
 run_stage build '{REMOTE_LAUNCHER}.build.exit' '{REMOTE_LAUNCHER}.build.log' \\
@@ -207,7 +213,7 @@ if [ "$build_ok" -ne 0 ]; then
   exit 1
 fi
 
-# Formal-run posture: MPT_OP_TRACE off, MPT_ECMH_VERIFY off (C5).
+# Formal-run posture: MPT_OP_TRACE off; MPT_ECMH_VERIFY via {ECMH_EXPORT}.
 set +e
 run_stage D2_amt '{RUN_AMT}.exit' '{RUN_AMT}.log' \\
   /usr/local/go/bin/go test ./trie/archive \\

@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -313,10 +314,15 @@ type traceStressWindow struct {
 	stemHits, stemMisses       int64
 	stemEvictions              int64
 	rawBatchOps, rawBatchBytes int64
-	mptDiag                    [7]int64 // staged hotNode/aggregate/archive/flat/index bytes, then node-cache gets/hits
+	mptDiag                    [10]int64 // staged hotNode/aggregate/archive/flat/index/stubMeta bytes, node-cache gets/hits, stubmeta fetches/fetch-bytes
 	access                     traceStressAccessStats
 	accessSample               time.Duration
 	classificationFilter       traceStressFilterStats
+	proofRedemptions           int64         // read-activation redemptions in this window
+	proofBytes                 int64         // total redemption-proof bytes in this window
+	proofBlocks                []int64       // completed per-block proof totals in this window
+	proofVerifyCount           int64         // sampled full-node verification audits in this window
+	proofVerify                time.Duration // sampled audit latency in this window
 }
 
 type traceStressFilterStats struct {
@@ -324,6 +330,35 @@ type traceStressFilterStats struct {
 	Negatives      int64
 	Positives      int64
 	FalsePositives int64
+}
+
+// proofReservoirAdd keeps a uniform random sample of at most cap int64
+// values (stream position seen is 1-based), so run-long percentile estimates
+// need constant memory.
+func proofReservoirAdd(res *[]int64, v, seen int64, cap int, rng *rand.Rand) {
+	if len(*res) < cap {
+		*res = append(*res, v)
+		return
+	}
+	if j := rng.Int63n(seen); j < int64(cap) {
+		(*res)[j] = v
+	}
+}
+
+// percentileInt64 reads q-quantile off an ascending-sorted slice (linear
+// index, matching percentileDuration's convention); empty yields 0.
+func percentileInt64(sorted []int64, q float64) int64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[min(int(q*float64(len(sorted))), len(sorted)-1)]
+}
+
+// sortedInt64Copy returns an ascending-sorted copy of values.
+func sortedInt64Copy(values []int64) []int64 {
+	out := append([]int64(nil), values...)
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // bucketCapacityMetadata reports the mpt bucket capacity M registered by the
@@ -1119,6 +1154,11 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"Commit_Hx_ms", "Commit_Stage_ms", "Commit_TdbCommit_ms", "Commit_ArchiveLoop_ms",
 		"Staged_Prune_Bytes", "Staged_Ops_Bytes",
 		"Archive_Bytes", "System_Total_Bytes",
+		"MPT_Staged_StubMeta_Bytes", "MPT_StubMeta_Fetches", "MPT_StubMeta_Fetch_Bytes",
+		"GC_Pause_ms", "GC_Num",
+		"Proof_Redemptions", "Proof_Bytes",
+		"Proof_Block_P50_Bytes", "Proof_Block_P95_Bytes", "Proof_Block_P99_Bytes", "Proof_Block_Max_Bytes",
+		"Proof_Verify_Count", "Proof_Verify_ms",
 	}
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
@@ -1151,13 +1191,28 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		prevCache                 = cacheDiagnostics()
 		initialUpdateDiag         = LastUpdateDiagnostics()
 		prevUpdateDiag            = initialUpdateDiag
-		prevMPTDiag               [7]int64
+		prevMPTDiag               [10]int64
 		prevPruneDiag             [4]int64
+		prevGCPauseNs             uint64
+		prevGCNum                 uint32
 		started                   = time.Now()
 		totalBatches              int64
 		prunesDone                int64
 		nextPruneBlock            uint64
 		executedOperations        int64
+		proofLastCount            int64
+		proofLastBytes            int64
+		proofBlockNum             uint64
+		proofBlockAcc             int64
+		proofBlockOpen            bool
+		proofBlockTotal           int64 // completed blocks carrying redemptions
+		proofBlockMax             int64 // global max single-block proof bytes
+		proofBlockReservoir       []int64
+		proofRedemptionSeen       int64
+		proofRedemptionReservoir  []int64
+		proofVerifyLastCount      int64
+		proofVerifyLastNanos      int64
+		proofRng                  = rand.New(rand.NewSource(20261004))
 	)
 	pruneOne := func() (time.Duration, error) {
 		if *traceStressDisableArchive {
@@ -1197,7 +1252,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		currentUpdateDiag := LastUpdateDiagnostics()
 		updateDiag := currentUpdateDiag.Sub(prevUpdateDiag)
 		prevUpdateDiag = currentUpdateDiag
-		curMPTDiag := [7]int64{diag.MPTStagedHotNodeBytes, diag.MPTStagedAggregateBytes, diag.MPTStagedArchiveBytes, diag.MPTStagedFlatBytes, diag.MPTStagedIndexBytes, diag.MPTNodeCacheGets, diag.MPTNodeCacheHits}
+		curMPTDiag := [10]int64{diag.MPTStagedHotNodeBytes, diag.MPTStagedAggregateBytes, diag.MPTStagedArchiveBytes, diag.MPTStagedFlatBytes, diag.MPTStagedIndexBytes, diag.MPTNodeCacheGets, diag.MPTNodeCacheHits, diag.MPTStagedStubMetaBytes, diag.MPTStubMetaFetches, diag.MPTStubMetaFetchBytes}
 		for i := range curMPTDiag {
 			window.mptDiag[i] = curMPTDiag[i] - prevMPTDiag[i]
 		}
@@ -1213,6 +1268,14 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		runtimeFilterFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.Negatives)
 		archiveRoundCompleted := prunesDone / archiveRoundDomains
 		archiveRoundProgress := prunesDone % archiveRoundDomains
+		// Redemption-proof telemetry: sampled full-node audit delta, plus the
+		// window's per-block proof percentiles (the trailing open block is
+		// carried into the next window, so only completed blocks are ranked).
+		vc, vn := MPTRedemptionVerifyStats()
+		window.proofVerifyCount = vc - proofVerifyLastCount
+		window.proofVerify = time.Duration(vn - proofVerifyLastNanos)
+		proofVerifyLastCount, proofVerifyLastNanos = vc, vn
+		proofBlocksSorted := sortedInt64Copy(window.proofBlocks)
 		row := []string{
 			strconv.FormatInt(batchNumber-int64(len(window.batchWall))+1, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(archiveRoundCompleted, 10), strconv.FormatInt(archiveRoundProgress, 10), strconv.FormatInt(totalCounts.total(), 10),
 			strconv.FormatUint(window.firstBlock, 10), strconv.FormatUint(window.lastBlock, 10), strconv.FormatInt(window.counts.total(), 10),
@@ -1250,7 +1313,15 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			strconv.FormatInt(window.finalCommitPhase[2]/1e6, 10), strconv.FormatInt(window.finalCommitPhase[3]/1e6, 10),
 			strconv.FormatInt(window.stagedPruneBytes, 10), strconv.FormatInt(window.stagedOpsBytes, 10),
 			strconv.FormatInt(diag.MPTArchivePayloadBytes, 10), strconv.FormatInt(stateBytes, 10),
+			strconv.FormatInt(window.mptDiag[7], 10), strconv.FormatInt(window.mptDiag[8], 10), strconv.FormatInt(window.mptDiag[9], 10),
+			strconv.FormatUint((mem.PauseTotalNs-prevGCPauseNs)/uint64(time.Millisecond), 10), strconv.FormatUint(uint64(mem.NumGC-prevGCNum), 10),
+			strconv.FormatInt(window.proofRedemptions, 10), strconv.FormatInt(window.proofBytes, 10),
+			strconv.FormatInt(percentileInt64(proofBlocksSorted, .50), 10), strconv.FormatInt(percentileInt64(proofBlocksSorted, .95), 10),
+			strconv.FormatInt(percentileInt64(proofBlocksSorted, .99), 10), strconv.FormatInt(percentileInt64(proofBlocksSorted, 1), 10),
+			strconv.FormatInt(window.proofVerifyCount, 10), durationMS(window.proofVerify),
 		}
+		prevGCPauseNs = mem.PauseTotalNs
+		prevGCNum = mem.NumGC
 		if err := metrics.Write(row); err != nil {
 			t.Fatal(err)
 		}
@@ -1426,6 +1497,31 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				}
 			}
 			executedOperations++
+			// Redemption-proof attribution: diff the cumulative counters per
+			// op (a redemption fires inside Get) and charge the bytes to the
+			// op's block; block totals close on block change and at run end.
+			if pc, pb, _, plast := MPTRedemptionProofStats(); pc != proofLastCount {
+				d := pb - proofLastBytes
+				window.proofRedemptions += pc - proofLastCount
+				window.proofBytes += d
+				if !proofBlockOpen || proofBlockNum != op.block {
+					if proofBlockOpen {
+						window.proofBlocks = append(window.proofBlocks, proofBlockAcc)
+						proofBlockTotal++
+						if proofBlockAcc > proofBlockMax {
+							proofBlockMax = proofBlockAcc
+						}
+						proofReservoirAdd(&proofBlockReservoir, proofBlockAcc, proofBlockTotal, 1<<19, proofRng)
+					}
+					proofBlockNum, proofBlockAcc, proofBlockOpen = op.block, 0, true
+				}
+				proofBlockAcc += d
+				for i := int64(0); i < pc-proofLastCount; i++ {
+					proofRedemptionSeen++
+					proofReservoirAdd(&proofRedemptionReservoir, plast, proofRedemptionSeen, 1<<18, proofRng)
+				}
+				proofLastCount, proofLastBytes = pc, pb
+			}
 		}
 		afterUpdateDiag := LastUpdateDiagnostics()
 		coldMaintenanceDur := time.Duration(afterUpdateDiag.ArchivePromotionNanos - beforeUpdateDiag.ArchivePromotionNanos)
@@ -1550,6 +1646,20 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	if operationsExcludingColdEstimate < 0 {
 		operationsExcludingColdEstimate = 0
 	}
+	// Close the final open redemption-proof block so its total joins the
+	// global ranking before the summary reads the reservoirs.
+	if proofBlockOpen {
+		proofBlockTotal++
+		if proofBlockAcc > proofBlockMax {
+			proofBlockMax = proofBlockAcc
+		}
+		proofReservoirAdd(&proofBlockReservoir, proofBlockAcc, proofBlockTotal, 1<<19, proofRng)
+		proofBlockOpen = false
+	}
+	proofRedemptionSorted := sortedInt64Copy(proofRedemptionReservoir)
+	proofBlockGlobalSorted := sortedInt64Copy(proofBlockReservoir)
+	_, _, proofRedemptionMaxExact, _ := MPTRedemptionProofStats()
+	proofVerifyTotalCount, proofVerifyTotalNanos := MPTRedemptionVerifyStats()
 	summary := map[string]any{
 		"status":                                "completed",
 		"finished_at":                           time.Now().Format(time.RFC3339),
@@ -1603,9 +1713,44 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			"in_operations": true,
 			"in_commit":     false,
 		},
+		// Redemption proof = the data the archive node hands the full node
+		// for verification: bucket payload record + stub side record. The
+		// full node's ECMH recompute audit runs on a sample
+		// (MPT_REDEMPTION_VERIFY_SAMPLE, default 1000) and reports latency.
+		// Run-long percentiles come from uniform reservoirs (estimates);
+		// per-window percentiles in the CSV are exact; maxes are exact.
+		"redemption_proof": map[string]any{
+			"definition":              "bucket payload record + stub side record (ECMH audit payload)",
+			"redemptions":             proofLastCount,
+			"bytes_total":             proofLastBytes,
+			"redemption_p50_bytes":    percentileInt64(proofRedemptionSorted, .50),
+			"redemption_p95_bytes":    percentileInt64(proofRedemptionSorted, .95),
+			"redemption_p99_bytes":    percentileInt64(proofRedemptionSorted, .99),
+			"redemption_max_bytes":    proofRedemptionMaxExact,
+			"blocks_with_redemptions": proofBlockTotal,
+			"block_p50_bytes":         percentileInt64(proofBlockGlobalSorted, .50),
+			"block_p95_bytes":         percentileInt64(proofBlockGlobalSorted, .95),
+			"block_p99_bytes":         percentileInt64(proofBlockGlobalSorted, .99),
+			"block_max_bytes":         proofBlockMax,
+			"verify_samples":          proofVerifyTotalCount,
+			"verify_ms_total":         float64(proofVerifyTotalNanos) / float64(time.Millisecond),
+			"verify_avg_us":           traceStressRatio(proofVerifyTotalNanos, proofVerifyTotalCount) / 1e3,
+		},
 		"stem_path_diagnostics": updateDiag,
-		"final_stats_ms":        float64(finalStatsDur) / float64(time.Millisecond),
-		"final_stats":           finalStats,
+		"stub_side_records": map[string]any{
+			"staged_bytes": LastCommitDiagnostics().MPTStagedStubMetaBytes,
+			"fetches":      LastCommitDiagnostics().MPTStubMetaFetches,
+			"fetch_bytes":  LastCommitDiagnostics().MPTStubMetaFetchBytes,
+		},
+		"stub_node_stubs_max": LastCommitDiagnostics().MPTStubNodeMax,
+		"stub_node_stubs_avg": traceStressRatio(LastCommitDiagnostics().MPTStubNodeSum, LastCommitDiagnostics().MPTStubNodeEvents),
+		"stub_node_events":    LastCommitDiagnostics().MPTStubNodeEvents,
+		// Write-path no-probe ruling tripwire: >0 means the workload
+		// contained blind writes to archived keys (violates the EVM
+		// read-before-write premise); must be 0 for the run to be valid.
+		"mpt_duplicate_archived_keys": MPTDuplicateArchivedKeys(),
+		"final_stats_ms":              float64(finalStatsDur) / float64(time.Millisecond),
+		"final_stats":                 finalStats,
 	}
 	// G2 accounting: with the path backend the LevelDB directory size misses
 	// nodes still held in pathdb's write buffer and diff layers, so report the

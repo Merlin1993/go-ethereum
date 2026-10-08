@@ -249,14 +249,23 @@ func TestMPTArchivePruneReloadAndReadActivation(t *testing.T) {
 
 // TestMPTArchiveFilterLookupCounters proves the G4 denominator wiring: an
 // archived bucket's cuckoo filter consult must feed Lookups/Positives on a
-// hit and Lookups/Negatives on a miss. The sharded path always reported
-// these; the mpt probe path only recorded false positives before.
+// hit and Lookups/Negatives on a miss — and, since v2 (bit-level since v3),
+// that a probe outside the bucket's coverage prefix skips the filter consult
+// entirely. The sharded path always reported these; the mpt probe path only
+// recorded false positives before.
 func TestMPTArchiveFilterLookupCounters(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr := newTestTrie(t, db, false)
-	key := []byte{0x00, 'k'}
-	if err := tr.Put(key, []byte("archived")); err != nil {
-		t.Fatal(err)
+	// Two keys in domain 0 whose bit LCP is 13 bits (nibbles [0,0,6] plus
+	// one shared bit): the bucket's coverage prefix. 0x00,0x6d shares it
+	// (filter consulted on a miss), 0x00,0x7a does not (skipped before the
+	// filter).
+	key1 := []byte{0x00, 0x6b}
+	key2 := []byte{0x00, 0x6c}
+	for _, key := range [][]byte{key1, key2} {
+		if err := tr.Put(key, []byte("archived")); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := tr.Commit(); err != nil {
 		t.Fatal(err)
@@ -269,12 +278,20 @@ func TestMPTArchiveFilterLookupCounters(t *testing.T) {
 	before := archivetrie.LastUpdateDiagnostics()
 	// Filter positive: the archived key routes to the bucket, the filter
 	// claims it, the payload confirms.
-	if ref, fromArchive, err := tr.GetValueRef(key); err != nil || !fromArchive || len(ref) != 32 {
+	if ref, fromArchive, err := tr.GetValueRef(key1); err != nil || !fromArchive || len(ref) != 32 {
 		t.Fatalf("GetValueRef archived = %x, archive=%v, err=%v", ref, fromArchive, err)
 	}
-	// Filter negative: same mount path, a key the filter has never seen.
+	mid := archivetrie.LastUpdateDiagnostics()
+	// Coverage skip: a key outside [0,0,6] must not consult the filter.
+	if _, fromArchive, err := tr.GetValueRef([]byte{0x00, 0x7a}); fromArchive || err == nil {
+		t.Fatalf("GetValueRef outside-coverage = archive=%v, err=%v; want not-found", fromArchive, err)
+	}
+	if dLook := archivetrie.LastUpdateDiagnostics().ArchiveFilterLookups - mid.ArchiveFilterLookups; dLook != 0 {
+		t.Fatalf("outside-coverage probe consulted the filter %d times; want 0 (coverage skip)", dLook)
+	}
+	// Filter negative: inside coverage, a key the filter has never seen.
 	// (A confirmed miss surfaces as "key not found" from GetValueRef.)
-	if _, fromArchive, err := tr.GetValueRef([]byte{0x00, 'z'}); fromArchive || err == nil {
+	if _, fromArchive, err := tr.GetValueRef([]byte{0x00, 0x6d}); fromArchive || err == nil {
 		t.Fatalf("GetValueRef missing = archive=%v, err=%v; want not-found", fromArchive, err)
 	}
 	after := archivetrie.LastUpdateDiagnostics()
@@ -575,7 +592,7 @@ func TestMPTSingleTreeDomainPruneStubResidue(t *testing.T) {
 		t.Fatalf("stubs after prune = %d, want 1", n)
 	}
 
-	reloaded, err := New(root, db, &Config{ShardDepthBits: 4})
+	reloaded, err := New(root, db, &Config{ShardDepthBits: 4, ActivateArchivedKeyOnRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,6 +608,12 @@ func TestMPTSingleTreeDomainPruneStubResidue(t *testing.T) {
 		t.Fatal("bucket missing after reload")
 	}
 	payloadKey := bucketKey(b.path)
+	// Read-before-write: the write path no longer probes the archive, so
+	// the delete is preceded by a resurrecting read (which itself empties
+	// the single-entry bucket).
+	if _, err := reloaded.Get(key); err != nil {
+		t.Fatalf("resurrecting read before delete: %v", err)
+	}
 	if err := reloaded.Delete(key); err != nil {
 		t.Fatal(err)
 	}
@@ -657,13 +680,18 @@ func TestMPTArchiveDeleteArchivedKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reloaded, err := New(root, db, &Config{ShardDepthBits: 4})
+	reloaded, err := New(root, db, &Config{ShardDepthBits: 4, ActivateArchivedKeyOnRead: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	// The key sits in the archive now; deleting it must empty the bucket.
 	if _, fromArchive, err := reloaded.GetValueRef(key); err != nil || !fromArchive {
 		t.Fatalf("before delete: archive=%v err=%v; want an archive hit", fromArchive, err)
+	}
+	// Read-before-write: the write path no longer probes the archive (EVM
+	// premise), so the delete is preceded by a resurrecting read.
+	if _, err := reloaded.Get(key); err != nil {
+		t.Fatalf("resurrecting read before delete: %v", err)
 	}
 	if err := reloaded.Delete(key); err != nil {
 		t.Fatal(err)
@@ -782,6 +810,12 @@ func TestMPTPathBackendRoundTrip(t *testing.T) {
 	}
 	if _, err := tr.Commit(); err != nil {
 		t.Fatalf("Commit after resurrection: %v", err)
+	}
+	// Read-before-write: the write path no longer probes the archive, so
+	// deleting an archived key first resurrects it via the read path
+	// (activation is on in this fixture).
+	if _, err := tr.Get([]byte{0x00, 1, 'k'}); err != nil {
+		t.Fatalf("resurrecting read before delete: %v", err)
 	}
 	if err := tr.Delete([]byte{0x00, 1, 'k'}); err != nil {
 		t.Fatalf("Delete: %v", err)
@@ -1013,7 +1047,8 @@ func TestMPTSingleTreeResurrectionRoundTrip(t *testing.T) {
 	if !ecmh.Verify(b.commitment, rest) {
 		t.Fatal("remaining multiset does not verify against the rewritten stub")
 	}
-	// The stub in the tree carries the same commitment (root covers it).
+	// The stub in the tree anchors the side record whose content carries the
+	// same commitment and count (root covers both through the hash).
 	hot, err := tr.hotTrieLocked()
 	if err != nil {
 		t.Fatal(err)
@@ -1022,8 +1057,11 @@ func TestMPTSingleTreeResurrectionRoundTrip(t *testing.T) {
 	if err := hot.AllStubs(func(_ []byte, s *gethtrie.Stub) { stubs = append(stubs, s) }); err != nil {
 		t.Fatal(err)
 	}
-	if len(stubs) != 1 || [33]byte(b.commitment) != stubs[0].Commitment || stubs[0].Count != 4 {
-		t.Fatalf("in-tree stub = %+v; want count 4 with the updated commitment", stubs)
+	if len(stubs) != 1 || stubs[0].ContentHash != b.metaHash {
+		t.Fatalf("in-tree stub = %+v; want anchor of the rendered side record", stubs)
+	}
+	if _, _, _, sc, scc, err := decodeStubMeta(b.metaBytes); err != nil || [33]byte(b.commitment) != [33]byte(sc) || scc != 4 {
+		t.Fatalf("side record = %x count %d err %v; want updated commitment with count 4", sc, scc, err)
 	}
 	// Persistence: reload, resurrect the rest, bucket destroys itself.
 	root, err := tr.Commit()
@@ -1204,7 +1242,11 @@ func TestMPTMountAppendSurvivesEviction(t *testing.T) {
 	db := &testStore{memorydb.New()}
 	tr := newTestTrie(t, db, false)
 
-	first := [][]byte{{0x00, 'a'}, {0x00, 'b'}, {0x00, 'c'}}
+	// Both rounds share the nibble-aligned coverage prefix [0,0,6] (12
+	// bits): bit-granular CanAppend (v3) rejects entries that would shrink
+	// the bound below the last whole nibble, so the second round's keys
+	// must live inside the first round's common bit prefix.
+	first := [][]byte{{0x00, 0x60}, {0x00, 0x68}, {0x00, 0x6f}}
 	for i, key := range first {
 		if err := tr.Put(key, []byte{0x11, byte(i)}); err != nil {
 			t.Fatal(err)
@@ -1225,7 +1267,7 @@ func TestMPTMountAppendSurvivesEviction(t *testing.T) {
 	// Second prune round: three more leaves of the same domain mount-append
 	// into the existing bucket (the path that previously skipped the dirty
 	// mark).
-	second := [][]byte{{0x00, 'd'}, {0x00, 'e'}, {0x00, 'f'}}
+	second := [][]byte{{0x00, 0x61}, {0x00, 0x62}, {0x00, 0x63}}
 	for i, key := range second {
 		if err := tr.Put(key, []byte{0x22, byte(i)}); err != nil {
 			t.Fatal(err)
