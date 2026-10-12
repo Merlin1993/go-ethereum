@@ -250,6 +250,13 @@ type Trie struct {
 	// the Archive_Bytes metric of the experiment plan's storage口径.
 	archiveBytes int64
 
+	// liveHotLeaves is the gauge of hot-tree leaves currently alive
+	// (insert/delete deltas drained at commit, extraction length subtracted
+	// at prune). Compaction-lag diagnosis pairs it with the physical du:
+	// a flat logical account under a rising du is the dead-byte signature.
+	// Not persisted: rebuilt from the first commit after reload.
+	liveHotLeaves int64
+
 	// lastTdbCommitDur records how long the forced pathdb Commit inside
 	// stageNodesLocked took, so commitToBatchLocked can report it as its own
 	// commit-phase component. Reset on read.
@@ -512,6 +519,23 @@ func (t *Trie) ArchivePayloadBytes() int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.archiveBytes
+}
+
+// LiveHotLeaves reports the current number of live leaves in the hot tree
+// (the "hot state" logical account). Pairs with the physical du gauge to
+// separate live growth from storage-engine dead bytes.
+func (t *Trie) LiveHotLeaves() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.liveHotLeaves
+}
+
+// LiveBuckets reports the current number of archive buckets (stub side
+// records) in the registry.
+func (t *Trie) LiveBuckets() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return int64(len(t.buckets))
 }
 
 // domainCount is the number of logical domains: 2^ShardDepthBits.
@@ -1728,6 +1752,7 @@ func (t *Trie) pruneNextDomainLocked() error {
 	}
 	// The extracted leaves are gone from the hot tree; no per-key deletes
 	// needed — ExtractDomain already detached and shrank the paths.
+	t.liveHotLeaves -= int64(len(extracted))
 	mountStart := time.Now()
 	if err := t.mountEntriesLocked(prefix, extracted); err != nil {
 		return err
@@ -1845,6 +1870,7 @@ func (t *Trie) Commit() ([]byte, error) {
 
 func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 	archivetrie.SetMPTArchivePayloadBytes(t.archiveBytes)
+	archivetrie.SetMPTLiveGauges(t.liveHotLeaves, int64(len(t.buckets)))
 	staged := &stagedBytes{}
 	rec := &recordingBatcher{Batcher: batch, staged: staged}
 	var hxDur, stageDur, tdbCommitDur, archiveDur time.Duration
@@ -1875,7 +1901,8 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		newRoot, nodes := t.hot.Commit()
 		hxDur = time.Since(hxStart)
 		// A committed trie is single-use; drop it so the next switch to a
-		// write path reopens from the new root.
+		// write path reopens from the new root. Drain the leaf delta first.
+		t.liveHotLeaves += t.hot.LeafDelta()
 		t.hot = nil
 		stageStart := time.Now()
 		if err := t.stageNodesLocked(rec, newRoot, nodes); err != nil {
@@ -1934,15 +1961,26 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 
 // ForEach visits every hot and archived value in key order.
 func (t *Trie) ForEach(fn func(key, value []byte) bool) {
+	t.ForEachPrefix(nil, 0, fn)
+}
+
+// ForEachPrefix visits every value under the given raw-key prefix in key
+// order. Only buckets whose mount path intersects the prefix are loaded, so
+// the cost is proportional to the prefix subtree (storage-wipe path) instead
+// of the whole tree. prefixBits is len(prefix)*8; a nil prefix iterates all.
+func (t *Trie) ForEachPrefix(prefix []byte, prefixBits int, fn func(key, value []byte) bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	values := make(map[string][]byte)
 	if hot, err := t.hotTrieLocked(); err == nil {
-		_ = hot.CollectLeaves(func(key, value []byte) bool {
+		_ = hot.CollectLeavesWithin(prefix, func(key, value []byte) bool {
 			values[string(key)] = bytes.Clone(value)
 			return true
 		})
-		_ = hot.AllStubs(func(mountPath []byte, st *gethtrie.Stub) {
+		_ = hot.AllStubsWithin(prefix, func(mountPath []byte, st *gethtrie.Stub) {
+			if len(prefix) > 0 && !pathIntersectsPrefix(mountPath, prefix) {
+				return
+			}
 			b, err := t.bucketForStubLocked(mountPath, st)
 			if err != nil {
 				return
@@ -1951,12 +1989,18 @@ func (t *Trie) ForEach(fn func(key, value []byte) bool) {
 				return
 			}
 			for key, value := range b.entries {
+				if len(prefix) > 0 && !bytes.HasPrefix([]byte(key), prefix) {
+					continue
+				}
 				values[key] = value
 			}
 		})
 	}
 	keys := make([]string, 0, len(values))
 	for key := range values {
+		if len(prefix) > 0 && !bytes.HasPrefix([]byte(key), prefix) {
+			continue
+		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
@@ -1965,6 +2009,33 @@ func (t *Trie) ForEach(fn func(key, value []byte) bool) {
 			return
 		}
 	}
+}
+
+// pathIntersectsPrefix reports whether a hot-trie node path (hex nibbles of
+// the raw key route) intersects a raw-key prefix: either one is a prefix of
+// the other, so a bucket mounted there can hold keys under the prefix.
+func pathIntersectsPrefix(mountPath []byte, prefix []byte) bool {
+	hexPrefix := hexExpand(prefix)
+	limit := len(mountPath)
+	if len(hexPrefix) < limit {
+		limit = len(hexPrefix)
+	}
+	for i := 0; i < limit; i++ {
+		if mountPath[i] != hexPrefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// hexExpand turns raw key bytes into hex nibbles.
+func hexExpand(key []byte) []byte {
+	hex := make([]byte, len(key)*2)
+	for i, b := range key {
+		hex[i*2] = b >> 4
+		hex[i*2+1] = b & 0x0f
+	}
+	return hex
 }
 
 // stageNodesLocked routes dirty nodes to the active backend.

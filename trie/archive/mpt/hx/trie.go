@@ -53,6 +53,14 @@ type Trie struct {
 	// Trie and never shares it).
 	resolvedNodes int64
 
+	// leafDelta accumulates live-leaf count changes since the last
+	// DrainLeafDelta: +1 for a newly inserted leaf, -1 for a deleted one.
+	// Domain extraction does NOT flow through insert/delete, so the mpt
+	// layer subtracts len(extracted) itself — no double counting. Feeds the
+	// Live_Hot_Leaves CSV gauge (compaction-lag diagnosis: logical account
+	// vs physical du).
+	leafDelta int64
+
 	// epochPolicy assigns the lifecycle bit for newly written leaves. Nil
 	// means "always 0" (used before the mpt layer wires the domain schedule).
 	epochPolicy func(key []byte) byte
@@ -249,6 +257,7 @@ func (t *Trie) insert(n node, prefix, key []byte, value node, epoch byte) (bool,
 
 	case nil:
 		t.tracer.onInsert(prefix)
+		t.leafDelta++
 		return true, &shortNode{Key: key, Val: value, Epoch: epoch, flags: t.newFlag()}, nil
 
 	case hashNode:
@@ -295,6 +304,7 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 		}
 		if matchlen == len(key) {
 			t.tracer.onDelete(prefix)
+			t.leafDelta--
 			return true, nil, nil
 		}
 		dirty, child, err := t.delete(n.Val, append(prefix, key[:len(n.Key)]...), key[len(n.Key):])
@@ -427,6 +437,16 @@ func (t *Trie) resolveAndTrack(n hashNode, prefix []byte) (node, error) {
 // ResolvedNodes reports how many nodes this trie has loaded from the store
 // since construction (diagnostics only).
 func (t *Trie) ResolvedNodes() int64 { return t.resolvedNodes }
+
+// LeafDelta reports and resets the live-leaf count change accumulated since
+// the last call. The mpt layer drains it once per commit and adds it to its
+// own live-leaves gauge; domain-extraction deltas are subtracted separately
+// by the caller, so this only ever counts insert()/delete() traffic.
+func (t *Trie) LeafDelta() int64 {
+	d := t.leafDelta
+	t.leafDelta = 0
+	return d
+}
 
 // PrefetchPrefix warms the node store's read cache by resolving up to budget
 // nodes under the given key-nibble prefix. It is read-only: nothing is
@@ -675,12 +695,150 @@ func (t *Trie) verifyNode(n node, prefix []byte) (uint8, error) {
 // invokes fn for every stored key/value in lexicographic-path order. fn
 // returning false stops the walk. Used by the mpt layer's ForEach and by the
 // pre-P4c domain scanner; the epoch-based pruner does not need it.
+// CollectLeaves enumerates every leaf in the tree in key order.
 func (t *Trie) CollectLeaves(fn func(key, value []byte) bool) error {
 	if t.committed {
 		return ErrCommitted
 	}
 	_, err := t.collect(t.root, nil, fn)
 	return err
+}
+
+// CollectLeavesWithin enumerates every leaf under the given raw-key prefix in
+// key order. It descends only along branches matching the prefix, so visits
+// stay proportional to the prefix subtree, not the whole tree. Storage-wipe
+// style scans use it to avoid touching unrelated domains.
+func (t *Trie) CollectLeavesWithin(prefix []byte, fn func(key, value []byte) bool) error {
+	if t.committed {
+		return ErrCommitted
+	}
+	if len(prefix) == 0 {
+		return t.CollectLeaves(fn)
+	}
+	hexPrefix := keybytesToHex(prefix)[:len(prefix)*2]
+	_, err := t.collectWithin(t.root, nil, hexPrefix, fn)
+	return err
+}
+
+func (t *Trie) collectWithin(n node, prefix, hexPrefix []byte, fn func(key, value []byte) bool) (bool, error) {
+	matchLen := commonPrefixLen(prefix, hexPrefix)
+	if matchLen < len(prefix) && matchLen < len(hexPrefix) {
+		// Branches diverged: nothing under this node can match.
+		return true, nil
+	}
+	switch n := n.(type) {
+	case nil:
+		return true, nil
+	case *shortNode:
+		if matchLen == len(prefix) { // prefix exhausted: whole subtree matches
+			return t.collect(n, prefix, fn)
+		}
+		// Compare the short node's key with the remaining hex prefix.
+		remaining := hexPrefix[len(prefix):]
+		if len(n.Key) < len(remaining) {
+			if !bytes.Equal(n.Key, remaining[:len(n.Key)]) {
+				return true, nil
+			}
+			return t.collectWithin(n.Val, concat(prefix, n.Key...), hexPrefix, fn)
+		}
+		if !bytes.Equal(remaining, n.Key[:len(remaining)]) {
+			return true, nil
+		}
+		if _, isVal := n.Val.(valueNode); isVal {
+			// The leaf sits at a shorter path than the prefix: not within.
+			return true, nil
+		}
+		return t.collectWithin(n.Val, concat(prefix, n.Key[:len(remaining)]...), hexPrefix, fn)
+	case *fullNode:
+		if matchLen == len(prefix) {
+			return t.collect(n, prefix, fn)
+		}
+		nibble := hexPrefix[len(prefix)]
+		child := n.Children[nibble]
+		if child == nil {
+			return true, nil
+		}
+		return t.collectWithin(child, concat(prefix, byte(nibble)), hexPrefix, fn)
+	case hashNode:
+		resolved, err := t.resolveAndTrack(n, prefix)
+		if err != nil {
+			return false, err
+		}
+		return t.collectWithin(resolved, prefix, hexPrefix, fn)
+	case valueNode:
+		return true, nil
+	default:
+		panic("hx: invalid node type")
+	}
+}
+
+// AllStubsWithin enumerates every mounted stub whose mount path intersects
+// the given raw-key prefix, in deterministic tree order. It descends only
+// along branches matching the prefix, so it resolves only the nodes of the
+// prefix subtree instead of the whole tree. ForEachPrefix uses it to skip
+// unrelated buckets without a full-tree stub sweep.
+func (t *Trie) AllStubsWithin(prefix []byte, fn func(nodePath []byte, stub *Stub)) error {
+	if len(prefix) == 0 {
+		return t.AllStubs(fn)
+	}
+	hexPrefix := keybytesToHex(prefix)[:len(prefix)*2]
+	_, err := t.allStubsWithin(t.root, nil, hexPrefix, fn)
+	return err
+}
+
+func (t *Trie) allStubsWithin(n node, path, hexPrefix []byte, fn func([]byte, *Stub)) (bool, error) {
+	matchLen := commonPrefixLen(path, hexPrefix)
+	if matchLen < len(path) && matchLen < len(hexPrefix) {
+		// Branches diverged: no stub under this node can hold prefix keys.
+		return true, nil
+	}
+	switch n := n.(type) {
+	case nil:
+		return true, nil
+	case hashNode:
+		resolved, err := t.resolveAndTrack(n, path)
+		if err != nil {
+			return false, err
+		}
+		return t.allStubsWithin(resolved, path, hexPrefix, fn)
+	case *shortNode:
+		for _, s := range n.Stubs {
+			fn(path, s)
+		}
+		if matchLen == len(hexPrefix) {
+			// Prefix exhausted on this node: every stub below matches.
+			_, err := t.allStubs(n, path, fn)
+			return true, err
+		}
+		if _, isVal := n.Val.(valueNode); isVal {
+			return true, nil
+		}
+		return t.allStubsWithin(n.Val, concat(path, n.Key...), hexPrefix, fn)
+	case *fullNode:
+		for _, s := range n.Stubs {
+			fn(path, s)
+		}
+		if matchLen == len(hexPrefix) {
+			_, err := t.allStubs(n, path, fn)
+			return true, err
+		}
+		nibble := hexPrefix[len(path)]
+		if n.Children[nibble] == nil {
+			return true, nil
+		}
+		return t.allStubsWithin(n.Children[nibble], concat(path, byte(nibble)), hexPrefix, fn)
+	default:
+		return false, fmt.Errorf("hx: allStubsWithin on invalid node type %T", n)
+	}
+}
+
+// commonPrefixLen returns the length of the longest common prefix of a and b.
+func commonPrefixLen(a, b []byte) int {
+	n := 0
+	for n < len(a) && n < len(b) && a[n] == b[n] {
+		n++
+	}
+	return n
 }
 
 func (t *Trie) collect(n node, prefix []byte, fn func(key, value []byte) bool) (bool, error) {

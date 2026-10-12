@@ -107,6 +107,13 @@ type CommitDiagnostics struct {
 	// uncompressed), as of the last commit. Zero unless the hot layer is
 	// the MPT fallback. Backs the Archive_Bytes CSV column.
 	MPTArchivePayloadBytes int64
+	// MPTLiveHotLeaves / MPTLiveBuckets are gauges (NOT cumulative since
+	// Reset): live hot-tree leaf count and live archive-bucket count, as of
+	// the last commit. Zero unless the hot layer is the MPT fallback.
+	// Backs the Live_Hot_Leaves / Live_Buckets CSV columns — the logical
+	// account that separates live growth from storage-engine dead bytes.
+	MPTLiveHotLeaves int64
+	MPTLiveBuckets   int64
 	// Hot-layer (mpt) commit-phase split, cumulative nanos since Reset:
 	// hx hash collection, node staging (incl. pathdb Update), the forced
 	// pathdb Commit inside staging, and the archive bucket/schedule loop.
@@ -1039,6 +1046,8 @@ var (
 	commitDiagMPTPruneExtractNanos       int64
 	commitDiagMPTPruneMountNanos         int64
 	commitDiagMPTArchivePayloadBytes     int64
+	commitDiagMPTLiveHotLeaves           int64
+	commitDiagMPTLiveBuckets             int64
 	commitDiagMPTCommitHxNanos           int64
 	commitDiagMPTCommitStageNanos        int64
 	commitDiagMPTCommitTdbCommitNanos    int64
@@ -1143,6 +1152,8 @@ func ResetCommitDiagnostics() {
 	atomic.StoreInt64(&commitDiagMPTPruneExtractNanos, 0)
 	atomic.StoreInt64(&commitDiagMPTPruneMountNanos, 0)
 	atomic.StoreInt64(&commitDiagMPTArchivePayloadBytes, 0)
+	atomic.StoreInt64(&commitDiagMPTLiveHotLeaves, 0)
+	atomic.StoreInt64(&commitDiagMPTLiveBuckets, 0)
 	atomic.StoreInt64(&commitDiagMPTCommitHxNanos, 0)
 	atomic.StoreInt64(&commitDiagMPTCommitStageNanos, 0)
 	atomic.StoreInt64(&commitDiagMPTCommitTdbCommitNanos, 0)
@@ -1591,6 +1602,8 @@ func LastCommitDiagnostics() CommitDiagnostics {
 		MPTPruneExtractNanos:       atomic.LoadInt64(&commitDiagMPTPruneExtractNanos),
 		MPTPruneMountNanos:         atomic.LoadInt64(&commitDiagMPTPruneMountNanos),
 		MPTArchivePayloadBytes:     atomic.LoadInt64(&commitDiagMPTArchivePayloadBytes),
+		MPTLiveHotLeaves:           atomic.LoadInt64(&commitDiagMPTLiveHotLeaves),
+		MPTLiveBuckets:             atomic.LoadInt64(&commitDiagMPTLiveBuckets),
 		MPTCommitHxNanos:           atomic.LoadInt64(&commitDiagMPTCommitHxNanos),
 		MPTCommitStageNanos:        atomic.LoadInt64(&commitDiagMPTCommitStageNanos),
 		MPTCommitTdbCommitNanos:    atomic.LoadInt64(&commitDiagMPTCommitTdbCommitNanos),
@@ -2038,6 +2051,13 @@ func SetMPTPruneDiagnostics(extracted, resolvedNodes, extractNanos, mountNanos i
 // encoded bytes of all bucket payload records) at commit time.
 func SetMPTArchivePayloadBytes(v int64) {
 	atomic.StoreInt64(&commitDiagMPTArchivePayloadBytes, v)
+}
+
+// SetMPTLiveGauges publishes the live hot-tree leaf and archive-bucket count
+// gauges at commit time. Zero for non-mpt hot layers.
+func SetMPTLiveGauges(liveHotLeaves, liveBuckets int64) {
+	atomic.StoreInt64(&commitDiagMPTLiveHotLeaves, liveHotLeaves)
+	atomic.StoreInt64(&commitDiagMPTLiveBuckets, liveBuckets)
 }
 
 // SetMPTCommitPhaseNanos adds one hot-layer (mpt) commit's phase split to
