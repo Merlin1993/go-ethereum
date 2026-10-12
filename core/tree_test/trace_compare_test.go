@@ -36,6 +36,7 @@ import (
 
 var (
 	traceCompareInputDir          = flag.String("traceCompareInputDir", "", "Directory containing state_access_trace_*.csv.gz files")
+	traceCompareCompactPerWindow  = flag.Bool("traceCompareCompactPerWindow", true, "Run a full LevelDB compaction at each metrics-window boundary, BEFORE measuring State_Bytes, so storage reflects live data only; mirrors the AMT arm's traceStressCompactPerWindow for a same-protocol comparison")
 	traceCompareEngine            = flag.String("traceCompareEngine", "mpt", "Comparison engine: mpt or verkle")
 	traceCompareBaseDir           = flag.String("traceCompareBaseDir", "", "Fresh output directory for TestTrieTraceCompare")
 	traceCompareOps               = flag.Int64("traceCompareOps", 100000000, "Number of ordered trace operations")
@@ -697,6 +698,17 @@ func TestTrieTraceCompare(t *testing.T) {
 			if info, err := proc.MemoryInfo(); err == nil {
 				rss = info.RSS
 			}
+		}
+		// Same-protocol storage measurement as the AMT arm (user ruling
+		// 2026-10-12): compact at the window boundary before scanning the
+		// directory, so State_Bytes reflects live data only. Runs between
+		// business batches; never counted in any timing column.
+		if *traceCompareCompactPerWindow {
+			compactStart := time.Now()
+			if err := ldb.Compact(nil, nil); err != nil {
+				t.Fatalf("per-window compaction: %v", err)
+			}
+			fmt.Printf("[TRACE_COMPARE] window compact_ms=%d\n", time.Since(compactStart).Milliseconds())
 		}
 		diskSize, _ := GetDirSize(stateDir)
 		diffs, buffered, _ := trieDB.Size()

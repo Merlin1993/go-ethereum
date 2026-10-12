@@ -63,6 +63,7 @@ var (
 	traceStressPathCleanCacheMB           = flag.Int("traceStressPathCleanCacheMB", 64, "pathdb clean cache size in MiB")
 	traceStressPathWriteBufferMB          = flag.Int("traceStressPathWriteBufferMB", 256, "pathdb dirty write buffer size in MiB (larger = fewer, fatter flushes)")
 	traceStressPathFlushEveryBatches      = flag.Int("traceStressPathFlushEveryBatches", 0, "Force a pathdb flush to disk every N commits; 0 lets pathdb decide")
+	traceStressCompactPerWindow           = flag.Bool("traceStressCompactPerWindow", true, "Run a full LevelDB compaction at each metrics-window boundary, BEFORE measuring State_Bytes, so storage reflects live data only (dead bytes reclaimed); compaction time lands in its own column, never in business timing")
 	traceStressCuckooBuckets              = flag.Int("traceStressCuckooBuckets", 32, "Archive cuckoo filter bucket count")
 	traceStressCuckooSlots                = flag.Int("traceStressCuckooSlots", 4, "Archive cuckoo filter slots per bucket")
 	traceStatsBaseDir                     = flag.String("traceStatsBaseDir", "", "Existing TestArchiveStemTraceStress base directory for TestArchiveStemTraceStorageStats")
@@ -309,6 +310,7 @@ type traceStressWindow struct {
 	pruneDiag                  [4]int64      // extracted/resolved/extractNanos/mountNanos, window diff
 	coldMaintenance            time.Duration
 	batchWall                  []time.Duration
+	pruneWall                  []time.Duration // per-batch Sharded-Pruning durations; batches that pruned only
 	comparativeBatchWall       []time.Duration
 	firstBlock, lastBlock      uint64
 	stemHits, stemMisses       int64
@@ -1043,6 +1045,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	config.CuckooBuckets = *traceStressCuckooBuckets
 	config.CuckooSlots = *traceStressCuckooSlots
 	backend := NewTrie(nil, &stressDBAdapter{db}, NewPooledKeccakHasher(), config, true)
+	stateAdapter := &stressDBAdapter{db}
 	var hotBackend TraceHotTrie = backend
 	switch *traceStressHotLayer {
 	case "amt":
@@ -1153,12 +1156,13 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"Prune_Extracted", "Prune_Resolved_Nodes", "Prune_Extract_ms", "Prune_Mount_ms",
 		"Commit_Hx_ms", "Commit_Stage_ms", "Commit_TdbCommit_ms", "Commit_ArchiveLoop_ms",
 		"Staged_Prune_Bytes", "Staged_Ops_Bytes",
-		"Archive_Bytes", "System_Total_Bytes",
+		"Archive_Bytes", "System_Total_Bytes", "Live_Hot_Leaves", "Live_Buckets",
 		"MPT_Staged_StubMeta_Bytes", "MPT_StubMeta_Fetches", "MPT_StubMeta_Fetch_Bytes",
 		"GC_Pause_ms", "GC_Num",
 		"Proof_Redemptions", "Proof_Bytes",
 		"Proof_Block_P50_Bytes", "Proof_Block_P95_Bytes", "Proof_Block_P99_Bytes", "Proof_Block_Max_Bytes",
 		"Proof_Verify_Count", "Proof_Verify_ms",
+		"Prune_P50_ms", "Prune_P95_ms", "Prune_P99_ms", "Prune_Max_ms", "Prune_Spike_Rate",
 	}
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
@@ -1247,6 +1251,28 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				rss = info.RSS
 			}
 		}
+		// Per-window storage compaction (user ruling 2026-10-12): compact the
+		// LevelDB BEFORE measuring State_Bytes so the storage curve reflects
+		// live data only — engine dead bytes (tombstones/overwritten versions
+		// not yet reclaimed) are reclaimed at every window boundary. Runs at
+		// the boundary where no business batch is in flight, so business
+		// latency timing is untouched; its own duration is reported in the
+		// per-window log line, not in any r/wall metric.
+		if *traceStressCompactPerWindow {
+			// Buffered writes must reach LevelDB first, or compaction would
+			// miss them and the measurement would understate live bytes.
+			if flusher, ok := hotBackend.(interface{ Flush() error }); ok {
+				if err := flusher.Flush(); err != nil {
+					t.Fatalf("per-window hot-layer flush: %v", err)
+				}
+			}
+			compactStart := time.Now()
+			if err := stateAdapter.Compact(); err != nil {
+				t.Fatalf("per-window compaction: %v", err)
+			}
+			windowCompactDur := time.Since(compactStart)
+			fmt.Printf("[TRACE_STRESS] batch=%d compact_ms=%d\n", batchNumber, windowCompactDur.Milliseconds())
+		}
 		diag := LastCommitDiagnostics()
 		stateBytes := getDirSize(stateDir)
 		currentUpdateDiag := LastUpdateDiagnostics()
@@ -1276,6 +1302,23 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		window.proofVerify = time.Duration(vn - proofVerifyLastNanos)
 		proofVerifyLastCount, proofVerifyLastNanos = vc, vn
 		proofBlocksSorted := sortedInt64Copy(window.proofBlocks)
+		// RQ4 per-prune latency: percentiles over this window's Sharded-Pruning
+		// batches. Spike rate = share of prune events exceeding 5x the window
+		// median. Guard: when the window median is below 0.1ms (idle-rotation
+		// prunes that move nothing), 5x-median is noise-adjacent to zero and
+		// would flag every event as a spike, so the rate is reported as 0.
+		pruneP50 := percentileDuration(window.pruneWall, .50)
+		pruneSpikeRate := float64(0)
+		if pruneP50 >= 100*time.Microsecond {
+			pruneSpikeThreshold := 5 * pruneP50
+			pruneSpikes := 0
+			for _, d := range window.pruneWall {
+				if d > pruneSpikeThreshold {
+					pruneSpikes++
+				}
+			}
+			pruneSpikeRate = float64(pruneSpikes) / float64(len(window.pruneWall))
+		}
 		row := []string{
 			strconv.FormatInt(batchNumber-int64(len(window.batchWall))+1, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(batchNumber, 10), strconv.FormatInt(archiveRoundCompleted, 10), strconv.FormatInt(archiveRoundProgress, 10), strconv.FormatInt(totalCounts.total(), 10),
 			strconv.FormatUint(window.firstBlock, 10), strconv.FormatUint(window.lastBlock, 10), strconv.FormatInt(window.counts.total(), 10),
@@ -1313,12 +1356,15 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			strconv.FormatInt(window.finalCommitPhase[2]/1e6, 10), strconv.FormatInt(window.finalCommitPhase[3]/1e6, 10),
 			strconv.FormatInt(window.stagedPruneBytes, 10), strconv.FormatInt(window.stagedOpsBytes, 10),
 			strconv.FormatInt(diag.MPTArchivePayloadBytes, 10), strconv.FormatInt(stateBytes, 10),
+			strconv.FormatInt(diag.MPTLiveHotLeaves, 10), strconv.FormatInt(diag.MPTLiveBuckets, 10),
 			strconv.FormatInt(window.mptDiag[7], 10), strconv.FormatInt(window.mptDiag[8], 10), strconv.FormatInt(window.mptDiag[9], 10),
 			strconv.FormatUint((mem.PauseTotalNs-prevGCPauseNs)/uint64(time.Millisecond), 10), strconv.FormatUint(uint64(mem.NumGC-prevGCNum), 10),
 			strconv.FormatInt(window.proofRedemptions, 10), strconv.FormatInt(window.proofBytes, 10),
 			strconv.FormatInt(percentileInt64(proofBlocksSorted, .50), 10), strconv.FormatInt(percentileInt64(proofBlocksSorted, .95), 10),
 			strconv.FormatInt(percentileInt64(proofBlocksSorted, .99), 10), strconv.FormatInt(percentileInt64(proofBlocksSorted, 1), 10),
 			strconv.FormatInt(window.proofVerifyCount, 10), durationMS(window.proofVerify),
+			durationMS(pruneP50), durationMS(percentileDuration(window.pruneWall, .95)), durationMS(percentileDuration(window.pruneWall, .99)), durationMS(percentileDuration(window.pruneWall, 1)),
+			strconv.FormatFloat(pruneSpikeRate, 'f', 6, 64),
 		}
 		prevGCPauseNs = mem.PauseTotalNs
 		prevGCNum = mem.NumGC
@@ -1553,6 +1599,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		batch.Reset()
 		window.operations += opDur
 		window.prune += pruneDur
+		if prunedThisBatch {
+			// Per-batch Sharded-Pruning duration for the RQ4 percentile columns;
+			// batches that did not prune are excluded (matching the per-prune
+			// population the latency judgments are defined on).
+			window.pruneWall = append(window.pruneWall, pruneDur)
+		}
 		window.intermediate += intermediateDur
 		window.intermediateWrite += intermediateWriteDur
 		window.commit += commitDur

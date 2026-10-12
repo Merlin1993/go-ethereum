@@ -157,6 +157,18 @@ func (db *stressDBAdapter) NewBatchWithSize(size int) Batcher {
 	return db.KeyValueStore.NewBatchWithSize(size)
 }
 
+// Compact passthrough for the per-window storage compaction: the embedded
+// KeyValueStore is the ethdb leveldb Database, whose Compact runs a full
+// CompactRange. Falls back to no-op on stores without it.
+func (db *stressDBAdapter) Compact() error {
+	if c, ok := db.KeyValueStore.(interface {
+		Compact(start, limit []byte) error
+	}); ok {
+		return c.Compact(nil, nil)
+	}
+	return nil
+}
+
 func (db *stressDBAdapter) PutBucket(hash []byte, data []byte) error {
 	return db.Put(hash, data)
 }
