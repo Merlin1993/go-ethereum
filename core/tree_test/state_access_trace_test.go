@@ -65,26 +65,26 @@ type traceFileInfo struct {
 }
 
 type traceManifest struct {
-	GeneratedAt        string            `json:"generated_at"`
-	SourceCommit       string            `json:"source_commit"`
-	Command            string            `json:"command"`
-	SourceFiles        []string          `json:"source_transaction_files"`
-	FirstBlock         uint64            `json:"first_block"`
-	LastBlock          uint64            `json:"last_block"`
-	TotalBlocks        uint64            `json:"total_blocks"`
-	EmptyBlocks        uint64            `json:"empty_blocks"`
-	MissingBlocks       []uint64          `json:"missing_blocks"`
-	TotalTxs           uint64            `json:"total_txs"`
-	SuccessTxs         uint64            `json:"success_txs"`
-	FailedTxs          uint64            `json:"failed_txs"`
-	TotalRows          uint64            `json:"total_rows"`
-	IncludeReads       bool              `json:"include_reads"`
-	Compressed         bool              `json:"compressed_gzip"`
-	IncludeValues      bool              `json:"include_values"`
-	OpCounts           map[string]uint64 `json:"op_counts"`
-	TypeCounts         map[string]uint64 `json:"object_type_counts"`
-	SeqViolations      uint64            `json:"seq_violations"`
-	Files              []traceFileInfo   `json:"files"`
+	GeneratedAt   string            `json:"generated_at"`
+	SourceCommit  string            `json:"source_commit"`
+	Command       string            `json:"command"`
+	SourceFiles   []string          `json:"source_transaction_files"`
+	FirstBlock    uint64            `json:"first_block"`
+	LastBlock     uint64            `json:"last_block"`
+	TotalBlocks   uint64            `json:"total_blocks"`
+	EmptyBlocks   uint64            `json:"empty_blocks"`
+	MissingBlocks []uint64          `json:"missing_blocks"`
+	TotalTxs      uint64            `json:"total_txs"`
+	SuccessTxs    uint64            `json:"success_txs"`
+	FailedTxs     uint64            `json:"failed_txs"`
+	TotalRows     uint64            `json:"total_rows"`
+	IncludeReads  bool              `json:"include_reads"`
+	Compressed    bool              `json:"compressed_gzip"`
+	IncludeValues bool              `json:"include_values"`
+	OpCounts      map[string]uint64 `json:"op_counts"`
+	TypeCounts    map[string]uint64 `json:"object_type_counts"`
+	SeqViolations uint64            `json:"seq_violations"`
+	Files         []traceFileInfo   `json:"files"`
 }
 
 // traceRecorder writes ordered events, rotating the CSV by block chunk.
@@ -101,9 +101,9 @@ type traceRecorder struct {
 	chunk    traceFileInfo // current chunk accumulator
 	chunkSet bool
 
-	block uint64
-	txIdx int64
-	seq   uint64
+	block    uint64
+	txIdx    int64
+	seq      uint64
 	codeSeen map[common.Address]struct{}
 
 	// validation
@@ -114,7 +114,7 @@ type traceRecorder struct {
 	seqVio    uint64
 
 	// totals
-	missingBlk []uint64
+	missingBlk  []uint64
 	totalRows   uint64
 	totalBlocks uint64
 	emptyBlocks uint64

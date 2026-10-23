@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/ethereum/go-ethereum/trie/archivev3"
 	"github.com/ethereum/go-ethereum/trie/utils"
 	"github.com/ethereum/go-ethereum/triedb"
 	"github.com/ethereum/go-ethereum/triedb/database"
@@ -290,6 +291,14 @@ func newTrieReader(root common.Hash, db *triedb.Database, cache *utils.PointCach
 		tr, err = trie.NewVerkleTrie(root, db, cache)
 	} else if db.IsBinary() {
 		tr, err = trie.NewArchiveTrie(root, db, db.Archive())
+	} else if db.IsAMTv3() {
+		// v3 档案树：同一棵持久树经 triedb 槽位复用，root 核对在
+		// OpenTrie 分支完成，这里直接取 wrapper（读走单棵树的键域）。
+		kvStore, kvErr := db.AMTv3KVStore()
+		if kvErr != nil {
+			return nil, kvErr
+		}
+		tr, err = archivev3.NewArchiveV3Trie(db, kvStore, v3ConfigFromTriedb(db))
 	} else {
 		tr, err = trie.NewStateTrie(trie.StateTrieID(root), db)
 	}
@@ -334,7 +343,7 @@ func (r *trieReader) Storage(addr common.Address, key common.Hash) (common.Hash,
 		found bool
 		value common.Hash
 	)
-	if r.db.IsVerkle() || r.db.IsBinary() {
+	if r.db.IsVerkle() || r.db.IsBinary() || r.db.IsAMTv3() {
 		tr = r.mainTrie
 	} else {
 		tr, found = r.subTries[addr]

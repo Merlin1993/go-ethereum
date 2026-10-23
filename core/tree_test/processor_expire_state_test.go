@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	"github.com/ethereum/go-ethereum/ethdb/memorydb"
+	"github.com/ethereum/go-ethereum/internal/experiment"
 	"github.com/ethereum/go-ethereum/params"
 	archivetrie "github.com/ethereum/go-ethereum/trie/archive"
 	"github.com/ethereum/go-ethereum/triedb"
@@ -51,6 +53,9 @@ type ProcessorHost struct {
 }
 
 var (
+	replayEnabled         = flag.Bool("replayEnabled2", false, "Explicitly enable the long-running mainnet replay experiment")
+	consistencyEnabled    = flag.Bool("consistencyEnabled2", false, "Explicitly enable the dataset-backed MPT/AMT consistency experiment")
+	treeMode              = flag.String("treeMode2", "", "State mode: mpt, verkle, amt, or kv; empty derives legacy flags")
 	dbDir                 = flag.String("dbDir2", "F:\\expire_data\\expire_state_db", "Database directory")
 	dataDir               = flag.String("dataDir2", "E:\\ethdata", "Input data directory")
 	startIdx              = flag.Int("startFileIdx2", 1, "Start file index")
@@ -95,6 +100,14 @@ var (
 	maxAvgArchiveProofBytes          = flag.Int("maxAvgArchiveProofBytes", 0, "Abort if an interval's average archive proof exceeds this many bytes; 0 disables")
 	maxItemArchiveProofBytes         = flag.Int("maxItemArchiveProofBytes", 0, "Abort if an archive item proof exceeds this many bytes; 0 disables")
 	maxArchiveProofVerifyMs          = flag.Int("maxArchiveProofVerifyMs", 0, "Abort if archive proof verification exceeds this many milliseconds; 0 disables")
+
+	// v3 archive tree flags (E1 AMT arm; the same implementation E2 runs).
+	// ShardDepthBits is the paper's shard granularity: 2^depth logical shards.
+	amtV3KVDir        = flag.String("amtV3KVDir2", "", "v3 archive tree KV store directory; empty uses a memory store")
+	amtV3DepthBits    = flag.Int("amtV3ShardDepthBits", 19, "v3 archive tree shard depth in bits (2^depth logical shards)")
+	amtV3BackendSel   = flag.String("amtV3Backend", "pathdb", "v3 archive tree backend: hashdb or pathdb")
+	amtV3FlushBatches = flag.Int("amtV3FlushEveryBatches", 1, "v3 path backend flush-to-disk every N commits; 0 leaves it to pathdb")
+	amtV3Activate     = flag.Bool("amtV3ActivateArchivedKeyOnRead", true, "Activate archived keys on read (E2 formal profile: true)")
 )
 
 func TestMain(m *testing.M) {
@@ -150,6 +163,14 @@ type ProcessorConfig struct {
 	MaxAvgArchiveProofBytes          int
 	MaxItemArchiveProofBytes         int
 	MaxArchiveProofVerifyMs          int
+
+	// v3 archive tree params (E1 AMT arm; the same implementation E2 runs).
+	UseAMTv3          bool
+	AMTv3KVDir        string
+	AMTv3DepthBits    int
+	AMTv3Backend      string
+	AMTv3FlushBatches int
+	AMTv3Activate     bool
 }
 
 type finalStorageBreakdownReport struct {
@@ -290,34 +311,51 @@ func NewProcessorHost(cfg *ProcessorConfig) (*ProcessorHost, error) {
 	} else {
 		pdb = nil
 	}
+	// v3 档案树：KV 后端自走（专用 LevelDB 或内存），不走 hashdb/pathdb
+	// 槽位，两侧配置都置空。
+	if cfg.UseAMTv3 {
+		hdb = nil
+		pdb = nil
+	}
 
 	trieDB := triedb.NewFixedDatabase(db, &triedb.Config{
-		Preimages:        false,
-		IsVerkle:         cfg.UseVerkle,
-		IsBinary:         cfg.UseBinaryTrie,
-		CacheTrie:        false,
-		ReadCache:        false,
-		StartNum:         cfg.StartNum,
-		BinaryArchiveDir: cfg.BinaryArchiveDir,
-		BinaryAblationConfig: &database.BinaryConfig{
-			ShardDepth:                 cfg.ShardDepth,
-			ArchiveBucketSize:          cfg.ArchiveBucketSize,
-			CuckooBuckets:              cfg.CuckooBuckets,
-			CuckooSlots:                cfg.CuckooSlots,
-			NodeCacheLimit:             cfg.BinaryNodeCacheLimit,
-			NodeCacheBytesLimit:        int64(cfg.BinaryNodeCacheBytesLimitMB) * 1024 * 1024,
-			NodeCacheWarmPathBits:      cfg.BinaryNodeCacheWarmPathBits,
-			StemCacheLimit:             cfg.BinaryStemCacheLimit,
-			StemCacheBytesLimit:        int64(cfg.BinaryStemCacheBytesLimitMB) * 1024 * 1024,
-			EnablePathDiagnostics:      cfg.BinaryPathDiagnostics,
-			AsyncPrune:                 cfg.BinaryAsyncPrune,
-			CommitWorkers:              cfg.BinaryCommitWorkers,
-			CommitWatchdogSeconds:      cfg.BinaryCommitWatchdog,
-			PhysicalDelete:             cfg.BinaryPhysicalDelete,
-			StemMode:                   cfg.BinaryStemArchive,
-			ActivateArchivedStemOnRead: cfg.BinaryActivateArchivedStemOnRead,
-			NodeStorageScheme:          cfg.BinaryNodeStorage,
-		},
+		Preimages:         false,
+		IsVerkle:          cfg.UseVerkle,
+		IsBinary:          cfg.UseBinaryTrie,
+		AMTv3:             cfg.UseAMTv3,
+		AMTv3KVDir:        cfg.AMTv3KVDir,
+		AMTv3Depth:        cfg.AMTv3DepthBits,
+		AMTv3Backend:      cfg.AMTv3Backend,
+		AMTv3FlushBatches: cfg.AMTv3FlushBatches,
+		AMTv3Activate:     cfg.AMTv3Activate,
+		CacheTrie:         false,
+		ReadCache:         false,
+		StartNum:          cfg.StartNum,
+		BinaryArchiveDir:  cfg.BinaryArchiveDir,
+		BinaryAblationConfig: func() *database.BinaryConfig {
+			if cfg.UseAMTv3 {
+				return nil
+			}
+			return &database.BinaryConfig{
+				ShardDepth:                 cfg.ShardDepth,
+				ArchiveBucketSize:          cfg.ArchiveBucketSize,
+				CuckooBuckets:              cfg.CuckooBuckets,
+				CuckooSlots:                cfg.CuckooSlots,
+				NodeCacheLimit:             cfg.BinaryNodeCacheLimit,
+				NodeCacheBytesLimit:        int64(cfg.BinaryNodeCacheBytesLimitMB) * 1024 * 1024,
+				NodeCacheWarmPathBits:      cfg.BinaryNodeCacheWarmPathBits,
+				StemCacheLimit:             cfg.BinaryStemCacheLimit,
+				StemCacheBytesLimit:        int64(cfg.BinaryStemCacheBytesLimitMB) * 1024 * 1024,
+				EnablePathDiagnostics:      cfg.BinaryPathDiagnostics,
+				AsyncPrune:                 cfg.BinaryAsyncPrune,
+				CommitWorkers:              cfg.BinaryCommitWorkers,
+				CommitWatchdogSeconds:      cfg.BinaryCommitWatchdog,
+				PhysicalDelete:             cfg.BinaryPhysicalDelete,
+				StemMode:                   cfg.BinaryStemArchive,
+				ActivateArchivedStemOnRead: cfg.BinaryActivateArchivedStemOnRead,
+				NodeStorageScheme:          cfg.BinaryNodeStorage,
+			}
+		}(),
 		PathDB: pdb,
 		HashDB: hdb,
 	})
@@ -348,6 +386,85 @@ func (h *ProcessorHost) Close() {
 	if h.db != nil {
 		h.db.Close()
 	}
+}
+
+// resolveProcessorMode 把 treeMode2 与 legacy flags 归一成一个后端选择。
+// 返回值：mode、verkle、binary（老二叉档案树）、kv、amtV3（v3 档案树）、err。
+// "amt" 路由到 v3（与 E2 同源实现）；需要跑老二叉树时用 "amt-legacy"。
+func resolveProcessorMode(mode string, legacyVerkle, legacyBinary, legacyKV bool) (string, bool, bool, bool, bool, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" {
+		switch {
+		case legacyKV:
+			mode = "kv"
+		case legacyVerkle:
+			mode = "verkle"
+		case legacyBinary:
+			mode = "amt"
+		default:
+			mode = "mpt"
+		}
+	}
+	switch mode {
+	case "mpt":
+		return mode, false, false, false, false, nil
+	case "verkle":
+		return mode, true, false, false, false, nil
+	case "amt", "asct":
+		return "amt", false, false, false, true, nil
+	case "amt-legacy":
+		return "amt-legacy", false, true, false, false, nil
+	case "kv":
+		return mode, false, false, true, false, nil
+	default:
+		return "", false, false, false, false, fmt.Errorf("unsupported treeMode2 %q; use mpt, verkle, amt, amt-legacy, or kv", mode)
+	}
+}
+
+func TestResolveProcessorMode(t *testing.T) {
+	tests := []struct {
+		name                                 string
+		mode                                 string
+		legacyVerkle, legacyBinary, legacyKV bool
+		want                                 string
+	}{
+		{name: "explicit mpt overrides binary default", mode: "mpt", legacyBinary: true, want: "mpt"},
+		{name: "explicit verkle is exclusive", mode: "verkle", legacyBinary: true, want: "verkle"},
+		{name: "explicit amt routes to v3", mode: "amt", want: "amt"},
+		{name: "explicit amt-legacy keeps the binary tree", mode: "amt-legacy", want: "amt-legacy"},
+		{name: "legacy verkle takes precedence", legacyVerkle: true, legacyBinary: true, want: "verkle"},
+		{name: "legacy kv takes precedence", legacyVerkle: true, legacyBinary: true, legacyKV: true, want: "kv"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, verkle, binary, kv, amtV3, err := resolveProcessorMode(test.mode, test.legacyVerkle, test.legacyBinary, test.legacyKV)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("mode = %s, want %s", got, test.want)
+			}
+			if enabled := boolToInt(verkle) + boolToInt(binary) + boolToInt(kv) + boolToInt(amtV3); enabled > 1 {
+				t.Fatalf("normalized mode enabled %d mutually exclusive backends", enabled)
+			}
+			if test.want == "amt" && !amtV3 {
+				t.Fatal("amt mode must enable the v3 archive tree")
+			}
+			if test.want == "amt-legacy" && !binary {
+				t.Fatal("amt-legacy mode must enable the binary archive tree")
+			}
+		})
+	}
+	if _, _, _, _, _, err := resolveProcessorMode("invalid", false, false, false); err == nil {
+		t.Fatal("invalid mode was accepted")
+	}
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func checkDurationLimit(t *testing.T, label string, block uint64, got time.Duration, limitMs int) {
@@ -393,14 +510,31 @@ func TestExpireStateProcessor(t *testing.T) {
 	if !flag.Parsed() {
 		flag.Parse()
 	}
+	if !*replayEnabled {
+		t.Skip("long-running mainnet replay disabled; pass -replayEnabled2=true explicitly")
+	}
+	// 归一 treeMode2 / legacy flags 到一个后端。"amt" 走 v3 档案树（与 E2
+	// 同源实现）；"amt-legacy" 保留老二叉档案树做回归。
+	procMode, useVerkleFlag, useBinaryFlag, useKVFlag, useAMTv3Flag, err := resolveProcessorMode(*treeMode, *useVerkle, *useBinaryTrie, *useKV)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	fmt.Printf("[ASCT_CONFIG] mode=%s replay=%t verkle=%t binary=%t kv=%t amtV3=%t shardDepthBits=%d backend=%s\n",
+		procMode, *replayEnabled, useVerkleFlag, useBinaryFlag, useKVFlag, useAMTv3Flag, *amtV3DepthBits, *amtV3BackendSel)
 	cfg := &ProcessorConfig{
 		DbDir:                            *dbDir,
 		DataDir:                          *dataDir,
 		StartFileIdx:                     *startIdx,
 		EndFileIdx:                       *endIdx,
-		UseVerkle:                        *useVerkle,
-		UseBinaryTrie:                    *useBinaryTrie && !*useKV,
-		UseKV:                            *useKV,
+		UseVerkle:                        useVerkleFlag,
+		UseBinaryTrie:                    useBinaryFlag && !useKVFlag,
+		UseKV:                            useKVFlag,
+		UseAMTv3:                         useAMTv3Flag,
+		AMTv3KVDir:                       *amtV3KVDir,
+		AMTv3DepthBits:                   *amtV3DepthBits,
+		AMTv3Backend:                     *amtV3BackendSel,
+		AMTv3FlushBatches:                *amtV3FlushBatches,
+		AMTv3Activate:                    *amtV3Activate,
 		UseMemory:                        *useMemory,
 		BinaryArchiveDir:                 *binaryArchiveDir,
 		MetricsDir:                       *metricsDir,
@@ -582,6 +716,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		lastStemPutLatency           archivetrie.LatencyHistogram
 		lastStemApplyLatency         archivetrie.LatencyHistogram
 		commitLatencySamples         []time.Duration
+		pruneLatencySamples          []time.Duration
 		preCommitLatencySamples      []time.Duration
 		rootPipelineLatencySamples   []time.Duration
 		rootChargedLatencySamples    []time.Duration
@@ -656,9 +791,40 @@ func TestExpireStateProcessor(t *testing.T) {
 		t.Fatalf("failed to create metrics directory %s: %v", outputDir, err)
 	}
 
+	metricsPath := filepath.Join(outputDir, "asct_mainnet_metrics.csv")
+	kvStatsPath := filepath.Join(outputDir, "kv_block_access_stats.csv")
+	filterFPPath := filepath.Join(outputDir, "asct_filter_fp_metrics.csv")
+	pruneShardPath := filepath.Join(outputDir, "asct_prune_shard_metrics.csv")
+	slowPrunePath := filepath.Join(outputDir, "asct_slow_prune_events.csv")
+	finalStorageBreakdownPath := filepath.Join(outputDir, "asct_final_storage_breakdown.json")
+	globalFPDistributionPath := filepath.Join(outputDir, "global_fp_distribution.json")
+	run, err := experiment.Start(outputDir, "mainnet-replay-"+procMode, map[string]any{
+		"mode": procMode, "data_dir": cfg.DataDir, "start_file_index": cfg.StartFileIdx,
+		"end_file_index": cfg.EndFileIdx, "max_blocks": cfg.MaxBlocks, "stats_interval": *statsInterval,
+		"amt_v3": cfg.UseAMTv3, "amt_v3_shard_depth_bits": cfg.AMTv3DepthBits,
+		"amt_v3_backend": cfg.AMTv3Backend, "amt_v3_flush_batches": cfg.AMTv3FlushBatches,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		profiles, _ := filepath.Glob(filepath.Join(outputDir, "slow_prune_profiles", "*"))
+		outputs := append([]string{
+			metricsPath,
+			kvStatsPath,
+			filterFPPath,
+			pruneShardPath,
+			slowPrunePath,
+			finalStorageBreakdownPath,
+			globalFPDistributionPath,
+		}, profiles...)
+		if err := run.Finish(t.Failed(), outputs...); err != nil {
+			t.Errorf("finish replay artifacts: %v", err)
+		}
+	}()
+
 	// CSV file setup
-	metricsCSVPath := filepath.Join(outputDir, "asct_mainnet_metrics.csv")
-	csvFile, err := os.Create(metricsCSVPath)
+	csvFile, err := os.Create(metricsPath)
 	if err != nil {
 		t.Fatalf("failed to create csv file: %v", err)
 	}
@@ -772,7 +938,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		"Avg_Handle_Destruction_Time_ms", "Max_Handle_Destruction_Time_ms", "Max_Handle_Destruction_Block",
 		"Avg_Account_State_Wipe_Time_ms", "Max_Account_State_Wipe_Time_ms", "Max_Account_State_Wipe_Block",
 		"Destroyed_Accounts", "Indexed_Wiped_Accounts", "Indexed_Wiped_Storage_Slots", "Indexed_Wiped_Code_Chunks",
-		"Avg_Pruning_Time_us", "Max_Pruning_Time_us",
+		"Avg_Pruning_Time_us", "Max_Pruning_Time_us", "Pruning_P50_us", "Pruning_P95_us", "Pruning_P99_us", "Pruning_Spike_Count", "Pruning_Spike_Rate",
 		"Avg_Archive_Compute_Time_us", "Max_Archive_Compute_Time_us",
 		"Avg_Archive_Wait_Time_us", "Max_Archive_Wait_Time_us",
 		"Max_Pruning_Shard_ID", "Max_Pruning_Shard_Time_us", "Max_Pruning_Shard_Total_us",
@@ -1150,6 +1316,21 @@ func TestExpireStateProcessor(t *testing.T) {
 			}
 		}
 		commitP50, commitP95, commitP99 := durationPercentiles(commitLatencySamples)
+		pruneP50, pruneP95, pruneP99 := durationPercentiles(pruneLatencySamples)
+		// 尖峰事件：单次裁剪耗时超过窗内中位数 5 倍。P50 为 0（亚微秒
+		// 采样被截断）时不判尖峰，尖峰数记 0，避免除零式噪声。
+		pruneSpikeCount := 0
+		if pruneP50 > 0 {
+			for _, sample := range pruneLatencySamples {
+				if sample > 5*pruneP50 {
+					pruneSpikeCount++
+				}
+			}
+		}
+		pruneSpikeRate := 0.0
+		if len(pruneLatencySamples) > 0 {
+			pruneSpikeRate = float64(pruneSpikeCount) / float64(len(pruneLatencySamples))
+		}
 		preCommitP50, preCommitP95, preCommitP99 := durationPercentiles(preCommitLatencySamples)
 		rootPipelineP50, rootPipelineP95, rootPipelineP99 := durationPercentiles(rootPipelineLatencySamples)
 		rootChargedP50, rootChargedP95, rootChargedP99 := durationPercentiles(rootChargedLatencySamples)
@@ -1507,6 +1688,11 @@ func TestExpireStateProcessor(t *testing.T) {
 			strconv.FormatUint(totalWipedCodeChunks, 10),
 			fmt.Sprintf("%.2f", avgBinaryPruneTime),
 			strconv.FormatInt(maxPruneTime.Microseconds(), 10),
+			strconv.FormatInt(pruneP50.Microseconds(), 10),
+			strconv.FormatInt(pruneP95.Microseconds(), 10),
+			strconv.FormatInt(pruneP99.Microseconds(), 10),
+			strconv.Itoa(pruneSpikeCount),
+			fmt.Sprintf("%.8f", pruneSpikeRate),
 			fmt.Sprintf("%.2f", avgArchiveCompute),
 			strconv.FormatInt(maxArchiveCompute.Microseconds(), 10),
 			fmt.Sprintf("%.2f", avgArchiveWait),
@@ -1823,6 +2009,7 @@ func TestExpireStateProcessor(t *testing.T) {
 		totalHashDirtyNodes = 0
 		totalHashCleanNodes = 0
 		commitLatencySamples = commitLatencySamples[:0]
+		pruneLatencySamples = pruneLatencySamples[:0]
 		preCommitLatencySamples = preCommitLatencySamples[:0]
 		rootPipelineLatencySamples = rootPipelineLatencySamples[:0]
 		rootChargedLatencySamples = rootChargedLatencySamples[:0]
@@ -2067,18 +2254,19 @@ processFiles:
 					archivetrie.ResetCommitDiagnostics()
 				}
 				prunedThisBlock := false
-				if cfg.UseBinaryTrie && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
+				if (cfg.UseBinaryTrie || cfg.UseAMTv3) && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
 					pruneStart := time.Now()
 					statedb.PruneNextShard()
 					pruneDuration := time.Since(pruneStart)
 					totalPruneTime += pruneDuration
+					pruneLatencySamples = append(pruneLatencySamples, pruneDuration)
 					if pruneDuration > maxPruneTime {
 						maxPruneTime = pruneDuration
 						maxPruneBlock = b
 					}
 					pruneCount++
 					prunedThisBlock = true
-					checkDurationLimit(t, "binary pruning", b, pruneDuration, cfg.MaxPruningMs)
+					checkDurationLimit(t, "pruning", b, pruneDuration, cfg.MaxPruningMs)
 				}
 				rootStart := time.Now()
 				finaliseStart := time.Now()
@@ -2285,18 +2473,19 @@ processFiles:
 				archivetrie.ResetCommitDiagnostics()
 			}
 			prunedThisBlock := false
-			if cfg.UseBinaryTrie && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
+			if (cfg.UseBinaryTrie || cfg.UseAMTv3) && cfg.PruneInterval > 0 && b%uint64(cfg.PruneInterval) == 0 {
 				pruneStart := time.Now()
 				statedb.PruneNextShard()
 				pruneDuration := time.Since(pruneStart)
 				totalPruneTime += pruneDuration
+				pruneLatencySamples = append(pruneLatencySamples, pruneDuration)
 				if pruneDuration > maxPruneTime {
 					maxPruneTime = pruneDuration
 					maxPruneBlock = b
 				}
 				pruneCount++
 				prunedThisBlock = true
-				checkDurationLimit(t, "binary pruning", b, pruneDuration, cfg.MaxPruningMs)
+				checkDurationLimit(t, "pruning", b, pruneDuration, cfg.MaxPruningMs)
 			}
 
 			// 2. State root calculation time statistics
@@ -2511,7 +2700,7 @@ processFiles:
 			}
 			if totalProcessedBlocks > 0 {
 				updates := finalStorageMetricsUpdates(finalStorageStats, finalStorageScanDuration, totalProcessedBlocks, sharedDatabasePhysicalBytes)
-				if err := rewriteLastMetricsRecord(metricsCSVPath, updates); err != nil {
+				if err := rewriteLastMetricsRecord(metricsPath, updates); err != nil {
 					t.Fatalf("failed to backfill final ASCT storage metrics: %v", err)
 				}
 			}
@@ -2744,6 +2933,9 @@ func (t *consistencyTracer) Summary(blockNum uint64, stateRoot common.Hash) Bloc
 func TestBinaryTrieConsistency(t *testing.T) {
 	if !flag.Parsed() {
 		flag.Parse()
+	}
+	if !*consistencyEnabled {
+		t.Skip("dataset-backed consistency test disabled; pass -consistencyEnabled2=true explicitly")
 	}
 	common.DebugFlag = false
 

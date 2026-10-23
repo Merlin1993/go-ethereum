@@ -23,6 +23,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
 	trieutils "github.com/ethereum/go-ethereum/trie/utils"
 	"github.com/shirou/gopsutil/process"
@@ -64,6 +65,7 @@ var (
 	traceStressPathWriteBufferMB          = flag.Int("traceStressPathWriteBufferMB", 256, "pathdb dirty write buffer size in MiB (larger = fewer, fatter flushes)")
 	traceStressPathFlushEveryBatches      = flag.Int("traceStressPathFlushEveryBatches", 0, "Force a pathdb flush to disk every N commits; 0 lets pathdb decide")
 	traceStressCompactPerWindow           = flag.Bool("traceStressCompactPerWindow", true, "Run a full LevelDB compaction at each metrics-window boundary, BEFORE measuring State_Bytes, so storage reflects live data only (dead bytes reclaimed); compaction time lands in its own column, never in business timing")
+	traceStressSplitArchiveDB             = flag.Bool("traceStressSplitArchiveDB", false, "Store MPTA archive payloads in archive_db and all other records in state_db; report both physical directory sizes per window")
 	traceStressCuckooBuckets              = flag.Int("traceStressCuckooBuckets", 32, "Archive cuckoo filter bucket count")
 	traceStressCuckooSlots                = flag.Int("traceStressCuckooSlots", 4, "Archive cuckoo filter slots per bucket")
 	traceStatsBaseDir                     = flag.String("traceStatsBaseDir", "", "Existing TestArchiveStemTraceStress base directory for TestArchiveStemTraceStorageStats")
@@ -320,11 +322,17 @@ type traceStressWindow struct {
 	access                     traceStressAccessStats
 	accessSample               time.Duration
 	classificationFilter       traceStressFilterStats
-	proofRedemptions           int64         // read-activation redemptions in this window
-	proofBytes                 int64         // total redemption-proof bytes in this window
-	proofBlocks                []int64       // completed per-block proof totals in this window
-	proofVerifyCount           int64         // sampled full-node verification audits in this window
-	proofVerify                time.Duration // sampled audit latency in this window
+	proofRedemptions           int64           // read-activation redemptions in this window
+	proofBytes                 int64           // total redemption-proof bytes in this window
+	proofBlocks                []int64         // completed per-block proof totals in this window
+	proofCounts                []int64         // completed per-block resurrection counts in this window
+	proofVerifyCount           int64           // sampled full-node verification audits in this window
+	proofVerify                time.Duration   // sampled audit latency in this window
+	proofSizes                 []int64         // exact single-proof size histogram drained at window close (E2 v6)
+	proofLatencies             []time.Duration // exact single-proof promotion latency histogram (E2 v6)
+	filterProbeLatencies       []time.Duration // exact per-cuckoo-lookup latency histogram (E2 v6)
+	bucketOccupancy            []int64         // archive-bucket entry-count snapshot taken at window close (E2 v6)
+	bucketEmpty                int64           // archive buckets with zero entries at window close (E2 v6)
 }
 
 type traceStressFilterStats struct {
@@ -911,6 +919,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	if *traceStressPruneEveryBatches > 0 && *traceStressPruneEveryBlocks > 0 {
 		t.Fatal("traceStressPruneEveryBatches and traceStressPruneEveryBlocks are mutually exclusive")
 	}
+	if *traceStressSplitArchiveDB && *traceStressHotLayer != "mpt" {
+		t.Fatal("traceStressSplitArchiveDB requires traceStressHotLayer=mpt")
+	}
+	if *traceStressSplitArchiveDB && !*traceStressCompactPerWindow {
+		t.Fatal("traceStressSplitArchiveDB requires traceStressCompactPerWindow=true")
+	}
 	if _, err := os.Stat(*traceStressBaseDir); !errors.Is(err, os.ErrNotExist) {
 		if err == nil {
 			t.Fatalf("traceStressBaseDir already exists: %s", *traceStressBaseDir)
@@ -918,12 +932,18 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		t.Fatalf("stat traceStressBaseDir: %v", err)
 	}
 	stateDir := filepath.Join(*traceStressBaseDir, "state_db")
+	archiveDir := filepath.Join(*traceStressBaseDir, "archive_db")
 	resultsDir := filepath.Join(*traceStressBaseDir, "results")
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
 		t.Fatal(err)
+	}
+	if *traceStressSplitArchiveDB {
+		if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	reader, err := newTraceStressReader(*traceStressInputDir, *traceStressStartFile, *traceStressFileLimit)
@@ -1005,6 +1025,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"leveldb_cache_mb":               512,
 		"leveldb_handles":                256,
 		"leveldb":                        map[string]any{"cache_mb": 512, "handles": 256},
+		"split_archive_db":               *traceStressSplitArchiveDB,
+		"archive_db_dir":                 map[bool]string{true: archiveDir, false: ""}[*traceStressSplitArchiveDB],
 		"destructive_commit":             *traceStressDestructiveCommit,
 		"access_sample_every":            *traceStressAccessSampleEvery,
 		"final_stats":                    *traceStressFinalStats,
@@ -1029,6 +1051,15 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	var stateStore ethdb.KeyValueStore = db
+	if *traceStressSplitArchiveDB {
+		archiveDB, err := leveldb.New(archiveDir, 512, 256, "trace-stress-archive", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer archiveDB.Close()
+		stateStore = &traceSplitArchiveStore{KeyValueStore: db, archive: archiveDB}
+	}
 	config := DefaultConfig()
 	config.ShardDepth = *traceStressShardDepth
 	config.NodeStorageScheme = NodeStoragePath
@@ -1044,8 +1075,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	config.PhysicalDelete = false
 	config.CuckooBuckets = *traceStressCuckooBuckets
 	config.CuckooSlots = *traceStressCuckooSlots
-	backend := NewTrie(nil, &stressDBAdapter{db}, NewPooledKeccakHasher(), config, true)
-	stateAdapter := &stressDBAdapter{db}
+	backend := NewTrie(nil, &stressDBAdapter{stateStore}, NewPooledKeccakHasher(), config, true)
+	stateAdapter := &stressDBAdapter{stateStore}
 	var hotBackend TraceHotTrie = backend
 	switch *traceStressHotLayer {
 	case "amt":
@@ -1058,7 +1089,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		}
 		hotBackend, err = TraceHotTrieNew(TraceHotTrieSpec{
 			Kind:                      *traceStressHotLayer,
-			DB:                        &stressDBAdapter{db},
+			DB:                        &stressDBAdapter{stateStore},
 			ShardDepthBits:            *traceStressShardDepthBits,
 			CuckooBuckets:             *traceStressCuckooBuckets,
 			CuckooSlots:               *traceStressCuckooSlots,
@@ -1163,6 +1194,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"Proof_Block_P50_Bytes", "Proof_Block_P95_Bytes", "Proof_Block_P99_Bytes", "Proof_Block_Max_Bytes",
 		"Proof_Verify_Count", "Proof_Verify_ms",
 		"Prune_P50_ms", "Prune_P95_ms", "Prune_P99_ms", "Prune_Max_ms", "Prune_Spike_Rate",
+		"Resurrection_Proof_P50_Bytes", "Resurrection_Proof_P95_Bytes", "Resurrection_Proof_P99_Bytes", "Resurrection_Proof_Max_Bytes",
+		"Resurrection_Proof_P50_ms", "Resurrection_Proof_P95_ms", "Resurrection_Proof_P99_ms", "Resurrection_Proof_Max_ms",
+		"Bucket_Occupancy_P50", "Bucket_Occupancy_P95", "Bucket_Occupancy_P99", "Bucket_Occupancy_Max", "Bucket_Empty_Count",
+		"Filter_Probe_P50_ms", "Filter_Probe_P95_ms", "Filter_Probe_P99_ms", "Filter_Probe_Max_ms",
+		"Resurrection_Block_P50", "Resurrection_Block_P95", "Resurrection_Block_P99",
+		"Full_Node_DB_Bytes", "Archive_DB_Bytes", "Path_Buffered_Bytes", "Path_Diff_Bytes",
 	}
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
@@ -1208,6 +1245,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		proofLastBytes            int64
 		proofBlockNum             uint64
 		proofBlockAcc             int64
+		proofCountAcc             int64 // per-block resurrection count for the trailing open block (E2 v6)
 		proofBlockOpen            bool
 		proofBlockTotal           int64 // completed blocks carrying redemptions
 		proofBlockMax             int64 // global max single-block proof bytes
@@ -1259,9 +1297,18 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		// latency timing is untouched; its own duration is reported in the
 		// per-window log line, not in any r/wall metric.
 		if *traceStressCompactPerWindow {
-			// Buffered writes must reach LevelDB first, or compaction would
-			// miss them and the measurement would understate live bytes.
-			if flusher, ok := hotBackend.(interface{ Flush() error }); ok {
+			// Split storage must persist all pathdb diff and buffer nodes before
+			// recording the physical full-node directory. The legacy Flush leaves
+			// one diff layer and may undercount the final state.
+			if *traceStressSplitArchiveDB {
+				flusher, ok := hotBackend.(interface{ FlushDurable() error })
+				if !ok {
+					t.Fatal("split archive DB requires a durable hot-layer flush")
+				}
+				if err := flusher.FlushDurable(); err != nil {
+					t.Fatalf("per-window durable hot-layer flush: %v", err)
+				}
+			} else if flusher, ok := hotBackend.(interface{ Flush() error }); ok {
 				if err := flusher.Flush(); err != nil {
 					t.Fatalf("per-window hot-layer flush: %v", err)
 				}
@@ -1274,7 +1321,21 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			fmt.Printf("[TRACE_STRESS] batch=%d compact_ms=%d\n", batchNumber, windowCompactDur.Milliseconds())
 		}
 		diag := LastCommitDiagnostics()
-		stateBytes := getDirSize(stateDir)
+		fullNodeDBBytes := getDirSize(stateDir)
+		archiveDBBytes := int64(0)
+		if *traceStressSplitArchiveDB {
+			archiveDBBytes = getDirSize(archiveDir)
+		}
+		stateBytes := fullNodeDBBytes + archiveDBBytes
+		var pathBufferedBytes, pathDiffBytes int64
+		if ps, ok := hotBackend.(interface {
+			PathStats() (int64, int64, int64, int64)
+		}); ok {
+			_, _, pathBufferedBytes, pathDiffBytes = ps.PathStats()
+			if *traceStressSplitArchiveDB && *traceStressCompactPerWindow && (pathBufferedBytes != 0 || pathDiffBytes != 0) {
+				t.Fatalf("per-window durable flush left pathdb bytes: buffer=%d diff=%d", pathBufferedBytes, pathDiffBytes)
+			}
+		}
 		currentUpdateDiag := LastUpdateDiagnostics()
 		updateDiag := currentUpdateDiag.Sub(prevUpdateDiag)
 		prevUpdateDiag = currentUpdateDiag
@@ -1302,6 +1363,30 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		window.proofVerify = time.Duration(vn - proofVerifyLastNanos)
 		proofVerifyLastCount, proofVerifyLastNanos = vc, vn
 		proofBlocksSorted := sortedInt64Copy(window.proofBlocks)
+		// E2 v6 exact histograms: drain the single resurrection-proof size and
+		// latency histograms and the filter-probe (cuckoo lookup) latency
+		// histogram at window close — full population, no sampling — then
+		// snapshot the archive-bucket occupancy distribution (entry count per
+		// bucket plus empty-bucket count; total buckets is the existing
+		// Live_Buckets column and is not repeated here). The bucket snapshot
+		// goes through the hot-layer hook for the same import-cycle reason the
+		// gauge does (mpt imports trie/archive).
+		psizes, platns, _, _, _ := TakeMPTRedemptionProofHistogram()
+		window.proofSizes = psizes
+		window.proofLatencies = make([]time.Duration, len(platns))
+		for i, ns := range platns {
+			window.proofLatencies[i] = time.Duration(ns)
+		}
+		fplatns, _, _ := TakeMPTFilterProbeLatencyHistogram()
+		window.filterProbeLatencies = make([]time.Duration, len(fplatns))
+		for i, ns := range fplatns {
+			window.filterProbeLatencies[i] = time.Duration(ns)
+		}
+		if snapper, ok := hotBackend.(interface {
+			BucketOccupancy() ([]int64, int64)
+		}); ok {
+			window.bucketOccupancy, window.bucketEmpty = snapper.BucketOccupancy()
+		}
 		// RQ4 per-prune latency: percentiles over this window's Sharded-Pruning
 		// batches. Spike rate = share of prune events exceeding 5x the window
 		// median. Guard: when the window median is below 0.1ms (idle-rotation
@@ -1365,6 +1450,33 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			strconv.FormatInt(window.proofVerifyCount, 10), durationMS(window.proofVerify),
 			durationMS(pruneP50), durationMS(percentileDuration(window.pruneWall, .95)), durationMS(percentileDuration(window.pruneWall, .99)), durationMS(percentileDuration(window.pruneWall, 1)),
 			strconv.FormatFloat(pruneSpikeRate, 'f', 6, 64),
+			// E2 v6: exact per-window statistics, appended columns only.
+			// Resurrection proofs (full population, no sampling).
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.proofSizes), .50), 10),
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.proofSizes), .95), 10),
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.proofSizes), .99), 10),
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.proofSizes), 1), 10),
+			durationMS(percentileDuration(window.proofLatencies, .50)),
+			durationMS(percentileDuration(window.proofLatencies, .95)),
+			durationMS(percentileDuration(window.proofLatencies, .99)),
+			durationMS(percentileDuration(window.proofLatencies, 1)),
+			// Archive-bucket occupancy distribution (window-close snapshot).
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.bucketOccupancy), .50), 10),
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.bucketOccupancy), .95), 10),
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.bucketOccupancy), .99), 10),
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.bucketOccupancy), 1), 10),
+			strconv.FormatInt(window.bucketEmpty, 10),
+			// Filter probe (cuckoo lookup) latency, exact per-probe histogram.
+			durationMS(percentileDuration(window.filterProbeLatencies, .50)),
+			durationMS(percentileDuration(window.filterProbeLatencies, .95)),
+			durationMS(percentileDuration(window.filterProbeLatencies, .99)),
+			durationMS(percentileDuration(window.filterProbeLatencies, 1)),
+			// Per-block resurrection counts (completed blocks only).
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.proofCounts), .50), 10),
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.proofCounts), .95), 10),
+			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.proofCounts), .99), 10),
+			strconv.FormatInt(fullNodeDBBytes, 10), strconv.FormatInt(archiveDBBytes, 10),
+			strconv.FormatInt(pathBufferedBytes, 10), strconv.FormatInt(pathDiffBytes, 10),
 		}
 		prevGCPauseNs = mem.PauseTotalNs
 		prevGCNum = mem.NumGC
@@ -1392,8 +1504,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			opTraceWriter.Flush()
 			prevOpTrace = snap
 		}
-		fmt.Printf("[TRACE_STRESS] batches=%d/%d ops=%d block=%d cache=%d hits=%d misses=%d db=%d rate=%.0f ops/s\n",
-			batchNumber, totalBatches, totalCounts.total(), window.lastBlock, cache.Entries, window.stemHits, window.stemMisses, getDirSize(stateDir), opsPerSec)
+		fmt.Printf("[TRACE_STRESS] batches=%d/%d ops=%d block=%d cache=%d hits=%d misses=%d full_db=%d archive_db=%d rate=%.0f ops/s\n",
+			batchNumber, totalBatches, totalCounts.total(), window.lastBlock, cache.Entries, window.stemHits, window.stemMisses, fullNodeDBBytes, archiveDBBytes, opsPerSec)
 		totalAccess.merge(window.access)
 		totalAccessSample += window.accessSample
 		totalClassificationFilter.add(window.classificationFilter)
@@ -1553,15 +1665,17 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				if !proofBlockOpen || proofBlockNum != op.block {
 					if proofBlockOpen {
 						window.proofBlocks = append(window.proofBlocks, proofBlockAcc)
+						window.proofCounts = append(window.proofCounts, proofCountAcc)
 						proofBlockTotal++
 						if proofBlockAcc > proofBlockMax {
 							proofBlockMax = proofBlockAcc
 						}
 						proofReservoirAdd(&proofBlockReservoir, proofBlockAcc, proofBlockTotal, 1<<19, proofRng)
 					}
-					proofBlockNum, proofBlockAcc, proofBlockOpen = op.block, 0, true
+					proofBlockNum, proofBlockAcc, proofCountAcc, proofBlockOpen = op.block, 0, 0, true
 				}
 				proofBlockAcc += d
+				proofCountAcc += pc - proofLastCount
 				for i := int64(0); i < pc-proofLastCount; i++ {
 					proofRedemptionSeen++
 					proofReservoirAdd(&proofRedemptionReservoir, plast, proofRedemptionSeen, 1<<18, proofRng)
@@ -1636,11 +1750,21 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	// actually stored, otherwise the final root is not resolvable from the
 	// database and the storage scan measures nothing. Layers without a buffered
 	// write tier simply do not implement Flush.
-	if flusher, ok := hotBackend.(interface{ Flush() error }); ok {
+	if *traceStressSplitArchiveDB {
+		if err := hotBackend.(interface{ FlushDurable() error }).FlushDurable(); err != nil {
+			t.Fatalf("final durable hot-layer flush: %v", err)
+		}
+	} else if flusher, ok := hotBackend.(interface{ Flush() error }); ok {
 		if err := flusher.Flush(); err != nil {
 			t.Fatalf("final hot-layer flush: %v", err)
 		}
 	}
+	finalFullNodeDBBytes := getDirSize(stateDir)
+	finalArchiveDBBytes := int64(0)
+	if *traceStressSplitArchiveDB {
+		finalArchiveDBBytes = getDirSize(archiveDir)
+	}
+	finalSystemBytes := finalFullNodeDBBytes + finalArchiveDBBytes
 	if *traceStressFinalStats {
 		statsStart := time.Now()
 		if amt, ok := hotBackend.(*Trie); ok {
@@ -1708,6 +1832,13 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		proofReservoirAdd(&proofBlockReservoir, proofBlockAcc, proofBlockTotal, 1<<19, proofRng)
 		proofBlockOpen = false
 	}
+	// E2 v6 note: the exact per-event histograms (single-proof size/latency,
+	// filter-probe latency) and the per-block resurrection counts follow the
+	// existing trailing-open-block convention — only completed windows are
+	// reported in the CSV, and the final window's flush has already written
+	// its row, so events recorded after the last flushWindow and the trailing
+	// open block's counts are deliberately not re-reported here (they remain
+	// in the lifetime maxima via the diagnostics atomics).
 	proofRedemptionSorted := sortedInt64Copy(proofRedemptionReservoir)
 	proofBlockGlobalSorted := sortedInt64Copy(proofBlockReservoir)
 	_, _, proofRedemptionMaxExact, _ := MPTRedemptionProofStats()
@@ -1741,9 +1872,11 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"measured_ops_excluding_cold_estimate_per_s": opsPerSecond(totalCounts.total(), operationsExcludingColdEstimate+totalCommit+totalWrite),
 		"measured_ops_per_s":                         opsPerSecond(totalCounts.total(), totalOpsDur+totalCommit+totalWrite),
 		"last_root":                                  common.BytesToHash(lastRoot).Hex(),
-		"state_bytes":                                getDirSize(stateDir),
+		"state_bytes":                                finalSystemBytes,
+		"full_node_db_bytes":                         finalFullNodeDBBytes,
+		"archive_db_bytes":                           finalArchiveDBBytes,
 		"archive_bytes":                              LastCommitDiagnostics().MPTArchivePayloadBytes,
-		"system_total_bytes":                         getDirSize(stateDir),
+		"system_total_bytes":                         finalSystemBytes,
 		"stem_cache":                                 cache,
 		"access_sample":                              totalAccess,
 		"access_sample_every":                        *traceStressAccessSampleEvery,
@@ -1826,7 +1959,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	if err := writeTraceStressJSON(filepath.Join(*traceStressBaseDir, "run_status.json"), map[string]any{"status": "completed", "finished_at": time.Now().Format(time.RFC3339), "operations": totalCounts.total()}); err != nil {
 		t.Fatal(err)
 	}
-	fmt.Printf("[TRACE_STRESS] DONE ops=%d batches=%d root=%s db=%d elapsed=%s\n", totalCounts.total(), totalBatches, common.BytesToHash(lastRoot).Hex(), getDirSize(stateDir), time.Since(started))
+	fmt.Printf("[TRACE_STRESS] DONE ops=%d batches=%d root=%s full_db=%d archive_db=%d elapsed=%s\n", totalCounts.total(), totalBatches, common.BytesToHash(lastRoot).Hex(), finalFullNodeDBBytes, finalArchiveDBBytes, time.Since(started))
 }
 
 // TestArchiveStemTraceInspectStem reconstructs one split stem directly from a

@@ -341,6 +341,30 @@ func (db *Database) Commit(root common.Hash, report bool) error {
 	return db.tree.cap(root, common.VerkleLayerCount)
 }
 
+// CommitAll persists every diff and the disk-layer write buffer for root.
+// Storage experiments use this before measuring the physical database size;
+// Commit retains one diff layer and can leave buffered nodes off disk.
+func (db *Database) CommitAll(root common.Hash) error {
+	db.lock.Lock()
+	defer db.lock.Unlock()
+	if err := db.modifyAllowed(); err != nil {
+		return err
+	}
+	l := db.tree.get(root)
+	if l == nil {
+		return fmt.Errorf("triedb layer [%#x] missing", root)
+	}
+	if disk, ok := l.(*diskLayer); ok {
+		disk.lock.Lock()
+		defer disk.lock.Unlock()
+		if disk.buffer.empty() {
+			return nil
+		}
+		return disk.buffer.flush(disk.db.diskdb, disk.db.freezer, disk.nodes, disk.id)
+	}
+	return db.tree.cap(root, 0)
+}
+
 // Disable deactivates the database and invalidates all available state layers
 // as stale to prevent access to the persistent state, which is in the syncing
 // stage.

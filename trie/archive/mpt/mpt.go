@@ -538,6 +538,27 @@ func (t *Trie) LiveBuckets() int64 {
 	return int64(len(t.buckets))
 }
 
+// BucketOccupancy is a snapshot of the archive-bucket occupancy distribution:
+// the resident entry count of every bucket in the registry plus the number of
+// empty buckets (count == 0 — payload evicted or fully redeemed, stub side
+// record still live). The count reflects each bucket's committed-and-staged
+// occupancy, so a window-close snapshot captures the distribution after the
+// window's last commit. Same wiring pattern as SetMPTLiveGauges: the E2
+// harness calls this per window for the CSV bucket-occupancy percentile
+// columns.
+func (t *Trie) BucketOccupancy() (counts []int64, empty int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	counts = make([]int64, 0, len(t.buckets))
+	for _, b := range t.buckets {
+		counts = append(counts, int64(b.count))
+		if b.count == 0 {
+			empty++
+		}
+	}
+	return counts, empty
+}
+
 // domainCount is the number of logical domains: 2^ShardDepthBits.
 func (t *Trie) domainCount() int { return 1 << uint(t.config.ShardDepthBits) }
 
@@ -1389,7 +1410,15 @@ func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []*bucket, []byte, 
 			return false // coverage excludes the key: skip the filter lookup
 		}
 		if b.filter != nil {
-			if !b.filter.Lookup(key) {
+			// E2 v6 exact histogram: time every cuckoo filter probe (the
+			// membership check for this archive bucket on the route). Two
+			// time syscalls inside the tree lock — accepted deliberately;
+			// the probe itself measured ~0.2µs so the overhead is invisible
+			// at window granularity.
+			filterStart := time.Now()
+			filterHit := b.filter.Lookup(key)
+			archivetrie.RecordMPTFilterProbeLatency(int64(time.Since(filterStart)))
+			if !filterHit {
 				archivetrie.RecordMPTFilterLookup(false)
 				return false
 			}
@@ -1531,6 +1560,11 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 		t.markDirtyLocked()
 		archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), true)
 		archivetrie.RecordMPTRedemptionProof(proofBytes)
+		// E2 v6 exact histogram: single-proof size plus the single-proof
+		// latency (bucket hit through hot reinsertion — the same span the
+		// promotion timer above covers). Recorded on every resurrection,
+		// never sampled.
+		archivetrie.RecordMPTRedemptionProofHistogram(proofBytes, int64(time.Since(promotionStart)))
 	}
 	return value, nil
 }
@@ -2108,6 +2142,27 @@ func (t *Trie) Flush() error {
 	}
 	t.commitsSinceFlush = 0
 	return t.tdb.Commit(t.root, false)
+}
+
+// FlushDurable is used at split-storage measurement boundaries so the
+// full-node directory includes the complete committed path trie.
+func (t *Trie) FlushDurable() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.dirty || t.scheduleDirty {
+		return fmt.Errorf("durable flush requires a committed trie")
+	}
+	if t.tdb == nil || t.root == (common.Hash{}) {
+		return nil
+	}
+	t.commitsSinceFlush = 0
+	if err := t.tdb.CommitAll(t.root); err != nil {
+		return err
+	}
+	// CommitAll replaces the pathdb layer tree. A read-only hot handle can
+	// survive CommitToBatch and still point to the now-stale pre-flush layer.
+	t.hot = nil
+	return nil
 }
 
 // PathStats reports write volume for the path backend: written/writes are the

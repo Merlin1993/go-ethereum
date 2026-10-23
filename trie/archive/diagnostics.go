@@ -2166,6 +2166,96 @@ func RecordMPTFilterLookup(positive bool) {
 	recordArchiveFilterLookup(positive)
 }
 
+// ---- Resurrection proof / filter probe latency histograms (E2 v6) ----
+// The three histograms below record EVERY event (no sampling, no reservoir
+// capping): single resurrection-proof sizes and their promotion latency, and
+// per-cuckoo-lookup latency. The harness drains them at window close to emit
+// exact per-window P50/P95/P99/Max columns. Volumes are bounded by the same
+// invariants the proof counters already live with: resurreptions are at most
+// one per read-triggered promotion, and each archive probe inspects a handful
+// of buckets, so a 20B-op run holds at most a few hundred million samples —
+// under 4GB for int64 pairs. Filter lookups share the FPR denominator's volume
+// (hundreds of millions), recorded as an int64 nanos pair.
+// Empty-window convention: a window with zero events reports 0 in every
+// percentile column (same as the per-block proof percentile columns).
+var (
+	resurrectionProofSizeHisto     []int64
+	resurrectionProofLatencyHisto  []int64
+	resurrectionProofHistoSeq      uint64
+	resurrectionProofHistoMaxSize  int64
+	resurrectionProofHistoMaxNanos int64
+	filterProbeLatencyHisto        []int64
+	filterProbeHistoSeq            uint64
+	filterProbeHistoMaxNanos       int64
+)
+
+// RecordMPTRedemptionProofHistogram appends one resurrection proof's size
+// (bytes) and full promotion latency (nanoseconds, bucket hit through
+// hot-layer reinsertion) to the exact per-event histograms. Called by the
+// MPT hot layer on every read-triggered resurrection — never sampled.
+func RecordMPTRedemptionProofHistogram(proofBytes, latencyNanos int64) {
+	resurrectionProofSizeHisto = append(resurrectionProofSizeHisto, proofBytes)
+	resurrectionProofLatencyHisto = append(resurrectionProofLatencyHisto, latencyNanos)
+	atomic.AddUint64(&resurrectionProofHistoSeq, 1)
+	if proofBytes > atomic.LoadInt64(&resurrectionProofHistoMaxSize) {
+		atomic.StoreInt64(&resurrectionProofHistoMaxSize, proofBytes)
+	}
+	if latencyNanos > atomic.LoadInt64(&resurrectionProofHistoMaxNanos) {
+		atomic.StoreInt64(&resurrectionProofHistoMaxNanos, latencyNanos)
+	}
+}
+
+// TakeMPTRedemptionProofHistogram drains the exact per-event resurrection
+// histogram: sizes, latencies, lifetime maxes, and a monotonic event sequence
+// number. Draining returns ownership of the slices to the caller (the harness
+// copies remain valid after the next append); the seq lets a caller distinguish
+// "no events" from "events but none drained" across drains. The histograms are
+// a telemetry side-channel with no state-machine role, so an unsynchronized
+// drain concurrent with a record can lose the events interleaved between the
+// copy and the reset — acceptable for window-level statistics, and unreachable
+// in the trace-stress driver anyway (records happen inside the op loop, drains
+// at window close, same goroutine).
+func TakeMPTRedemptionProofHistogram() (sizes, latencies []int64, maxSize, maxNanos int64, seq uint64) {
+	sizes, latencies = resurrectionProofSizeHisto, resurrectionProofLatencyHisto
+	resurrectionProofSizeHisto, resurrectionProofLatencyHisto = nil, nil
+	return sizes, latencies,
+		atomic.LoadInt64(&resurrectionProofHistoMaxSize),
+		atomic.LoadInt64(&resurrectionProofHistoMaxNanos),
+		atomic.LoadUint64(&resurrectionProofHistoSeq)
+}
+
+// MPTResurrectionProofMaxStats exposes the lifetime maxima without draining.
+func MPTResurrectionProofMaxStats() (maxSize, maxNanos int64) {
+	return atomic.LoadInt64(&resurrectionProofHistoMaxSize), atomic.LoadInt64(&resurrectionProofHistoMaxNanos)
+}
+
+// RecordMPTFilterProbeLatency appends one cuckoo-filter lookup's latency
+// (nanoseconds) to the exact per-event histogram. Called on every filter probe
+// in the archive route walk — never sampled. The clock cost is two time
+// syscalls inside the tree lock; accepted deliberately (per-probe cost was
+// measured at ~0.2µs, so the timing overhead is comparable to the probe
+// itself and stays invisible at window granularity).
+func RecordMPTFilterProbeLatency(nanos int64) {
+	filterProbeLatencyHisto = append(filterProbeLatencyHisto, nanos)
+	atomic.AddUint64(&filterProbeHistoSeq, 1)
+	if nanos > atomic.LoadInt64(&filterProbeHistoMaxNanos) {
+		atomic.StoreInt64(&filterProbeHistoMaxNanos, nanos)
+	}
+}
+
+// TakeMPTFilterProbeLatencyHistogram drains the exact per-event filter probe
+// latency histogram (nanoseconds) with its monotonic sequence number.
+func TakeMPTFilterProbeLatencyHistogram() (latencies []int64, maxNanos int64, seq uint64) {
+	latencies = filterProbeLatencyHisto
+	filterProbeLatencyHisto = nil
+	return latencies, atomic.LoadInt64(&filterProbeHistoMaxNanos), atomic.LoadUint64(&filterProbeHistoSeq)
+}
+
+// MPTFilterProbeMaxLatencyNanos exposes the lifetime max probe latency.
+func MPTFilterProbeMaxLatencyNanos() int64 {
+	return atomic.LoadInt64(&filterProbeHistoMaxNanos)
+}
+
 // mptDuplicateArchivedKeys counts probes that found the same key genuinely
 // held by two or more buckets' payloads. The write path (mpt Put/Delete)
 // does not probe the archive — it relies on the EVM read-before-write

@@ -68,13 +68,29 @@ func (h mptHotLayer) CommitToBatch(batch archive.Batcher, destructive bool) ([]b
 
 func (h mptHotLayer) Flush() error { return h.trie.Flush() }
 
+func (h mptHotLayer) FlushDurable() error { return h.trie.FlushDurable() }
+
 // PathStats exposes the path-backend write accounting to the driver, which
 // probes for it with a type assertion (same pattern as Flush).
 func (h mptHotLayer) PathStats() (written, writes, buffered, diff int64) {
 	return h.trie.PathStats()
 }
 
+// BucketOccupancy forwards the archive-bucket occupancy snapshot to the
+// driver, which probes for it with a type assertion (same pattern as
+// PathStats). Without this forwarder the assertion in the trace-stress
+// harness silently fails and the Bucket_Occupancy columns stay zero.
+func (h mptHotLayer) BucketOccupancy() ([]int64, int64) {
+	return h.trie.BucketOccupancy()
+}
+
 func init() {
+	// Compile-time guarantee that the trace-stress harness's probe assertions
+	// (Flush / PathStats / BucketOccupancy) can never silently fail again:
+	// a forwarder missing here shows up as a build error, not zeroed columns.
+	var _ interface {
+		BucketOccupancy() ([]int64, int64)
+	} = mptHotLayer{}
 	archive.TraceMPTBucketCapacity = mpt.DefaultBucketCapacity
 	archive.TraceHotTrieNew = func(spec archive.TraceHotTrieSpec) (archive.TraceHotTrie, error) {
 		if spec.Kind != "mpt" {

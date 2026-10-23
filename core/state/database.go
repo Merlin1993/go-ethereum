@@ -17,6 +17,9 @@
 package state
 
 import (
+	"bytes"
+	"fmt"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -25,6 +28,8 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/trie"
+	"github.com/ethereum/go-ethereum/trie/archive/mpt"
+	"github.com/ethereum/go-ethereum/trie/archivev3"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/utils"
 	"github.com/ethereum/go-ethereum/triedb"
@@ -245,6 +250,22 @@ func (db *CachingDB) OpenTrie(root common.Hash) (Trie, error) {
 			}
 		}
 		baseTrie, err = trie.NewArchiveTrie(root, db.triedb, db.triedb.Archive(), flat)
+	} else if db.triedb.IsAMTv3() {
+		// v3 档案树（与 E2 同源实现）：账户/存储/代码共用一棵树，键域
+		// 分隔由 wrapper 完成；wrapper 全程持有持久实例并经 triedb 槽位
+		// 复用，传入的 root 仅用于与 wrapper 当前根核对。
+		kvStore, kvErr := db.triedb.AMTv3KVStore()
+		if kvErr != nil {
+			return nil, kvErr
+		}
+		wt, wrapErr := archivev3.NewArchiveV3Trie(db.triedb, kvStore, v3ConfigFromTriedb(db.triedb))
+		if wrapErr != nil {
+			return nil, wrapErr
+		}
+		if root != (common.Hash{}) && root != types.EmptyRootHash && !bytes.Equal(wt.Hash().Bytes(), root.Bytes()) {
+			return nil, fmt.Errorf("archivev3: state root mismatch: replay wants %x, v3 tree at %x", root, wt.Hash())
+		}
+		baseTrie = wt
 	} else {
 		baseTrie, err = trie.NewStateTrie(trie.StateTrieID(root), db.triedb)
 	}
@@ -276,6 +297,13 @@ func (db *CachingDB) OpenStorageTrie(stateRoot common.Hash, address common.Addre
 		}
 		return self, nil
 	}
+	if db.triedb.IsAMTv3() {
+		// v3 档案树：账户/存储同一棵树（键域分隔），存储视图只是转发壳。
+		if vt, ok := self.(*archivev3.ArchiveV3Trie); ok {
+			return archivev3.NewStorageTrie(address, vt), nil
+		}
+		return self, nil
+	}
 
 	// 创建底层存储trie
 	baseTrie, err := trie.NewStateTrie(trie.StorageTrieID(stateRoot, crypto.Keccak256Hash(address.Bytes()), root), db.triedb)
@@ -290,6 +318,24 @@ func (db *CachingDB) OpenStorageTrie(stateRoot common.Hash, address common.Addre
 	}
 
 	return baseTrie, nil
+}
+
+// v3ConfigFromTriedb 把 triedb 的 AMTv3 侧配置折成 mpt.Config。构造只在
+// 槽位为空时发生一次，之后的复用会忽略 cfg。
+func v3ConfigFromTriedb(tdb *triedb.Database) *mpt.Config {
+	cfg := &mpt.Config{
+		ShardDepthBits:            tdb.Config().AMTv3Depth,
+		Backend:                   tdb.Config().AMTv3Backend,
+		ForceCommitEveryBatches:   tdb.Config().AMTv3FlushBatches,
+		ActivateArchivedKeyOnRead: tdb.Config().AMTv3Activate,
+	}
+	if cfg.ShardDepthBits <= 0 {
+		cfg.ShardDepthBits = 19 // E1 正式档口径（与 E2 相同的分片粒度）
+	}
+	if cfg.Backend == "" {
+		cfg.Backend = mpt.BackendPath
+	}
+	return cfg
 }
 
 // ContractCodeWithPrefix retrieves a particular contract's code. If the

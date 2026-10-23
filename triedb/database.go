@@ -24,7 +24,9 @@ import (
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethdb/leveldb"
+	"github.com/ethereum/go-ethereum/ethdb/memorydb"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/trie/archive"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/triedb/database"
 	"github.com/ethereum/go-ethereum/triedb/hashdb"
@@ -43,6 +45,17 @@ type Config struct {
 	IsBinary             bool                   // Flag whether the db is holding a binary trie
 	BinaryArchiveDir     string                 // Directory for binary trie archive storage
 	BinaryAblationConfig *database.BinaryConfig // Configuration for binary trie ablation
+
+	// AMTv3 selects the v3 archive implementation (trie/archive/mpt, the same
+	// code E2 runs) as the tree under the triedb slot. It is mutually
+	// exclusive with IsBinary: the E1 AMT arm routes here while the legacy
+	// binary tree keeps IsBinary.
+	AMTv3             bool   // Flag whether the db drives the v3 archive tree
+	AMTv3KVDir        string // Directory for the v3 archive KV store (empty = memory store)
+	AMTv3Depth        int    // ShardDepthBits for the v3 archive tree (paper's shard granularity)
+	AMTv3Backend      string // v3 tree backend: "hashdb" or "pathdb"
+	AMTv3FlushBatches int    // ForceCommitEveryBatches for the v3 path backend
+	AMTv3Activate     bool   // Activate archived keys on read (E2 formal profile: true)
 }
 
 // HashDefaults represents a config for using hash-based scheme with
@@ -108,6 +121,7 @@ type Database struct {
 	cacheTrie         *cachetrie.CacheTrie // Cache trie used for enhanced caching
 	archive           ethdb.Database       // Separate archive database for binary trie
 	activeArchiveTrie interface{}          // Persistent archive trie instance
+	amtV3KV           ethdb.KeyValueStore  // KV store backing the v3 archive tree
 	blockNum          uint64               // Current block number for diagnostics
 }
 
@@ -320,6 +334,19 @@ func (db *Database) Commit(root common.Hash, report bool) error {
 	return db.backend.Commit(root, report)
 }
 
+// CommitAll forces a path database's current root and write buffer to disk.
+// The ordinary Commit intentionally retains a diff layer. Hash databases use
+// their existing Commit behavior.
+func (db *Database) CommitAll(root common.Hash) error {
+	if db.preimages != nil {
+		db.preimages.commit(true)
+	}
+	if pdb, ok := db.backend.(*pathdb.Database); ok {
+		return pdb.CommitAll(root)
+	}
+	return db.backend.Commit(root, false)
+}
+
 // Size returns the storage size of diff layer nodes above the persistent disk
 // layer, the dirty nodes buffered within the disk layer, and the size of cached
 // preimages.
@@ -483,6 +510,11 @@ func (db *Database) IsBinary() bool {
 	return db.config.IsBinary
 }
 
+// IsAMTv3 returns the indicator if the database drives the v3 archive tree.
+func (db *Database) IsAMTv3() bool {
+	return db.config.AMTv3
+}
+
 // BinaryArchiveDir returns the directory for binary trie archive storage.
 func (db *Database) BinaryArchiveDir() string {
 	return db.config.BinaryArchiveDir
@@ -516,6 +548,49 @@ func (db *Database) ReadCache() bool {
 // SetArchiveTrie stores a persistent archive trie instance in the database.
 func (db *Database) SetArchiveTrie(trie interface{}) {
 	db.activeArchiveTrie = trie
+}
+
+// amtV3KVAdapter 把 ethdb.KeyValueStore 适配成 mpt 需要的 archive.KVStore
+// （NewBatch 返回 archive.Batcher）。与 trace_stress 的 stressDBAdapter 同款。
+type amtV3KVAdapter struct {
+	store ethdb.KeyValueStore
+}
+
+func (a *amtV3KVAdapter) Put(key, value []byte) error    { return a.store.Put(key, value) }
+func (a *amtV3KVAdapter) Get(key []byte) ([]byte, error) { return a.store.Get(key) }
+func (a *amtV3KVAdapter) Delete(key []byte) error        { return a.store.Delete(key) }
+func (a *amtV3KVAdapter) NewBatch() archive.Batcher {
+	return a.store.NewBatch()
+}
+
+// AMTv3KVStore returns the KV store backing the v3 archive tree, adapted to
+// the mpt package's KVStore interface. A non-empty AMTv3KVDir opens (or
+// reuses) a dedicated LevelDB; an empty one returns a memory store. The
+// harness closes it via CloseAMTv3KVStore when the run finishes.
+func (db *Database) AMTv3KVStore() (archive.KVStore, error) {
+	if db.amtV3KV != nil {
+		return &amtV3KVAdapter{store: db.amtV3KV}, nil
+	}
+	if db.config.AMTv3KVDir == "" {
+		db.amtV3KV = memorydb.New()
+		return &amtV3KVAdapter{store: db.amtV3KV}, nil
+	}
+	store, err := leveldb.New(db.config.AMTv3KVDir, 512, 256, "amt-v3-archive", false)
+	if err != nil {
+		return nil, err
+	}
+	db.amtV3KV = store
+	return &amtV3KVAdapter{store: store}, nil
+}
+
+// CloseAMTv3KVStore closes the v3 archive KV store if one was opened. The
+// triedb's own Close does not know about it, so the harness must call this
+// when the run finishes.
+func (db *Database) CloseAMTv3KVStore() {
+	if db.amtV3KV != nil {
+		_ = db.amtV3KV.Close()
+		db.amtV3KV = nil
+	}
 }
 
 // GetArchiveTrie retrieves the persistent archive trie instance from the database.
