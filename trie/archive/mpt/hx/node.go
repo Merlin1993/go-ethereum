@@ -176,10 +176,10 @@ func (n valueNode) cache() (hashNode, bool)  { return nil, true }
 func (n *fullNode) copy() *fullNode {
 	c := *n
 	if n.Stubs != nil {
-		c.Stubs = make([]*Stub, len(n.Stubs))
-		for i, s := range n.Stubs {
-			c.Stubs[i] = s.copy()
-		}
+		// A trie node owns its list, but the stub descriptors are immutable.
+		// Sharing descriptors avoids allocating one object per stub on every
+		// ordinary hot-tree update.
+		c.Stubs = append([]*Stub(nil), n.Stubs...)
 	}
 	return &c
 }
