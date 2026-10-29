@@ -2146,6 +2146,14 @@ func RecordMPTRedemptionVerify(elapsed time.Duration) {
 	atomic.AddInt64(&redemptionVerifyNanos, elapsed.Nanoseconds())
 }
 
+// RecordMPTRedemptionVerifyBatch records a complete pre-commit audit. Count
+// is the number of distinct buckets; elapsed is wall time for the whole batch
+// and therefore remains meaningful when bucket audits overlap.
+func RecordMPTRedemptionVerifyBatch(count int64, elapsed time.Duration) {
+	atomic.AddInt64(&redemptionVerifyCount, count)
+	atomic.AddInt64(&redemptionVerifyNanos, elapsed.Nanoseconds())
+}
+
 // MPTRedemptionVerifyStats snapshots the cumulative sampled-audit counters.
 func MPTRedemptionVerifyStats() (count, nanos int64) {
 	return atomic.LoadInt64(&redemptionVerifyCount), atomic.LoadInt64(&redemptionVerifyNanos)

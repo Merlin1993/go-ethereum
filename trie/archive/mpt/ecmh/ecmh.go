@@ -41,6 +41,7 @@ package ecmh
 
 import (
 	"crypto/sha256"
+	"sync"
 
 	bytemaresecp256k1 "github.com/bytemare/secp256k1"
 
@@ -52,6 +53,12 @@ import (
 // all-zero 33-byte array, since compressed secp256k1 encoding has no
 // canonical infinity representation.
 type Commitment [33]byte
+
+// Entry is an archived key and its raw value. The value hash is calculated
+// inside the verification worker, alongside the curve mapping.
+type Entry struct {
+	Key, Value []byte
+}
 
 // mptRFC9380DST separates this MPT archive format from other hash-to-curve uses.
 // Changing it invalidates every nonempty MPT archive bucket commitment.
@@ -121,6 +128,38 @@ func Create(items [][]byte) Commitment {
 	for _, item := range items {
 		p := itemPoint(item)
 		secp256k1.AddNonConst(&sum, &p, &sum)
+	}
+	return encodePoint(&sum)
+}
+
+// CreateEntriesParallel covers value hashing as well as hash-to-curve work.
+func CreateEntriesParallel(entries []Entry, workers int) Commitment {
+	if len(entries) == 0 {
+		return Commitment{}
+	}
+	workers = max(1, min(workers, len(entries)))
+	partials := make([]secp256k1.JacobianPoint, workers)
+	addRange := func(worker int) {
+		for _, entry := range entries[worker*len(entries)/workers : (worker+1)*len(entries)/workers] {
+			valueHash := sha256.Sum256(entry.Value)
+			item := make([]byte, 0, len(entry.Key)+len(valueHash))
+			item = append(item, entry.Key...)
+			item = append(item, valueHash[:]...)
+			point := itemPoint(item)
+			secp256k1.AddNonConst(&partials[worker], &point, &partials[worker])
+		}
+	}
+	var wg sync.WaitGroup
+	for worker := 1; worker < workers; worker++ {
+		worker := worker
+		wg.Add(1)
+		go func() { defer wg.Done(); addRange(worker) }()
+	}
+	addRange(0)
+	wg.Wait()
+	var sum secp256k1.JacobianPoint
+	for i := range partials {
+		secp256k1.AddNonConst(&sum, &partials[i], &sum)
 	}
 	return encodePoint(&sum)
 }

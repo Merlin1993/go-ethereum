@@ -141,6 +141,13 @@ type Config struct {
 	CuckooSlots   int
 
 	ActivateArchivedKeyOnRead bool
+	// VerifyAtCommit audits every distinct redeemed bucket before the next
+	// commit. Reads are speculative until the audit succeeds.
+	VerifyAtCommit bool
+	// Verification runs across buckets and inside each bucket independently.
+	// Zero defaults to eight buckets and two item workers per bucket.
+	VerifyBucketWorkers int
+	VerifyItemWorkers   int
 
 	// Backend is BackendHash or BackendPath (default BackendHash).
 	Backend string
@@ -295,6 +302,27 @@ type Trie struct {
 	// so a full-map scan per commit costs O(total buckets) and dominated the
 	// archive loop once the archive filled (~10 ms/batch at ~220K buckets).
 	dirtyBuckets []*bucket
+	// A bucket is frozen once, before its first in-block redemption changes it.
+	// Later redemptions from the same bucket are covered by that original proof.
+	pendingAudits     []bucketAudit
+	auditedPaths      map[string]struct{}
+	pendingProofBytes int64
+	checkpoint        committedState
+}
+
+type bucketAudit struct {
+	path       []byte
+	commitment ecmh.Commitment
+	metaHash   [32]byte
+	metaBytes  []byte
+	entries    []ecmh.Entry
+}
+
+type committedState struct {
+	block, bucketSeq                  uint64
+	archiveBytes, liveHotLeaves       int64
+	baseBit                           byte
+	pruneDomainIdx, commitsSinceFlush int
 }
 
 // bucket is the in-memory handle for one archive bucket (paper: Stub Bucket
@@ -372,6 +400,12 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 	if cfg.BucketCapacity <= 0 {
 		cfg.BucketCapacity = defaultBucketCapacity
 	}
+	if cfg.VerifyBucketWorkers <= 0 {
+		cfg.VerifyBucketWorkers = 8
+	}
+	if cfg.VerifyItemWorkers <= 0 {
+		cfg.VerifyItemWorkers = 2
+	}
 
 	t := &Trie{
 		db:         db,
@@ -402,6 +436,7 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 	if err := t.loadSchedule(); err != nil {
 		return nil, err
 	}
+	t.saveCheckpointLocked()
 	return t, nil
 }
 
@@ -1265,6 +1300,19 @@ func (t *Trie) bucketDeleteLocked(b *bucket, key, value []byte) error {
 	return t.hot.ReplaceStub(b.mount, b.path, b.stub())
 }
 
+// canAppendAtMount permits a nearby underfull bucket to broaden its coverage
+// only inside its own logical domain and only while both keys traverse the
+// same mount node. The stored coverage is recomputed after a successful append.
+func (t *Trie) canAppendAtMount(b *bucket, key, mount []byte) bool {
+	if b.prefixBits == 0 || keyHasBitPrefix(key, &b.prefixBuf, b.prefixBits) {
+		return true
+	}
+	depth := t.config.ShardDepthBits
+	return int(b.prefixBits) >= depth &&
+		keyHasBitPrefix(key, &b.prefixBuf, uint16(depth)) &&
+		commonNibblePrefix(b.prefixBuf[:], key) >= len(mount)
+}
+
 // mountEntriesLocked hangs the extracted batch on the tree (paper "Stub
 // Mounting"): existing non-full buckets at the mount point absorb first, a
 // remaining batch of at least M forces fresh full buckets, the remainder
@@ -1286,31 +1334,38 @@ func (t *Trie) mountEntriesLocked(domainPrefix []byte, entries []gethtrie.Extrac
 		if err != nil {
 			return err
 		}
+		candidates := make([]*bucket, 0, len(stubs))
 		for _, st := range stubs {
-			if len(rest) == 0 {
-				break
-			}
 			b, err := t.bucketForStubLocked(nodePath, st)
 			if err != nil {
 				return err
 			}
-			room := min(capacity-b.count, softCap-b.count)
-			if room <= 0 {
-				continue
+			if min(capacity-b.count, softCap-b.count) > 0 {
+				candidates = append(candidates, b)
 			}
-			// Feed only entries inside the bucket's coverage (paper
-			// CanAppend), matched at bit granularity: mixed-prefix entries
-			// would erode the coverage bound that lets probes skip this
-			// bucket, and at D%4=3 shard geometry a nibble-level check
-			// would wave through the sibling shards sharing this mount
-			// node, diluting every prefix back to the shared node path.
+		}
+		// Prefer the bucket sharing the longest key prefix. Ties use the
+		// smaller bucket, then its stable path, so packing is reproducible.
+		sort.Slice(candidates, func(i, j int) bool {
+			a, b := candidates[i], candidates[j]
+			aScore := min(int(a.prefixBits), commonBitPrefixLen(a.prefixBuf[:], rest[0].Key))
+			bScore := min(int(b.prefixBits), commonBitPrefixLen(b.prefixBuf[:], rest[0].Key))
+			if aScore != bScore {
+				return aScore > bScore
+			}
+			if a.count != b.count {
+				return a.count < b.count
+			}
+			return bytes.Compare(a.path, b.path) < 0
+		})
+		for _, b := range candidates {
+			if len(rest) == 0 {
+				break
+			}
+			room := min(capacity-b.count, softCap-b.count)
 			n := 0
-			if b.prefixBits > 0 {
-				for n < room && n < len(rest) && keyHasBitPrefix(rest[n].Key, &b.prefixBuf, b.prefixBits) {
-					n++
-				}
-			} else {
-				n = min(room, len(rest))
+			for n < room && n < len(rest) && t.canAppendAtMount(b, rest[n].Key, nodePath) {
+				n++
 			}
 			if n == 0 {
 				continue
@@ -1491,6 +1546,115 @@ func (t *Trie) verifyBucketLocked(b *bucket) error {
 	return nil
 }
 
+func (t *Trie) saveCheckpointLocked() {
+	t.checkpoint = committedState{
+		block: t.block, bucketSeq: t.bucketSeq,
+		archiveBytes: t.archiveBytes, liveHotLeaves: t.liveHotLeaves,
+		baseBit: t.baseBit, pruneDomainIdx: t.pruneDomainIdx,
+		commitsSinceFlush: t.commitsSinceFlush,
+	}
+}
+
+// rollbackUncommittedLocked discards the speculative working tree and bucket
+// handles. The last committed root and pathdb layer remain available.
+func (t *Trie) rollbackUncommittedLocked() {
+	t.hot = nil
+	t.buckets = make(map[string]*bucket)
+	t.archiveLRU = list.New()
+	t.residentEntries = 0
+	t.dirtyBuckets = nil
+	t.dirty, t.scheduleDirty = false, false
+	t.pendingAudits, t.auditedPaths = nil, nil
+	t.pendingProofBytes = 0
+	t.block, t.bucketSeq = t.checkpoint.block, t.checkpoint.bucketSeq
+	t.archiveBytes, t.liveHotLeaves = t.checkpoint.archiveBytes, t.checkpoint.liveHotLeaves
+	t.baseBit, t.pruneDomainIdx = t.checkpoint.baseBit, t.checkpoint.pruneDomainIdx
+	t.commitsSinceFlush = t.checkpoint.commitsSinceFlush
+}
+
+func (t *Trie) captureBucketAuditLocked(b *bucket) {
+	path := string(b.path)
+	if _, present := t.auditedPaths[path]; present {
+		return
+	}
+	if t.auditedPaths == nil {
+		t.auditedPaths = make(map[string]struct{})
+	}
+	t.auditedPaths[path] = struct{}{}
+	audit := bucketAudit{
+		path: bytes.Clone(b.path), commitment: b.commitment,
+		metaHash: b.metaHash, metaBytes: bytes.Clone(b.metaBytes),
+		entries: make([]ecmh.Entry, 0, len(b.entries)),
+	}
+	for key, value := range b.entries {
+		audit.entries = append(audit.entries, ecmh.Entry{
+			Key: []byte(key), Value: bytes.Clone(value),
+		})
+	}
+	t.pendingAudits = append(t.pendingAudits, audit)
+	t.pendingProofBytes += int64(len(b.metaBytes)) + b.payloadBytes
+}
+
+// PendingProofStats returns this block's distinct redeemed-bucket count and
+// aggregate proof bytes. Repeated Get calls against the same original bucket
+// contribute to the redemption count, but add no duplicate proof bytes.
+func (t *Trie) PendingProofStats() (buckets, proofBytes int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return int64(len(t.pendingAudits)), t.pendingProofBytes
+}
+
+func verifyBucketAudit(audit bucketAudit, itemWorkers int) error {
+	if got := [32]byte(crypto.Keccak256Hash(audit.metaBytes)); got != audit.metaHash {
+		return fmt.Errorf("mpt archive: stub metadata mismatch on bucket %x", audit.path)
+	}
+	_, _, _, commitment, count, err := decodeStubMeta(audit.metaBytes)
+	if err != nil {
+		return fmt.Errorf("mpt archive: bucket %x: %w", audit.path, err)
+	}
+	if commitment != audit.commitment || count != len(audit.entries) ||
+		ecmh.CreateEntriesParallel(audit.entries, itemWorkers) != commitment {
+		return fmt.Errorf("mpt archive: ECMH commitment mismatch on bucket %x", audit.path)
+	}
+	return nil
+}
+
+// auditPendingLocked verifies distinct pre-redemption bucket snapshots. It
+// holds the trie lock only to prevent a concurrent commit; workers touch
+// immutable snapshots and may verify different buckets concurrently.
+func (t *Trie) auditPendingLocked() error {
+	if len(t.pendingAudits) == 0 {
+		return nil
+	}
+	started := time.Now()
+	workers := min(t.config.VerifyBucketWorkers, len(t.pendingAudits))
+	jobs := make(chan int)
+	errorsByBucket := make([]error, len(t.pendingAudits))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				errorsByBucket[index] = verifyBucketAudit(t.pendingAudits[index], t.config.VerifyItemWorkers)
+			}
+		}()
+	}
+	for index := range t.pendingAudits {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+	archivetrie.RecordMPTRedemptionVerifyBatch(int64(len(t.pendingAudits)), time.Since(started))
+	for _, err := range errorsByBucket {
+		if err != nil {
+			t.rollbackUncommittedLocked()
+			return err
+		}
+	}
+	return nil
+}
+
 // Get returns a value from the hot tree or from an archived domain bucket.
 func (t *Trie) Get(key []byte) ([]byte, error) {
 	lockStart := t.opTraceStart()
@@ -1526,23 +1690,25 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 		// Mirror the binary layer's promotion timing: only the promotion
 		// itself (bucket removal + hot reinsert) is measured, not the lookup.
 		promotionStart := time.Now()
-		// Two-party simulation: the archive node hands the full node the
-		// bucket payload record plus the stub side record — that bundle IS
-		// the redemption proof (paper) — and the full node verifies it by
-		// re-running the ECMH audit. The audit runs on a sample so formal
-		// runs measure its cost without paying it on every redemption.
-		// The audited bucket is the one that supplied the value (the
-		// newest copy, hits[0]).
+		// Freeze every bucket actually holding this key before local deletion.
+		// One original full-bucket proof covers further redemptions from that
+		// bucket during this block; the commit audits all distinct snapshots.
 		proofBytes := int64(len(b.metaBytes)) + b.payloadBytes
-		proofCount, _, _, _ := archivetrie.MPTRedemptionProofStats()
-		if ecmhVerifyGate || (redemptionVerifySample > 0 && proofCount%int64(redemptionVerifySample) == 0) {
-			verifyStart := time.Now()
-			if err := t.verifyBucketLocked(b); err != nil {
-				archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
-				return nil, err
+		if t.config.VerifyAtCommit {
+			for _, hb := range hits {
+				t.captureBucketAuditLocked(hb)
 			}
-			if !ecmhVerifyGate {
-				archivetrie.RecordMPTRedemptionVerify(time.Since(verifyStart))
+		} else {
+			proofCount, _, _, _ := archivetrie.MPTRedemptionProofStats()
+			if ecmhVerifyGate || (redemptionVerifySample > 0 && proofCount%int64(redemptionVerifySample) == 0) {
+				verifyStart := time.Now()
+				if err := t.verifyBucketLocked(b); err != nil {
+					archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
+					return nil, err
+				}
+				if !ecmhVerifyGate {
+					archivetrie.RecordMPTRedemptionVerify(time.Since(verifyStart))
+				}
 			}
 		}
 		// Redeem from EVERY bucket genuinely holding the key (blind-write
@@ -1691,6 +1857,9 @@ func (t *Trie) DeleteBatch(keys [][]byte) error {
 func (t *Trie) PruneNextShard() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.config.VerifyAtCommit && len(t.pendingAudits) != 0 {
+		return errors.New("mpt archive: commit pending bucket audits before pruning the next block")
+	}
 	return t.pruneNextDomainLocked()
 }
 
@@ -1905,6 +2074,11 @@ func (t *Trie) Commit() ([]byte, error) {
 }
 
 func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
+	if t.config.VerifyAtCommit {
+		if err := t.auditPendingLocked(); err != nil {
+			return nil, err
+		}
+	}
 	archivetrie.SetMPTArchivePayloadBytes(t.archiveBytes)
 	archivetrie.SetMPTLiveGauges(t.liveHotLeaves, int64(len(t.buckets)))
 	staged := &stagedBytes{}
@@ -1927,6 +2101,8 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		}
 	}()
 	if !t.dirty && !t.scheduleDirty {
+		t.pendingAudits, t.auditedPaths = nil, nil
+		t.pendingProofBytes = 0
 		return t.rootBytes(), nil
 	}
 	if t.dirty {
@@ -1992,6 +2168,9 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 	archiveDur = time.Since(archiveStart)
 	// Committed buckets are clean again: release resident entries over budget.
 	t.evictArchivesLocked(false)
+	t.pendingAudits, t.auditedPaths = nil, nil
+	t.pendingProofBytes = 0
+	t.saveCheckpointLocked()
 	return t.rootBytes(), nil
 }
 

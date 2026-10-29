@@ -84,6 +84,10 @@ func (h mptHotLayer) BucketOccupancy() ([]int64, int64) {
 	return h.trie.BucketOccupancy()
 }
 
+func (h mptHotLayer) PendingProofStats() (buckets, proofBytes int64) {
+	return h.trie.PendingProofStats()
+}
+
 func init() {
 	// Compile-time guarantee that the trace-stress harness's probe assertions
 	// (Flush / PathStats / BucketOccupancy) can never silently fail again:
@@ -107,6 +111,9 @@ func init() {
 			ForceCommitEveryBatches:   spec.FlushEveryBatches,
 			ArchiveResidentEntries:    spec.ArchiveResidentEntries,
 			AsyncPrune:                spec.AsyncPrune,
+			VerifyAtCommit:            spec.VerifyAtCommit,
+			VerifyBucketWorkers:       spec.VerifyBucketWorkers,
+			VerifyItemWorkers:         spec.VerifyItemWorkers,
 		})
 		if err != nil {
 			return nil, err

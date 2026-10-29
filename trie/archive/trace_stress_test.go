@@ -69,6 +69,9 @@ var (
 	traceStressSplitArchiveDB             = flag.Bool("traceStressSplitArchiveDB", false, "Store MPTA archive payloads in archive_db and all other records in state_db; report both physical directory sizes per window")
 	traceStressCuckooBuckets              = flag.Int("traceStressCuckooBuckets", 32, "Archive cuckoo filter bucket count")
 	traceStressCuckooSlots                = flag.Int("traceStressCuckooSlots", 4, "Archive cuckoo filter slots per bucket")
+	traceStressMPTVerifyAtCommit          = flag.Bool("traceStressMPTVerifyAtCommit", false, "MPT: audit every distinct redeemed bucket before the block's final commit")
+	traceStressMPTVerifyBucketWorkers     = flag.Int("traceStressMPTVerifyBucketWorkers", 8, "MPT: concurrent bucket audit workers")
+	traceStressMPTVerifyItemWorkers       = flag.Int("traceStressMPTVerifyItemWorkers", 2, "MPT: concurrent item workers per bucket")
 	traceStatsBaseDir                     = flag.String("traceStatsBaseDir", "", "Existing TestArchiveStemTraceStress base directory for TestArchiveStemTraceStorageStats")
 	traceStatsRoot                        = flag.String("traceStatsRoot", "", "Final trie root for TestArchiveStemTraceStorageStats")
 	traceStatsOutput                      = flag.String("traceStatsOutput", "", "Output JSON path for TestArchiveStemTraceStorageStats")
@@ -301,39 +304,44 @@ func (c traceStressCounts) total() int64 {
 }
 
 type traceStressWindow struct {
-	counts                     traceStressCounts
-	gets, puts, deletes        int64
-	parse, operations          time.Duration
-	prune, commit, write       time.Duration
-	intermediate               time.Duration // intermediate-root commit (archive maintenance)
-	intermediateWrite          time.Duration // intermediate batch write (archive maintenance)
-	finalCommitPhase           [4]int64      // hx/stage/tdbCommit/archiveLoop nanos of the FINAL commit only
-	stagedPruneBytes           int64         // staged hot-node bytes of the intermediate commit
-	stagedOpsBytes             int64         // staged hot-node bytes of the final commit
-	pruneDiag                  [4]int64      // extracted/resolved/extractNanos/mountNanos, window diff
-	coldMaintenance            time.Duration
-	batchWall                  []time.Duration
-	pruneWall                  []time.Duration // per-batch Sharded-Pruning durations; batches that pruned only
-	comparativeBatchWall       []time.Duration
-	firstBlock, lastBlock      uint64
-	stemHits, stemMisses       int64
-	stemEvictions              int64
-	rawBatchOps, rawBatchBytes int64
-	mptDiag                    [10]int64 // staged hotNode/aggregate/archive/flat/index/stubMeta bytes, node-cache gets/hits, stubmeta fetches/fetch-bytes
-	access                     traceStressAccessStats
-	accessSample               time.Duration
-	classificationFilter       traceStressFilterStats
-	proofRedemptions           int64           // read-activation redemptions in this window
-	proofBytes                 int64           // total redemption-proof bytes in this window
-	proofBlocks                []int64         // completed per-block proof totals in this window
-	proofCounts                []int64         // completed per-block resurrection counts in this window
-	proofVerifyCount           int64           // sampled full-node verification audits in this window
-	proofVerify                time.Duration   // sampled audit latency in this window
-	proofSizes                 []int64         // exact single-proof size histogram drained at window close (E2 v6)
-	proofLatencies             []time.Duration // exact single-proof promotion latency histogram (E2 v6)
-	filterProbeLatencies       []time.Duration // exact per-cuckoo-lookup latency histogram (E2 v6)
-	bucketOccupancy            []int64         // archive-bucket entry-count snapshot taken at window close (E2 v6)
-	bucketEmpty                int64           // archive buckets with zero entries at window close (E2 v6)
+	counts                        traceStressCounts
+	gets, puts, deletes           int64
+	parse, operations             time.Duration
+	prune, commit, write          time.Duration
+	intermediate                  time.Duration // intermediate-root commit (archive maintenance)
+	intermediateWrite             time.Duration // intermediate batch write (archive maintenance)
+	finalCommitPhase              [4]int64      // hx/stage/tdbCommit/archiveLoop nanos of the FINAL commit only
+	stagedPruneBytes              int64         // staged hot-node bytes of the intermediate commit
+	stagedOpsBytes                int64         // staged hot-node bytes of the final commit
+	pruneDiag                     [4]int64      // extracted/resolved/extractNanos/mountNanos, window diff
+	coldMaintenance               time.Duration
+	batchWall                     []time.Duration
+	pruneWall                     []time.Duration // per-batch Sharded-Pruning durations; batches that pruned only
+	comparativeBatchWall          []time.Duration
+	firstBlock, lastBlock         uint64
+	stemHits, stemMisses          int64
+	stemEvictions                 int64
+	rawBatchOps, rawBatchBytes    int64
+	mptDiag                       [10]int64 // staged hotNode/aggregate/archive/flat/index/stubMeta bytes, node-cache gets/hits, stubmeta fetches/fetch-bytes
+	access                        traceStressAccessStats
+	accessSample                  time.Duration
+	classificationFilter          traceStressFilterStats
+	proofRedemptions              int64         // read-activation redemptions in this window
+	proofBytes                    int64         // total redemption-proof bytes in this window
+	proofBlocks                   []int64       // completed per-block proof totals in this window
+	proofCounts                   []int64       // completed per-block resurrection counts in this window
+	proofVerifyCount              int64         // sampled full-node verification audits in this window
+	proofVerify                   time.Duration // sampled audit latency in this window
+	blockRedemptionsAll           []int64       // exact: every source block, including zeroes
+	blockUniqueProofBytesAll      []int64       // one proof per distinct redeemed bucket per block
+	blockRedemptionsPositive      []int64       // exact: blocks with at least one redemption
+	blockUniqueProofBytesPositive []int64
+	blockUniqueBucketsTotal       int64
+	proofSizes                    []int64         // exact single-proof size histogram drained at window close (E2 v6)
+	proofLatencies                []time.Duration // exact single-proof promotion latency histogram (E2 v6)
+	filterProbeLatencies          []time.Duration // exact per-cuckoo-lookup latency histogram (E2 v6)
+	bucketOccupancy               []int64         // archive-bucket entry-count snapshot taken at window close (E2 v6)
+	bucketEmpty                   int64           // archive buckets with zero entries at window close (E2 v6)
 }
 
 type traceStressFilterStats struct {
@@ -370,6 +378,54 @@ func sortedInt64Copy(values []int64) []int64 {
 	out := append([]int64(nil), values...)
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
+}
+
+func meanInt64(values []int64) float64 {
+	return traceStressRatio(sumInt64(values), int64(len(values)))
+}
+
+func sumInt64(values []int64) int64 {
+	var total int64
+	for _, value := range values {
+		total += value
+	}
+	return total
+}
+
+// blockDistributionColumns reports exact window statistics. Each source
+// block contributes once to the all-block population, including empty ones.
+func blockDistributionColumns(allCounts, allBytes, positiveCounts, positiveBytes []int64, uniqueBuckets int64) []string {
+	ac := sortedInt64Copy(allCounts)
+	ab := sortedInt64Copy(allBytes)
+	pc := sortedInt64Copy(positiveCounts)
+	pb := sortedInt64Copy(positiveBytes)
+	integer := func(v int64) string { return strconv.FormatInt(v, 10) }
+	mean := func(v []int64) string { return strconv.FormatFloat(meanInt64(v), 'f', 6, 64) }
+	return []string{
+		integer(int64(len(ac))), mean(allCounts), integer(percentileInt64(ac, .50)), integer(percentileInt64(ac, .95)), integer(percentileInt64(ac, .99)),
+		mean(allBytes), integer(percentileInt64(ab, .50)), integer(percentileInt64(ab, .95)), integer(percentileInt64(ab, .99)),
+		integer(int64(len(pc))), mean(positiveCounts), integer(percentileInt64(pc, .50)), integer(percentileInt64(pc, .95)), integer(percentileInt64(pc, .99)),
+		mean(positiveBytes), integer(percentileInt64(pb, .50)), integer(percentileInt64(pb, .95)), integer(percentileInt64(pb, .99)),
+		integer(uniqueBuckets), integer(sumInt64(allBytes)),
+	}
+}
+
+func blockDistributionSummary(counts, proofBytes []int64) map[string]any {
+	c := sortedInt64Copy(counts)
+	b := sortedInt64Copy(proofBytes)
+	return map[string]any{
+		"blocks":                   len(counts),
+		"redemptions_total":        sumInt64(counts),
+		"redemptions_mean":         meanInt64(counts),
+		"redemptions_p50":          percentileInt64(c, .50),
+		"redemptions_p95":          percentileInt64(c, .95),
+		"redemptions_p99":          percentileInt64(c, .99),
+		"unique_proof_bytes_total": sumInt64(proofBytes),
+		"unique_proof_bytes_mean":  meanInt64(proofBytes),
+		"unique_proof_bytes_p50":   percentileInt64(b, .50),
+		"unique_proof_bytes_p95":   percentileInt64(b, .95),
+		"unique_proof_bytes_p99":   percentileInt64(b, .99),
+	}
 }
 
 // bucketCapacityMetadata reports the mpt bucket capacity M registered by the
@@ -559,6 +615,9 @@ type TraceHotTrieSpec struct {
 	FlushEveryBatches         int
 	ArchiveResidentEntries    int
 	AsyncPrune                bool
+	VerifyAtCommit            bool
+	VerifyBucketWorkers       int
+	VerifyItemWorkers         int
 }
 
 // TraceHotTrieNew constructs the alternative hot layer named by
@@ -1034,6 +1093,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	if *traceStressBatchByBlock && !blockBoundary {
 		t.Fatal("traceStressBatchByBlock requires traceStressEndBlock or traceStressBlocks")
 	}
+	if *traceStressMPTVerifyAtCommit && (!*traceStressBatchByBlock || *traceStressHotLayer != "mpt") {
+		t.Fatal("traceStressMPTVerifyAtCommit requires a block-aligned MPT run")
+	}
+	if *traceStressMPTVerifyAtCommit && (*traceStressMPTVerifyBucketWorkers < 1 || *traceStressMPTVerifyItemWorkers < 1) {
+		t.Fatal("MPT verification worker counts must be positive")
+	}
 	if *traceStressEndBlock > 0 && *traceStressBlocks > 0 {
 		t.Fatal("traceStressEndBlock and traceStressBlocks are mutually exclusive")
 	}
@@ -1108,48 +1173,51 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		stemActivationMetadata = "not_applicable"
 	}
 	metadata := map[string]any{
-		"generated_at":             time.Now().Format(time.RFC3339),
-		"base_dir":                 *traceStressBaseDir,
-		"input_dir":                *traceStressInputDir,
-		"source_files":             reader.files,
-		"start_file":               *traceStressStartFile,
-		"requested_start_file":     *traceStressStartFile,
-		"file_limit":               *traceStressFileLimit,
-		"operations":               *traceStressOps,
-		"start_block":              *traceStressStartBlock,
-		"requested_start_block":    *traceStressStartBlock,
-		"effective_start_file":     *traceStressStartFile,
-		"effective_start_block":    nil,
-		"end_block":                *traceStressEndBlock,
-		"block_count":              *traceStressBlocks,
-		"batch_size":               *traceStressBatchSize,
-		"batch_by_block":           *traceStressBatchByBlock,
-		"metrics_batches":          *traceStressMetricsBatches,
-		"shard_depth":              *traceStressShardDepth,
-		"stem_mode":                *traceStressStemMode,
-		"stem_cache_limit":         stemCacheLimitMetadata,
-		"stem_cache_mb":            stemCacheMBMetadata,
-		"node_cache_limit":         *traceStressNodeCacheLimit,
-		"node_cache_mb":            *traceStressNodeCacheMB,
-		"commit_workers":           *traceStressCommitWorkers,
-		"async_prune":              *traceStressAsyncPrune,
-		"prune_every_batches":      *traceStressPruneEveryBatches,
-		"prune_every_blocks":       *traceStressPruneEveryBlocks,
-		"disable_archive":          *traceStressDisableArchive,
-		"hot_layer":                *traceStressHotLayer,
-		"shard_depth_bits":         *traceStressShardDepthBits,
-		"shard_count":              1 << uint(*traceStressShardDepthBits),
-		"epoch_bitmap":             *traceStressHotLayer == "mpt",
-		"hot_value_layout":         map[bool]string{true: "inline", false: "flatref"}[*traceStressHotLayer == "mpt"],
-		"archive_bucket_capacity":  bucketCapacityMetadata(),
-		"trie_backend":             *traceStressTrieBackend,
-		"clean_cache_mb":           *traceStressPathCleanCacheMB,
-		"write_buffer_mb":          *traceStressPathWriteBufferMB,
-		"flush_every_batches":      *traceStressPathFlushEveryBatches,
-		"archive_resident_entries": *traceStressArchiveResidentEntries,
-		"archive_period_ops":       archivePeriodOps,
-		"cuckoo_buckets":           *traceStressCuckooBuckets,
-		"cuckoo_slots":             *traceStressCuckooSlots,
+		"generated_at":              time.Now().Format(time.RFC3339),
+		"base_dir":                  *traceStressBaseDir,
+		"input_dir":                 *traceStressInputDir,
+		"source_files":              reader.files,
+		"start_file":                *traceStressStartFile,
+		"requested_start_file":      *traceStressStartFile,
+		"file_limit":                *traceStressFileLimit,
+		"operations":                *traceStressOps,
+		"start_block":               *traceStressStartBlock,
+		"requested_start_block":     *traceStressStartBlock,
+		"effective_start_file":      *traceStressStartFile,
+		"effective_start_block":     nil,
+		"end_block":                 *traceStressEndBlock,
+		"block_count":               *traceStressBlocks,
+		"batch_size":                *traceStressBatchSize,
+		"batch_by_block":            *traceStressBatchByBlock,
+		"metrics_batches":           *traceStressMetricsBatches,
+		"shard_depth":               *traceStressShardDepth,
+		"stem_mode":                 *traceStressStemMode,
+		"stem_cache_limit":          stemCacheLimitMetadata,
+		"stem_cache_mb":             stemCacheMBMetadata,
+		"node_cache_limit":          *traceStressNodeCacheLimit,
+		"node_cache_mb":             *traceStressNodeCacheMB,
+		"commit_workers":            *traceStressCommitWorkers,
+		"async_prune":               *traceStressAsyncPrune,
+		"prune_every_batches":       *traceStressPruneEveryBatches,
+		"prune_every_blocks":        *traceStressPruneEveryBlocks,
+		"disable_archive":           *traceStressDisableArchive,
+		"hot_layer":                 *traceStressHotLayer,
+		"shard_depth_bits":          *traceStressShardDepthBits,
+		"shard_count":               1 << uint(*traceStressShardDepthBits),
+		"epoch_bitmap":              *traceStressHotLayer == "mpt",
+		"hot_value_layout":          map[bool]string{true: "inline", false: "flatref"}[*traceStressHotLayer == "mpt"],
+		"archive_bucket_capacity":   bucketCapacityMetadata(),
+		"trie_backend":              *traceStressTrieBackend,
+		"clean_cache_mb":            *traceStressPathCleanCacheMB,
+		"write_buffer_mb":           *traceStressPathWriteBufferMB,
+		"flush_every_batches":       *traceStressPathFlushEveryBatches,
+		"archive_resident_entries":  *traceStressArchiveResidentEntries,
+		"archive_period_ops":        archivePeriodOps,
+		"cuckoo_buckets":            *traceStressCuckooBuckets,
+		"cuckoo_slots":              *traceStressCuckooSlots,
+		"mpt_verify_at_commit":      *traceStressMPTVerifyAtCommit,
+		"mpt_verify_bucket_workers": *traceStressMPTVerifyBucketWorkers,
+		"mpt_verify_item_workers":   *traceStressMPTVerifyItemWorkers,
 		"archive_bucket_size": func() int {
 			c := DefaultConfig()
 			c.CuckooBuckets = *traceStressCuckooBuckets
@@ -1170,7 +1238,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"physical_delete":                false,
 		"value_rule":                     "32-byte value_hash; deterministic key/op hash when absent",
 		"storage_zero_hash_is_delete":    true,
-		"timing_scope":                   "measured_ops_per_s and Operations_Per_Sec exclude parse, prune launch, access sampling, synchronous cold maintenance, and final stats",
+		"timing_scope":                   "Operations_Per_Sec excludes parse, prune, access sampling, synchronous cold maintenance, final stats, and block verification when enabled; raw Commit_ms includes block verification",
 		"command":                        strings.Join(os.Args, " "),
 	}
 	if err := writeTraceStressJSON(filepath.Join(*traceStressBaseDir, "metadata.json"), metadata); err != nil {
@@ -1234,6 +1302,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			FlushEveryBatches:         *traceStressPathFlushEveryBatches,
 			ArchiveResidentEntries:    *traceStressArchiveResidentEntries,
 			AsyncPrune:                *traceStressAsyncPrune,
+			VerifyAtCommit:            *traceStressMPTVerifyAtCommit,
+			VerifyBucketWorkers:       *traceStressMPTVerifyBucketWorkers,
+			VerifyItemWorkers:         *traceStressMPTVerifyItemWorkers,
 		})
 		if err != nil {
 			t.Fatalf("hot layer %q: %v", *traceStressHotLayer, err)
@@ -1335,6 +1406,13 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"Resurrection_Block_P50", "Resurrection_Block_P95", "Resurrection_Block_P99",
 		"Full_Node_DB_Bytes", "Archive_DB_Bytes", "Path_Buffered_Bytes", "Path_Diff_Bytes",
 	}
+	header = append(header,
+		"Block_All_N", "Block_All_Redemptions_Mean", "Block_All_Redemptions_P50", "Block_All_Redemptions_P95", "Block_All_Redemptions_P99",
+		"Block_All_Unique_Proof_Mean_Bytes", "Block_All_Unique_Proof_P50_Bytes", "Block_All_Unique_Proof_P95_Bytes", "Block_All_Unique_Proof_P99_Bytes",
+		"Block_With_Redemption_N", "Block_With_Redemption_Redemptions_Mean", "Block_With_Redemption_Redemptions_P50", "Block_With_Redemption_Redemptions_P95", "Block_With_Redemption_Redemptions_P99",
+		"Block_With_Redemption_Unique_Proof_Mean_Bytes", "Block_With_Redemption_Unique_Proof_P50_Bytes", "Block_With_Redemption_Unique_Proof_P95_Bytes", "Block_With_Redemption_Unique_Proof_P99_Bytes",
+		"Block_Unique_Buckets_Total", "Block_Unique_Proof_Bytes_Total",
+	)
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
 	}
@@ -1348,47 +1426,52 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		blockCount: *traceStressBlocks,
 	}
 	var (
-		totalCounts               traceStressCounts
-		window                    traceStressWindow
-		totalParse                time.Duration
-		totalOpsDur               time.Duration
-		totalPrune                time.Duration
-		totalCommit               time.Duration
-		totalWrite                time.Duration
-		totalGets                 int64
-		totalPuts                 int64
-		totalDeletes              int64
-		totalAccess               traceStressAccessStats
-		totalAccessSample         time.Duration
-		totalClassificationFilter traceStressFilterStats
-		totalColdMaintenance      time.Duration
-		lastRoot                  []byte
-		prevCache                 = cacheDiagnostics()
-		initialUpdateDiag         = LastUpdateDiagnostics()
-		prevUpdateDiag            = initialUpdateDiag
-		prevMPTDiag               [10]int64
-		prevPruneDiag             [4]int64
-		prevGCPauseNs             uint64
-		prevGCNum                 uint32
-		started                   = time.Now()
-		totalBatches              int64
-		prunesDone                int64
-		nextPruneBlock            uint64
-		executedOperations        int64
-		proofLastCount            int64
-		proofLastBytes            int64
-		proofBlockNum             uint64
-		proofBlockAcc             int64
-		proofCountAcc             int64 // per-block resurrection count for the trailing open block (E2 v6)
-		proofBlockOpen            bool
-		proofBlockTotal           int64 // completed blocks carrying redemptions
-		proofBlockMax             int64 // global max single-block proof bytes
-		proofBlockReservoir       []int64
-		proofRedemptionSeen       int64
-		proofRedemptionReservoir  []int64
-		proofVerifyLastCount      int64
-		proofVerifyLastNanos      int64
-		proofRng                  = rand.New(rand.NewSource(20261004))
+		totalCounts                   traceStressCounts
+		window                        traceStressWindow
+		totalParse                    time.Duration
+		totalOpsDur                   time.Duration
+		totalPrune                    time.Duration
+		totalCommit                   time.Duration
+		totalWrite                    time.Duration
+		totalGets                     int64
+		totalPuts                     int64
+		totalDeletes                  int64
+		totalAccess                   traceStressAccessStats
+		totalAccessSample             time.Duration
+		totalClassificationFilter     traceStressFilterStats
+		totalColdMaintenance          time.Duration
+		lastRoot                      []byte
+		prevCache                     = cacheDiagnostics()
+		initialUpdateDiag             = LastUpdateDiagnostics()
+		prevUpdateDiag                = initialUpdateDiag
+		prevMPTDiag                   [10]int64
+		prevPruneDiag                 [4]int64
+		prevGCPauseNs                 uint64
+		prevGCNum                     uint32
+		started                       = time.Now()
+		totalBatches                  int64
+		prunesDone                    int64
+		nextPruneBlock                uint64
+		executedOperations            int64
+		proofLastCount                int64
+		proofLastBytes                int64
+		proofBlockNum                 uint64
+		proofBlockAcc                 int64
+		proofCountAcc                 int64 // per-block resurrection count for the trailing open block (E2 v6)
+		proofBlockOpen                bool
+		proofBlockTotal               int64 // completed blocks carrying redemptions
+		proofBlockMax                 int64 // global max single-block proof bytes
+		proofBlockReservoir           []int64
+		proofRedemptionSeen           int64
+		proofRedemptionReservoir      []int64
+		proofVerifyLastCount          int64
+		proofVerifyLastNanos          int64
+		proofRng                      = rand.New(rand.NewSource(20261004))
+		allBlockRedemptions           []int64
+		allBlockUniqueProofBytes      []int64
+		positiveBlockRedemptions      []int64
+		positiveBlockUniqueProofBytes []int64
+		totalUniqueProofBuckets       int64
 	)
 	pruneOne := func() (time.Duration, error) {
 		if *traceStressDisableArchive {
@@ -1403,6 +1486,10 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	}
 
 	flushWindow := func(batchNumber int64) {
+		vc, vn := MPTRedemptionVerifyStats()
+		window.proofVerifyCount = vc - proofVerifyLastCount
+		window.proofVerify = time.Duration(vn - proofVerifyLastNanos)
+		proofVerifyLastCount, proofVerifyLastNanos = vc, vn
 		cache := cacheDiagnostics()
 		window.stemHits = cache.Hits - prevCache.Hits
 		window.stemMisses = cache.Misses - prevCache.Misses
@@ -1410,6 +1497,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		prevCache = cache
 		measured := window.operations + window.prune + window.intermediate + window.intermediateWrite + window.commit + window.write
 		comparative := window.operations + window.commit + window.write
+		if *traceStressMPTVerifyAtCommit {
+			comparative -= window.proofVerify
+		}
 		archiveMaint := window.prune + window.intermediate + window.intermediateWrite
 		opsPerSec := float64(0)
 		if comparative > 0 {
@@ -1492,10 +1582,6 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		// Redemption-proof telemetry: sampled full-node audit delta, plus the
 		// window's per-block proof percentiles (the trailing open block is
 		// carried into the next window, so only completed blocks are ranked).
-		vc, vn := MPTRedemptionVerifyStats()
-		window.proofVerifyCount = vc - proofVerifyLastCount
-		window.proofVerify = time.Duration(vn - proofVerifyLastNanos)
-		proofVerifyLastCount, proofVerifyLastNanos = vc, vn
 		proofBlocksSorted := sortedInt64Copy(window.proofBlocks)
 		// E2 v6 exact histograms: drain the single resurrection-proof size and
 		// latency histograms and the filter-probe (cuckoo lookup) latency
@@ -1611,6 +1697,15 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			strconv.FormatInt(percentileInt64(sortedInt64Copy(window.proofCounts), .99), 10),
 			strconv.FormatInt(fullNodeDBBytes, 10), strconv.FormatInt(archiveDBBytes, 10),
 			strconv.FormatInt(pathBufferedBytes, 10), strconv.FormatInt(pathDiffBytes, 10),
+		}
+		if *traceStressMPTVerifyAtCommit {
+			row = append(row, blockDistributionColumns(
+				window.blockRedemptionsAll, window.blockUniqueProofBytesAll,
+				window.blockRedemptionsPositive, window.blockUniqueProofBytesPositive,
+				window.blockUniqueBucketsTotal,
+			)...)
+		} else {
+			row = append(row, make([]string, 20)...)
 		}
 		prevGCPauseNs = mem.PauseTotalNs
 		prevGCNum = mem.NumGC
@@ -1754,6 +1849,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		}
 		snapMidCommit := LastCommitDiagnostics()
 		beforeUpdateDiag := LastUpdateDiagnostics()
+		blockProofStart, _, _, _ := MPTRedemptionProofStats()
 		opStart := time.Now()
 		batchAccessSampleDur := time.Duration(0)
 		for _, op := range ops {
@@ -1835,18 +1931,48 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				proofLastCount, proofLastBytes = pc, pb
 			}
 		}
+		if *traceStressMPTVerifyAtCommit {
+			blockProofEnd, _, _, _ := MPTRedemptionProofStats()
+			redemptions := blockProofEnd - blockProofStart
+			counter, ok := hotBackend.(interface{ PendingProofStats() (int64, int64) })
+			if !ok {
+				t.Fatal("MPT block verification has no distinct-proof counter")
+			}
+			buckets, uniqueBytes := counter.PendingProofStats()
+			if (redemptions == 0) != (buckets == 0) {
+				t.Fatalf("block %d: redemption/proof mismatch: %d redemptions, %d buckets", blockNumber, redemptions, buckets)
+			}
+			window.blockRedemptionsAll = append(window.blockRedemptionsAll, redemptions)
+			window.blockUniqueProofBytesAll = append(window.blockUniqueProofBytesAll, uniqueBytes)
+			allBlockRedemptions = append(allBlockRedemptions, redemptions)
+			allBlockUniqueProofBytes = append(allBlockUniqueProofBytes, uniqueBytes)
+			window.blockUniqueBucketsTotal += buckets
+			totalUniqueProofBuckets += buckets
+			if redemptions > 0 {
+				window.blockRedemptionsPositive = append(window.blockRedemptionsPositive, redemptions)
+				window.blockUniqueProofBytesPositive = append(window.blockUniqueProofBytesPositive, uniqueBytes)
+				positiveBlockRedemptions = append(positiveBlockRedemptions, redemptions)
+				positiveBlockUniqueProofBytes = append(positiveBlockUniqueProofBytes, uniqueBytes)
+			}
+		}
 		afterUpdateDiag := LastUpdateDiagnostics()
 		coldMaintenanceDur := time.Duration(afterUpdateDiag.ArchivePromotionNanos - beforeUpdateDiag.ArchivePromotionNanos)
 		if coldMaintenanceDur < 0 {
 			coldMaintenanceDur = 0
 		}
 		opDur := time.Since(opStart) - batchAccessSampleDur - coldMaintenanceDur
+		_, verifyBeforeNanos := MPTRedemptionVerifyStats()
 		commitStart := time.Now()
 		lastRoot, err = hotBackend.CommitToBatch(batch, *traceStressDestructiveCommit)
 		if err != nil {
 			t.Fatalf("batch %d commit: %v", batchNumber, err)
 		}
 		commitDur := time.Since(commitStart)
+		verifyBlockDur := time.Duration(0)
+		if *traceStressMPTVerifyAtCommit {
+			_, verifyAfterNanos := MPTRedemptionVerifyStats()
+			verifyBlockDur = time.Duration(verifyAfterNanos - verifyBeforeNanos)
+		}
 		diag := LastCommitDiagnostics()
 		// Per-phase attribution: the intermediate commit's staged bytes are
 		// archive maintenance; the final commit's staged bytes and phase
@@ -1877,7 +2003,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		window.write += writeDur
 		window.coldMaintenance += coldMaintenanceDur
 		window.batchWall = append(window.batchWall, time.Since(batchStart))
-		window.comparativeBatchWall = append(window.comparativeBatchWall, opDur+commitDur+writeDur)
+		window.comparativeBatchWall = append(window.comparativeBatchWall, opDur+commitDur+writeDur-verifyBlockDur)
 		window.rawBatchOps += diag.RawBatchOps
 		window.rawBatchBytes += diag.RawBatchBytes
 		totalOpsDur += opDur
@@ -1995,6 +2121,10 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	proofBlockGlobalSorted := sortedInt64Copy(proofBlockReservoir)
 	_, _, proofRedemptionMaxExact, _ := MPTRedemptionProofStats()
 	proofVerifyTotalCount, proofVerifyTotalNanos := MPTRedemptionVerifyStats()
+	verificationToExclude := time.Duration(0)
+	if *traceStressMPTVerifyAtCommit {
+		verificationToExclude = time.Duration(proofVerifyTotalNanos)
+	}
 	summary := map[string]any{
 		"status":                                "completed",
 		"finished_at":                           time.Now().Format(time.RFC3339),
@@ -2021,8 +2151,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"cold_maintenance_ms":                   float64(totalColdMaintenance) / float64(time.Millisecond),
 		"cold_maintenance_estimate_ms":          float64(coldMaintenanceEstimate) / float64(time.Millisecond),
 		"operations_excluding_cold_estimate_ms": float64(operationsExcludingColdEstimate) / float64(time.Millisecond),
-		"measured_ops_excluding_cold_estimate_per_s": opsPerSecond(totalCounts.total(), operationsExcludingColdEstimate+totalCommit+totalWrite),
-		"measured_ops_per_s":                         opsPerSecond(totalCounts.total(), totalOpsDur+totalCommit+totalWrite),
+		"measured_ops_excluding_cold_estimate_per_s": opsPerSecond(totalCounts.total(), operationsExcludingColdEstimate+totalCommit+totalWrite-verificationToExclude),
+		"measured_ops_per_s":                         opsPerSecond(totalCounts.total(), totalOpsDur+totalCommit+totalWrite-verificationToExclude),
 		"last_root":                                  common.BytesToHash(lastRoot).Hex(),
 		"state_bytes":                                finalSystemBytes,
 		"full_node_db_bytes":                         finalFullNodeDBBytes,
@@ -2058,6 +2188,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		// per-window percentiles in the CSV are exact; maxes are exact.
 		"redemption_proof": map[string]any{
 			"definition":              "bucket payload record + stub side record (ECMH audit payload)",
+			"bytes_total_scope":       "per-redemption traffic; repeated buckets are counted again here",
 			"redemptions":             proofLastCount,
 			"bytes_total":             proofLastBytes,
 			"redemption_p50_bytes":    percentileInt64(proofRedemptionSorted, .50),
@@ -2069,9 +2200,37 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			"block_p95_bytes":         percentileInt64(proofBlockGlobalSorted, .95),
 			"block_p99_bytes":         percentileInt64(proofBlockGlobalSorted, .99),
 			"block_max_bytes":         proofBlockMax,
-			"verify_samples":          proofVerifyTotalCount,
-			"verify_ms_total":         float64(proofVerifyTotalNanos) / float64(time.Millisecond),
-			"verify_avg_us":           traceStressRatio(proofVerifyTotalNanos, proofVerifyTotalCount) / 1e3,
+			"verify_samples": func() any {
+				if *traceStressMPTVerifyAtCommit {
+					return nil
+				}
+				return proofVerifyTotalCount
+			}(),
+			"verify_distinct_buckets": func() any {
+				if *traceStressMPTVerifyAtCommit {
+					return proofVerifyTotalCount
+				}
+				return nil
+			}(),
+			"verify_time_scope": func() string {
+				if *traceStressMPTVerifyAtCommit {
+					return "sum of per-block parallel-audit wall times"
+				}
+				return "sum of sampled in-Get audit times"
+			}(),
+			"verify_ms_total": float64(proofVerifyTotalNanos) / float64(time.Millisecond),
+			"verify_avg_us": func() any {
+				if *traceStressMPTVerifyAtCommit {
+					return nil // Parallel wall time is not an individual bucket latency.
+				}
+				return traceStressRatio(proofVerifyTotalNanos, proofVerifyTotalCount) / 1e3
+			}(),
+			"verify_wall_amortized_us_per_bucket": func() any {
+				if *traceStressMPTVerifyAtCommit {
+					return traceStressRatio(proofVerifyTotalNanos, proofVerifyTotalCount) / 1e3
+				}
+				return nil
+			}(),
 		},
 		"stem_path_diagnostics": updateDiag,
 		"stub_side_records": map[string]any{
@@ -2088,6 +2247,18 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"mpt_duplicate_archived_keys": MPTDuplicateArchivedKeys(),
 		"final_stats_ms":              float64(finalStatsDur) / float64(time.Millisecond),
 		"final_stats":                 finalStats,
+	}
+	if *traceStressMPTVerifyAtCommit {
+		if uint64(len(allBlockRedemptions)) != actualBlockCount || len(allBlockUniqueProofBytes) != len(allBlockRedemptions) {
+			t.Fatalf("block proof statistics cover %d of %d blocks", len(allBlockRedemptions), actualBlockCount)
+		}
+		summary["block_redemption_distributions"] = map[string]any{
+			"definition":              "one row per source block; proof bytes sum each distinct bucket's pre-redemption payload and stub metadata once within that block",
+			"quantiles":               "exact nearest-rank over the stated block population",
+			"all_blocks":              blockDistributionSummary(allBlockRedemptions, allBlockUniqueProofBytes),
+			"blocks_with_redemptions": blockDistributionSummary(positiveBlockRedemptions, positiveBlockUniqueProofBytes),
+			"distinct_buckets_total":  totalUniqueProofBuckets,
+		}
 	}
 	// G2 accounting: with the path backend the LevelDB directory size misses
 	// nodes still held in pathdb's write buffer and diff layers, so report the
