@@ -40,6 +40,7 @@ package mpt
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -618,11 +619,12 @@ func (t *Trie) markBucketDirtyLocked(b *bucket) {
 	t.dirtyBuckets = append(t.dirtyBuckets, b)
 }
 
-// bucketItem is the ECMH multiset element for one entry: k ‖ keccak(v).
+// bucketItem is the ECMH multiset element for one entry: k ‖ SHA-256(v).
 func bucketItem(key, value []byte) []byte {
 	item := make([]byte, 0, len(key)+32)
 	item = append(item, key...)
-	return append(item, crypto.Keccak256(value)...)
+	valueHash := sha256.Sum256(value)
+	return append(item, valueHash[:]...)
 }
 
 // nibbleLCPLen returns the length of the longest common key prefix of the

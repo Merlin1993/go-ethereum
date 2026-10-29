@@ -2,13 +2,13 @@ package archive
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/trie/archive/cuckoo"
 	"github.com/ethereum/go-ethereum/trie/archive/ecmh"
 )
@@ -230,15 +230,15 @@ func valueRefForKeyValue(key []byte, value []byte) []byte {
 	n = binary.PutUvarint(scratch[:], uint64(len(value)))
 	buf = append(buf, scratch[:n]...)
 	buf = append(buf, value...)
-	h := crypto.Keccak256Hash(buf)
-	return h.Bytes()
+	h := sha256.Sum256(buf)
+	return h[:]
 }
 
 func (s *Shard) archivePointHash(bucket *ArchiveBucketNode, key ArchivedKey, valueRef []byte, keyBuf []byte, hashBuf []byte) (common.Hash, []byte, []byte) {
 	fullKey, fullBits := s.prependPath(key.Suffix, key.SuffixBits, bucket.Path, bucket.PathBits)
 	keyWithLen := appendArchiveItemKey(keyBuf, fullBits, fullKey)
 	hashInput := appendArchiveItemHashInput(hashBuf, keyWithLen, valueRef)
-	return crypto.Keccak256Hash(hashInput), keyWithLen, hashInput
+	return sha256.Sum256(hashInput), keyWithLen, hashInput
 }
 
 func (s *Shard) bucketKeys(bucket *ArchiveBucketNode) ([]ArchivedKey, error) {

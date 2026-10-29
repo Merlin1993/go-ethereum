@@ -34,6 +34,7 @@ var (
 	traceStressBaseDir                    = flag.String("traceStressBaseDir", "", "Fresh output directory for TestArchiveStemTraceStress")
 	traceStressOps                        = flag.Int64("traceStressOps", 100000000, "Maximum ordered trace operations; zero is unlimited when a block boundary is set")
 	traceStressBatchSize                  = flag.Int("traceStressBatchSize", 4000, "Trace operations per prune/commit cycle")
+	traceStressBatchByBlock               = flag.Bool("traceStressBatchByBlock", false, "Commit once per source block, including blocks without trace records")
 	traceStressMetricsBatches             = flag.Int("traceStressMetricsBatches", 250, "Commit batches per metrics row")
 	traceStressStartFile                  = flag.Int("traceStressStartFile", 0, "Zero-based sorted trace shard index to start from")
 	traceStressFileLimit                  = flag.Int("traceStressFileLimit", 0, "Maximum trace shards to read; zero uses all remaining shards")
@@ -599,6 +600,8 @@ type traceStressSelection struct {
 	started         bool
 	firstBlock      uint64
 	lastBlock       uint64
+	nextBlock       uint64
+	pending         *traceStressOp
 	reachedEOF      bool
 	reachedEndBlock bool
 }
@@ -641,6 +644,133 @@ func (s *traceStressSelection) collect(reader *traceStressReader, limit int, rem
 		}
 	}
 	return ops, false, nil
+}
+
+// collectBlock returns exactly one source block. A pending record is retained
+// across calls, and gaps in the trace produce empty blocks so block-based
+// pruning and commits still advance once for every real block number.
+func (s *traceStressSelection) collectBlock(reader *traceStressReader) (uint64, []traceStressOp, bool, error) {
+	if !s.started {
+		for {
+			op, err := reader.Read()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					s.reachedEOF = true
+					return 0, nil, true, nil
+				}
+				return 0, nil, false, err
+			}
+			if op.block < s.startBlock {
+				continue
+			}
+			s.started = true
+			s.firstBlock = op.block
+			if s.startBlock > 0 {
+				s.firstBlock = s.startBlock
+			}
+			s.nextBlock = s.firstBlock
+			if s.blockCount > 0 {
+				s.endBlock = s.firstBlock + s.blockCount - 1
+			}
+			s.pending = &op
+			break
+		}
+	}
+	block := s.nextBlock
+	if s.endBlock > 0 && block > s.endBlock {
+		s.reachedEndBlock = true
+		return 0, nil, true, nil
+	}
+	var ops []traceStressOp
+	for {
+		var op traceStressOp
+		if s.pending != nil {
+			op = *s.pending
+			s.pending = nil
+		} else {
+			var err error
+			op, err = reader.Read()
+			if err != nil {
+				if errors.Is(err, io.EOF) {
+					s.reachedEOF = true
+					s.lastBlock = block
+					s.nextBlock = block + 1
+					if s.endBlock > 0 && block == s.endBlock {
+						s.reachedEndBlock = true
+					}
+					return block, ops, true, nil
+				}
+				return 0, nil, false, err
+			}
+		}
+		if op.block < block {
+			return 0, nil, false, fmt.Errorf("out-of-order source block %d after block %d", op.block, block)
+		}
+		if op.block > block {
+			s.pending = &op
+			s.lastBlock = block
+			s.nextBlock = block + 1
+			if s.endBlock > 0 && block == s.endBlock {
+				s.reachedEndBlock = true
+				return block, ops, true, nil
+			}
+			return block, ops, false, nil
+		}
+		ops = append(ops, op)
+	}
+}
+
+func TestTraceStressCollectBlock(t *testing.T) {
+	dir := t.TempDir()
+	file, err := os.Create(filepath.Join(dir, "state_access_trace_000000001_000000004.csv.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(file)
+	writer := csv.NewWriter(gz)
+	if err := writer.Write(strings.Split(traceStressHeader, ",")); err != nil {
+		t.Fatal(err)
+	}
+	for _, block := range []uint64{1, 2, 4} {
+		count := 1
+		if block == 2 {
+			count = 4101 // A large block must never split at the old 4000-op limit.
+		}
+		for i := 0; i < count; i++ {
+			if err := writer.Write([]string{strconv.FormatUint(block, 10), "0", strconv.Itoa(i), "account", "0x0000000000000000000000000000000000001234", "", "read", common.Hash{}.Hex(), "32"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := newTraceStressReader(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	selection := traceStressSelection{startBlock: 1, endBlock: 4}
+	for _, want := range []struct {
+		block uint64
+		count int
+		end   bool
+	}{{1, 1, false}, {2, 4101, false}, {3, 0, false}, {4, 1, true}} {
+		block, ops, end, err := selection.collectBlock(reader)
+		if err != nil || block != want.block || len(ops) != want.count || end != want.end {
+			t.Fatalf("block=%d ops=%d end=%t err=%v; want %+v", block, len(ops), end, err, want)
+		}
+	}
+	if !selection.reachedEndBlock {
+		t.Fatal("end block was not reached")
+	}
 }
 
 func durationMS(d time.Duration) string {
@@ -901,6 +1031,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	if blockBoundary && *traceStressOps != 0 {
 		t.Fatal("use traceStressOps=0 with traceStressEndBlock or traceStressBlocks so a block range is never truncated")
 	}
+	if *traceStressBatchByBlock && !blockBoundary {
+		t.Fatal("traceStressBatchByBlock requires traceStressEndBlock or traceStressBlocks")
+	}
 	if *traceStressEndBlock > 0 && *traceStressBlocks > 0 {
 		t.Fatal("traceStressEndBlock and traceStressBlocks are mutually exclusive")
 	}
@@ -990,6 +1123,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"end_block":                *traceStressEndBlock,
 		"block_count":              *traceStressBlocks,
 		"batch_size":               *traceStressBatchSize,
+		"batch_by_block":           *traceStressBatchByBlock,
 		"metrics_batches":          *traceStressMetricsBatches,
 		"shard_depth":              *traceStressShardDepth,
 		"stem_mode":                *traceStressStemMode,
@@ -1522,11 +1656,22 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		if *traceStressOps == 0 {
 			remaining = 0
 		}
-		ops, reachedBoundary, err := selection.collect(reader, *traceStressBatchSize, remaining)
+		var ops []traceStressOp
+		var blockNumber uint64
+		var reachedBoundary bool
+		var err error
+		if *traceStressBatchByBlock {
+			blockNumber, ops, reachedBoundary, err = selection.collectBlock(reader)
+		} else {
+			ops, reachedBoundary, err = selection.collect(reader, *traceStressBatchSize, remaining)
+			if len(ops) > 0 {
+				blockNumber = ops[0].block
+			}
+		}
 		if err != nil {
 			t.Fatalf("batch %d parse: %v", batchNumber, err)
 		}
-		if len(ops) == 0 {
+		if blockNumber == 0 {
 			if !selection.started {
 				t.Fatalf("no trace records at or after traceStressStartBlock=%d", *traceStressStartBlock)
 			}
@@ -1534,14 +1679,21 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		}
 		totalBatches = batchNumber
 		if metadata["effective_start_block"] == nil {
-			metadata["effective_start_block"] = ops[0].block
-			metadata["start_block"] = ops[0].block
+			metadata["effective_start_block"] = blockNumber
+			metadata["start_block"] = blockNumber
 			if err := writeTraceStressJSON(filepath.Join(*traceStressBaseDir, "metadata.json"), metadata); err != nil {
 				t.Fatal(err)
 			}
 		}
-		window.firstBlock = ops[0].block
-		window.lastBlock = ops[len(ops)-1].block
+		if *traceStressBatchByBlock {
+			if window.firstBlock == 0 {
+				window.firstBlock = blockNumber
+			}
+			window.lastBlock = blockNumber
+		} else {
+			window.firstBlock = ops[0].block
+			window.lastBlock = ops[len(ops)-1].block
+		}
 		for _, op := range ops {
 			window.counts.add(op.operation)
 			totalCounts.add(op.operation)

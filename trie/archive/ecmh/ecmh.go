@@ -314,18 +314,7 @@ func (c *Committer) hashesToJacobianSum(hashes []common.Hash, negate bool) secp2
 }
 
 func (c *Committer) hashToJacobianPoint(h common.Hash) secp256k1.JacobianPoint {
-	data := h
-	var compressed [33]byte
-	compressed[0] = 0x02 // even-y compressed key, matching the previous deterministic choice.
-	for {
-		copy(compressed[1:], data[:])
-		if key, err := secp256k1.ParsePubKey(compressed[:]); err == nil {
-			var point secp256k1.JacobianPoint
-			key.AsJacobian(&point)
-			return point
-		}
-		data = crypto.Keccak256Hash(data[:])
-	}
+	return hashToRFC9380JacobianPoint(h)
 }
 
 func (c *Committer) hashToPoint(h common.Hash) (x, y *big.Int) {
@@ -335,32 +324,6 @@ func (c *Committer) hashToPoint(h common.Hash) (x, y *big.Int) {
 	point.X.PutBytes(&xBytes)
 	point.Y.PutBytes(&yBytes)
 	return new(big.Int).SetBytes(xBytes[:]), new(big.Int).SetBytes(yBytes[:])
-}
-
-// hashToPoint 使用 "Try-and-increment" 方法将哈希映射到 secp256k1 曲线上的点。
-func (c *Committer) hashToPointBigInt(h common.Hash) (x, y *big.Int) {
-	data := h[:]
-	for {
-		x = new(big.Int).SetBytes(data)
-		if x.Cmp(c.p) < 0 {
-			// 计算 y^2 = (x^3 + 7) % p
-			x3 := new(big.Int).Mul(x, x)
-			x3.Mul(x3, x)
-			x3.Add(x3, big.NewInt(7))
-			x3.Mod(x3, c.p)
-
-			y = new(big.Int).ModSqrt(x3, c.p)
-			if y != nil {
-				// 确定性地选择 y。选择偶数 y 以保证唯一性。
-				if y.Bit(0) != 0 {
-					y.Sub(c.p, y)
-				}
-				return x, y
-			}
-		}
-		// 如果不满足条件，则对哈希再次取哈希，尝试下一个 x
-		data = crypto.Keccak256(data)
-	}
 }
 
 // encode 将曲线上的点编码为压缩格式（33 字节）。

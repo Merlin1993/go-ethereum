@@ -19,7 +19,7 @@
 //
 // A bucket commitment is the secp256k1 point sum
 //
-//	C_ECMH = Σ H_c(k ‖ hash(v))
+//	C_ECMH = Σ H_c(SHA-256(k ‖ SHA-256(v)))
 //
 // over all items in the bucket, where each item is the 64-byte concatenation
 // of a 32-byte key k and the 32-byte value hash hash(v). Because elliptic
@@ -40,10 +40,11 @@
 package ecmh
 
 import (
-	"math/big"
+	"crypto/sha256"
+
+	bytemaresecp256k1 "github.com/bytemare/secp256k1"
 
 	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
-	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // Commitment is an ECMH multiset commitment: a 33-byte compressed secp256k1
@@ -52,37 +53,19 @@ import (
 // canonical infinity representation.
 type Commitment [33]byte
 
-// curveP is the secp256k1 field prime p = 2^256 - 2^32 - 977.
-var curveP = secp256k1.S256().Params().P
+// mptRFC9380DST separates this MPT archive format from other hash-to-curve uses.
+// Changing it invalidates every nonempty MPT archive bucket commitment.
+const mptRFC9380DST = "AMT-MPT-ECMH-v1-secp256k1_XMD:SHA-256_SSWU_RO_"
 
-// HashToCurve deterministically maps arbitrary data to a point on secp256k1
-// using try-and-increment: x starts at keccak256(data) and is incremented
-// (mod p) until x³+7 is a quadratic residue, i.e. until 0x02‖x is a valid
-// compressed public key. The even-y root is always selected (0x02 prefix),
-// fixing the sign ambiguity deterministically. Returns the 33-byte compressed
-// encoding of the point.
+// HashToCurve hashes the fixed-format item to 32 bytes and applies the RFC 9380
+// secp256k1 random-oracle suite. Ordinary points retain 33-byte compression.
 func HashToCurve(data []byte) (pointBytes33 []byte) {
-	x := new(big.Int).SetBytes(crypto.Keccak256(data))
-	x.Mod(x, curveP)
-	var compressed [33]byte
-	compressed[0] = 0x02 // even-y compressed key: deterministic sign choice.
-	for {
-		xBytes := x.Bytes()
-		copy(compressed[1+32-len(xBytes):], xBytes)
-		// Clear the tail in case a previous iteration left longer bytes.
-		if len(xBytes) < 32 {
-			for i := 1; i < 1+32-len(xBytes); i++ {
-				compressed[i] = 0
-			}
-		}
-		if _, err := secp256k1.ParsePubKey(compressed[:]); err == nil {
-			out := make([]byte, 33)
-			copy(out, compressed[:])
-			return out
-		}
-		x.Add(x, big.NewInt(1))
-		x.Mod(x, curveP)
+	digest := sha256.Sum256(data)
+	point, err := bytemaresecp256k1.HashToGroup(digest[:], []byte(mptRFC9380DST))
+	if err != nil {
+		panic(err) // The fixed, nonempty DST makes its only documented error impossible.
 	}
+	return point.Encode()
 }
 
 // itemPoint hashes one item to a Jacobian curve point. The item is expected
