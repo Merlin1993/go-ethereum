@@ -51,6 +51,58 @@ func TestBlockAuditDeduplicatesBucketAndCommits(t *testing.T) {
 	}
 }
 
+func TestBucketReadIOIsSeparateFromPromotionAndAudit(t *testing.T) {
+	db := &testStore{memorydb.New()}
+	tr := newTestTrie(t, db, true)
+	key := []byte{0x00, 0x11}
+	if err := tr.Put(key, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	expirePrune(t, tr, 0)
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	tr.config.VerifyAtCommit = true
+	resetHandles := func() {
+		tr.buckets = make(map[string]*bucket)
+		tr.archiveLRU.Init()
+		tr.residentEntries = 0
+	}
+	resetHandles()
+	beforeIO := archivetrie.CurrentMPTBucketReadIOStats()
+	if _, archived, err := tr.GetValueRef(key); err != nil || !archived {
+		t.Fatalf("classification read: archived=%t err=%v", archived, err)
+	}
+	if got := archivetrie.CurrentMPTBucketReadIOStats().Sub(beforeIO); got.MetaReads != 0 || got.PayloadReads != 0 {
+		t.Fatalf("classification read polluted foreground bucket IO: %+v", got)
+	}
+	resetHandles()
+	verifyBefore, _ := archivetrie.MPTRedemptionVerifyStats()
+	promotionBefore := archivetrie.LastUpdateDiagnostics().ArchiveReadPromotionCalls
+	if got, err := tr.Get(key); err != nil || !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("Get = %q, %v", got, err)
+	}
+	io := archivetrie.CurrentMPTBucketReadIOStats().Sub(beforeIO)
+	if io.MetaReads != 1 || io.PayloadReads != 1 || io.MetaNanos < 0 || io.PayloadNanos < 0 {
+		t.Fatalf("executed Get bucket IO = %+v", io)
+	}
+	if archivetrie.LastUpdateDiagnostics().ArchiveReadPromotionCalls != promotionBefore+1 {
+		t.Fatal("read promotion was not recorded separately")
+	}
+	if count, _ := archivetrie.MPTRedemptionVerifyStats(); count != verifyBefore {
+		t.Fatal("audit ran during Get")
+	}
+	if _, err := tr.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if count, _ := archivetrie.MPTRedemptionVerifyStats(); count != verifyBefore+1 {
+		t.Fatalf("committed bucket audits = %d, want %d", count, verifyBefore+1)
+	}
+}
+
 func TestBlockAuditFailureRollsBackSpeculativeRedemption(t *testing.T) {
 	for _, backend := range []string{BackendHash, BackendPath} {
 		t.Run(backend, func(t *testing.T) {

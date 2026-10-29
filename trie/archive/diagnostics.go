@@ -2096,6 +2096,51 @@ func RecordMPTReadPromotion(elapsed time.Duration, hit bool) {
 	recordArchiveReadPromotion(elapsed, hit)
 }
 
+// MPTBucketReadIOStats counts KV Get calls made by executed MPT Get archive
+// probes. It excludes classification reads, pruning, decoding, and hot-tree
+// node reads. A DB Get may be served from cache rather than physical storage.
+type MPTBucketReadIOStats struct {
+	MetaReads, MetaNanos       int64
+	PayloadReads, PayloadNanos int64
+}
+
+func (s MPTBucketReadIOStats) Sub(previous MPTBucketReadIOStats) MPTBucketReadIOStats {
+	return MPTBucketReadIOStats{
+		MetaReads: s.MetaReads - previous.MetaReads, MetaNanos: s.MetaNanos - previous.MetaNanos,
+		PayloadReads: s.PayloadReads - previous.PayloadReads, PayloadNanos: s.PayloadNanos - previous.PayloadNanos,
+	}
+}
+
+func (s MPTBucketReadIOStats) TotalNanos() int64 { return s.MetaNanos + s.PayloadNanos }
+
+var (
+	mptBucketMetaReads, mptBucketMetaNanos       int64
+	mptBucketPayloadReads, mptBucketPayloadNanos int64
+)
+
+// RecordMPTBucketReadIO publishes only the KV reads from one executed Get's
+// archive probe. The caller's timer does not include payload decoding.
+func RecordMPTBucketReadIO(metaReads, metaNanos, payloadReads, payloadNanos int64) {
+	if metaReads == 0 && payloadReads == 0 {
+		return
+	}
+	if metaReads != 0 {
+		atomic.AddInt64(&mptBucketMetaReads, metaReads)
+		atomic.AddInt64(&mptBucketMetaNanos, metaNanos)
+	}
+	if payloadReads != 0 {
+		atomic.AddInt64(&mptBucketPayloadReads, payloadReads)
+		atomic.AddInt64(&mptBucketPayloadNanos, payloadNanos)
+	}
+}
+
+func CurrentMPTBucketReadIOStats() MPTBucketReadIOStats {
+	return MPTBucketReadIOStats{
+		MetaReads: atomic.LoadInt64(&mptBucketMetaReads), MetaNanos: atomic.LoadInt64(&mptBucketMetaNanos),
+		PayloadReads: atomic.LoadInt64(&mptBucketPayloadReads), PayloadNanos: atomic.LoadInt64(&mptBucketPayloadNanos),
+	}
+}
+
 // ---- Redemption proof telemetry (two-party simulation) ----
 // Each read-triggered resurrection reports the size of the verification
 // payload: the bytes the archive node hands the full node so the full node

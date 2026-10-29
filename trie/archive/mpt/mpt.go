@@ -275,6 +275,9 @@ type Trie struct {
 	// Config.ArchiveResidentEntries without walking the maps.
 	archiveLRU      *list.List
 	residentEntries int
+	// Timed KV reads for bucket side records and payloads. Get publishes only
+	// the delta of its own archive probe, excluding classification and pruning.
+	bucketIO bucketIOStats
 
 	// opTrace caches the MPT_OP_TRACE gate so the hot path pays one field
 	// load per instrumented section (plan item T4).
@@ -308,6 +311,11 @@ type Trie struct {
 	auditedPaths      map[string]struct{}
 	pendingProofBytes int64
 	checkpoint        committedState
+}
+
+type bucketIOStats struct {
+	metaReads, payloadReads int64
+	metaNanos, payloadNanos int64
 }
 
 type bucketAudit struct {
@@ -788,7 +796,10 @@ func (t *Trie) bucketForStubLocked(mountPath []byte, st *gethtrie.Stub) (*bucket
 	if b := t.buckets[string(st.Path)]; b != nil {
 		return b, nil
 	}
+	ioStart := time.Now()
 	data, err := optionalGet(t.db, stubMetaKey(st.Path))
+	t.bucketIO.metaReads++
+	t.bucketIO.metaNanos += time.Since(ioStart).Nanoseconds()
 	if err != nil {
 		return nil, err
 	}
@@ -814,6 +825,7 @@ func (t *Trie) bucketForStubLocked(mountPath []byte, st *gethtrie.Stub) (*bucket
 		commitment: commitment,
 		count:      count,
 		metaBytes:  data,
+		metaHash:   [32]byte(st.ContentHash),
 	}
 	t.buckets[string(st.Path)] = b
 	archivetrie.RecordMPTStubMetaFetch(int64(len(data)))
@@ -987,7 +999,10 @@ func (t *Trie) loadBucketLocked(b *bucket) error {
 		return nil
 	}
 	loadStart := t.opTraceStart()
+	ioStart := time.Now()
 	data, err := optionalGet(t.db, bucketKey(b.path))
+	t.bucketIO.payloadReads++
+	t.bucketIO.payloadNanos += time.Since(ioStart).Nanoseconds()
 	if err != nil {
 		return err
 	}
@@ -1679,7 +1694,12 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 	if t.opTrace {
 		opTrace.hotMisses.Add(1)
 	}
+	ioBefore := t.bucketIO
 	b, hits, value, fromArchive, err := t.archiveProbeLocked(key)
+	archivetrie.RecordMPTBucketReadIO(
+		t.bucketIO.metaReads-ioBefore.metaReads, t.bucketIO.metaNanos-ioBefore.metaNanos,
+		t.bucketIO.payloadReads-ioBefore.payloadReads, t.bucketIO.payloadNanos-ioBefore.payloadNanos,
+	)
 	if err != nil {
 		return nil, err
 	}

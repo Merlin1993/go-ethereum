@@ -326,15 +326,16 @@ type traceStressWindow struct {
 	access                        traceStressAccessStats
 	accessSample                  time.Duration
 	classificationFilter          traceStressFilterStats
-	proofRedemptions              int64         // read-activation redemptions in this window
-	proofBytes                    int64         // total redemption-proof bytes in this window
-	proofBlocks                   []int64       // completed per-block proof totals in this window
-	proofCounts                   []int64       // completed per-block resurrection counts in this window
-	proofVerifyCount              int64         // sampled full-node verification audits in this window
-	proofVerify                   time.Duration // sampled audit latency in this window
-	blockRedemptionsAll           []int64       // exact: every source block, including zeroes
-	blockUniqueProofBytesAll      []int64       // one proof per distinct redeemed bucket per block
-	blockRedemptionsPositive      []int64       // exact: blocks with at least one redemption
+	proofRedemptions              int64                // read-activation redemptions in this window
+	proofBytes                    int64                // total redemption-proof bytes in this window
+	proofBlocks                   []int64              // completed per-block proof totals in this window
+	proofCounts                   []int64              // completed per-block resurrection counts in this window
+	proofVerifyCount              int64                // sampled full-node verification audits in this window
+	proofVerify                   time.Duration        // sampled audit latency in this window
+	bucketIO                      MPTBucketReadIOStats // KV Gets for executed MPT Get probes only
+	blockRedemptionsAll           []int64              // exact: every source block, including zeroes
+	blockUniqueProofBytesAll      []int64              // one proof per distinct redeemed bucket per block
+	blockRedemptionsPositive      []int64              // exact: blocks with at least one redemption
 	blockUniqueProofBytesPositive []int64
 	blockUniqueBucketsTotal       int64
 	proofSizes                    []int64         // exact single-proof size histogram drained at window close (E2 v6)
@@ -1238,7 +1239,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"physical_delete":                false,
 		"value_rule":                     "32-byte value_hash; deterministic key/op hash when absent",
 		"storage_zero_hash_is_delete":    true,
-		"timing_scope":                   "Operations_Per_Sec includes archive bucket reads and read-triggered promotion; excludes parse, prune, access sampling, final stats, and block verification when enabled; raw Commit_ms includes block verification",
+		"timing_scope":                   "Operations_Per_Sec includes bucket KV Gets and read-triggered promotion; Excl_Bucket_IO variants subtract only timed bucket metadata/payload KV Gets; all variants exclude parse, prune, access sampling, final stats, and block verification when enabled",
+		"bucket_io_scope":                "KV Get wall time for bucket stub metadata and payload during executed MPT Get archive probes; cached DB Gets count, decoding and hot-tree node reads do not",
 		"command":                        strings.Join(os.Args, " "),
 	}
 	if err := writeTraceStressJSON(filepath.Join(*traceStressBaseDir, "metadata.json"), metadata); err != nil {
@@ -1412,6 +1414,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"Block_With_Redemption_N", "Block_With_Redemption_Redemptions_Mean", "Block_With_Redemption_Redemptions_P50", "Block_With_Redemption_Redemptions_P95", "Block_With_Redemption_Redemptions_P99",
 		"Block_With_Redemption_Unique_Proof_Mean_Bytes", "Block_With_Redemption_Unique_Proof_P50_Bytes", "Block_With_Redemption_Unique_Proof_P95_Bytes", "Block_With_Redemption_Unique_Proof_P99_Bytes",
 		"Block_Unique_Buckets_Total", "Block_Unique_Proof_Bytes_Total",
+		"MPT_Bucket_StubMeta_DB_Reads", "MPT_Bucket_StubMeta_DB_Get_ms",
+		"MPT_Bucket_Payload_DB_Reads", "MPT_Bucket_Payload_DB_Get_ms",
+		"Operations_Excl_Bucket_IO_Per_Sec", "Operations_Excl_Bucket_IO_And_Read_Promotion_Per_Sec",
 	)
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
@@ -1444,6 +1449,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		prevCache                     = cacheDiagnostics()
 		initialUpdateDiag             = LastUpdateDiagnostics()
 		prevUpdateDiag                = initialUpdateDiag
+		initialBucketIO               = CurrentMPTBucketReadIOStats()
+		prevBucketIO                  = initialBucketIO
 		prevMPTDiag                   [10]int64
 		prevPruneDiag                 [4]int64
 		prevGCPauseNs                 uint64
@@ -1486,6 +1493,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	}
 
 	flushWindow := func(batchNumber int64) {
+		currentBucketIO := CurrentMPTBucketReadIOStats()
+		window.bucketIO = currentBucketIO.Sub(prevBucketIO)
+		prevBucketIO = currentBucketIO
 		vc, vn := MPTRedemptionVerifyStats()
 		window.proofVerifyCount = vc - proofVerifyLastCount
 		window.proofVerify = time.Duration(vn - proofVerifyLastNanos)
@@ -1563,6 +1573,14 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		currentUpdateDiag := LastUpdateDiagnostics()
 		updateDiag := currentUpdateDiag.Sub(prevUpdateDiag)
 		prevUpdateDiag = currentUpdateDiag
+		throughput := func(elapsed time.Duration) float64 {
+			if elapsed <= 0 {
+				return 0
+			}
+			return float64(window.counts.total()) / elapsed.Seconds()
+		}
+		withoutBucketIO := comparative - time.Duration(window.bucketIO.TotalNanos())
+		withoutBucketIOAndPromotion := withoutBucketIO - time.Duration(updateDiag.ArchiveReadPromotionNanos)
 		curMPTDiag := [10]int64{diag.MPTStagedHotNodeBytes, diag.MPTStagedAggregateBytes, diag.MPTStagedArchiveBytes, diag.MPTStagedFlatBytes, diag.MPTStagedIndexBytes, diag.MPTNodeCacheGets, diag.MPTNodeCacheHits, diag.MPTStagedStubMetaBytes, diag.MPTStubMetaFetches, diag.MPTStubMetaFetchBytes}
 		for i := range curMPTDiag {
 			window.mptDiag[i] = curMPTDiag[i] - prevMPTDiag[i]
@@ -1707,6 +1725,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		} else {
 			row = append(row, make([]string, 20)...)
 		}
+		row = append(row,
+			strconv.FormatInt(window.bucketIO.MetaReads, 10), durationMS(time.Duration(window.bucketIO.MetaNanos)),
+			strconv.FormatInt(window.bucketIO.PayloadReads, 10), durationMS(time.Duration(window.bucketIO.PayloadNanos)),
+			strconv.FormatFloat(throughput(withoutBucketIO), 'f', 2, 64),
+			strconv.FormatFloat(throughput(withoutBucketIOAndPromotion), 'f', 2, 64),
+		)
 		prevGCPauseNs = mem.PauseTotalNs
 		prevGCNum = mem.NumGC
 		if err := metrics.Write(row); err != nil {
@@ -2124,6 +2148,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	proofBlockGlobalSorted := sortedInt64Copy(proofBlockReservoir)
 	_, _, proofRedemptionMaxExact, _ := MPTRedemptionProofStats()
 	proofVerifyTotalCount, proofVerifyTotalNanos := MPTRedemptionVerifyStats()
+	bucketIO := CurrentMPTBucketReadIOStats().Sub(initialBucketIO)
 	verificationToExclude := time.Duration(0)
 	if *traceStressMPTVerifyAtCommit {
 		verificationToExclude = time.Duration(proofVerifyTotalNanos)
@@ -2154,21 +2179,28 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"cold_maintenance_ms":                   float64(totalColdMaintenance) / float64(time.Millisecond),
 		"cold_maintenance_estimate_ms":          float64(coldMaintenanceEstimate) / float64(time.Millisecond),
 		"operations_excluding_cold_estimate_ms": float64(operationsExcludingColdEstimate) / float64(time.Millisecond),
-		"measured_ops_excluding_cold_estimate_per_s": opsPerSecond(totalCounts.total(), operationsExcludingColdEstimate+totalCommit+totalWrite-verificationToExclude),
-		"measured_ops_per_s":                         opsPerSecond(totalCounts.total(), totalOpsDur+totalCommit+totalWrite-verificationToExclude),
-		"last_root":                                  common.BytesToHash(lastRoot).Hex(),
-		"state_bytes":                                finalSystemBytes,
-		"full_node_db_bytes":                         finalFullNodeDBBytes,
-		"archive_db_bytes":                           finalArchiveDBBytes,
-		"archive_bytes":                              LastCommitDiagnostics().MPTArchivePayloadBytes,
-		"system_total_bytes":                         finalSystemBytes,
-		"stem_cache":                                 cache,
-		"access_sample":                              totalAccess,
-		"access_sample_every":                        *traceStressAccessSampleEvery,
-		"access_sample_ms":                           float64(totalAccessSample) / float64(time.Millisecond),
-		"access_average_ns":                          accessAverageNanos,
-		"hot_read_hit_rate":                          hotReadRate,
-		"read_archive_share":                         readArchiveShare,
+		"measured_ops_excluding_cold_estimate_per_s":                opsPerSecond(totalCounts.total(), operationsExcludingColdEstimate+totalCommit+totalWrite-verificationToExclude),
+		"measured_ops_per_s":                                        opsPerSecond(totalCounts.total(), totalOpsDur+totalCommit+totalWrite-verificationToExclude),
+		"measured_ops_excluding_bucket_io_per_s":                    opsPerSecond(totalCounts.total(), totalOpsDur+totalCommit+totalWrite-verificationToExclude-time.Duration(bucketIO.TotalNanos())),
+		"measured_ops_excluding_bucket_io_and_read_promotion_per_s": opsPerSecond(totalCounts.total(), totalOpsDur+totalCommit+totalWrite-verificationToExclude-time.Duration(bucketIO.TotalNanos())-time.Duration(updateDiag.ArchiveReadPromotionNanos)),
+		"bucket_read_io": map[string]any{
+			"scope":      "timed KV Get calls for bucket stub metadata and payload during executed MPT Get archive probes; excludes classification, pruning, decoding, and hot-tree node reads",
+			"meta_reads": bucketIO.MetaReads, "meta_ms": float64(bucketIO.MetaNanos) / float64(time.Millisecond),
+			"payload_reads": bucketIO.PayloadReads, "payload_ms": float64(bucketIO.PayloadNanos) / float64(time.Millisecond),
+		},
+		"last_root":           common.BytesToHash(lastRoot).Hex(),
+		"state_bytes":         finalSystemBytes,
+		"full_node_db_bytes":  finalFullNodeDBBytes,
+		"archive_db_bytes":    finalArchiveDBBytes,
+		"archive_bytes":       LastCommitDiagnostics().MPTArchivePayloadBytes,
+		"system_total_bytes":  finalSystemBytes,
+		"stem_cache":          cache,
+		"access_sample":       totalAccess,
+		"access_sample_every": *traceStressAccessSampleEvery,
+		"access_sample_ms":    float64(totalAccessSample) / float64(time.Millisecond),
+		"access_average_ns":   accessAverageNanos,
+		"hot_read_hit_rate":   hotReadRate,
+		"read_archive_share":  readArchiveShare,
 		"archive_filter_runtime": map[string]any{
 			"lookups":         workloadFilter.Lookups,
 			"negatives":       workloadFilter.Negatives,
