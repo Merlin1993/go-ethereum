@@ -1238,7 +1238,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"physical_delete":                false,
 		"value_rule":                     "32-byte value_hash; deterministic key/op hash when absent",
 		"storage_zero_hash_is_delete":    true,
-		"timing_scope":                   "Operations_Per_Sec excludes parse, prune, access sampling, synchronous cold maintenance, final stats, and block verification when enabled; raw Commit_ms includes block verification",
+		"timing_scope":                   "Operations_Per_Sec includes archive bucket reads and read-triggered promotion; excludes parse, prune, access sampling, final stats, and block verification when enabled; raw Commit_ms includes block verification",
 		"command":                        strings.Join(os.Args, " "),
 	}
 	if err := writeTraceStressJSON(filepath.Join(*traceStressBaseDir, "metadata.json"), metadata); err != nil {
@@ -1960,7 +1960,10 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		if coldMaintenanceDur < 0 {
 			coldMaintenanceDur = 0
 		}
-		opDur := time.Since(opStart) - batchAccessSampleDur - coldMaintenanceDur
+		// Bucket loads happen during Get's archive probe, and promotion is part
+		// of serving that Get. Keep both in foreground operation time; only
+		// access-classification sampling is removed here.
+		opDur := time.Since(opStart) - batchAccessSampleDur
 		_, verifyBeforeNanos := MPTRedemptionVerifyStats()
 		commitStart := time.Now()
 		lastRoot, err = hotBackend.CommitToBatch(batch, *traceStressDestructiveCommit)
