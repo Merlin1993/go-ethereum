@@ -55,6 +55,8 @@ var (
 	traceStressMPTIntermediateRoot        = flag.Bool("traceStressMPTIntermediateRoot", true, "AMT pipeline (mpt hot layer): commit the intermediate root right after pruning so prune dirt flushes in the archive-maintenance phase instead of bloating the final root's batch writes; prune+intermediate time is excluded from the counted operations+root time")
 	traceStressFinalStats                 = flag.Bool("traceStressFinalStats", true, "Run an exact structural scan after the workload")
 	traceStressAccessSampleEvery          = flag.Int64("traceStressAccessSampleEvery", 1000, "Sample logical hot/archive access state every N operations; zero disables")
+	traceStressProbeSampleOnlyTiming      = flag.Bool("traceStressProbeSampleOnlyTiming", false, "Diagnostic: time only sampled individual operations, instead of every operation")
+	traceStressProbeSkipProofAttribution  = flag.Bool("traceStressProbeSkipProofAttribution", false, "Diagnostic: skip per-operation proof attribution (proof block metrics become unavailable)")
 	traceStressActivateArchivedStemOnRead = flag.Bool("traceStressActivateArchivedStemOnRead", false, "Activate an archived stem when a read finds it")
 	traceStressActivateArchivedKeyOnRead  = flag.Bool("traceStressActivateArchivedKeyOnRead", false, "Activate an archived AMT key when a read finds it")
 	traceStressDisableArchive             = flag.Bool("traceStressDisableArchive", false, "Do not call PruneNextShard during the trace run")
@@ -307,6 +309,8 @@ type traceStressWindow struct {
 	counts                        traceStressCounts
 	gets, puts, deletes           int64
 	parse, operations             time.Duration
+	workingTrieOpens              int64
+	workingTrieOpen               time.Duration // successful opens inside counted operations/final commit only
 	prune, commit, write          time.Duration
 	intermediate                  time.Duration // intermediate-root commit (archive maintenance)
 	intermediateWrite             time.Duration // intermediate batch write (archive maintenance)
@@ -1239,7 +1243,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"physical_delete":                false,
 		"value_rule":                     "32-byte value_hash; deterministic key/op hash when absent",
 		"storage_zero_hash_is_delete":    true,
-		"timing_scope":                   "Operations_Per_Sec includes bucket KV Gets and read-triggered promotion; Excl_Bucket_IO variants subtract only timed bucket metadata/payload KV Gets; all variants exclude parse, prune, access sampling, final stats, and block verification when enabled",
+		"timing_scope":                   "Operations_Per_Sec includes bucket KV Gets and read-triggered promotion; Excl_Bucket_IO variants subtract only timed bucket metadata/payload KV Gets; Operations_Excl_Working_Trie_Open_Per_Sec subtracts only measured working-trie handle opens within counted operations/final commit, excluding opens in prune/intermediate commit/access sampling; all variants exclude parse, prune, access sampling, final stats, and block verification when enabled",
 		"bucket_io_scope":                "KV Get wall time for bucket stub metadata and payload during executed MPT Get archive probes; cached DB Gets count, decoding and hot-tree node reads do not",
 		"command":                        strings.Join(os.Args, " "),
 	}
@@ -1318,6 +1322,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	getValue := hotBackend.Get
 	putValue := hotBackend.Put
 	deleteValue := hotBackend.Delete
+	workingTrieOpenStats := func() (count, nanos int64) {
+		if recorder, ok := hotBackend.(interface{ WorkingTrieOpenStats() (int64, int64) }); ok {
+			return recorder.WorkingTrieOpenStats()
+		}
+		return 0, 0
+	}
 	cacheDiagnostics := func() StemCacheDiagnostics { return StemCacheDiagnostics{} }
 	classifyAccess := classifyTraceStressAccessAMT
 	if *traceStressStemMode {
@@ -1417,6 +1427,8 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"MPT_Bucket_StubMeta_DB_Reads", "MPT_Bucket_StubMeta_DB_Get_ms",
 		"MPT_Bucket_Payload_DB_Reads", "MPT_Bucket_Payload_DB_Get_ms",
 		"Operations_Excl_Bucket_IO_Per_Sec", "Operations_Excl_Bucket_IO_And_Read_Promotion_Per_Sec",
+		"Working_Trie_Open_Counted_N", "Working_Trie_Open_Counted_ms",
+		"Comparative_Excl_Working_Trie_Open_ms", "Operations_Excl_Working_Trie_Open_Per_Sec",
 	)
 	if err := metrics.Write(header); err != nil {
 		t.Fatal(err)
@@ -1581,6 +1593,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		}
 		withoutBucketIO := comparative - time.Duration(window.bucketIO.TotalNanos())
 		withoutBucketIOAndPromotion := withoutBucketIO - time.Duration(updateDiag.ArchiveReadPromotionNanos)
+		withoutWorkingTrieOpen := comparative - window.workingTrieOpen
 		curMPTDiag := [10]int64{diag.MPTStagedHotNodeBytes, diag.MPTStagedAggregateBytes, diag.MPTStagedArchiveBytes, diag.MPTStagedFlatBytes, diag.MPTStagedIndexBytes, diag.MPTNodeCacheGets, diag.MPTNodeCacheHits, diag.MPTStagedStubMetaBytes, diag.MPTStubMetaFetches, diag.MPTStubMetaFetchBytes}
 		for i := range curMPTDiag {
 			window.mptDiag[i] = curMPTDiag[i] - prevMPTDiag[i]
@@ -1730,6 +1743,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			strconv.FormatInt(window.bucketIO.PayloadReads, 10), durationMS(time.Duration(window.bucketIO.PayloadNanos)),
 			strconv.FormatFloat(throughput(withoutBucketIO), 'f', 2, 64),
 			strconv.FormatFloat(throughput(withoutBucketIOAndPromotion), 'f', 2, 64),
+			strconv.FormatInt(window.workingTrieOpens, 10), durationMS(window.workingTrieOpen),
+			durationMS(withoutWorkingTrieOpen),
+			strconv.FormatFloat(throughput(withoutWorkingTrieOpen), 'f', 2, 64),
 		)
 		prevGCPauseNs = mem.PauseTotalNs
 		prevGCNum = mem.NumGC
@@ -1874,8 +1890,10 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		snapMidCommit := LastCommitDiagnostics()
 		beforeUpdateDiag := LastUpdateDiagnostics()
 		blockProofStart, _, _, _ := MPTRedemptionProofStats()
+		opOpenCountBefore, opOpenNanosBefore := workingTrieOpenStats()
 		opStart := time.Now()
 		batchAccessSampleDur := time.Duration(0)
+		var sampledOpenCount, sampledOpenNanos int64
 		for _, op := range ops {
 			sample := *traceStressAccessSampleEvery > 0 &&
 				executedOperations%*traceStressAccessSampleEvery == 0
@@ -1883,20 +1901,30 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			var sampleErr error
 			if sample {
 				beforeSampleDiag := LastUpdateDiagnostics()
+				sampleOpenCountBefore, sampleOpenNanosBefore := workingTrieOpenStats()
 				sampleStart := time.Now()
 				fromArchive, sampleErr = classifyAccess(hotBackend, op.key)
 				sampleDur := time.Since(sampleStart)
+				sampleOpenCountAfter, sampleOpenNanosAfter := workingTrieOpenStats()
+				sampledOpenCount += sampleOpenCountAfter - sampleOpenCountBefore
+				sampledOpenNanos += sampleOpenNanosAfter - sampleOpenNanosBefore
 				window.classificationFilter.add(filterStatsFromDiagnostics(LastUpdateDiagnostics()).sub(filterStatsFromDiagnostics(beforeSampleDiag)))
 				window.accessSample += sampleDur
 				batchAccessSampleDur += sampleDur
 			}
-			executionStart := time.Now()
+			var executionStart time.Time
+			if sample || !*traceStressProbeSampleOnlyTiming {
+				executionStart = time.Now()
+			}
 			switch op.kind {
 			case traceStressGet:
 				window.gets++
 				totalGets++
 				_, err := getValue(op.key)
-				executionDur := time.Since(executionStart)
+				var executionDur time.Duration
+				if sample || !*traceStressProbeSampleOnlyTiming {
+					executionDur = time.Since(executionStart)
+				}
 				if sample {
 					window.access.add(op.kind, fromArchive, sampleErr, executionDur)
 				}
@@ -1907,7 +1935,10 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				window.puts++
 				totalPuts++
 				err := putValue(op.key, op.value)
-				executionDur := time.Since(executionStart)
+				var executionDur time.Duration
+				if sample || !*traceStressProbeSampleOnlyTiming {
+					executionDur = time.Since(executionStart)
+				}
 				if sample {
 					window.access.add(op.kind, fromArchive, sampleErr, executionDur)
 				}
@@ -1918,7 +1949,10 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				window.deletes++
 				totalDeletes++
 				err := deleteValue(op.key)
-				executionDur := time.Since(executionStart)
+				var executionDur time.Duration
+				if sample || !*traceStressProbeSampleOnlyTiming {
+					executionDur = time.Since(executionStart)
+				}
 				if sample {
 					window.access.add(op.kind, fromArchive, sampleErr, executionDur)
 				}
@@ -1930,29 +1964,31 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			// Redemption-proof attribution: diff the cumulative counters per
 			// op (a redemption fires inside Get) and charge the bytes to the
 			// op's block; block totals close on block change and at run end.
-			if pc, pb, _, plast := MPTRedemptionProofStats(); pc != proofLastCount {
-				d := pb - proofLastBytes
-				window.proofRedemptions += pc - proofLastCount
-				window.proofBytes += d
-				if !proofBlockOpen || proofBlockNum != op.block {
-					if proofBlockOpen {
-						window.proofBlocks = append(window.proofBlocks, proofBlockAcc)
-						window.proofCounts = append(window.proofCounts, proofCountAcc)
-						proofBlockTotal++
-						if proofBlockAcc > proofBlockMax {
-							proofBlockMax = proofBlockAcc
+			if !*traceStressProbeSkipProofAttribution {
+				if pc, pb, _, plast := MPTRedemptionProofStats(); pc != proofLastCount {
+					d := pb - proofLastBytes
+					window.proofRedemptions += pc - proofLastCount
+					window.proofBytes += d
+					if !proofBlockOpen || proofBlockNum != op.block {
+						if proofBlockOpen {
+							window.proofBlocks = append(window.proofBlocks, proofBlockAcc)
+							window.proofCounts = append(window.proofCounts, proofCountAcc)
+							proofBlockTotal++
+							if proofBlockAcc > proofBlockMax {
+								proofBlockMax = proofBlockAcc
+							}
+							proofReservoirAdd(&proofBlockReservoir, proofBlockAcc, proofBlockTotal, 1<<19, proofRng)
 						}
-						proofReservoirAdd(&proofBlockReservoir, proofBlockAcc, proofBlockTotal, 1<<19, proofRng)
+						proofBlockNum, proofBlockAcc, proofCountAcc, proofBlockOpen = op.block, 0, 0, true
 					}
-					proofBlockNum, proofBlockAcc, proofCountAcc, proofBlockOpen = op.block, 0, 0, true
+					proofBlockAcc += d
+					proofCountAcc += pc - proofLastCount
+					for i := int64(0); i < pc-proofLastCount; i++ {
+						proofRedemptionSeen++
+						proofReservoirAdd(&proofRedemptionReservoir, plast, proofRedemptionSeen, 1<<18, proofRng)
+					}
+					proofLastCount, proofLastBytes = pc, pb
 				}
-				proofBlockAcc += d
-				proofCountAcc += pc - proofLastCount
-				for i := int64(0); i < pc-proofLastCount; i++ {
-					proofRedemptionSeen++
-					proofReservoirAdd(&proofRedemptionReservoir, plast, proofRedemptionSeen, 1<<18, proofRng)
-				}
-				proofLastCount, proofLastBytes = pc, pb
 			}
 		}
 		if *traceStressMPTVerifyAtCommit {
@@ -1988,13 +2024,20 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		// of serving that Get. Keep both in foreground operation time; only
 		// access-classification sampling is removed here.
 		opDur := time.Since(opStart) - batchAccessSampleDur
+		opOpenCountAfter, opOpenNanosAfter := workingTrieOpenStats()
+		countedOpOpens := opOpenCountAfter - opOpenCountBefore - sampledOpenCount
+		countedOpOpenNanos := opOpenNanosAfter - opOpenNanosBefore - sampledOpenNanos
 		_, verifyBeforeNanos := MPTRedemptionVerifyStats()
+		commitOpenCountBefore, commitOpenNanosBefore := workingTrieOpenStats()
 		commitStart := time.Now()
 		lastRoot, err = hotBackend.CommitToBatch(batch, *traceStressDestructiveCommit)
 		if err != nil {
 			t.Fatalf("batch %d commit: %v", batchNumber, err)
 		}
 		commitDur := time.Since(commitStart)
+		commitOpenCountAfter, commitOpenNanosAfter := workingTrieOpenStats()
+		window.workingTrieOpens += countedOpOpens + commitOpenCountAfter - commitOpenCountBefore
+		window.workingTrieOpen += time.Duration(countedOpOpenNanos + commitOpenNanosAfter - commitOpenNanosBefore)
 		verifyBlockDur := time.Duration(0)
 		if *traceStressMPTVerifyAtCommit {
 			_, verifyAfterNanos := MPTRedemptionVerifyStats()

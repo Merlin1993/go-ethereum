@@ -239,6 +239,11 @@ type Trie struct {
 	hot   *gethtrie.Trie
 	root  common.Hash
 	block uint64
+	// Working-tree handle opens are tracked separately so the trace replay can
+	// report a throughput variant with the same timing boundary as native MPT.
+	// Background prune prefetch opens its own trie and is not counted here.
+	hotOpenCount atomic.Int64
+	hotOpenNanos atomic.Int64
 
 	dirty bool
 
@@ -635,9 +640,12 @@ func (t *Trie) ensureHotLocked() error {
 	if t.hot != nil {
 		return nil
 	}
+	start := time.Now()
 	if t.root == (common.Hash{}) {
 		t.hot = gethtrie.NewEmpty(t.ndb)
 		t.hot.SetEpochPolicy(t.epochForKeyLocked)
+		t.hotOpenNanos.Add(int64(time.Since(start)))
+		t.hotOpenCount.Add(1)
 		return nil
 	}
 	hot, err := gethtrie.New(t.root, common.Hash{}, t.ndb)
@@ -646,7 +654,15 @@ func (t *Trie) ensureHotLocked() error {
 	}
 	hot.SetEpochPolicy(t.epochForKeyLocked)
 	t.hot = hot
+	t.hotOpenNanos.Add(int64(time.Since(start)))
+	t.hotOpenCount.Add(1)
 	return nil
+}
+
+// WorkingTrieOpenStats returns cumulative successful working-tree handle
+// opens. It excludes the separate background prefetch trie.
+func (t *Trie) WorkingTrieOpenStats() (count, nanos int64) {
+	return t.hotOpenCount.Load(), t.hotOpenNanos.Load()
 }
 
 func (t *Trie) markDirtyLocked() { t.dirty = true }

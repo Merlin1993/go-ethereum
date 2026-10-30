@@ -88,6 +88,10 @@ func (h mptHotLayer) PendingProofStats() (buckets, proofBytes int64) {
 	return h.trie.PendingProofStats()
 }
 
+func (h mptHotLayer) WorkingTrieOpenStats() (count, nanos int64) {
+	return h.trie.WorkingTrieOpenStats()
+}
+
 func init() {
 	// Compile-time guarantee that the trace-stress harness's probe assertions
 	// (Flush / PathStats / BucketOccupancy) can never silently fail again:
