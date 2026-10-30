@@ -74,6 +74,7 @@ var (
 	traceStressMPTVerifyAtCommit          = flag.Bool("traceStressMPTVerifyAtCommit", false, "MPT: audit every distinct redeemed bucket before the block's final commit")
 	traceStressMPTVerifyBucketWorkers     = flag.Int("traceStressMPTVerifyBucketWorkers", 8, "MPT: concurrent bucket audit workers")
 	traceStressMPTVerifyItemWorkers       = flag.Int("traceStressMPTVerifyItemWorkers", 2, "MPT: concurrent item workers per bucket")
+	traceStressFullBucketsBeforeSplit     = flag.Int("traceStressFullBucketsBeforeSplit", 2, "Maximum full archive buckets at one logical prefix before creating a bucket one nibble deeper")
 	traceStatsBaseDir                     = flag.String("traceStatsBaseDir", "", "Existing TestArchiveStemTraceStress base directory for TestArchiveStemTraceStorageStats")
 	traceStatsRoot                        = flag.String("traceStatsRoot", "", "Final trie root for TestArchiveStemTraceStorageStats")
 	traceStatsOutput                      = flag.String("traceStatsOutput", "", "Output JSON path for TestArchiveStemTraceStorageStats")
@@ -354,6 +355,7 @@ type traceStressFilterStats struct {
 	Negatives      int64
 	Positives      int64
 	FalsePositives int64
+	HotMissQueries int64
 }
 
 // proofReservoirAdd keeps a uniform random sample of at most cap int64
@@ -448,6 +450,7 @@ func filterStatsFromDiagnostics(d UpdateDiagnostics) traceStressFilterStats {
 		Negatives:      d.ArchiveFilterNegatives,
 		Positives:      d.ArchiveFilterPositives,
 		FalsePositives: d.ArchiveFilterFalsePositives,
+		HotMissQueries: d.MPTHotMissQueries,
 	}
 }
 
@@ -456,6 +459,7 @@ func (s *traceStressFilterStats) add(other traceStressFilterStats) {
 	s.Negatives += other.Negatives
 	s.Positives += other.Positives
 	s.FalsePositives += other.FalsePositives
+	s.HotMissQueries += other.HotMissQueries
 }
 
 func (s traceStressFilterStats) sub(other traceStressFilterStats) traceStressFilterStats {
@@ -464,6 +468,7 @@ func (s traceStressFilterStats) sub(other traceStressFilterStats) traceStressFil
 		Negatives:      s.Negatives - other.Negatives,
 		Positives:      s.Positives - other.Positives,
 		FalsePositives: s.FalsePositives - other.FalsePositives,
+		HotMissQueries: s.HotMissQueries - other.HotMissQueries,
 	}
 }
 
@@ -613,6 +618,7 @@ type TraceHotTrieSpec struct {
 	ShardDepthBits            int
 	CuckooBuckets             int
 	CuckooSlots               int
+	FullBucketsBeforeSplit    int
 	ActivateArchivedKeyOnRead bool
 	Backend                   string
 	CleanCacheBytes           int
@@ -1119,6 +1125,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	if *traceStressPruneEveryBatches < 0 {
 		t.Fatal("traceStressPruneEveryBatches cannot be negative")
 	}
+	if *traceStressFullBucketsBeforeSplit < 1 {
+		t.Fatal("traceStressFullBucketsBeforeSplit must be positive")
+	}
 	if *traceStressPruneEveryBatches > 0 && *traceStressPruneEveryBlocks > 0 {
 		t.Fatal("traceStressPruneEveryBatches and traceStressPruneEveryBlocks are mutually exclusive")
 	}
@@ -1212,6 +1221,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"epoch_bitmap":              *traceStressHotLayer == "mpt",
 		"hot_value_layout":          map[bool]string{true: "inline", false: "flatref"}[*traceStressHotLayer == "mpt"],
 		"archive_bucket_capacity":   bucketCapacityMetadata(),
+		"full_buckets_before_split": *traceStressFullBucketsBeforeSplit,
 		"trie_backend":              *traceStressTrieBackend,
 		"clean_cache_mb":            *traceStressPathCleanCacheMB,
 		"write_buffer_mb":           *traceStressPathWriteBufferMB,
@@ -1301,6 +1311,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			ShardDepthBits:            *traceStressShardDepthBits,
 			CuckooBuckets:             *traceStressCuckooBuckets,
 			CuckooSlots:               *traceStressCuckooSlots,
+			FullBucketsBeforeSplit:    *traceStressFullBucketsBeforeSplit,
 			ActivateArchivedKeyOnRead: *traceStressActivateArchivedKeyOnRead,
 			Backend:                   *traceStressTrieBackend,
 			CleanCacheBytes:           *traceStressPathCleanCacheMB << 20,
@@ -1387,7 +1398,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"Sampled_Delete_Hot_ms", "Sampled_Delete_Archived_ms", "Sampled_Delete_Missing_ms",
 		"Sampled_Access_Errors", "Hot_Read_Hit_Rate", "Access_Sample_ms",
 		"Cold_Maintenance_ms",
-		"Archive_Filter_Lookups", "Archive_Filter_Negatives", "Archive_Filter_Positives", "Archive_Filter_False_Positives", "Runtime_Filter_FPR",
+		"Archive_Filter_Lookups", "Archive_Filter_Negatives", "Archive_Filter_Positives", "Archive_Filter_False_Positives", "Runtime_Filter_FPR", "Hot_Miss_Queries", "Hot_Miss_FP_Rate",
 		"Mutation_NonCold", "Archive_Promotion_Checks", "Archive_Promotion_Hits",
 		"Archive_Read_Promotion_Calls", "Archive_Read_Promotion_Hits", "Archive_Read_Promotion_ms",
 		"FlatValue_Gets", "FlatValue_Hits", "FlatValue_Misses",
@@ -1608,6 +1619,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		workloadFilter := filterStatsFromDiagnostics(updateDiag).sub(window.classificationFilter)
 		hotReadRate := traceStressRatio(window.access.ReadHot, sampledExistingReads)
 		runtimeFilterFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.Negatives)
+		hotMissFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.HotMissQueries)
 		archiveRoundCompleted := prunesDone / archiveRoundDomains
 		archiveRoundProgress := prunesDone % archiveRoundDomains
 		// Redemption-proof telemetry: sampled full-node audit delta, plus the
@@ -1672,6 +1684,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			strconv.FormatInt(workloadFilter.Lookups, 10), strconv.FormatInt(workloadFilter.Negatives, 10),
 			strconv.FormatInt(workloadFilter.Positives, 10), strconv.FormatInt(workloadFilter.FalsePositives, 10),
 			strconv.FormatFloat(runtimeFilterFPR*100, 'f', 6, 64),
+			strconv.FormatInt(workloadFilter.HotMissQueries, 10), strconv.FormatFloat(hotMissFPR*100, 'f', 6, 64),
 			strconv.FormatInt(window.puts+window.deletes-updateDiag.ArchivePromotionHits, 10), strconv.FormatInt(updateDiag.ArchivePromotionChecks, 10), strconv.FormatInt(updateDiag.ArchivePromotionHits, 10),
 			strconv.FormatInt(updateDiag.ArchiveReadPromotionCalls, 10), strconv.FormatInt(updateDiag.ArchiveReadPromotionHits, 10), durationMS(time.Duration(updateDiag.ArchiveReadPromotionNanos)),
 			strconv.FormatInt(updateDiag.FlatValueGets, 10), strconv.FormatInt(updateDiag.FlatValueGetHits, 10), strconv.FormatInt(updateDiag.FlatValueGetMisses, 10),
@@ -2131,6 +2144,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	hotReadRate := traceStressRatio(totalAccess.ReadHot, sampledExistingReads)
 	readArchiveShare := traceStressRatio(totalAccess.ReadArchived, sampledExistingReads)
 	runtimeFilterFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.Negatives)
+	hotMissFPR := traceStressRatio(workloadFilter.FalsePositives, workloadFilter.HotMissQueries)
 	average := func(total, count int64) float64 {
 		if count == 0 {
 			return 0
@@ -2245,11 +2259,13 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"hot_read_hit_rate":   hotReadRate,
 		"read_archive_share":  readArchiveShare,
 		"archive_filter_runtime": map[string]any{
-			"lookups":         workloadFilter.Lookups,
-			"negatives":       workloadFilter.Negatives,
-			"positives":       workloadFilter.Positives,
-			"false_positives": workloadFilter.FalsePositives,
-			"fpr":             runtimeFilterFPR,
+			"lookups":                      workloadFilter.Lookups,
+			"negatives":                    workloadFilter.Negatives,
+			"positives":                    workloadFilter.Positives,
+			"false_positives":              workloadFilter.FalsePositives,
+			"fpr":                          runtimeFilterFPR,
+			"hot_miss_queries":             workloadFilter.HotMissQueries,
+			"hot_miss_false_positive_rate": hotMissFPR,
 		},
 		"archive_read_promotion": map[string]any{
 			"calls":         updateDiag.ArchiveReadPromotionCalls,

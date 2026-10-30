@@ -325,6 +325,7 @@ type UpdateDiagnostics struct {
 	ArchiveFilterNegatives      int64
 	ArchiveFilterPositives      int64
 	ArchiveFilterFalsePositives int64
+	MPTHotMissQueries           int64
 	ValueRefCalls               int64
 	ValueRefLockWaitNanos       int64
 }
@@ -433,6 +434,7 @@ func (d UpdateDiagnostics) Sub(previous UpdateDiagnostics) UpdateDiagnostics {
 		ArchiveFilterNegatives:      d.ArchiveFilterNegatives - previous.ArchiveFilterNegatives,
 		ArchiveFilterPositives:      d.ArchiveFilterPositives - previous.ArchiveFilterPositives,
 		ArchiveFilterFalsePositives: d.ArchiveFilterFalsePositives - previous.ArchiveFilterFalsePositives,
+		MPTHotMissQueries:           d.MPTHotMissQueries - previous.MPTHotMissQueries,
 		ValueRefCalls:               d.ValueRefCalls - previous.ValueRefCalls,
 		ValueRefLockWaitNanos:       d.ValueRefLockWaitNanos - previous.ValueRefLockWaitNanos,
 	}
@@ -539,6 +541,7 @@ var (
 	updateArchiveFilterNegatives       int64
 	updateArchiveFilterPositives       int64
 	updateArchiveFilterFalsePositives  int64
+	updateMPTHotMissQueries            int64
 	updateStemPutLatencyBuckets        [latencyHistogramBuckets]int64
 	updateStemPutLatencyCount          int64
 	updateStemApplyLatencyBuckets      [latencyHistogramBuckets]int64
@@ -609,6 +612,7 @@ func LastUpdateDiagnostics() UpdateDiagnostics {
 		ArchiveFilterNegatives:      atomic.LoadInt64(&updateArchiveFilterNegatives),
 		ArchiveFilterPositives:      atomic.LoadInt64(&updateArchiveFilterPositives),
 		ArchiveFilterFalsePositives: atomic.LoadInt64(&updateArchiveFilterFalsePositives),
+		MPTHotMissQueries:           atomic.LoadInt64(&updateMPTHotMissQueries),
 	}
 	for i := range updateValueRefDiagnostics {
 		diag.ValueRefCalls += updateValueRefDiagnostics[i].calls.Load()
@@ -2217,6 +2221,12 @@ func RecordMPTFilterFalsePositive() {
 // sharded path already feeds via recordArchiveFilterLookup.
 func RecordMPTFilterLookup(positive bool) {
 	recordArchiveFilterLookup(positive)
+}
+
+// RecordMPTHotMissQuery counts one real Get that missed the hot MPT before
+// probing archive buckets. Sampling-only GetValueRef calls do not use it.
+func RecordMPTHotMissQuery() {
+	atomic.AddInt64(&updateMPTHotMissQueries, 1)
 }
 
 // ---- Resurrection proof / filter probe latency histograms (E2 v6) ----

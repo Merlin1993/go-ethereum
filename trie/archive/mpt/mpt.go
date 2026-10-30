@@ -187,6 +187,11 @@ type Config struct {
 	// BucketCapacity is the paper's M: maximum entries per archive bucket.
 	// Zero uses defaultBucketCapacity (100).
 	BucketCapacity int
+
+	// FullBucketsBeforeSplit is the number of buckets allowed at one logical
+	// prefix before a rejected append creates a bucket one nibble deeper.
+	// Zero uses the E2 default of two buckets per logical prefix.
+	FullBucketsBeforeSplit int
 }
 
 // defaultNodeCacheBytes is the fallback node cache budget for the hash backend.
@@ -209,10 +214,11 @@ type KeyValue struct {
 
 func defaultConfig() *Config {
 	return &Config{
-		ShardDepthBits: 16, // 65,536 domains, the previous 4-nibble default
-		CuckooBuckets:  32,
-		CuckooSlots:    4,
-		Backend:        BackendHash,
+		ShardDepthBits:         16, // 65,536 domains, the previous 4-nibble default
+		CuckooBuckets:          32,
+		CuckooSlots:            4,
+		Backend:                BackendHash,
+		FullBucketsBeforeSplit: 2,
 	}
 }
 
@@ -418,6 +424,9 @@ func New(root []byte, db archivetrie.KVStore, config *Config) (*Trie, error) {
 	}
 	if cfg.VerifyItemWorkers <= 0 {
 		cfg.VerifyItemWorkers = 2
+	}
+	if cfg.FullBucketsBeforeSplit <= 0 {
+		cfg.FullBucketsBeforeSplit = 2
 	}
 
 	t := &Trie{
@@ -1130,13 +1139,14 @@ func (t *Trie) cuckooSoftCap() int {
 	return t.config.CuckooBuckets * t.config.CuckooSlots * 7 / 8
 }
 
-// createBucketLocked mounts a fresh bucket holding entries at nodePath
-// (paper: forced compaction and partial-bucket materialization). It returns
+// createBucketLocked mounts a fresh bucket with an immutable logical nibble
+// prefix. MountStub may place it on a shallower physical node when the hot
+// trie has no branch at that prefix. It returns
 // the number of entries the bucket absorbed; the filter may saturate before
 // the batch runs out, in which case the bucket holds the absorbed prefix and
 // the caller rotates a fresh sibling for the remainder. This also caps
 // BucketCapacity at the filter's true slot count when M exceeds it.
-func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedEntry) (int, error) {
+func (t *Trie) createBucketLocked(logicalPath []byte, entries []gethtrie.ExtractedEntry) (int, error) {
 	filter := cuckoo.New(t.config.CuckooBuckets, t.config.CuckooSlots)
 	items := make([][]byte, 0, len(entries))
 	payload := make(map[string][]byte, len(entries))
@@ -1159,9 +1169,9 @@ func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedE
 		// from the absorbed entries so every key stays probe-visible.
 		filter = rebuildFilter(payload, t.config.CuckooBuckets, t.config.CuckooSlots)
 	}
-	path := make([]byte, len(nodePath)+8)
-	copy(path, nodePath)
-	binary.BigEndian.PutUint64(path[len(nodePath):], t.bucketSeq)
+	path := make([]byte, len(logicalPath)+8)
+	copy(path, logicalPath)
+	binary.BigEndian.PutUint64(path[len(logicalPath):], t.bucketSeq)
 	t.bucketSeq++
 	t.scheduleDirty = true // bucketSeq persists in the schedule record
 	prefixBuf, prefixBits := coveragePrefixBits(payload)
@@ -1176,7 +1186,7 @@ func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedE
 		dirty:        true,
 		payloadBytes: bucketRecordSize(payload),
 	}
-	mp, err := t.hot.MountStub(nodePath, b.stub())
+	mp, err := t.hot.MountStub(logicalPath, b.stub())
 	if err != nil {
 		return 0, err
 	}
@@ -1272,6 +1282,14 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 	}
 	if consumed == 0 {
 		if saturated {
+			// Insert may have displaced a resident fingerprint before it
+			// failed. Restore the authoritative filter even when no new key
+			// was consumed, then persist the restored stub anchor.
+			b.filter = rebuildFilter(b.entries, t.config.CuckooBuckets, t.config.CuckooSlots)
+			t.markBucketDirtyLocked(b)
+			if err := t.hot.ReplaceStub(b.mount, b.path, b.stub()); err != nil {
+				return 0, err
+			}
 			return 0, errBucketSaturated
 		}
 		return 0, nil // empty batch: nothing to rewrite
@@ -1331,118 +1349,151 @@ func (t *Trie) bucketDeleteLocked(b *bucket, key, value []byte) error {
 	return t.hot.ReplaceStub(b.mount, b.path, b.stub())
 }
 
-// canAppendAtMount permits a nearby underfull bucket to broaden its coverage
-// only inside its own logical domain and only while both keys traverse the
-// same mount node. The stored coverage is recomputed after a successful append.
-func (t *Trie) canAppendAtMount(b *bucket, key, mount []byte) bool {
-	if b.prefixBits == 0 || keyHasBitPrefix(key, &b.prefixBuf, b.prefixBits) {
-		return true
+// bucketLogicalPath is the immutable nibble prefix in the bucket identifier.
+// The final eight bytes are only a unique sequence number; the physical mount
+// returned by MountStub is stored separately in bucket.mount.
+func bucketLogicalPath(path []byte) []byte {
+	if len(path) < 8 {
+		return nil
 	}
-	depth := t.config.ShardDepthBits
-	return int(b.prefixBits) >= depth &&
-		keyHasBitPrefix(key, &b.prefixBuf, uint16(depth)) &&
-		commonNibblePrefix(b.prefixBuf[:], key) >= len(mount)
+	return path[:len(path)-8]
 }
 
-// mountEntriesLocked hangs the extracted batch on the tree (paper "Stub
-// Mounting"): existing non-full buckets at the mount point absorb first, a
-// remaining batch of at least M forces fresh full buckets, the remainder
-// pushes down by longest common prefix, and whatever cannot descend
-// materializes as a partial bucket at the deepest reachable node — the root
-// catch-all when the domain subtree has shrunk away entirely.
+func keyHasNibblePath(key, path []byte) bool {
+	if len(path) > len(key)*2 {
+		return false
+	}
+	for i, nibble := range path {
+		if i&1 == 0 {
+			if key[i/2]>>4 != nibble {
+				return false
+			}
+		} else if key[i/2]&0x0f != nibble {
+			return false
+		}
+	}
+	return true
+}
+
+// mountEntriesLocked places each expired state by its immutable logical
+// prefix. A matching bucket at the deepest prefix gets the first append
+// attempt; shallower buckets are fallback candidates. When all matching
+// buckets reject an entry, the deepest prefix may acquire another bucket up
+// to FullBucketsBeforeSplit. After that, the new bucket goes one nibble deeper
+// even when no physical branch exists there.
 func (t *Trie) mountEntriesLocked(domainPrefix []byte, entries []gethtrie.ExtractedEntry) error {
-	capacity := t.config.BucketCapacity
-	softCap := t.cuckooSoftCap()
-	nodePath := domainPrefix
-	rest := entries
-	for len(rest) > 0 {
-		mp, err := t.hot.MountPoint(nodePath)
-		if err != nil {
-			return err
+	// Extraction order is normally trie order, but sorting here makes bucket
+	// creation and filter insertion independent of traversal/cache details.
+	ordered := append([]gethtrie.ExtractedEntry(nil), entries...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return bytes.Compare(ordered[i].Key, ordered[j].Key) < 0
+	})
+	for _, entry := range ordered {
+		key := entry.Key
+		// A bit-granular domain may span two nibbles. Starting at ceil(D/4)
+		// keeps new buckets inside one domain without adding a physical node.
+		initialDepth := (t.config.ShardDepthBits + 3) / 4
+		if initialDepth < len(domainPrefix) || initialDepth > len(key)*2 {
+			return fmt.Errorf("mpt archive: invalid logical prefix depth %d for key %x", initialDepth, key)
 		}
-		nodePath = mp
-		stubs, err := t.hot.StubsAt(nodePath)
-		if err != nil {
-			return err
-		}
-		candidates := make([]*bucket, 0, len(stubs))
-		for _, st := range stubs {
-			b, err := t.bucketForStubLocked(nodePath, st)
+		initial := keyNibblesPrefix(key, initialDepth)
+		var candidates []*bucket
+		var walkErr error
+		err := t.hot.StubsOnPath(key, func(mountPath []byte, st *gethtrie.Stub) bool {
+			b, err := t.bucketForStubLocked(mountPath, st)
 			if err != nil {
-				return err
+				walkErr = err
+				return true
 			}
-			if min(capacity-b.count, softCap-b.count) > 0 {
-				candidates = append(candidates, b)
+			if len(b.path) < 8 {
+				walkErr = fmt.Errorf("mpt archive: malformed bucket identifier %x", b.path)
+				return true
 			}
-		}
-		// Prefer the bucket sharing the longest key prefix. Ties use the
-		// smaller bucket, then its stable path, so packing is reproducible.
-		sort.Slice(candidates, func(i, j int) bool {
-			a, b := candidates[i], candidates[j]
-			aScore := min(int(a.prefixBits), commonBitPrefixLen(a.prefixBuf[:], rest[0].Key))
-			bScore := min(int(b.prefixBits), commonBitPrefixLen(b.prefixBuf[:], rest[0].Key))
-			if aScore != bScore {
-				return aScore > bScore
+			logical := bucketLogicalPath(b.path)
+			if !keyHasNibblePath(key, logical) {
+				return false
 			}
-			if a.count != b.count {
-				return a.count < b.count
+			// Legacy E2 buckets may have a shorter-than-domain logical path.
+			// Keep their original bit-granular coverage when topping them up.
+			if len(logical)*4 < t.config.ShardDepthBits && b.prefixBits >= uint16(t.config.ShardDepthBits) &&
+				!keyHasBitPrefix(key, &b.prefixBuf, uint16(t.config.ShardDepthBits)) {
+				return false
 			}
-			return bytes.Compare(a.path, b.path) < 0
+			candidates = append(candidates, b)
+			return false
 		})
+		if err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return walkErr
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			pi, pj := bucketLogicalPath(candidates[i].path), bucketLogicalPath(candidates[j].path)
+			if len(pi) != len(pj) {
+				return len(pi) > len(pj)
+			}
+			return bytes.Compare(candidates[i].path, candidates[j].path) < 0
+		})
+		deepest := initial
+		appended := false
 		for _, b := range candidates {
-			if len(rest) == 0 {
-				break
+			if logical := bucketLogicalPath(b.path); len(logical) > len(deepest) {
+				deepest = logical
 			}
-			room := min(capacity-b.count, softCap-b.count)
-			n := 0
-			for n < room && n < len(rest) && t.canAppendAtMount(b, rest[n].Key, nodePath) {
-				n++
-			}
-			if n == 0 {
+			if b.count >= t.config.BucketCapacity || b.count >= t.cuckooSoftCap() {
+				// At the end of a fixed-width key there is no next nibble.
+				// A repeated archived key can still replace its old value
+				// without consuming a filter slot or increasing Count.
+				if len(bucketLogicalPath(b.path)) == len(key)*2 {
+					if err := t.loadBucketLocked(b); err != nil {
+						return err
+					}
+					if _, exists := b.entries[string(key)]; exists {
+						if _, err := t.bucketAppendLocked(b, []gethtrie.ExtractedEntry{entry}); err != nil {
+							return err
+						}
+						appended = true
+						break
+					}
+				}
 				continue
 			}
-			consumed, err := t.bucketAppendLocked(b, rest[:n])
-			rest = rest[consumed:]
+			consumed, err := t.bucketAppendLocked(b, []gethtrie.ExtractedEntry{entry})
 			if err != nil && !errors.Is(err, errBucketSaturated) {
 				return err
 			}
-			// Saturation: the bucket kept its prefix and is full for
-			// rotation purposes — fall through to the next stub at this
-			// mount, exactly like the room<=0 case.
-		}
-		if len(rest) == 0 {
-			break
-		}
-		for len(rest) >= capacity {
-			consumed, err := t.createBucketLocked(nodePath, rest[:capacity])
-			if err != nil {
-				return err
-			}
-			// createBucketLocked consumes at least one entry (an empty
-			// filter always accepts the first insert), but possibly fewer
-			// than capacity when the filter saturates: the next sibling
-			// picks up the remainder.
-			rest = rest[consumed:]
-		}
-		if len(rest) == 0 {
-			break
-		}
-		// Push down by longest common prefix of the remaining keys.
-		if lcp := nibbleLCPLen(rest); lcp > len(nodePath) {
-			mp2, err := t.hot.MountPoint(keyNibblesPrefix(rest[0].Key, lcp))
-			if err != nil {
-				return err
-			}
-			if len(mp2) > len(nodePath) {
-				nodePath = mp2
-				continue
+			if consumed == 1 {
+				appended = true
+				break
 			}
 		}
-		consumed, err := t.createBucketLocked(nodePath, rest)
-		if err != nil {
+		if appended {
+			continue
+		}
+		// The initial prefix has no bucket, or every matching bucket rejected
+		// the entry. Allow up to the configured number at the deepest logical
+		// prefix, then grow one nibble below it.
+		if len(candidates) > 0 && len(deepest) == len(key)*2 {
+			return fmt.Errorf("mpt archive: exhausted logical prefix for key %x", key)
+		}
+		newPath := initial
+		if len(candidates) > 0 && len(deepest) >= len(initial) {
+			atDeepest := 0
+			for _, b := range candidates {
+				if bytes.Equal(bucketLogicalPath(b.path), deepest) {
+					atDeepest++
+				}
+			}
+			if atDeepest < t.config.FullBucketsBeforeSplit {
+				newPath = bytes.Clone(deepest)
+			} else {
+				newPath = keyNibblesPrefix(key, len(deepest)+1)
+			}
+		}
+		if _, err := t.createBucketLocked(newPath, []gethtrie.ExtractedEntry{entry}); err != nil {
 			return err
 		}
-		rest = rest[consumed:]
 	}
 	return nil
 }
@@ -1493,6 +1544,15 @@ func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []*bucket, []byte, 
 		if err != nil {
 			walkErr = err
 			return true
+		}
+		if len(b.path) < 8 {
+			walkErr = fmt.Errorf("mpt archive: malformed bucket identifier %x", b.path)
+			return true
+		}
+		// Physical placement may be an ancestor of Bucket.Path. Check the
+		// immutable logical prefix before touching the Cuckoo filter.
+		if !keyHasNibblePath(key, bucketLogicalPath(b.path)) {
+			return false
 		}
 		if b.prefixBits > 0 && !keyHasBitPrefix(key, &b.prefixBuf, b.prefixBits) {
 			return false // coverage excludes the key: skip the filter lookup
@@ -1707,6 +1767,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 	if len(value) != 0 {
 		return bytes.Clone(value), nil
 	}
+	archivetrie.RecordMPTHotMissQuery()
 	if t.opTrace {
 		opTrace.hotMisses.Add(1)
 	}
@@ -2234,6 +2295,9 @@ func (t *Trie) ForEachPrefix(prefix []byte, prefixBits int, fn func(key, value [
 			}
 			b, err := t.bucketForStubLocked(mountPath, st)
 			if err != nil {
+				return
+			}
+			if len(b.path) < 8 || (len(prefix) > 0 && !pathIntersectsPrefix(bucketLogicalPath(b.path), prefix)) {
 				return
 			}
 			if err := t.loadBucketLocked(b); err != nil {

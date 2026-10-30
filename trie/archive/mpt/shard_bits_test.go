@@ -102,12 +102,15 @@ func TestMPTShardBitBoundarySplitD13(t *testing.T) {
 	}
 	// ... and only they moved: exactly the four epoch-0 A leaves are in the
 	// archive (the fresh A leaf and every B leaf stayed hot).
-	b := bucketOfKey(t, tr, keysA[0])
-	if b == nil {
+	if bucketOfKey(t, tr, keysA[0]) == nil {
 		t.Fatal("no bucket claims the pruned A keys")
 	}
-	if b.count != len(keysA) {
-		t.Fatalf("archived count = %d, want exactly the %d expired A leaves", b.count, len(keysA))
+	archived := 0
+	for _, b := range tr.buckets {
+		archived += b.count
+	}
+	if archived != len(keysA) {
+		t.Fatalf("archived count = %d, want exactly the %d expired A leaves", archived, len(keysA))
 	}
 	if _, fromArchive, err := tr.GetValueRef(kFreshA); err != nil || fromArchive {
 		t.Fatalf("fresh A leaf after prune: fromArchive=%v err=%v; want a hot hit (epoch 1 survives)", fromArchive, err)
