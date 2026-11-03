@@ -1000,7 +1000,7 @@ func (t *Trie) evictArchivesLocked(protectMRU bool) {
 		b.elem = nil
 		t.residentEntries -= b.count
 		b.entries = nil
-		if t.opTrace {
+		if t.opTraceEnabled() {
 			opTrace.evictions.Add(1)
 		}
 	}
@@ -1458,7 +1458,7 @@ func (t *Trie) mountEntriesLocked(domainPrefix []byte, entries []gethtrie.Extrac
 // archiveProbeLocked times the probe when the op-trace gate is open; the
 // wrapper keeps the gated-off path to one field check with no defer.
 func (t *Trie) archiveProbeLocked(key []byte) (*bucket, []*bucket, []byte, bool, error) {
-	if !t.opTrace {
+	if !t.opTraceEnabled() {
 		return t.archiveProbeInnerLocked(key)
 	}
 	opTrace.probes.Add(1)
@@ -1513,7 +1513,11 @@ func (t *Trie) archiveProbeInnerLocked(key []byte) (*bucket, []*bucket, []byte, 
 			// at window granularity.
 			filterStart := time.Now()
 			filterHit := b.filter.Lookup(key)
-			archivetrie.RecordMPTFilterProbeLatency(int64(time.Since(filterStart)))
+			filterDur := time.Since(filterStart)
+			archivetrie.RecordMPTFilterProbeLatency(int64(filterDur))
+			if t.opTraceEnabled() {
+				opTrace.filterNanos.Add(int64(filterDur))
+			}
 			if !filterHit {
 				archivetrie.RecordMPTFilterLookup(false)
 				return false
@@ -1703,7 +1707,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 	if err := t.ensureHotLocked(); err != nil {
 		return nil, err
 	}
-	if t.opTrace {
+	if t.opTraceEnabled() {
 		opTrace.ops.Add(1)
 	}
 	hotStart := t.opTraceStart()
@@ -1715,7 +1719,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 	if len(value) != 0 {
 		return bytes.Clone(value), nil
 	}
-	if t.opTrace {
+	if t.opTraceEnabled() {
 		opTrace.hotMisses.Add(1)
 	}
 	archivetrie.RecordMPTHotMissQuery()
@@ -1735,6 +1739,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 		// Mirror the binary layer's promotion timing: only the promotion
 		// itself (bucket removal + hot reinsert) is measured, not the lookup.
 		promotionStart := time.Now()
+		promotionTraceStart := t.opTraceStart()
 		// Freeze every bucket actually holding this key before local deletion.
 		// One original full-bucket proof covers further redemptions from that
 		// bucket during this block; the commit audits all distinct snapshots.
@@ -1748,6 +1753,7 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 			if ecmhVerifyGate || (redemptionVerifySample > 0 && proofCount%int64(redemptionVerifySample) == 0) {
 				verifyStart := time.Now()
 				if err := t.verifyBucketLocked(b); err != nil {
+					opTraceAdd(&opTrace.promotionNanos, promotionTraceStart)
 					archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
 					return nil, err
 				}
@@ -1761,16 +1767,28 @@ func (t *Trie) Get(key []byte) ([]byte, error) {
 		// payload value, so the commitment == payload multiset invariant
 		// survives per bucket and no stale copy is left behind.
 		for _, hb := range hits {
-			if err := t.bucketDeleteLocked(hb, key, hb.entries[string(key)]); err != nil {
+			removeStart := t.opTraceStart()
+			err := t.bucketDeleteLocked(hb, key, hb.entries[string(key)])
+			opTraceAdd(&opTrace.removeNanos, removeStart)
+			if !removeStart.IsZero() {
+				opTrace.removes.Add(1)
+			}
+			if err != nil {
+				opTraceAdd(&opTrace.promotionNanos, promotionTraceStart)
 				archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
 				return nil, err
 			}
 		}
-		if err := t.hot.Update(key, value); err != nil {
+		promotionHotStart := t.opTraceStart()
+		err = t.hot.Update(key, value)
+		opTraceAdd(&opTrace.promotionHotNanos, promotionHotStart)
+		if err != nil {
+			opTraceAdd(&opTrace.promotionNanos, promotionTraceStart)
 			archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), false)
 			return nil, err
 		}
 		t.markDirtyLocked()
+		opTraceAdd(&opTrace.promotionNanos, promotionTraceStart)
 		archivetrie.RecordMPTReadPromotion(time.Since(promotionStart), true)
 		archivetrie.RecordMPTRedemptionProof(proofBytes)
 		// E2 v6 exact histogram: single-proof size plus the single-proof
@@ -1794,7 +1812,7 @@ func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
 	if err := t.ensureHotLocked(); err != nil {
 		return nil, false, err
 	}
-	if t.opTrace {
+	if t.opTraceEnabled() {
 		opTrace.ops.Add(1)
 	}
 	hotStart := t.opTraceStart()
@@ -1806,7 +1824,7 @@ func (t *Trie) GetValueRef(key []byte) ([]byte, bool, error) {
 	if len(value) != 0 {
 		return crypto.Keccak256(value), false, nil
 	}
-	if t.opTrace {
+	if t.opTraceEnabled() {
 		opTrace.hotMisses.Add(1)
 	}
 	_, _, archived, ok, err := t.archiveProbeLocked(key)
@@ -1836,7 +1854,7 @@ func (t *Trie) Put(key, value []byte) error {
 	if err := t.ensureHotLocked(); err != nil {
 		return err
 	}
-	if t.opTrace {
+	if t.opTraceEnabled() {
 		opTrace.ops.Add(1)
 	}
 	hotStart := t.opTraceStart()
@@ -1870,7 +1888,7 @@ func (t *Trie) Delete(key []byte) error {
 	if err := t.ensureHotLocked(); err != nil {
 		return err
 	}
-	if t.opTrace {
+	if t.opTraceEnabled() {
 		opTrace.ops.Add(1)
 	}
 	hotStart := t.opTraceStart()

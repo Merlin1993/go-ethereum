@@ -2085,6 +2085,10 @@ func SetMPTNodeCacheStats(gets, hits int64) {
 // or the gate is closed.
 var OpTraceProbe func() map[string]int64
 
+// OpTraceSetActive limits optional operation tracing to the foreground
+// workload. The replay driver disables it during sampling, pruning and commit.
+var OpTraceSetActive func(bool)
+
 // TraceMPTBucketCapacity mirrors the mpt bucket capacity M into metadata
 // without the in-package stress test importing mpt (import cycle). The
 // external hook package sets it at registration; zero means unavailable.

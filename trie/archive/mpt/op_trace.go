@@ -37,21 +37,25 @@ import (
 // is registered into the archive package, mirroring the TraceHotTrieNew hook.
 
 var opTraceGate atomic.Bool
+var opTraceActive atomic.Bool
 
 // opTraceCounters holds cumulative counters; the driver diffs snapshots per
 // window, so nothing here ever resets.
 var opTrace struct {
-	ops         atomic.Int64 // instrumented Get/Put/Delete/GetValueRef calls
-	hotNanos    atomic.Int64 // geth hexary trie Get/Update/Delete
-	hotMisses   atomic.Int64 // Get/GetValueRef calls where the hot trie returned empty
-	probes      atomic.Int64 // archiveLookupLocked calls
-	probeNanos  atomic.Int64 // archiveLookupLocked: index + filter + map confirm
-	lockNanos   atomic.Int64 // time blocked acquiring t.mu
-	loads       atomic.Int64 // bucket entry-map (re)loads from disk
-	loadNanos   atomic.Int64 // optionalGet + decodeArchive for those loads
-	removes     atomic.Int64 // write-path removals of archived copies
-	removeNanos atomic.Int64
-	evictions   atomic.Int64 // resident-budget evictions
+	ops               atomic.Int64 // foreground Get/Put/Delete calls
+	hotNanos          atomic.Int64 // geth hexary trie Get/Update/Delete
+	hotMisses         atomic.Int64 // foreground Get calls where the hot trie returned empty
+	probes            atomic.Int64 // archiveLookupLocked calls
+	probeNanos        atomic.Int64 // archiveLookupLocked: index + filter + map confirm
+	filterNanos       atomic.Int64 // cuckoo Lookup only; nested within probeNanos
+	lockNanos         atomic.Int64 // time blocked acquiring t.mu
+	loads             atomic.Int64 // bucket entry-map (re)loads from disk
+	loadNanos         atomic.Int64 // optionalGet + decodeArchive for those loads
+	removes           atomic.Int64 // bucketDeleteLocked calls during promotion
+	removeNanos       atomic.Int64 // nested within promotionNanos
+	promotionNanos    atomic.Int64 // bucket removal and hot reinsert
+	promotionHotNanos atomic.Int64 // hot reinsert, nested within promotionNanos
+	evictions         atomic.Int64 // resident-budget evictions
 }
 
 func init() {
@@ -59,36 +63,40 @@ func init() {
 	opTraceGate.Store(enabled)
 	if enabled {
 		archivetrie.OpTraceProbe = opTraceSnapshot
+		archivetrie.OpTraceSetActive = opTraceActive.Store
 	}
 }
 
 // opTraceEnabled reports whether this trie should time its sections. The gate
 // is process-wide; storing it on the trie turns the hot path into a single
 // field load.
-func (t *Trie) opTraceEnabled() bool { return t.opTrace }
+func (t *Trie) opTraceEnabled() bool { return t.opTrace && opTraceActive.Load() }
 
 // opTraceSnapshot reports cumulative counters in fixed units (nanoseconds for
 // durations). Keys are stable: the driver writes them as CSV columns.
 func opTraceSnapshot() map[string]int64 {
 	return map[string]int64{
-		"ops":        opTrace.ops.Load(),
-		"hot_ns":     opTrace.hotNanos.Load(),
-		"hot_misses": opTrace.hotMisses.Load(),
-		"probes":     opTrace.probes.Load(),
-		"probe_ns":   opTrace.probeNanos.Load(),
-		"lock_ns":    opTrace.lockNanos.Load(),
-		"loads":      opTrace.loads.Load(),
-		"load_ns":    opTrace.loadNanos.Load(),
-		"removes":    opTrace.removes.Load(),
-		"remove_ns":  opTrace.removeNanos.Load(),
-		"evictions":  opTrace.evictions.Load(),
+		"ops":              opTrace.ops.Load(),
+		"hot_ns":           opTrace.hotNanos.Load(),
+		"hot_misses":       opTrace.hotMisses.Load(),
+		"probes":           opTrace.probes.Load(),
+		"probe_ns":         opTrace.probeNanos.Load(),
+		"filter_ns":        opTrace.filterNanos.Load(),
+		"lock_ns":          opTrace.lockNanos.Load(),
+		"loads":            opTrace.loads.Load(),
+		"load_ns":          opTrace.loadNanos.Load(),
+		"removes":          opTrace.removes.Load(),
+		"remove_ns":        opTrace.removeNanos.Load(),
+		"promotion_ns":     opTrace.promotionNanos.Load(),
+		"promotion_hot_ns": opTrace.promotionHotNanos.Load(),
+		"evictions":        opTrace.evictions.Load(),
 	}
 }
 
 // opTraceSince returns the zero time with the gate closed, so callers can do
 // `start := t.opTraceStart()` unconditionally and only pay when enabled.
 func (t *Trie) opTraceStart() time.Time {
-	if !t.opTrace {
+	if !t.opTraceEnabled() {
 		return time.Time{}
 	}
 	return time.Now()

@@ -1096,6 +1096,12 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	if *traceStressAccessSampleEvery < 0 {
 		t.Fatal("traceStressAccessSampleEvery cannot be negative")
 	}
+	if os.Getenv("MPT_OP_TRACE") != "" && *traceStressProbeSampleOnlyTiming {
+		t.Fatal("MPT_OP_TRACE requires timing every executed operation")
+	}
+	if os.Getenv("MPT_OP_TRACE") != "" && *traceStressHotLayer != "mpt" {
+		t.Fatal("MPT_OP_TRACE requires traceStressHotLayer=mpt")
+	}
 	if blockBoundary && *traceStressOps != 0 {
 		t.Fatal("use traceStressOps=0 with traceStressEndBlock or traceStressBlocks so a block range is never truncated")
 	}
@@ -1240,6 +1246,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"archive_db_dir":                 map[bool]string{true: archiveDir, false: ""}[*traceStressSplitArchiveDB],
 		"destructive_commit":             *traceStressDestructiveCommit,
 		"access_sample_every":            *traceStressAccessSampleEvery,
+		"op_trace_enabled":               os.Getenv("MPT_OP_TRACE") != "" && OpTraceProbe != nil,
 		"final_stats":                    *traceStressFinalStats,
 		"activate_archived_stem_on_read": stemActivationMetadata,
 		"activate_archived_key_on_read":  *traceStressActivateArchivedKeyOnRead,
@@ -1365,6 +1372,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	var opTraceWriter *csv.Writer
 	var opTraceFile *os.File
 	var prevOpTrace map[string]int64
+	var opTraceGetNanos, opTracePutNanos, opTraceDeleteNanos int64
 	if os.Getenv("MPT_OP_TRACE") != "" && OpTraceProbe != nil {
 		opTraceFile, err = os.Create(filepath.Join(resultsDir, "op_trace.csv"))
 		if err != nil {
@@ -1373,7 +1381,17 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		defer opTraceFile.Close()
 		opTraceWriter = csv.NewWriter(opTraceFile)
 		defer opTraceWriter.Flush()
-		if err := opTraceWriter.Write([]string{"Window_End_Batch", "Ops", "Hot_ns", "Hot_Misses", "Probes", "Probe_ns", "Lock_ns", "Loads", "Load_ns", "Removes", "Remove_ns", "Evictions"}); err != nil {
+		if OpTraceSetActive == nil {
+			t.Fatal("MPT_OP_TRACE probe has no foreground scope hook")
+		}
+		if err := opTraceWriter.Write([]string{
+			"Window_End_Batch", "First_Block", "Last_Block", "Window_Operations", "Operations_ns",
+			"Get_Call_ns", "Put_Call_ns", "Delete_Call_ns", "Call_ns", "Driver_Residual_ns",
+			"Ops", "Hot_ns", "Hot_Misses", "Probes", "Probe_ns", "Filter_ns", "Lock_ns",
+			"Loads", "Load_ns", "Bucket_IO_ns", "Bucket_Meta_IO_ns", "Bucket_Payload_IO_ns",
+			"Removes", "Remove_ns", "Promotion_ns", "Promotion_Hot_ns", "Evictions",
+			"Call_Other_ns", "Probe_Other_ns", "Promotion_Other_ns",
+		}); err != nil {
 			t.Fatal(err)
 		}
 		prevOpTrace = OpTraceProbe()
@@ -1765,19 +1783,36 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		if opTraceWriter != nil {
 			snap := OpTraceProbe()
 			delta := func(key string) int64 { return snap[key] - prevOpTrace[key] }
+			callNanos := opTraceGetNanos + opTracePutNanos + opTraceDeleteNanos
+			callOther := callNanos - delta("lock_ns") - delta("hot_ns") - delta("probe_ns") - delta("promotion_ns")
 			if err := opTraceWriter.Write([]string{
 				strconv.FormatInt(batchNumber, 10),
+				strconv.FormatUint(window.firstBlock, 10), strconv.FormatUint(window.lastBlock, 10),
+				strconv.FormatInt(window.counts.total(), 10), strconv.FormatInt(int64(window.operations), 10),
+				strconv.FormatInt(opTraceGetNanos, 10), strconv.FormatInt(opTracePutNanos, 10),
+				strconv.FormatInt(opTraceDeleteNanos, 10), strconv.FormatInt(callNanos, 10),
+				strconv.FormatInt(int64(window.operations)-callNanos, 10),
 				strconv.FormatInt(delta("ops"), 10), strconv.FormatInt(delta("hot_ns"), 10),
 				strconv.FormatInt(delta("hot_misses"), 10), strconv.FormatInt(delta("probes"), 10),
-				strconv.FormatInt(delta("probe_ns"), 10), strconv.FormatInt(delta("lock_ns"), 10),
+				strconv.FormatInt(delta("probe_ns"), 10), strconv.FormatInt(delta("filter_ns"), 10), strconv.FormatInt(delta("lock_ns"), 10),
 				strconv.FormatInt(delta("loads"), 10),
-				strconv.FormatInt(delta("load_ns"), 10), strconv.FormatInt(delta("removes"), 10),
-				strconv.FormatInt(delta("remove_ns"), 10), strconv.FormatInt(delta("evictions"), 10),
+				strconv.FormatInt(delta("load_ns"), 10), strconv.FormatInt(window.bucketIO.TotalNanos(), 10),
+				strconv.FormatInt(window.bucketIO.MetaNanos, 10), strconv.FormatInt(window.bucketIO.PayloadNanos, 10),
+				strconv.FormatInt(delta("removes"), 10), strconv.FormatInt(delta("remove_ns"), 10),
+				strconv.FormatInt(delta("promotion_ns"), 10), strconv.FormatInt(delta("promotion_hot_ns"), 10),
+				strconv.FormatInt(delta("evictions"), 10),
+				strconv.FormatInt(callOther, 10),
+				strconv.FormatInt(delta("probe_ns")-delta("filter_ns")-delta("load_ns"), 10),
+				strconv.FormatInt(delta("promotion_ns")-delta("remove_ns")-delta("promotion_hot_ns"), 10),
 			}); err != nil {
 				t.Fatal(err)
 			}
 			opTraceWriter.Flush()
+			if err := opTraceWriter.Error(); err != nil {
+				t.Fatal(err)
+			}
 			prevOpTrace = snap
+			opTraceGetNanos, opTracePutNanos, opTraceDeleteNanos = 0, 0, 0
 		}
 		fmt.Printf("[TRACE_STRESS] batches=%d/%d ops=%d block=%d cache=%d hits=%d misses=%d full_db=%d archive_db=%d rate=%.0f ops/s\n",
 			batchNumber, totalBatches, totalCounts.total(), window.lastBlock, cache.Entries, window.stemHits, window.stemMisses, fullNodeDBBytes, archiveDBBytes, opsPerSec)
@@ -1898,6 +1933,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		blockProofStart, _, _, _ := MPTRedemptionProofStats()
 		opOpenCountBefore, opOpenNanosBefore := workingTrieOpenStats()
 		opStart := time.Now()
+		if opTraceWriter != nil {
+			OpTraceSetActive(true)
+		}
 		batchAccessSampleDur := time.Duration(0)
 		var sampledOpenCount, sampledOpenNanos int64
 		for _, op := range ops {
@@ -1906,6 +1944,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			var fromArchive bool
 			var sampleErr error
 			if sample {
+				if opTraceWriter != nil {
+					OpTraceSetActive(false)
+				}
 				beforeSampleDiag := LastUpdateDiagnostics()
 				sampleOpenCountBefore, sampleOpenNanosBefore := workingTrieOpenStats()
 				sampleStart := time.Now()
@@ -1917,6 +1958,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				window.classificationFilter.add(filterStatsFromDiagnostics(LastUpdateDiagnostics()).sub(filterStatsFromDiagnostics(beforeSampleDiag)))
 				window.accessSample += sampleDur
 				batchAccessSampleDur += sampleDur
+				if opTraceWriter != nil {
+					OpTraceSetActive(true)
+				}
 			}
 			var executionStart time.Time
 			if sample || !*traceStressProbeSampleOnlyTiming {
@@ -1934,6 +1978,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				if sample {
 					window.access.add(op.kind, fromArchive, sampleErr, executionDur)
 				}
+				if opTraceWriter != nil {
+					opTraceGetNanos += int64(executionDur)
+				}
 				if err != nil && !errors.Is(err, ErrNodeNotFound) {
 					t.Fatalf("batch %d get: %v", batchNumber, err)
 				}
@@ -1948,6 +1995,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				if sample {
 					window.access.add(op.kind, fromArchive, sampleErr, executionDur)
 				}
+				if opTraceWriter != nil {
+					opTracePutNanos += int64(executionDur)
+				}
 				if err != nil {
 					t.Fatalf("batch %d put: %v", batchNumber, err)
 				}
@@ -1961,6 +2011,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 				}
 				if sample {
 					window.access.add(op.kind, fromArchive, sampleErr, executionDur)
+				}
+				if opTraceWriter != nil {
+					opTraceDeleteNanos += int64(executionDur)
 				}
 				if err != nil {
 					t.Fatalf("batch %d delete: %v", batchNumber, err)
@@ -1996,6 +2049,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 					proofLastCount, proofLastBytes = pc, pb
 				}
 			}
+		}
+		if opTraceWriter != nil {
+			OpTraceSetActive(false)
 		}
 		if *traceStressMPTVerifyAtCommit {
 			blockProofEnd, _, _, _ := MPTRedemptionProofStats()
