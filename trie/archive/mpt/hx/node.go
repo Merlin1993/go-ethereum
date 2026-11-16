@@ -180,21 +180,33 @@ func (n hashNode) cache() (hashNode, bool)   { return nil, true }
 func (n valueNode) cache() (hashNode, bool)  { return nil, true }
 
 func (n *fullNode) copy() *fullNode {
-	c := *n
+	c := n.copyPath()
 	if n.Stubs != nil {
 		// A trie node owns its list, but the stub descriptors are immutable.
 		// Sharing descriptors avoids allocating one object per stub on every
 		// ordinary hot-tree update.
 		c.Stubs = append([]*Stub(nil), n.Stubs...)
 	}
-	return &c
+	return c
 }
 func (n *shortNode) copy() *shortNode {
-	cpy := *n
+	cpy := n.copyPath()
 	if n.Stubs != nil {
 		cpy.Stubs = append([]*Stub(nil), n.Stubs...)
 	}
-	return &cpy
+	return cpy
+}
+
+// copyPath changes only the trie path. Stub lists remain shared until a
+// mount or replacement calls copy, which gives that mutation its own slice.
+func (n *fullNode) copyPath() *fullNode {
+	c := *n
+	return &c
+}
+
+func (n *shortNode) copyPath() *shortNode {
+	c := *n
+	return &c
 }
 
 var indices = []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f", "[17]"}

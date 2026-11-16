@@ -134,14 +134,14 @@ func (t *Trie) get(origNode node, key []byte, pos int) (value []byte, newnode no
 		}
 		value, newnode, didResolve, err = t.get(n.Val, key, pos+len(n.Key))
 		if err == nil && didResolve {
-			n = n.copy()
+			n = n.copyPath()
 			n.Val = newnode
 		}
 		return value, n, didResolve, err
 	case *fullNode:
 		value, newnode, didResolve, err = t.get(n.Children[key[pos]], key, pos+1)
 		if err == nil && didResolve {
-			n = n.copy()
+			n = n.copyPath()
 			n.Children[key[pos]] = newnode
 		}
 		return value, n, didResolve, err
@@ -249,7 +249,7 @@ func (t *Trie) insert(n node, prefix, key []byte, value node, epoch byte) (bool,
 		if !dirty || err != nil {
 			return false, n, err
 		}
-		n = n.copy()
+		n = n.copyPath()
 		n.flags = t.newFlag()
 		n.Children[key[0]] = nn
 		n.refreshAgg(int(key[0]))
@@ -334,7 +334,7 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 		if !dirty || err != nil {
 			return false, n, err
 		}
-		n = n.copy()
+		n = n.copyPath()
 		n.flags = t.newFlag()
 		n.Children[key[0]] = nn
 

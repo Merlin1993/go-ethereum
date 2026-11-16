@@ -27,7 +27,7 @@ func BenchmarkFullNodeCopy(b *testing.B) {
 		for _, variant := range []struct {
 			name string
 			copy func(*fullNode) *fullNode
-		}{{"original", copyFullNodeOriginal}, {"shared_descriptors", (*fullNode).copy}} {
+		}{{"original", copyFullNodeOriginal}, {"shared_descriptors", (*fullNode).copy}, {"path_only", (*fullNode).copyPath}} {
 			b.Run(fmt.Sprintf("%s/stubs=%d", variant.name, count), func(b *testing.B) {
 				b.ReportAllocs()
 				for i := 0; i < b.N; i++ {

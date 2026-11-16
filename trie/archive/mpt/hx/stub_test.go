@@ -140,6 +140,44 @@ func TestHXStubReplaceAndRemove(t *testing.T) {
 	}
 }
 
+// A hot-tree write may share a stub slice with an older node. Replacing a
+// stub later must not change that older node or its commitment.
+func TestHXStubReplaceAfterHotWriteKeepsOldRoot(t *testing.T) {
+	db := newTestDB()
+	tr := NewEmpty(db)
+	for i := 0; i < 30; i++ {
+		if err := tr.Update(mkKey(i), []byte{byte(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stub := stubFor(1, 3)
+	if _, err := tr.MountStub(nil, stub); err != nil {
+		t.Fatal(err)
+	}
+	oldRoot := tr.root
+	oldHash := tr.Hash()
+	if err := tr.Update(mkKey(0), []byte("updated")); err != nil {
+		t.Fatal(err)
+	}
+	repl := stubFor(1, 2)
+	if err := tr.ReplaceStub(nil, stub.Path, repl); err != nil {
+		t.Fatal(err)
+	}
+	oldNode, ok := oldRoot.(*fullNode)
+	if !ok {
+		t.Fatalf("old root type = %T", oldRoot)
+	}
+	if len(oldNode.Stubs) != 1 || oldNode.Stubs[0].ContentHash != stub.ContentHash {
+		t.Fatalf("old root stub changed: %+v", oldNode.Stubs)
+	}
+	if oldHash == tr.Hash() {
+		t.Fatal("root unchanged after hot write and stub replacement")
+	}
+	if err := tr.VerifyAggregates(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Root catch-all: pruning may shrink the tree below every mount point; the
 // residual bucket hangs on the (possibly stub-only) root.
 func TestHXStubRootCatchAll(t *testing.T) {
