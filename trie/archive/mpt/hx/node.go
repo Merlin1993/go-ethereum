@@ -125,14 +125,20 @@ func subtreeAggOf(n node) uint8 {
 		}
 		return n.Agg
 	case *fullNode:
-		agg, seen := uint8(0), false
-		for i := 0; i < 16; i++ {
-			agg, seen = combineAgg(agg, seen, n.getAgg(i))
-		}
-		if !seen {
+		// Each child contributes two bits: 01 for epoch 0, 10 for epoch 1,
+		// and 11 for mixed. Both bit planes being nonzero means mixed.
+		low := n.EpochAgg & 0x55555555
+		high := (n.EpochAgg >> 1) & 0x55555555
+		if low == 0 && high == 0 {
 			return aggEmpty
 		}
-		return agg
+		if low != 0 && high != 0 {
+			return aggMixed
+		}
+		if low != 0 {
+			return aggZero
+		}
+		return aggOne
 	case hashNode:
 		return aggMixed // conservative: unknown without loading
 	default:
