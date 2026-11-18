@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"math/bits"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -1647,7 +1648,7 @@ func (t *Trie) PendingProofStats() (buckets, proofBytes int64) {
 	return int64(len(t.pendingAudits)), t.pendingProofBytes
 }
 
-func verifyBucketAudit(audit bucketAudit, itemWorkers int) error {
+func validateBucketAudit(audit bucketAudit) error {
 	if got := [32]byte(crypto.Keccak256Hash(audit.metaBytes)); got != audit.metaHash {
 		return fmt.Errorf("mpt archive: stub metadata mismatch on bucket %x", audit.path)
 	}
@@ -1655,39 +1656,68 @@ func verifyBucketAudit(audit bucketAudit, itemWorkers int) error {
 	if err != nil {
 		return fmt.Errorf("mpt archive: bucket %x: %w", audit.path, err)
 	}
-	if commitment != audit.commitment || count != len(audit.entries) ||
-		ecmh.CreateEntriesParallel(audit.entries, itemWorkers) != commitment {
+	if commitment != audit.commitment || count != len(audit.entries) {
+		return fmt.Errorf("mpt archive: ECMH commitment mismatch on bucket %x", audit.path)
+	}
+	return nil
+}
+
+func verifyBucketAudit(audit bucketAudit, itemWorkers int) error {
+	if err := validateBucketAudit(audit); err != nil {
+		return err
+	}
+	if ecmh.CreateEntriesParallel(audit.entries, itemWorkers) != audit.commitment {
 		return fmt.Errorf("mpt archive: ECMH commitment mismatch on bucket %x", audit.path)
 	}
 	return nil
 }
 
 // auditPendingLocked verifies distinct pre-redemption bucket snapshots. It
-// holds the trie lock only to prevent a concurrent commit; workers touch
-// immutable snapshots and may verify different buckets concurrently.
+// holds the trie lock only to prevent a concurrent commit. A bounded mapping
+// pool shares the CPU budget across all immutable bucket snapshots, including
+// blocks with only one or two buckets.
 func (t *Trie) auditPendingLocked() error {
 	if len(t.pendingAudits) == 0 {
 		return nil
 	}
 	started := time.Now()
-	workers := min(t.config.VerifyBucketWorkers, len(t.pendingAudits))
-	jobs := make(chan int)
 	errorsByBucket := make([]error, len(t.pendingAudits))
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for index := range jobs {
-				errorsByBucket[index] = verifyBucketAudit(t.pendingAudits[index], t.config.VerifyItemWorkers)
+	if len(t.pendingAudits) >= t.config.VerifyBucketWorkers {
+		// At full bucket-worker occupancy the old two-level schedule uses
+		// the same CPU budget with less task-queue overhead.
+		jobs := make(chan int)
+		var wg sync.WaitGroup
+		for i := 0; i < t.config.VerifyBucketWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for index := range jobs {
+					errorsByBucket[index] = verifyBucketAudit(t.pendingAudits[index], t.config.VerifyItemWorkers)
+				}
+			}()
+		}
+		for i := range t.pendingAudits {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+	} else {
+		batches := make([][]ecmh.Entry, len(t.pendingAudits))
+		for i, audit := range t.pendingAudits {
+			errorsByBucket[i] = validateBucketAudit(audit)
+			if errorsByBucket[i] == nil {
+				batches[i] = audit.entries
 			}
-		}()
+		}
+		cores := runtime.GOMAXPROCS(0)
+		workers := min(t.config.VerifyBucketWorkers, cores) * min(t.config.VerifyItemWorkers, cores)
+		commitments := ecmh.CreateEntryBatchesParallel(batches, workers)
+		for i := range errorsByBucket {
+			if errorsByBucket[i] == nil && commitments[i] != t.pendingAudits[i].commitment {
+				errorsByBucket[i] = fmt.Errorf("mpt archive: ECMH commitment mismatch on bucket %x", t.pendingAudits[i].path)
+			}
+		}
 	}
-	for index := range t.pendingAudits {
-		jobs <- index
-	}
-	close(jobs)
-	wg.Wait()
 	archivetrie.RecordMPTRedemptionVerifyBatch(int64(len(t.pendingAudits)), time.Since(started))
 	for _, err := range errorsByBucket {
 		if err != nil {

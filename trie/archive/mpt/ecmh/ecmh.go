@@ -172,11 +172,7 @@ func CreateEntriesParallel(entries []Entry, workers int) Commitment {
 	partials := make([]secp256k1.JacobianPoint, workers)
 	addRange := func(worker int) {
 		for _, entry := range entries[worker*len(entries)/workers : (worker+1)*len(entries)/workers] {
-			valueHash := sha256.Sum256(entry.Value)
-			item := make([]byte, 0, len(entry.Key)+len(valueHash))
-			item = append(item, entry.Key...)
-			item = append(item, valueHash[:]...)
-			point := itemPoint(item)
+			point := entryPoint(entry)
 			secp256k1.AddNonConst(&partials[worker], &point, &partials[worker])
 		}
 	}
@@ -193,6 +189,73 @@ func CreateEntriesParallel(entries []Entry, workers int) Commitment {
 		secp256k1.AddNonConst(&sum, &partials[i], &sum)
 	}
 	return encodePoint(&sum)
+}
+
+func entryPoint(entry Entry) secp256k1.JacobianPoint {
+	valueHash := sha256.Sum256(entry.Value)
+	item := make([]byte, 0, len(entry.Key)+len(valueHash))
+	item = append(item, entry.Key...)
+	item = append(item, valueHash[:]...)
+	return itemPoint(item)
+}
+
+// CreateEntryBatchesParallel shares a bounded mapping pool across independent
+// buckets. Workers write separate partial sums; each bucket is reduced in a
+// fixed task order after all mappings finish, so results match the serial sum.
+func CreateEntryBatchesParallel(batches [][]Entry, workers int) []Commitment {
+	results := make([]Commitment, len(batches))
+	total := 0
+	for _, batch := range batches {
+		total += len(batch)
+	}
+	if total == 0 {
+		return results
+	}
+	workers = max(1, min(workers, runtime.GOMAXPROCS(0), max(1, total/4)))
+	if workers == 1 {
+		for i, batch := range batches {
+			results[i] = CreateEntriesParallel(batch, 1)
+		}
+		return results
+	}
+	type job struct{ bucket, start, end int }
+	chunkSize := max(1, (total+2*workers-1)/(2*workers))
+	jobs := make([]job, 0, total/chunkSize+len(batches))
+	for bucket, batch := range batches {
+		for start := 0; start < len(batch); start += chunkSize {
+			jobs = append(jobs, job{bucket, start, min(start+chunkSize, len(batch))})
+		}
+	}
+	partials := make([]secp256k1.JacobianPoint, len(jobs))
+	queue := make(chan int, len(jobs))
+	for i := range jobs {
+		queue <- i
+	}
+	close(queue)
+	work := func() {
+		for i := range queue {
+			job := jobs[i]
+			for _, entry := range batches[job.bucket][job.start:job.end] {
+				point := entryPoint(entry)
+				secp256k1.AddNonConst(&partials[i], &point, &partials[i])
+			}
+		}
+	}
+	var wg sync.WaitGroup
+	for i := 1; i < workers; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); work() }()
+	}
+	work()
+	wg.Wait()
+	sums := make([]secp256k1.JacobianPoint, len(batches))
+	for i, job := range jobs {
+		secp256k1.AddNonConst(&sums[job.bucket], &partials[i], &sums[job.bucket])
+	}
+	for i := range sums {
+		results[i] = encodePoint(&sums[i])
+	}
+	return results
 }
 
 // BlindAppend returns the commitment with one item added: c + H_c(item).
