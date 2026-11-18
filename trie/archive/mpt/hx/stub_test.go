@@ -167,7 +167,7 @@ func TestHXStubReplaceAfterHotWriteKeepsOldRoot(t *testing.T) {
 	if !ok {
 		t.Fatalf("old root type = %T", oldRoot)
 	}
-	if len(oldNode.Stubs) != 1 || oldNode.Stubs[0].ContentHash != stub.ContentHash {
+	if len(stubsOf(oldNode.Stubs)) != 1 || oldNode.Stubs.entries[0].ContentHash != stub.ContentHash {
 		t.Fatalf("old root stub changed: %+v", oldNode.Stubs)
 	}
 	if oldHash == tr.Hash() {

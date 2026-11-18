@@ -50,17 +50,17 @@ type node interface {
 
 type (
 	fullNode struct {
-		Children [17]node // Actual trie node data; slot 16 is the branch value
-		EpochAgg uint32   // 2 bits per child slot 0..15: empty/all0/all1/mixed
-		Stubs    []*Stub  // side-mounted archival commitments (paper stubList)
+		Children [17]node  // Actual trie node data; slot 16 is the branch value
+		EpochAgg uint32    // 2 bits per child slot 0..15: empty/all0/all1/mixed
+		Stubs    *stubList // side-mounted archival commitments (paper stubList)
 		flags    nodeFlag
 	}
 	shortNode struct {
 		Key   []byte
 		Val   node
-		Epoch byte    // leaf only: 1-bit lifecycle indicator (0/1)
-		Agg   uint8   // extension only: 2-bit aggregate of the subtree below
-		Stubs []*Stub // rarely used: archive mounts when no branch node exists
+		Epoch byte      // leaf only: 1-bit lifecycle indicator (0/1)
+		Agg   uint8     // extension only: 2-bit aggregate of the subtree below
+		Stubs *stubList // rarely used: archive mounts when no branch node exists
 		flags nodeFlag
 	}
 	hashNode  []byte
@@ -163,6 +163,35 @@ type Stub struct {
 	ContentHash [32]byte // keccak of the side-stored stub content record (filter+commitment+count)
 }
 
+// stubList is immutable while shared by hot-tree path copies. A mount or
+// replacement clones its slice before changing it. Keeping only a pointer in
+// each trie node avoids copying a 24-byte slice header on every hot write.
+type stubList struct{ entries []*Stub }
+
+func stubsOf(list *stubList) []*Stub {
+	if list == nil {
+		return nil
+	}
+	return list.entries
+}
+
+func listOf(stubs []*Stub) *stubList {
+	if len(stubs) == 0 {
+		return nil
+	}
+	return &stubList{entries: stubs}
+}
+
+func mergeStubLists(a, b *stubList) *stubList {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	return listOf(mergeStubs(a.entries, b.entries))
+}
+
 func (s *Stub) copy() *Stub {
 	c := *s
 	return &c
@@ -185,14 +214,14 @@ func (n *fullNode) copy() *fullNode {
 		// A trie node owns its list, but the stub descriptors are immutable.
 		// Sharing descriptors avoids allocating one object per stub on every
 		// ordinary hot-tree update.
-		c.Stubs = append([]*Stub(nil), n.Stubs...)
+		c.Stubs = listOf(append([]*Stub(nil), n.Stubs.entries...))
 	}
 	return c
 }
 func (n *shortNode) copy() *shortNode {
 	cpy := n.copyPath()
 	if n.Stubs != nil {
-		cpy.Stubs = append([]*Stub(nil), n.Stubs...)
+		cpy.Stubs = listOf(append([]*Stub(nil), n.Stubs.entries...))
 	}
 	return cpy
 }
@@ -218,7 +247,7 @@ func (n hashNode) String() string   { return n.fstring("") }
 func (n valueNode) String() string  { return n.fstring("") }
 
 func (n *fullNode) fstring(ind string) string {
-	resp := fmt.Sprintf("[agg=%08x stubs=%d\n%s  ", n.EpochAgg, len(n.Stubs), ind)
+	resp := fmt.Sprintf("[agg=%08x stubs=%d\n%s  ", n.EpochAgg, len(stubsOf(n.Stubs)), ind)
 	for i, node := range &n.Children {
 		if node == nil {
 			resp += fmt.Sprintf("%s: <nil> ", indices[i])

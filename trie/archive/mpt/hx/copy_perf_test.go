@@ -10,9 +10,9 @@ var copyPerfSink *fullNode
 func copyFullNodeOriginal(n *fullNode) *fullNode {
 	c := *n
 	if n.Stubs != nil {
-		c.Stubs = make([]*Stub, len(n.Stubs))
-		for i, s := range n.Stubs {
-			c.Stubs[i] = s.copy()
+		c.Stubs = listOf(make([]*Stub, len(n.Stubs.entries)))
+		for i, s := range n.Stubs.entries {
+			c.Stubs.entries[i] = s.copy()
 		}
 	}
 	return &c
@@ -20,9 +20,9 @@ func copyFullNodeOriginal(n *fullNode) *fullNode {
 
 func BenchmarkFullNodeCopy(b *testing.B) {
 	for _, count := range []int{0, 1, 16, 128} {
-		n := &fullNode{Stubs: make([]*Stub, count)}
-		for i := range n.Stubs {
-			n.Stubs[i] = &Stub{Path: []byte{byte(i)}}
+		n := &fullNode{Stubs: listOf(make([]*Stub, count))}
+		for i := range stubsOf(n.Stubs) {
+			n.Stubs.entries[i] = &Stub{Path: []byte{byte(i)}}
 		}
 		for _, variant := range []struct {
 			name string

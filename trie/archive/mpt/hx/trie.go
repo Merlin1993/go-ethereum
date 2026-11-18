@@ -315,13 +315,13 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 		case *shortNode:
 			// Merging into a leaf would land n's stubs on a leaf, which the
 			// mounting rules forbid — keep the extension above it instead.
-			if _, isVal := child.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+			if _, isVal := child.Val.(valueNode); isVal && n.Stubs != nil {
 				fresh := &shortNode{Key: n.Key, Val: child, Stubs: n.Stubs, flags: t.newFlag()}
 				fresh.Agg = subtreeAggOf(child)
 				return true, fresh, nil
 			}
 			t.tracer.onDelete(append(prefix, n.Key...))
-			merged := &shortNode{Key: concat(n.Key, child.Key...), Val: child.Val, Epoch: child.Epoch, Agg: child.Agg, Stubs: mergeStubs(n.Stubs, child.Stubs), flags: t.newFlag()}
+			merged := &shortNode{Key: concat(n.Key, child.Key...), Val: child.Val, Epoch: child.Epoch, Agg: child.Agg, Stubs: mergeStubLists(n.Stubs, child.Stubs), flags: t.newFlag()}
 			return true, merged, nil
 		default:
 			fresh := &shortNode{Key: n.Key, Val: child, Stubs: n.Stubs, flags: t.newFlag()}
@@ -363,14 +363,14 @@ func (t *Trie) delete(n node, prefix, key []byte) (bool, node, error) {
 				}
 				if cnode, ok := cnode.(*shortNode); ok {
 					// As above: never land stubs on a leaf through a merge.
-					if _, isVal := cnode.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+					if _, isVal := cnode.Val.(valueNode); isVal && n.Stubs != nil {
 						fresh := &shortNode{Key: []byte{byte(pos)}, Val: cnode, Stubs: n.Stubs, flags: t.newFlag()}
 						fresh.Agg = subtreeAggOf(cnode)
 						return true, fresh, nil
 					}
 					t.tracer.onDelete(append(prefix, byte(pos)))
 					k := append([]byte{byte(pos)}, cnode.Key...)
-					return true, &shortNode{Key: k, Val: cnode.Val, Epoch: cnode.Epoch, Agg: cnode.Agg, Stubs: mergeStubs(n.Stubs, cnode.Stubs), flags: t.newFlag()}, nil
+					return true, &shortNode{Key: k, Val: cnode.Val, Epoch: cnode.Epoch, Agg: cnode.Agg, Stubs: mergeStubLists(n.Stubs, cnode.Stubs), flags: t.newFlag()}, nil
 				}
 				// Child is a branch: the one-nibble extension inherits its aggregate.
 				fresh := &shortNode{Key: []byte{byte(pos)}, Val: n.Children[pos], Stubs: n.Stubs, flags: t.newFlag()}
@@ -802,7 +802,7 @@ func (t *Trie) allStubsWithin(n node, path, hexPrefix []byte, fn func([]byte, *S
 		}
 		return t.allStubsWithin(resolved, path, hexPrefix, fn)
 	case *shortNode:
-		for _, s := range n.Stubs {
+		for _, s := range stubsOf(n.Stubs) {
 			fn(path, s)
 		}
 		if matchLen == len(hexPrefix) {
@@ -815,7 +815,7 @@ func (t *Trie) allStubsWithin(n node, path, hexPrefix []byte, fn func([]byte, *S
 		}
 		return t.allStubsWithin(n.Val, concat(path, n.Key...), hexPrefix, fn)
 	case *fullNode:
-		for _, s := range n.Stubs {
+		for _, s := range stubsOf(n.Stubs) {
 			fn(path, s)
 		}
 		if matchLen == len(hexPrefix) {

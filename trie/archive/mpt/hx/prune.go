@@ -280,7 +280,7 @@ func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, tailB
 		// The entire subtree below vanished. Stubs mounted here keep a
 		// stub-only branch alive (bucket mounting must stay addressable);
 		// without stubs the short node goes with its subtree.
-		if len(n.Stubs) > 0 {
+		if n.Stubs != nil {
 			t.tracer.onDelete(childPath)
 			t.tracer.onInsert(path)
 			return &fullNode{Stubs: n.Stubs, flags: t.newFlag()}, true, nil
@@ -291,7 +291,7 @@ func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, tailB
 	if child, ok := nc.(*shortNode); ok {
 		// Merging into a leaf would land n's stubs on a leaf, which the
 		// mounting rules forbid — keep the extension above it instead.
-		if _, isVal := child.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+		if _, isVal := child.Val.(valueNode); isVal && n.Stubs != nil {
 			fresh := &shortNode{Key: n.Key, Val: nc, Agg: subtreeAggOf(nc), Stubs: n.Stubs, flags: t.newFlag()}
 			t.tracer.onInsert(path)
 			return fresh, true, nil
@@ -306,7 +306,7 @@ func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, tailB
 			Val:   child.Val,
 			Epoch: child.Epoch,
 			Agg:   child.Agg,
-			Stubs: mergeStubs(n.Stubs, child.Stubs),
+			Stubs: mergeStubLists(n.Stubs, child.Stubs),
 			flags: t.newFlag(),
 		}, concat(childPath, child.Key...)), true, nil
 	}
@@ -336,7 +336,7 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 		return n, true, nil
 	}
 	if count == 0 {
-		if len(n.Stubs) > 0 {
+		if n.Stubs != nil {
 			// A stub-only branch: everything below was evicted, but mounted
 			// buckets keep it alive (root catch-all included). Never remove.
 			n.flags = t.newFlag()
@@ -366,7 +366,7 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 	if short, ok := child.(*shortNode); ok {
 		// Merging into a leaf would land n's stubs on a leaf, which the
 		// mounting rules forbid — keep the branch above it instead.
-		if _, isVal := short.Val.(valueNode); isVal && len(n.Stubs) > 0 {
+		if _, isVal := short.Val.(valueNode); isVal && n.Stubs != nil {
 			n.flags = t.newFlag() // descendant changed: force rehash
 			return n, true, nil
 		}
@@ -378,7 +378,7 @@ func (t *Trie) shrinkFull(n *fullNode, path []byte) (node, bool, error) {
 			Val:   short.Val,
 			Epoch: short.Epoch,
 			Agg:   short.Agg,
-			Stubs: mergeStubs(n.Stubs, short.Stubs),
+			Stubs: mergeStubLists(n.Stubs, short.Stubs),
 			flags: t.newFlag(),
 		}, concat(childPath, short.Key...)), true, nil
 	}
@@ -409,7 +409,7 @@ func (t *Trie) foldShortChain(merged *shortNode, innerPath []byte) *shortNode {
 			Val:   inner.Val,
 			Epoch: inner.Epoch,
 			Agg:   inner.Agg,
-			Stubs: mergeStubs(merged.Stubs, inner.Stubs),
+			Stubs: mergeStubLists(merged.Stubs, inner.Stubs),
 			flags: t.newFlag(),
 		}
 		innerPath = concat(innerPath, inner.Key...)

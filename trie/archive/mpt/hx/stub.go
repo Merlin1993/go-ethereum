@@ -47,9 +47,9 @@ func (t *Trie) StubsAt(path []byte) ([]*Stub, error) {
 	}
 	switch n := n.(type) {
 	case *fullNode:
-		return n.Stubs, nil
+		return stubsOf(n.Stubs), nil
 	case *shortNode:
-		return n.Stubs, nil
+		return stubsOf(n.Stubs), nil
 	default:
 		return nil, nil
 	}
@@ -157,7 +157,7 @@ func (t *Trie) MountStub(prefix []byte, stub *Stub) ([]byte, error) {
 		// Fully evicted tree: the catch-all root is a bare branch node
 		// carrying only stubs (paper: residual reaching the top mounts at the
 		// root's catch-all stub).
-		t.root = &fullNode{Stubs: []*Stub{stub}, flags: t.newFlag()}
+		t.root = &fullNode{Stubs: listOf([]*Stub{stub}), flags: t.newFlag()}
 		return nil, nil
 	}
 	n, mp, err := t.mountStubAt(t.root, nil, prefix, stub)
@@ -198,14 +198,18 @@ func (t *Trie) mountStubAt(n node, path, prefix []byte, stub *Stub) (node, []byt
 				if err != nil {
 					return nil, nil, err
 				}
-				cpy := n.copy()
+				cpy := n.copyPath()
 				cpy.Val = nn
 				cpy.flags = t.newFlag()
 				return cpy, mp, nil
 			}
 		}
 		cpy := n.copy()
-		cpy.Stubs = append(cpy.Stubs, stub)
+		if cpy.Stubs == nil {
+			cpy.Stubs = listOf([]*Stub{stub})
+		} else {
+			cpy.Stubs.entries = append(cpy.Stubs.entries, stub)
+		}
 		cpy.flags = t.newFlag()
 		return cpy, path, nil
 	case *fullNode:
@@ -216,7 +220,7 @@ func (t *Trie) mountStubAt(n node, path, prefix []byte, stub *Stub) (node, []byt
 					return nil, nil, err
 				}
 				if !leaf {
-					cpy := n.copy()
+					cpy := n.copyPath()
 					nn, mp, err := t.mountStubAt(child, concat(path, prefix[len(path)]), prefix, stub)
 					if err != nil {
 						return nil, nil, err
@@ -228,7 +232,11 @@ func (t *Trie) mountStubAt(n node, path, prefix []byte, stub *Stub) (node, []byt
 			}
 		}
 		cpy := n.copy()
-		cpy.Stubs = append(cpy.Stubs, stub)
+		if cpy.Stubs == nil {
+			cpy.Stubs = listOf([]*Stub{stub})
+		} else {
+			cpy.Stubs.entries = append(cpy.Stubs.entries, stub)
+		}
 		cpy.flags = t.newFlag()
 		return cpy, path, nil
 	default:
@@ -275,7 +283,7 @@ func (t *Trie) stubsOnPath(n node, path, hexKey []byte, fn func([]byte, *Stub) b
 		}
 		return t.stubsOnPath(resolved, path, hexKey, fn)
 	case *shortNode:
-		for _, s := range n.Stubs {
+		for _, s := range stubsOf(n.Stubs) {
 			if fn(path, s) {
 				return true, nil
 			}
@@ -289,7 +297,7 @@ func (t *Trie) stubsOnPath(n node, path, hexKey []byte, fn func([]byte, *Stub) b
 		}
 		return t.stubsOnPath(n.Val, concat(path, n.Key...), hexKey, fn)
 	case *fullNode:
-		for _, s := range n.Stubs {
+		for _, s := range stubsOf(n.Stubs) {
 			if fn(path, s) {
 				return true, nil
 			}
@@ -335,9 +343,12 @@ func (t *Trie) replaceStubAt(n node, path, route, stubPath []byte, repl *Stub) (
 		}
 		return t.replaceStubAt(resolved, path, route, stubPath, repl)
 	case *shortNode:
-		if stubListHas(n.Stubs, stubPath) {
+		if stubListHas(stubsOf(n.Stubs), stubPath) {
 			cpy := n.copy()
-			cpy.Stubs = replaceStubIn(cpy.Stubs, stubPath, repl)
+			cpy.Stubs.entries = replaceStubIn(cpy.Stubs.entries, stubPath, repl)
+			if len(cpy.Stubs.entries) == 0 {
+				cpy.Stubs = nil
+			}
 			cpy.flags = t.newFlag()
 			return cpy, nil
 		}
@@ -352,14 +363,17 @@ func (t *Trie) replaceStubAt(n node, path, route, stubPath []byte, repl *Stub) (
 		if err != nil {
 			return nil, err
 		}
-		cpy := n.copy()
+		cpy := n.copyPath()
 		cpy.Val = nn
 		cpy.flags = t.newFlag()
 		return cpy, nil
 	case *fullNode:
-		if stubListHas(n.Stubs, stubPath) {
+		if stubListHas(stubsOf(n.Stubs), stubPath) {
 			cpy := n.copy()
-			cpy.Stubs = replaceStubIn(cpy.Stubs, stubPath, repl)
+			cpy.Stubs.entries = replaceStubIn(cpy.Stubs.entries, stubPath, repl)
+			if len(cpy.Stubs.entries) == 0 {
+				cpy.Stubs = nil
+			}
 			cpy.flags = t.newFlag()
 			return cpy, nil
 		}
@@ -374,7 +388,7 @@ func (t *Trie) replaceStubAt(n node, path, route, stubPath []byte, repl *Stub) (
 		if err != nil {
 			return nil, err
 		}
-		cpy := n.copy()
+		cpy := n.copyPath()
 		cpy.Children[slot] = nn
 		cpy.flags = t.newFlag()
 		return cpy, nil
@@ -423,7 +437,7 @@ func (t *Trie) allStubs(n node, path []byte, fn func([]byte, *Stub)) (bool, erro
 		}
 		return t.allStubs(resolved, path, fn)
 	case *shortNode:
-		for _, s := range n.Stubs {
+		for _, s := range stubsOf(n.Stubs) {
 			fn(path, s)
 		}
 		if _, isVal := n.Val.(valueNode); isVal {
@@ -431,7 +445,7 @@ func (t *Trie) allStubs(n node, path []byte, fn func([]byte, *Stub)) (bool, erro
 		}
 		return t.allStubs(n.Val, concat(path, n.Key...), fn)
 	case *fullNode:
-		for _, s := range n.Stubs {
+		for _, s := range stubsOf(n.Stubs) {
 			fn(path, s)
 		}
 		for i := 0; i < 16; i++ {

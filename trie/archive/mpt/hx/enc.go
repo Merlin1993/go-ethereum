@@ -101,7 +101,7 @@ func (n *fullNode) encode(w rlp.EncoderBuffer) {
 		}
 	}
 	w.WriteUint64(uint64(n.EpochAgg))
-	encodeStubs(w, n.Stubs)
+	encodeStubs(w, stubsOf(n.Stubs))
 	w.ListEnd(offset)
 }
 
@@ -142,8 +142,8 @@ func (n *shortNode) encode(w rlp.EncoderBuffer) {
 	} else {
 		w.WriteUint64(uint64(n.Agg))
 	}
-	if len(n.Stubs) > 0 {
-		encodeStubs(w, n.Stubs)
+	if n.Stubs != nil {
+		encodeStubs(w, stubsOf(n.Stubs))
 	}
 	w.ListEnd(offset)
 }
@@ -247,7 +247,7 @@ func decodeShort(hash, elems []byte) (node, error) {
 			if err != nil {
 				return nil, err
 			}
-			sn.Stubs = append(sn.Stubs, stub)
+			sn.Stubs = listOf(append(stubsOf(sn.Stubs), stub))
 		}
 	}
 	if len(rest) != 0 {
@@ -295,7 +295,7 @@ func decodeFull(hash, elems []byte) (*fullNode, error) {
 		if err != nil {
 			return n, err
 		}
-		n.Stubs = append(n.Stubs, stub)
+		n.Stubs = listOf(append(stubsOf(n.Stubs), stub))
 	}
 	return n, nil
 }
