@@ -50,6 +50,22 @@ func TestCreateEmpty(t *testing.T) {
 	}
 }
 
+func TestCreateParallelMatchesSerial(t *testing.T) {
+	r := rand.New(rand.NewSource(901))
+	for _, count := range []int{0, 1, 7, 20, 100, 200} {
+		items := makeItems(r, count)
+		if count >= 2 {
+			items[count-1] = items[0] // duplicate multiset occurrence
+		}
+		want := Create(items)
+		for _, workers := range []int{0, 1, 2, 4, 8} {
+			if got := CreateParallel(items, workers); got != want {
+				t.Fatalf("count=%d workers=%d: got %x, want %x", count, workers, got, want)
+			}
+		}
+	}
+}
+
 // TestHashToCurve verifies determinism, 33-byte output, and that the result
 // is a valid compressed secp256k1 public key.
 func TestHashToCurve(t *testing.T) {

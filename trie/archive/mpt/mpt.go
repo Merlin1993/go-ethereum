@@ -1171,7 +1171,7 @@ func (t *Trie) createBucketLocked(nodePath []byte, entries []gethtrie.ExtractedE
 		prefixBits:   prefixBits,
 		entries:      payload,
 		filter:       filter,
-		commitment:   ecmh.Create(items),
+		commitment:   ecmh.CreateParallel(items, 4),
 		count:        consumed,
 		dirty:        true,
 		payloadBytes: bucketRecordSize(payload),

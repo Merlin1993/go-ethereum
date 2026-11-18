@@ -41,6 +41,7 @@ package ecmh
 
 import (
 	"crypto/sha256"
+	"runtime"
 	"sync"
 
 	bytemaresecp256k1 "github.com/bytemare/secp256k1"
@@ -128,6 +129,36 @@ func Create(items [][]byte) Commitment {
 	for _, item := range items {
 		p := itemPoint(item)
 		secp256k1.AddNonConst(&sum, &p, &sum)
+	}
+	return encodePoint(&sum)
+}
+
+// CreateParallel computes independent item mappings concurrently and reduces
+// worker sums in a fixed order. Small buckets stay serial to avoid scheduling
+// overhead. The returned commitment is identical to Create's multiset sum.
+func CreateParallel(items [][]byte, workers int) Commitment {
+	workers = min(workers, runtime.GOMAXPROCS(0), len(items))
+	if len(items) < 16 || workers < 2 {
+		return Create(items)
+	}
+	partials := make([]secp256k1.JacobianPoint, workers)
+	addRange := func(worker int) {
+		for _, item := range items[worker*len(items)/workers : (worker+1)*len(items)/workers] {
+			point := itemPoint(item)
+			secp256k1.AddNonConst(&partials[worker], &point, &partials[worker])
+		}
+	}
+	var wg sync.WaitGroup
+	for worker := 1; worker < workers; worker++ {
+		worker := worker
+		wg.Add(1)
+		go func() { defer wg.Done(); addRange(worker) }()
+	}
+	addRange(0)
+	wg.Wait()
+	var sum secp256k1.JacobianPoint
+	for i := range partials {
+		secp256k1.AddNonConst(&sum, &partials[i], &sum)
 	}
 	return encodePoint(&sum)
 }
