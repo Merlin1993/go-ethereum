@@ -1045,10 +1045,13 @@ func TestMPTSingleTreeResurrectionRoundTrip(t *testing.T) {
 	}
 	rest := items[1:]
 	if !ecmh.Verify(b.commitment, rest) {
-		t.Fatal("remaining multiset does not verify against the rewritten stub")
+		t.Fatal("remaining multiset does not verify against the updated commitment")
 	}
-	// The stub in the tree anchors the side record whose content carries the
-	// same commitment and count (root covers both through the hash).
+	// A root observation publishes the final stub metadata before hashing it.
+	// The stub then anchors the side record's updated commitment and count.
+	if _, err := tr.Hash(); err != nil {
+		t.Fatal(err)
+	}
 	hot, err := tr.hotTrieLocked()
 	if err != nil {
 		t.Fatal(err)

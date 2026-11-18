@@ -340,9 +340,9 @@ type committedState struct {
 }
 
 // bucket is the in-memory handle for one archive bucket (paper: Stub Bucket
-// B = <Path, CF, C_ECMH, Count>). The authoritative metadata is the stub
-// serialized into the tree; this handle caches the decoded filter/commitment
-// and, while resident, the payload entries.
+// B = <Path, CF, C_ECMH, Count>). Committed metadata is anchored by the stub
+// serialized into the tree; this handle holds uncommitted filter/commitment
+// changes and, while resident, the payload entries.
 type bucket struct {
 	path  []byte // identifier: mount path + sequence discriminator
 	mount []byte // nibble path of the node carrying the stub
@@ -358,6 +358,7 @@ type bucket struct {
 	commitment   ecmh.Commitment
 	count        int
 	dirty        bool          // uncommitted mutation; dirty buckets are never evicted
+	stubPending  bool          // nonempty redemption changed the in-tree stub; refresh before commit or prune
 	payloadGone  bool          // count hit zero: delete the record at commit
 	elem         *list.Element // non-nil exactly while entries is resident
 	metaBytes    []byte        // rendered side record staged at commit (see stub())
@@ -677,6 +678,22 @@ func (t *Trie) markBucketDirtyLocked(b *bucket) {
 	}
 	b.dirty = true
 	t.dirtyBuckets = append(t.dirtyBuckets, b)
+}
+
+// flushPendingStubsLocked publishes the current metadata of redeemed buckets.
+// Their filters, commitments, and payloads change on every redemption, but
+// the tree only needs one content anchor per root observation or commit.
+func (t *Trie) flushPendingStubsLocked() error {
+	for _, b := range t.dirtyBuckets {
+		if !b.stubPending {
+			continue
+		}
+		if err := t.hot.ReplaceStub(b.mount, b.path, b.stub()); err != nil {
+			return err
+		}
+		b.stubPending = false
+	}
+	return nil
 }
 
 // bucketItem is the ECMH multiset element for one entry: k ‖ SHA-256(v).
@@ -1281,6 +1298,7 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 			if err := t.hot.ReplaceStub(b.mount, b.path, b.stub()); err != nil {
 				return 0, err
 			}
+			b.stubPending = false
 			return 0, errBucketSaturated
 		}
 		return 0, nil // empty batch: nothing to rewrite
@@ -1302,6 +1320,7 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 	if err := t.hot.ReplaceStub(b.mount, b.path, b.stub()); err != nil {
 		return consumed, err
 	}
+	b.stubPending = false
 	if saturated {
 		return consumed, errBucketSaturated
 	}
@@ -1309,10 +1328,10 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 }
 
 // bucketDeleteLocked removes one entry (paper BlindDelete): the commitment
-// updates by point subtraction over k‖keccak(v) alone, the filter drops the
-// fingerprint, and the stub is rewritten in place. A bucket reaching Count
-// zero is destroyed — the stub leaves the tree and the payload record is
-// deleted at the next commit.
+// updates by point subtraction over k‖SHA-256(v), and the filter drops the
+// fingerprint. A nonempty bucket's stub is refreshed before the next root
+// observation or commit. A bucket reaching Count zero is destroyed immediately
+// in the working tree; its payload record is deleted at the next commit.
 func (t *Trie) bucketDeleteLocked(b *bucket, key, value []byte) error {
 	b.filter.Delete(key)
 	b.commitment = ecmh.Delete(b.commitment, bucketItem(key, value))
@@ -1329,6 +1348,7 @@ func (t *Trie) bucketDeleteLocked(b *bucket, key, value []byte) error {
 		if err := t.hot.ReplaceStub(b.mount, b.path, nil); err != nil {
 			return err
 		}
+		b.stubPending = false
 		b.payloadGone = true
 		b.entries = nil
 		if b.elem != nil {
@@ -1337,7 +1357,8 @@ func (t *Trie) bucketDeleteLocked(b *bucket, key, value []byte) error {
 		}
 		return nil
 	}
-	return t.hot.ReplaceStub(b.mount, b.path, b.stub())
+	b.stubPending = true
+	return nil
 }
 
 // canAppendAtMount permits a nearby underfull bucket to broaden its coverage
@@ -1953,6 +1974,9 @@ func (t *Trie) PruneNextShard() error {
 	if t.config.VerifyAtCommit && len(t.pendingAudits) != 0 {
 		return errors.New("mpt archive: commit pending bucket audits before pruning the next block")
 	}
+	if err := t.flushPendingStubsLocked(); err != nil {
+		return err
+	}
 	return t.pruneNextDomainLocked()
 }
 
@@ -2074,6 +2098,9 @@ func (t *Trie) Hash() ([]byte, error) {
 	if err := t.ensureHotLocked(); err != nil {
 		return nil, err
 	}
+	if err := t.flushPendingStubsLocked(); err != nil {
+		return nil, err
+	}
 	hash := t.hot.Hash()
 	if hash == (common.Hash{}) || hash == types.EmptyRootHash {
 		return nil, nil
@@ -2171,6 +2198,9 @@ func (t *Trie) commitToBatchLocked(batch archivetrie.Batcher) ([]byte, error) {
 		if err := t.auditPendingLocked(); err != nil {
 			return nil, err
 		}
+	}
+	if err := t.flushPendingStubsLocked(); err != nil {
+		return nil, err
 	}
 	archivetrie.SetMPTArchivePayloadBytes(t.archiveBytes)
 	archivetrie.SetMPTLiveGauges(t.liveHotLeaves, int64(len(t.buckets)))
