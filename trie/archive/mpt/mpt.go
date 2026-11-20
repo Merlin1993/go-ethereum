@@ -624,12 +624,17 @@ func (t *Trie) domainID(key []byte) int { return domainIDOf(key, t.config.ShardD
 // consistent for keys shorter than the domain prefix.
 func domainIDOf(key []byte, depth int) int {
 	id := 0
-	for i := 0; i < depth; i++ {
-		var bit byte
-		if idx := i / 8; idx < len(key) {
-			bit = (key[idx] >> (7 - uint(i%8))) & 1
+	for i := 0; i < depth/8; i++ {
+		id <<= 8
+		if i < len(key) {
+			id |= int(key[i])
 		}
-		id = id<<1 | int(bit)
+	}
+	if tail := depth % 8; tail != 0 {
+		id <<= uint(tail)
+		if i := depth / 8; i < len(key) {
+			id |= int(key[i] >> uint(8-tail))
+		}
 	}
 	return id
 }
