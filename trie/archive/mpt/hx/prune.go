@@ -15,6 +15,7 @@ package hx
 
 import (
 	"bytes"
+	"fmt"
 )
 
 // ExtractedEntry is a leaf lifted out of the tree by pruning.
@@ -52,11 +53,25 @@ func aggExcludesEpoch(agg uint8, evict byte) bool {
 // receives the full leaf key and reports whether the leaf belongs to the
 // target domain. A nil inDomain selects the whole prefix subtree.
 func (t *Trie) ExtractDomain(prefix []byte, evictEpoch byte, inDomain func(key []byte) bool) ([]ExtractedEntry, error) {
+	return t.extractDomain(prefix, 0, 0, evictEpoch, inDomain)
+}
+
+// ExtractDomainBitTail applies the remaining 1..3 domain bits at the nibble
+// boundary, before resolving sibling subtrees. inDomain remains the final
+// check for leaves on compressed paths and keys shorter than the boundary.
+func (t *Trie) ExtractDomainBitTail(prefix []byte, tailBits, tailValue byte, evictEpoch byte, inDomain func(key []byte) bool) ([]ExtractedEntry, error) {
+	if tailBits == 0 || tailBits > 3 || tailValue >= 1<<tailBits || inDomain == nil {
+		return nil, fmt.Errorf("hx: invalid bit-tail domain filter")
+	}
+	return t.extractDomain(prefix, tailBits, tailValue, evictEpoch, inDomain)
+}
+
+func (t *Trie) extractDomain(prefix []byte, tailBits, tailValue byte, evictEpoch byte, inDomain func(key []byte) bool) ([]ExtractedEntry, error) {
 	if t.committed {
 		return nil, ErrCommitted
 	}
 	var out []ExtractedEntry
-	n, _, err := t.extract(t.root, nil, prefix, evictEpoch, inDomain, &out)
+	n, _, err := t.extract(t.root, nil, prefix, tailBits, tailValue, evictEpoch, inDomain, &out)
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +82,7 @@ func (t *Trie) ExtractDomain(prefix []byte, evictEpoch byte, inDomain func(key [
 // extract walks node n at absolute nibble path `path`, removing in-domain
 // leaves with the evict epoch. It returns the replacement node (nil if the
 // subtree vanished) and whether anything changed.
-func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, inDomain func([]byte) bool, out *[]ExtractedEntry) (node, bool, error) {
+func (t *Trie) extract(n node, path []byte, domain []byte, tailBits, tailValue, evict byte, inDomain func([]byte) bool, out *[]ExtractedEntry) (node, bool, error) {
 	inside := len(path) >= len(domain)
 	switch n := n.(type) {
 	case nil:
@@ -84,7 +99,7 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, inDomain 
 		if err != nil {
 			return nil, false, err
 		}
-		nn, changed, err := t.extract(resolved, path, domain, evict, inDomain, out)
+		nn, changed, err := t.extract(resolved, path, domain, tailBits, tailValue, evict, inDomain, out)
 		if err != nil {
 			return nil, false, err
 		}
@@ -124,23 +139,29 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, inDomain 
 				if aggExcludesEpoch(n.Agg, evict) {
 					return n, false, nil
 				}
-				return t.extractShortChild(n, path, domain, evict, inDomain, out)
+				return t.extractShortChild(n, path, domain, tailBits, tailValue, evict, inDomain, out)
 			}
 			// Fully consumed: descend (leaf check happens at the recursion).
 			if _, isLeaf := n.Val.(valueNode); isLeaf {
 				// Leaf path covers the domain prefix: in-domain by construction.
 				return t.extractLeaf(n, path, evict, inDomain, out)
 			}
-			return t.extractShortChild(n, path, domain, evict, inDomain, out)
+			if aggExcludesEpoch(n.Agg, evict) {
+				return n, false, nil
+			}
+			return t.extractShortChild(n, path, domain, tailBits, tailValue, evict, inDomain, out)
 		}
 		// Extraction mode.
+		if tailBits != 0 && len(path) == len(domain) && len(n.Key) != 0 && n.Key[0] < 16 && n.Key[0]>>(4-tailBits) != tailValue {
+			return n, false, nil
+		}
 		if _, isLeaf := n.Val.(valueNode); isLeaf {
 			return t.extractLeaf(n, path, evict, inDomain, out)
 		}
 		if aggExcludesEpoch(n.Agg, evict) {
 			return n, false, nil // CanSkip: do not touch the subtree
 		}
-		return t.extractShortChild(n, path, domain, evict, inDomain, out)
+		return t.extractShortChild(n, path, domain, tailBits, tailValue, evict, inDomain, out)
 
 	case *fullNode:
 		if !inside {
@@ -150,7 +171,10 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, inDomain 
 			if child == nil {
 				return n, false, nil // empty domain
 			}
-			nc, changed, err := t.extract(child, concat(path, idx), domain, evict, inDomain, out)
+			if aggExcludesEpoch(n.getAgg(int(idx)), evict) {
+				return n, false, nil
+			}
+			nc, changed, err := t.extract(child, concat(path, idx), domain, tailBits, tailValue, evict, inDomain, out)
 			if err != nil {
 				return nil, false, err
 			}
@@ -186,10 +210,13 @@ func (t *Trie) extract(n node, path []byte, domain []byte, evict byte, inDomain 
 			if child == nil {
 				continue
 			}
+			if tailBits != 0 && len(path) == len(domain) && byte(i)>>(4-tailBits) != tailValue {
+				continue // Different logical domain within this nibble subtree.
+			}
 			if aggExcludesEpoch(n.getAgg(i), evict) {
 				continue // CanSkip: zero access to this subtree
 			}
-			nc, childChanged, err := t.extract(child, concat(path, byte(i)), domain, evict, inDomain, out)
+			nc, childChanged, err := t.extract(child, concat(path, byte(i)), domain, tailBits, tailValue, evict, inDomain, out)
 			if err != nil {
 				return nil, false, err
 			}
@@ -240,9 +267,9 @@ func (t *Trie) extractLeaf(n *shortNode, path []byte, evict byte, inDomain func(
 // extractShortChild recurses into an extension's child and re-wraps,
 // merging with a shortNode child (path compression) when the child itself
 // became short.
-func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, evict byte, inDomain func([]byte) bool, out *[]ExtractedEntry) (node, bool, error) {
+func (t *Trie) extractShortChild(n *shortNode, path []byte, domain []byte, tailBits, tailValue, evict byte, inDomain func([]byte) bool, out *[]ExtractedEntry) (node, bool, error) {
 	childPath := concat(path, n.Key...)
-	nc, changed, err := t.extract(n.Val, childPath, domain, evict, inDomain, out)
+	nc, changed, err := t.extract(n.Val, childPath, domain, tailBits, tailValue, evict, inDomain, out)
 	if err != nil {
 		return nil, false, err
 	}

@@ -14,6 +14,7 @@
 package hx
 
 import (
+	"bytes"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -276,6 +277,111 @@ func TestHXExtractDomainBitFilter(t *testing.T) {
 	}
 	if err := tr.VerifyAggregates(); err != nil {
 		t.Fatalf("aggregates after filtered extract: %v", err)
+	}
+}
+
+// A 19-bit logical domain shares its first four nibbles with seven other
+// domains. The bit-tail path must leave the final root and extracted entries
+// unchanged while avoiding node reads in unrelated boundary-nibble subtrees.
+func TestHXExtractDomainBitTailSkipsSiblingDomains(t *testing.T) {
+	run := func(selectTail bool) (common.Hash, []ExtractedEntry, int64) {
+		db := &countingNodeDB{memNodeDB: newTestDB()}
+		tr := NewEmpty(db)
+		tr.SetEpochPolicy(func(key []byte) byte { return key[3] & 1 })
+		for nibble := 0; nibble < 16; nibble++ {
+			for seq := 0; seq < 8; seq++ {
+				key := make([]byte, 32)
+				key[0], key[1], key[2], key[3] = 0x12, 0x34, byte(nibble<<4), byte(seq)
+				if err := tr.Update(key, []byte{byte(nibble), byte(seq)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		root := db.memNodeDB.commit(t, tr)
+		cold, err := New(root, common.Hash{}, db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inDomain := func(key []byte) bool { return key[2]>>5 == 5 }
+		var extracted []ExtractedEntry
+		if selectTail {
+			extracted, err = cold.ExtractDomainBitTail([]byte{1, 2, 3, 4}, 3, 5, 0, inDomain)
+		} else {
+			extracted, err = cold.ExtractDomain([]byte{1, 2, 3, 4}, 0, inDomain)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		reads := db.reads.Load()
+		if err := cold.VerifyAggregates(); err != nil {
+			t.Fatal(err)
+		}
+		return db.memNodeDB.commit(t, cold), extracted, reads
+	}
+	wantRoot, wantEntries, oldReads := run(false)
+	gotRoot, gotEntries, newReads := run(true)
+	if gotRoot != wantRoot {
+		t.Fatalf("root changed: bit-tail %x, old filter %x", gotRoot, wantRoot)
+	}
+	if len(gotEntries) != 8 || len(wantEntries) != len(gotEntries) {
+		t.Fatalf("extracted %d entries, want %d", len(gotEntries), len(wantEntries))
+	}
+	for i := range gotEntries {
+		if !bytes.Equal(gotEntries[i].Key, wantEntries[i].Key) || !bytes.Equal(gotEntries[i].Value, wantEntries[i].Value) {
+			t.Fatalf("extracted entry %d changed", i)
+		}
+	}
+	if newReads >= oldReads {
+		t.Fatalf("bit-tail read %d nodes, old filter read %d", newReads, oldReads)
+	}
+}
+
+func BenchmarkExtractDomainBitTail(b *testing.B) {
+	db := newTestDB()
+	tr := NewEmpty(db)
+	tr.SetEpochPolicy(func(key []byte) byte { return key[3] & 1 })
+	for nibble := 0; nibble < 16; nibble++ {
+		for seq := 0; seq < 64; seq++ {
+			key := make([]byte, 32)
+			key[0], key[1], key[2], key[3] = 0x12, 0x34, byte(nibble<<4), byte(seq)
+			if err := tr.Update(key, []byte{byte(nibble), byte(seq)}); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+	root, nodes := tr.Commit()
+	for _, n := range nodes.Nodes {
+		if n.IsDeleted() {
+			delete(db.nodes, n.Hash)
+		} else {
+			db.nodes[n.Hash] = n.Blob
+		}
+	}
+	inDomain := func(key []byte) bool { return key[2]>>5 == 5 }
+	for _, variant := range []struct {
+		name string
+		run  func(*Trie) ([]ExtractedEntry, error)
+	}{
+		{"leaf_filter", func(t *Trie) ([]ExtractedEntry, error) {
+			return t.ExtractDomain([]byte{1, 2, 3, 4}, 0, inDomain)
+		}},
+		{"bit_tail", func(t *Trie) ([]ExtractedEntry, error) {
+			return t.ExtractDomainBitTail([]byte{1, 2, 3, 4}, 3, 5, 0, inDomain)
+		}},
+	} {
+		b.Run(variant.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				cold, err := New(root, common.Hash{}, db)
+				if err != nil {
+					b.Fatal(err)
+				}
+				entries, err := variant.run(cold)
+				if err != nil || len(entries) != 64 {
+					b.Fatalf("extracted %d entries: %v", len(entries), err)
+				}
+			}
+		})
 	}
 }
 

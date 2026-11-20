@@ -2059,9 +2059,16 @@ func (t *Trie) pruneNextDomainLocked() error {
 	prefix := t.domainPrefixNibbles(id)
 	resolveBefore := t.hot.ResolvedNodes()
 	extractStart := time.Now()
-	extracted, err := t.hot.ExtractDomain(prefix, t.baseBit, func(key []byte) bool {
+	inDomain := func(key []byte) bool {
 		return domainIDOf(key, t.config.ShardDepthBits) == id
-	})
+	}
+	var extracted []gethtrie.ExtractedEntry
+	var err error
+	if tailBits := byte(t.config.ShardDepthBits % 4); tailBits != 0 {
+		extracted, err = t.hot.ExtractDomainBitTail(prefix, tailBits, byte(id&((1<<tailBits)-1)), t.baseBit, inDomain)
+	} else {
+		extracted, err = t.hot.ExtractDomain(prefix, t.baseBit, inDomain)
+	}
 	extractDur := time.Since(extractStart)
 	if err != nil {
 		return err
