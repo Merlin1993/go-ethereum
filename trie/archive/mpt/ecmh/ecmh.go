@@ -269,6 +269,29 @@ func BlindAppend(c Commitment, item []byte) Commitment {
 	return encodePoint(&sum)
 }
 
+// AppendBatch adds several items while decoding and encoding the existing
+// commitment once. For larger batches, independent mappings use the same
+// standard hash-to-curve worker path as CreateParallel.
+func AppendBatch(c Commitment, items [][]byte, workers int) Commitment {
+	if len(items) == 0 {
+		return c
+	}
+	if len(items) == 1 {
+		return BlindAppend(c, items[0])
+	}
+	sum := decodePoint(c)
+	if len(items) >= 16 && workers > 1 {
+		batch := decodePoint(CreateParallel(items, workers))
+		secp256k1.AddNonConst(&sum, &batch, &sum)
+	} else {
+		for _, item := range items {
+			point := itemPoint(item)
+			secp256k1.AddNonConst(&sum, &point, &sum)
+		}
+	}
+	return encodePoint(&sum)
+}
+
 // Delete returns the commitment with one occurrence of item removed:
 // c - H_c(item), i.e. c + (-H_c(item)) where the negation flips y to p-y.
 // It is O(1): a single hash-to-curve plus one point addition against the

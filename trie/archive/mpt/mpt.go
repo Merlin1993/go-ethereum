@@ -1259,6 +1259,8 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 	newKeys := 0
 	saturated := false
 	var added int64
+	var singleItem []byte
+	var newItems [][]byte
 	for _, e := range entries {
 		if old, ok := b.entries[string(e.Key)]; ok {
 			// Blind rewrite of an already-archived key (the write path
@@ -1283,10 +1285,24 @@ func (t *Trie) bucketAppendLocked(b *bucket, entries []gethtrie.ExtractedEntry) 
 			break
 		}
 		b.entries[string(e.Key)] = bytes.Clone(e.Value)
-		b.commitment = ecmh.BlindAppend(b.commitment, bucketItem(e.Key, e.Value))
+		item := bucketItem(e.Key, e.Value)
+		if singleItem == nil {
+			singleItem = item
+		} else {
+			if newItems == nil {
+				newItems = make([][]byte, 0, len(entries))
+				newItems = append(newItems, singleItem)
+			}
+			newItems = append(newItems, item)
+		}
 		added += int64(8 + len(e.Key) + len(e.Value))
 		consumed++
 		newKeys++
+	}
+	if newItems != nil {
+		b.commitment = ecmh.AppendBatch(b.commitment, newItems, 4)
+	} else if singleItem != nil {
+		b.commitment = ecmh.BlindAppend(b.commitment, singleItem)
 	}
 	if consumed == 0 {
 		if saturated {
