@@ -52,7 +52,7 @@ func alternateHash(fp uint16) uint32 {
 
 // Filter 是一个紧凑的布谷鸟过滤器。
 type Filter struct {
-	buckets        [][]uint16
+	data           []uint16 // flat bucket x slot array; one backing allocation per filter
 	numBuckets     int
 	slotsPerBucket int
 	count          int
@@ -69,12 +69,14 @@ func New(buckets, slots int) *Filter {
 	f := &Filter{
 		numBuckets:     buckets,
 		slotsPerBucket: slots,
-		buckets:        make([][]uint16, buckets),
-	}
-	for i := range f.buckets {
-		f.buckets[i] = make([]uint16, slots)
+		data:           make([]uint16, buckets*slots),
 	}
 	return f
+}
+
+func (f *Filter) bucket(i uint) []uint16 {
+	start := int(i) * f.slotsPerBucket
+	return f.data[start : start+f.slotsPerBucket]
 }
 
 // hash 返回数据的原始哈希值和指纹。
@@ -101,11 +103,12 @@ func (f *Filter) alternateIndex(i uint, fp uint16) uint {
 // Insert 将数据添加到过滤器中。
 func (f *Filter) Insert(data []byte) error {
 	i1, fp := f.hash(data)
+	primary := f.bucket(i1)
 
 	// 尝试存入主桶
 	for s := 0; s < f.slotsPerBucket; s++ {
-		if f.buckets[i1][s] == 0 {
-			f.buckets[i1][s] = fp
+		if primary[s] == 0 {
+			primary[s] = fp
 			f.count++
 			return nil
 		}
@@ -113,9 +116,10 @@ func (f *Filter) Insert(data []byte) error {
 
 	// 尝试存入备选桶
 	i2 := f.alternateIndex(i1, fp)
+	alternate := f.bucket(i2)
 	for s := 0; s < f.slotsPerBucket; s++ {
-		if f.buckets[i2][s] == 0 {
-			f.buckets[i2][s] = fp
+		if alternate[s] == 0 {
+			alternate[s] = fp
 			f.count++
 			return nil
 		}
@@ -128,12 +132,14 @@ func (f *Filter) Insert(data []byte) error {
 	for n := 0; n < maxKicks; n++ {
 		// 确定性地选择槽位（原逻辑是 rand.Intn(f.slotsPerBucket)）
 		slot := n % f.slotsPerBucket
-		f.buckets[i][slot], fp = fp, f.buckets[i][slot]
+		current := f.bucket(i)
+		current[slot], fp = fp, current[slot]
 		i = f.alternateIndex(i, fp)
+		current = f.bucket(i)
 
 		for s := 0; s < f.slotsPerBucket; s++ {
-			if f.buckets[i][s] == 0 {
-				f.buckets[i][s] = fp
+			if current[s] == 0 {
+				current[s] = fp
 				f.count++
 				return nil
 			}
@@ -146,15 +152,17 @@ func (f *Filter) Insert(data []byte) error {
 // Lookup 检查数据是否在过滤器中。
 func (f *Filter) Lookup(data []byte) bool {
 	i1, fp := f.hash(data)
+	primary := f.bucket(i1)
 	for s := 0; s < f.slotsPerBucket; s++ {
-		if f.buckets[i1][s] == fp {
+		if primary[s] == fp {
 			return true
 		}
 	}
 
 	i2 := f.alternateIndex(i1, fp)
+	alternate := f.bucket(i2)
 	for s := 0; s < f.slotsPerBucket; s++ {
-		if f.buckets[i2][s] == fp {
+		if alternate[s] == fp {
 			return true
 		}
 	}
@@ -165,18 +173,20 @@ func (f *Filter) Lookup(data []byte) bool {
 // Delete 从过滤器中移除数据。
 func (f *Filter) Delete(data []byte) bool {
 	i1, fp := f.hash(data)
+	primary := f.bucket(i1)
 	for s := 0; s < f.slotsPerBucket; s++ {
-		if f.buckets[i1][s] == fp {
-			f.buckets[i1][s] = 0
+		if primary[s] == fp {
+			primary[s] = 0
 			f.count--
 			return true
 		}
 	}
 
 	i2 := f.alternateIndex(i1, fp)
+	alternate := f.bucket(i2)
 	for s := 0; s < f.slotsPerBucket; s++ {
-		if f.buckets[i2][s] == fp {
-			f.buckets[i2][s] = 0
+		if alternate[s] == fp {
+			alternate[s] = 0
 			f.count--
 			return true
 		}
@@ -192,10 +202,8 @@ func (f *Filter) Count() int {
 
 // Reset 清空过滤器。
 func (f *Filter) Reset() {
-	for i := 0; i < f.numBuckets; i++ {
-		for s := 0; s < f.slotsPerBucket; s++ {
-			f.buckets[i][s] = 0
-		}
+	for i := range f.data {
+		f.data[i] = 0
 	}
 	f.count = 0
 }
@@ -215,12 +223,12 @@ func (f *Filter) Encode() []byte {
 	for i := 0; i < f.numBuckets; i++ {
 		for s := 0; s < f.slotsPerBucket; s++ {
 			slotIdx := i*f.slotsPerBucket + s
-			if f.buckets[i][s] != 0 {
+			if f.data[slotIdx] != 0 {
 				// 在位图中设置对应位
 				bitmask[slotIdx/8] |= (1 << (7 - (slotIdx % 8)))
 				// 追加指纹数据
 				var fpBytes [2]byte
-				binary.BigEndian.PutUint16(fpBytes[:], f.buckets[i][s])
+				binary.BigEndian.PutUint16(fpBytes[:], f.data[slotIdx])
 				fingerprints = append(fingerprints, fpBytes[:]...)
 			}
 		}
@@ -254,10 +262,7 @@ func (f *Filter) Decode(data []byte, buckets, slots int) error {
 
 	f.numBuckets = buckets
 	f.slotsPerBucket = slots
-	f.buckets = make([][]uint16, buckets)
-	for i := range f.buckets {
-		f.buckets[i] = make([]uint16, slots)
-	}
+	f.data = make([]uint16, buckets*slots)
 	f.count = 0
 
 	totalSlots := encodedBuckets * encodedSlots
@@ -282,7 +287,7 @@ func (f *Filter) Decode(data []byte, buckets, slots int) error {
 
 				// Only store if within current (potentially different) dimensions
 				if i < f.numBuckets && s < f.slotsPerBucket {
-					f.buckets[i][s] = fp
+					f.data[i*f.slotsPerBucket+s] = fp
 					f.count++
 				}
 			}
