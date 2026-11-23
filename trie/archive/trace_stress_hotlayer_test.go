@@ -108,6 +108,7 @@ func init() {
 			ShardDepthBits:            spec.ShardDepthBits,
 			CuckooBuckets:             spec.CuckooBuckets,
 			CuckooSlots:               spec.CuckooSlots,
+			FullBucketsBeforeSplit:    spec.FullBucketsBeforeSplit,
 			ActivateArchivedKeyOnRead: spec.ActivateArchivedKeyOnRead,
 			Backend:                   spec.Backend,
 			CleanCacheBytes:           spec.CleanCacheBytes,

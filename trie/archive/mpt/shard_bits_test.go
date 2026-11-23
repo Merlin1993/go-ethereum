@@ -100,14 +100,14 @@ func TestMPTShardBitBoundarySplitD13(t *testing.T) {
 			t.Fatalf("A key %d after prune: fromArchive=%v err=%v; want an archive hit", i, fromArchive, err)
 		}
 	}
-	// ... and only they moved: exactly the four epoch-0 A leaves are in the
-	// archive (the fresh A leaf and every B leaf stayed hot).
-	b := bucketOfKey(t, tr, keysA[0])
-	if b == nil {
-		t.Fatal("no bucket claims the pruned A keys")
+	// ... and only they moved. Bit-level routing may place the four A keys in
+	// separate buckets, so count across the archive rather than one bucket.
+	archived := 0
+	for _, b := range tr.buckets {
+		archived += b.count
 	}
-	if b.count != len(keysA) {
-		t.Fatalf("archived count = %d, want exactly the %d expired A leaves", b.count, len(keysA))
+	if archived != len(keysA) {
+		t.Fatalf("archived count = %d, want exactly the %d expired A leaves", archived, len(keysA))
 	}
 	if _, fromArchive, err := tr.GetValueRef(kFreshA); err != nil || fromArchive {
 		t.Fatalf("fresh A leaf after prune: fromArchive=%v err=%v; want a hot hit (epoch 1 survives)", fromArchive, err)

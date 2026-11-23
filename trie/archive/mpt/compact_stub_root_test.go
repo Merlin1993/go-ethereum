@@ -41,8 +41,8 @@ func TestCompactStubRootCompatibility(t *testing.T) {
 			roots[2] = hex.EncodeToString(root)
 			want := [3]string{
 				"a6af1eef99cd9e5fb32e5c1d4fa7c0e0c9a6c780edff5848cd1a03f1a9fdd143",
-				"bfb9dc82fd62291f90e2b2d390c1dd788231dacca4b8b6cb2d0c7884c30f39f3",
-				"5c229b7c6b1abfbddc7d728a929ad9e80d070c236389e8bc799462905ed1458b",
+				"c77f5565a116113cd21189edb3eb52de68d658a3a62732b17e06d8096c0b0d19",
+				"b928c68542dba2db8521b72d6aa4bb06a21bc42ab0335542260f4d5b09081df5",
 			}
 			if roots != want {
 				t.Fatalf("root encoding changed: got %v, want %v", roots, want)

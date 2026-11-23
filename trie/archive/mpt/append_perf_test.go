@@ -26,7 +26,7 @@ func TestBucketAppendBatchPreservesCommitment(t *testing.T) {
 		return gethtrie.ExtractedEntry{Key: k, Value: []byte{value}}
 	}
 	initial := []gethtrie.ExtractedEntry{entry(1, 1), entry(2, 2)}
-	if n, err := tr.createBucketLocked(nil, initial); err != nil || n != len(initial) {
+	if n, err := tr.createBucketLocked(keyLogicalPath(initial[0].Key, 0), initial); err != nil || n != len(initial) {
 		t.Fatalf("create consumed %d: %v", n, err)
 	}
 	var b *bucket
@@ -73,7 +73,7 @@ func BenchmarkAppendExistingBucket(b *testing.B) {
 					b.Fatal(err)
 				}
 				initial := 100 - added
-				if n, err := tr.createBucketLocked(nil, entries[:initial]); err != nil || n != initial {
+				if n, err := tr.createBucketLocked(keyLogicalPath(entries[0].Key, 0), entries[:initial]); err != nil || n != initial {
 					b.Fatalf("create consumed %d: %v", n, err)
 				}
 				var bucket *bucket

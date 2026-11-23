@@ -71,6 +71,7 @@ var (
 	traceStressSplitArchiveDB             = flag.Bool("traceStressSplitArchiveDB", false, "Store MPTA archive payloads in archive_db and all other records in state_db; report both physical directory sizes per window")
 	traceStressCuckooBuckets              = flag.Int("traceStressCuckooBuckets", 32, "Archive cuckoo filter bucket count")
 	traceStressCuckooSlots                = flag.Int("traceStressCuckooSlots", 4, "Archive cuckoo filter slots per bucket")
+	traceStressFullBucketsBeforeSplit     = flag.Int("traceStressFullBucketsBeforeSplit", 2, "Full archive buckets at one logical prefix before routing new entries one bit deeper")
 	traceStressMPTVerifyAtCommit          = flag.Bool("traceStressMPTVerifyAtCommit", false, "MPT: audit every distinct redeemed bucket before the block's final commit")
 	traceStressMPTVerifyBucketWorkers     = flag.Int("traceStressMPTVerifyBucketWorkers", 8, "MPT: concurrent bucket audit workers")
 	traceStressMPTVerifyItemWorkers       = flag.Int("traceStressMPTVerifyItemWorkers", 2, "MPT: concurrent item workers per bucket")
@@ -617,6 +618,7 @@ type TraceHotTrieSpec struct {
 	ShardDepthBits            int
 	CuckooBuckets             int
 	CuckooSlots               int
+	FullBucketsBeforeSplit    int
 	ActivateArchivedKeyOnRead bool
 	Backend                   string
 	CleanCacheBytes           int
@@ -1126,6 +1128,9 @@ func TestArchiveStemTraceStress(t *testing.T) {
 	if *traceStressCuckooBuckets <= 0 || *traceStressCuckooSlots <= 0 {
 		t.Fatalf("traceStressCuckooBuckets and traceStressCuckooSlots must be positive")
 	}
+	if *traceStressFullBucketsBeforeSplit < 1 {
+		t.Fatal("traceStressFullBucketsBeforeSplit must be positive")
+	}
 	if *traceStressPruneEveryBatches < 0 {
 		t.Fatal("traceStressPruneEveryBatches cannot be negative")
 	}
@@ -1222,6 +1227,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 		"epoch_bitmap":              *traceStressHotLayer == "mpt",
 		"hot_value_layout":          map[bool]string{true: "inline", false: "flatref"}[*traceStressHotLayer == "mpt"],
 		"archive_bucket_capacity":   bucketCapacityMetadata(),
+		"full_buckets_before_split": *traceStressFullBucketsBeforeSplit,
 		"trie_backend":              *traceStressTrieBackend,
 		"clean_cache_mb":            *traceStressPathCleanCacheMB,
 		"write_buffer_mb":           *traceStressPathWriteBufferMB,
@@ -1312,6 +1318,7 @@ func TestArchiveStemTraceStress(t *testing.T) {
 			ShardDepthBits:            *traceStressShardDepthBits,
 			CuckooBuckets:             *traceStressCuckooBuckets,
 			CuckooSlots:               *traceStressCuckooSlots,
+			FullBucketsBeforeSplit:    *traceStressFullBucketsBeforeSplit,
 			ActivateArchivedKeyOnRead: *traceStressActivateArchivedKeyOnRead,
 			Backend:                   *traceStressTrieBackend,
 			CleanCacheBytes:           *traceStressPathCleanCacheMB << 20,
