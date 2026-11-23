@@ -137,7 +137,9 @@ func (n *shortNode) encode(w rlp.EncoderBuffer) {
 	} else {
 		w.Write(rlp.EmptyString)
 	}
-	if hasTerm(compactToHex(n.Key)) {
+	// Bit 5 of the compact key is the leaf terminator flag. Reading it
+	// directly avoids unpacking the entire key merely to select the metadata.
+	if len(n.Key) > 0 && n.Key[0]&0x20 != 0 {
 		w.WriteUint64(uint64(n.Epoch))
 	} else {
 		w.WriteUint64(uint64(n.Agg))

@@ -14,7 +14,14 @@ var compactReadSink []byte
 
 // Changed values force path copies, exposing the extra in-memory AMT fields.
 func BenchmarkCompactHotWrite(b *testing.B) {
-	const count = 4096
+	benchmarkCompactHotWrite(b, 4096)
+}
+
+func BenchmarkCompactLargeHotWrite(b *testing.B) {
+	benchmarkCompactHotWrite(b, 262144)
+}
+
+func benchmarkCompactHotWrite(b *testing.B, count int) {
 	keys := make([][]byte, count)
 	for i := range keys {
 		key := make([]byte, 32)

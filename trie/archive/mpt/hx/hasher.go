@@ -86,7 +86,9 @@ func (h *hasher) hash(n node, force bool) (hashed node, cached node) {
 // hashShortNodeChildren collapses the short node. The returned collapsed node
 // holds a live reference to the Key, and must not be modified.
 func (h *hasher) hashShortNodeChildren(n *shortNode) (collapsed, cached *shortNode) {
-	collapsed, cached = n.copy(), n.copy()
+	// Hashing changes only the temporary key/value and cache flag. Stub lists
+	// are immutable here, so hashing need not clone their slices twice.
+	collapsed, cached = n.copyPath(), n.copyPath()
 	collapsed.Key = hexToCompact(n.Key)
 	switch n.Val.(type) {
 	case *fullNode, *shortNode:
@@ -96,8 +98,8 @@ func (h *hasher) hashShortNodeChildren(n *shortNode) (collapsed, cached *shortNo
 }
 
 func (h *hasher) hashFullNodeChildren(n *fullNode) (collapsed *fullNode, cached *fullNode) {
-	cached = n.copy()
-	collapsed = n.copy()
+	cached = n.copyPath()
+	collapsed = n.copyPath()
 	if h.parallel {
 		var wg sync.WaitGroup
 		wg.Add(16)

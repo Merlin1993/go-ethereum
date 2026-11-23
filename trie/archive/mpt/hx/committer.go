@@ -47,9 +47,11 @@ func (c *committer) commit(path []byte, n node, parallel bool) node {
 	if hash != nil && !dirty {
 		return hash
 	}
+	// Collapsing changes key and child references only. Stub lists remain
+	// immutable, so both temporary copies can share them.
 	switch cn := n.(type) {
 	case *shortNode:
-		collapsed := cn.copy()
+		collapsed := cn.copyPath()
 		// Upstream only commits fullNode children here because the canonical
 		// MPT form has no adjacent shortNodes. hx deliberately keeps
 		// extension->short links in one prune corner (stubs must not land on
@@ -68,7 +70,7 @@ func (c *committer) commit(path []byte, n node, parallel bool) node {
 		return collapsed
 	case *fullNode:
 		hashedKids := c.commitChildren(path, cn, parallel)
-		collapsed := cn.copy()
+		collapsed := cn.copyPath()
 		collapsed.Children = hashedKids
 		hashedNode := c.store(path, collapsed)
 		if hn, ok := hashedNode.(hashNode); ok {
